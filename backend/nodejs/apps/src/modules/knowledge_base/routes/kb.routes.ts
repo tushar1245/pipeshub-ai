@@ -31,6 +31,9 @@ import {
   uploadRecordsToKB,
   getKnowledgeHubNodes,
   moveRecord,
+  getRecordKBLinks,
+  linkRecordToKB,
+  unlinkRecordFromKB,
 } from '../controllers/kb_controllers';
 import { ArangoService } from '../../../libs/services/arango.service';
 import { metricsMiddleware } from '../../../libs/middlewares/prometheus.middleware';
@@ -280,6 +283,30 @@ export function createKnowledgeBaseRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(reindexRecordSchema),
     reindexRecord(appConfig),
+  );
+
+  // Get KB links for a record
+  router.get(
+    '/record/:recordId/kb-links',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    getRecordKBLinks(appConfig),
+  );
+
+  // Link a record to a KB
+  router.post(
+    '/record/:recordId/kb-links',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    linkRecordToKB(appConfig),
+  );
+
+  // Remove link between record and KB
+  router.delete(
+    '/record/:recordId/kb-links/:kbId',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    unlinkRecordFromKB(appConfig),
   );
 
   // reindex a record group

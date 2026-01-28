@@ -401,4 +401,35 @@ export class KnowledgeBaseAPI {
       throw new Error('Error searching knowledge base ');
     }
   }
+
+  // Record-KB Link operations
+  static async getRecordKBLinks(recordId: string): Promise<any> {
+    const response = await axios.get(`${API_BASE}/record/${recordId}/kb-links`);
+    if (!response.data) throw new Error('Failed to fetch record KB links');
+    return response.data.kbLinks || [];
+  }
+
+  static async linkRecordToKB(recordId: string, kbId: string): Promise<any> {
+    const response = await axios.post(`${API_BASE}/record/${recordId}/kb-links`, {
+      kbId,
+    });
+    if (!response.data) throw new Error('Failed to link record to KB');
+    return response.data;
+  }
+
+  static async unlinkRecordFromKB(recordId: string, kbId: string): Promise<any> {
+    const response = await axios.delete(`${API_BASE}/record/${recordId}/kb-links/${kbId}`);
+    if (!response.data) throw new Error('Failed to unlink record from KB');
+    return response.data;
+  }
+
+  static async getAccessibleKBs(params?: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
+  }): Promise<any> {
+    return this.getKnowledgeBases(params);
+  }
 }

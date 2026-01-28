@@ -1424,6 +1424,219 @@ async def reindex_single_record(
             detail=f"Internal server error while reindexing record: {str(e)}"
         )
 
+@router.get("/api/v1/records/{record_id}/kb-links")
+@inject
+async def get_record_kb_links(
+    record_id: str,
+    request: Request,
+    arango_service: BaseArangoService = Depends(get_arango_service),
+) -> Dict:
+    """
+    Get all KBs linked to a record via belongs_to edges.
+    """
+    try:
+        container = request.app.container
+        logger = container.logger()
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+
+        if not user_id or not org_id:
+            raise HTTPException(
+                status_code=HttpStatusCode.UNAUTHORIZED.value,
+                detail="User not authenticated"
+            )
+
+        # Check if user has access to the record
+        has_access = await arango_service.check_record_access_with_details(
+            user_id=user_id,
+            org_id=org_id,
+            record_id=record_id,
+        )
+
+        if not has_access:
+            raise HTTPException(
+                status_code=HttpStatusCode.FORBIDDEN.value,
+                detail="You do not have access to this record"
+            )
+
+        # Get KB links
+        kb_links = await arango_service.get_record_kb_links(
+            record_id=record_id,
+            user_id=user_id,
+            org_id=org_id,
+        )
+
+        return {
+            "success": True,
+            "kbLinks": kb_links,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error getting record KB links: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@router.post("/api/v1/records/{record_id}/kb-links")
+@inject
+async def create_record_kb_link(
+    record_id: str,
+    request: Request,
+    arango_service: BaseArangoService = Depends(get_arango_service),
+) -> Dict:
+    """
+    Link a record to a Knowledge Base via belongs_to edge.
+    
+    Request Body:
+        {
+            "kbId": "string"  # Knowledge Base ID
+        }
+    """
+    try:
+        container = request.app.container
+        logger = container.logger()
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+
+        if not user_id or not org_id:
+            raise HTTPException(
+                status_code=HttpStatusCode.UNAUTHORIZED.value,
+                detail="User not authenticated"
+            )
+
+        # Parse request body
+        body = await request.json()
+        kb_id = body.get("kbId")
+
+        if not kb_id:
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="kbId is required"
+            )
+
+        # Check if user has access to the record
+        has_access = await arango_service.check_record_access_with_details(
+            user_id=user_id,
+            org_id=org_id,
+            record_id=record_id,
+        )
+
+
+        if not has_access:
+            raise HTTPException(
+                status_code=HttpStatusCode.FORBIDDEN.value,
+                detail="You do not have access to this record"
+            )
+
+        # Check if user has access to the KB
+        user = await arango_service.get_user_by_user_id(user_id=user_id)
+        if not user:
+            raise HTTPException(
+                status_code=HttpStatusCode.NOT_FOUND.value,
+                detail="User not found"
+            )
+
+        user_key = user.get("_key")
+        kb_permission = await arango_service.get_user_kb_permission(kb_id, user_key)
+
+        if not kb_permission:
+            raise HTTPException(
+                status_code=HttpStatusCode.FORBIDDEN.value,
+                detail="You do not have access to this Knowledge Base"
+            )
+
+        # Create the link
+        result = await arango_service.create_record_kb_link(
+            record_id=record_id,
+            kb_id=kb_id,
+            user_id=user_id,
+        )
+
+        if result:
+            return {
+                "success": True,
+                "message": "Record linked to Knowledge Base successfully",
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Link already exists",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error creating record KB link: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@router.delete("/api/v1/records/{record_id}/kb-links/{kb_id}")
+@inject
+async def delete_record_kb_link(
+    record_id: str,
+    kb_id: str,
+    request: Request,
+    arango_service: BaseArangoService = Depends(get_arango_service),
+) -> Dict:
+    """
+    Remove a link between a record and a Knowledge Base.
+    """
+    try:
+        container = request.app.container
+        logger = container.logger()
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+
+        if not user_id or not org_id:
+            raise HTTPException(
+                status_code=HttpStatusCode.UNAUTHORIZED.value,
+                detail="User not authenticated"
+            )
+
+        # Check if user has access to the record
+        has_access = await arango_service.check_record_access_with_details(
+            user_id=user_id,
+            org_id=org_id,
+            record_id=record_id,
+        )
+
+        if not has_access:
+            raise HTTPException(
+                status_code=HttpStatusCode.FORBIDDEN.value,
+                detail="You do not have access to this record"
+            )
+
+        # Delete the link
+        result = await arango_service.delete_record_kb_link(
+            record_id=record_id,
+            kb_id=kb_id,
+        )
+
+        if result:
+            return {
+                "success": True,
+                "message": "Link removed successfully",
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Link not found",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error deleting record KB link: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
 @router.get("/api/v1/stats")
 async def get_connector_stats_endpoint(
     request: Request,

@@ -20,6 +20,7 @@ import languagePhpIcon from '@iconify-icons/mdi/language-php';
 import downloadIcon from '@iconify-icons/mdi/download-outline';
 import fileWordBoxIcon from '@iconify-icons/vscode-icons/file-type-word';
 import trashCanIcon from '@iconify-icons/mdi/trash-can-outline';
+import linkIcon from '@iconify-icons/mdi/link-variant';
 import languageCss3Icon from '@iconify-icons/mdi/language-css3';
 import languageJavaIcon from '@iconify-icons/mdi/language-java';
 import languageRubyIcon from '@iconify-icons/mdi/language-ruby';
@@ -70,6 +71,7 @@ import DeleteRecordDialog from '../delete-record-dialog';
 import KnowledgeBaseSideBar from '../knowledge-base-sidebar';
 import { Filters } from '../types/knowledge-base';
 import { ORIGIN } from '../constants/knowledge-search';
+import { LinkToKBDialog } from './dialogs';
 
 // Import the Filters type from the sidebar to ensure compatibility
 
@@ -219,6 +221,13 @@ const AllRecordsView: React.FC<AllRecordsViewProps> = ({ onNavigateBack, onNavig
 
   // Delete dialog state
   const [deleteDialogData, setDeleteDialogData] = useState({
+    open: false,
+    recordId: '',
+    recordName: '',
+  });
+
+  // Link to KB dialog state
+  const [linkKBDialogData, setLinkKBDialogData] = useState({
     open: false,
     recordId: '',
     recordName: '',
@@ -1150,6 +1159,22 @@ const AllRecordsView: React.FC<AllRecordsViewProps> = ({ onNavigateBack, onNavig
                 },
               ]
               : []),
+            // Show Link to KB option for CONNECTOR records
+            ...(params.row.origin === ORIGIN.CONNECTOR
+              ? [
+                {
+                  label: 'Add to KB',
+                  icon: linkIcon,
+                  color: theme.palette.primary.main,
+                  onClick: () =>
+                    setLinkKBDialogData({
+                      open: true,
+                      recordId: params.row.id,
+                      recordName: params.row.recordName,
+                    }),
+                },
+              ]
+              : []),
             // Only show delete option for OWNER and WRITER, and hide if origin is CONNECTOR
             ...(canModify && params.row.origin !== ORIGIN.CONNECTOR
               ? [
@@ -1586,6 +1611,20 @@ const AllRecordsView: React.FC<AllRecordsViewProps> = ({ onNavigateBack, onNavig
               onRecordDeleted={handleDeleteSuccess}
               recordId={deleteDialogData.recordId}
               recordName={deleteDialogData.recordName}
+            />
+
+            {/* Link to KB Dialog */}
+            <LinkToKBDialog
+              open={linkKBDialogData.open}
+              onClose={() =>
+                setLinkKBDialogData({
+                  open: false,
+                  recordId: '',
+                  recordName: '',
+                })
+              }
+              recordId={linkKBDialogData.recordId}
+              recordName={linkKBDialogData.recordName}
             />
 
             {/* Snackbars */}

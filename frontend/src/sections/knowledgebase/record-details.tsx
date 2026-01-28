@@ -18,6 +18,7 @@ import descriptionIcon from '@iconify-icons/mdi/file-document-outline';
 import databaseIcon from '@iconify-icons/mdi/database';
 import infoIcon from '@iconify-icons/mdi/information-outline';
 import ticketIcon from '@iconify-icons/mdi/ticket-outline';
+import linkIcon from '@iconify-icons/mdi/link-variant';
 
 import {
   Box,
@@ -43,6 +44,9 @@ import {
   Dialog,
   DialogContent,
   Menu,
+  MenuItem,
+  ListItemIcon,
+  ListItemText,
 } from '@mui/material';
 
 import axios from 'src/utils/axios';
@@ -55,6 +59,7 @@ import RecordSalesAgent from './ask-me-anything';
 import RecordDocumentViewer from './show-documents';
 import EditRecordDialog from './edit-record-dialog';
 import DeleteRecordDialog from './delete-record-dialog';
+import { LinkToKBDialog } from './components/dialogs';
 import type { MetadataItem, Permissions, RecordDetailsResponse } from './types/record-details';
 import {
   DeleteButton,
@@ -79,6 +84,7 @@ export default function RecordDetails() {
   const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
   const [isEditDialogOpen, setIsEditDialogOpen] = useState<boolean>(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState<boolean>(false);
+  const [isLinkKBDialogOpen, setIsLinkKBDialogOpen] = useState<boolean>(false);
   const users = useUsers() as User[];
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
@@ -442,6 +448,34 @@ export default function RecordDetails() {
                   />
                 )}
 
+                {/* Add to KB button - only for connector records */}
+                {isRecordConnector && recordId && (
+                  <Tooltip title="Add to Knowledge Base">
+                    <Button
+                      onClick={() => setIsLinkKBDialogOpen(true)}
+                      variant="outlined"
+                      size="small"
+                      startIcon={<Icon icon={linkIcon} width={18} height={18} />}
+                      sx={{
+                        height: 32,
+                        px: 1.5,
+                        borderRadius: '6px',
+                        textTransform: 'none',
+                        fontSize: '0.8125rem',
+                        fontWeight: 500,
+                        borderColor: (themeVal) => alpha(themeVal.palette.info.main, 0.5),
+                        color: (themeVal) => themeVal.palette.info.main,
+                        '&:hover': {
+                          borderColor: (themeVal) => themeVal.palette.info.main,
+                          bgcolor: (themeVal) => alpha(themeVal.palette.info.main, 0.08),
+                        },
+                      }}
+                    >
+                      Add to KB
+                    </Button>
+                  </Tooltip>
+                )}
+
                 {/* Delete button */}
                 {!isRecordConnector && (
                   <DeleteButton onClick={() => setIsDeleteDialogOpen(true)} variant="default" />
@@ -481,6 +515,34 @@ export default function RecordDetails() {
                   />
                 )}
 
+                {/* Add to KB button - only for connector records */}
+                {isRecordConnector && recordId && (
+                  <Tooltip title="Add to Knowledge Base">
+                    <Button
+                      onClick={() => setIsLinkKBDialogOpen(true)}
+                      variant="outlined"
+                      size="small"
+                      startIcon={<Icon icon={linkIcon} width={18} height={18} />}
+                      sx={{
+                        height: 32,
+                        px: 1.5,
+                        borderRadius: '6px',
+                        textTransform: 'none',
+                        fontSize: '0.8125rem',
+                        fontWeight: 500,
+                        borderColor: (themeVal) => alpha(themeVal.palette.info.main, 0.5),
+                        color: (themeVal) => themeVal.palette.info.main,
+                        '&:hover': {
+                          borderColor: (themeVal) => themeVal.palette.info.main,
+                          bgcolor: (themeVal) => alpha(themeVal.palette.info.main, 0.08),
+                        },
+                      }}
+                    >
+                      Add to KB
+                    </Button>
+                  </Tooltip>
+                )}
+
                 {/* Delete button */}
                 {!isRecordConnector && (
                   <DeleteButton onClick={() => setIsDeleteDialogOpen(true)} variant="default" />
@@ -515,6 +577,34 @@ export default function RecordDetails() {
                     onRetryIndexing={handleRetryIndexing}
                     variant="compact"
                   />
+                )}
+
+                {/* Add to KB button - only for connector records */}
+                {isRecordConnector && recordId && (
+                  <Tooltip title="Add to Knowledge Base">
+                    <Button
+                      onClick={() => setIsLinkKBDialogOpen(true)}
+                      variant="outlined"
+                      size="small"
+                      startIcon={<Icon icon={linkIcon} width={16} height={16} />}
+                      sx={{
+                        height: 28,
+                        px: 1,
+                        borderRadius: '6px',
+                        textTransform: 'none',
+                        fontSize: '0.75rem',
+                        fontWeight: 500,
+                        borderColor: (themeVal) => alpha(themeVal.palette.info.main, 0.5),
+                        color: (themeVal) => themeVal.palette.info.main,
+                        '&:hover': {
+                          borderColor: (themeVal) => themeVal.palette.info.main,
+                          bgcolor: (themeVal) => alpha(themeVal.palette.info.main, 0.08),
+                        },
+                      }}
+                    >
+                      Add to KB
+                    </Button>
+                  </Tooltip>
                 )}
 
                 {webUrl && record.origin !=='UPLOAD' && !hideWeburl && <OpenButton webUrl={webUrl} variant="compact" />}
@@ -644,6 +734,37 @@ export default function RecordDetails() {
                     />
                   )}
 
+                  {/* Add to KB - only for connector records */}
+                  {isRecordConnector && recordId && (
+                    <>
+                      <MenuItem
+                        onClick={() => {
+                          setIsLinkKBDialogOpen(true);
+                          handleActionMenuClose();
+                        }}
+                        sx={{
+                          py: 1.25,
+                          px: 2,
+                          '&:hover': {
+                            bgcolor: (themeVal) => alpha(themeVal.palette.info.main, 0.08),
+                          },
+                        }}
+                      >
+                        <ListItemIcon>
+                          <Icon icon={linkIcon} width={20} height={20} style={{ color: theme.palette.info.main }} />
+                        </ListItemIcon>
+                        <ListItemText
+                          primary="Add to Knowledge Base"
+                          primaryTypographyProps={{
+                            fontSize: '0.875rem',
+                            fontWeight: 500,
+                            color: theme.palette.info.main,
+                          }}
+                        />
+                      </MenuItem>
+                    </>
+                  )}
+
                   {!isRecordConnector && (
                     <>
                       <Divider sx={{ my: 0.5 }} />
@@ -745,13 +866,16 @@ export default function RecordDetails() {
                       flexWrap: 'wrap',
                     }}
                   >
-                    <Icon
-                      icon={record?.origin === 'CONNECTOR' ? connectorIcon : databaseIcon}
-                      style={{ fontSize: '16px' }}
-                    />
-                    {knowledgeBase && `KB: ${knowledgeBase.name || 'Default'}`}
-                    {record?.origin === 'CONNECTOR' && record.connectorName && (
-                      <>{record.connectorName}</>
+                    {record?.origin === 'CONNECTOR' ? (
+                      <>
+                        <Icon icon={connectorIcon} style={{ fontSize: '16px' }} />
+                        {record.connectorName && <>{record.connectorName}</>}
+                      </>
+                    ) : (
+                      <>
+                        <Icon icon={databaseIcon} style={{ fontSize: '16px' }} />
+                        {knowledgeBase && `KB: ${knowledgeBase.name || 'Default'}`}
+                      </>
                     )}
                   </Typography>
                 </Grid>
@@ -1712,6 +1836,14 @@ export default function RecordDetails() {
             open={isDeleteDialogOpen}
             onClose={() => setIsDeleteDialogOpen(false)}
             onRecordDeleted={handleDeleteRecord}
+            recordId={record._key}
+            recordName={record.recordName}
+          />
+        )}
+        {recordData && recordData.record && isRecordConnector && recordId && (
+          <LinkToKBDialog
+            open={isLinkKBDialogOpen}
+            onClose={() => setIsLinkKBDialogOpen(false)}
             recordId={record._key}
             recordName={record.recordName}
           />

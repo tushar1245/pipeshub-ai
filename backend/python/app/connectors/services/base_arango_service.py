@@ -10016,6 +10016,188 @@ class BaseArangoService:
             self.logger.error(f"❌ Failed to update knowledge base: {str(e)}")
             raise
 
+    async def get_record_kb_links(
+        self,
+        record_id: str,
+        user_id: str,
+        org_id: str,
+        transaction: Optional[TransactionDatabase] = None,
+    ) -> List[Dict]:
+        """
+        Get all KBs linked to a record via belongs_to edges.
+        
+        Args:
+            record_id: Record ID
+            user_id: User ID for permission checking
+            org_id: Organization ID
+            transaction: Optional transaction database
+            
+        Returns:
+            List of KB information dictionaries with id, name, createdAtTimestamp, createdBy
+        """
+        try:
+            db = transaction if transaction else self.db
+            self.logger.info(f"🔍 Getting KB links for record {record_id}")
+            
+            query = """
+            LET record_from = CONCAT('records/', @record_id)
+            
+            // Find all belongs_to edges from record to KB record groups
+            FOR edge IN @@belongs_to
+                FILTER edge._from == record_from
+                FILTER STARTS_WITH(edge._to, 'recordGroups/')
+                FILTER edge.entityType == 'KB'
+                
+                LET kb = DOCUMENT(edge._to)
+                FILTER kb != null
+                FILTER kb.orgId == @org_id
+                
+                RETURN {
+                    id: kb._key,
+                    name: kb.groupName,
+                    createdAtTimestamp: edge.createdAtTimestamp,
+                    createdBy: edge.createdBy,
+                    edgeId: edge._key
+                }
+            """
+            
+            cursor = db.aql.execute(query, bind_vars={
+                "record_id": record_id,
+                "org_id": org_id,
+                "@belongs_to": CollectionNames.BELONGS_TO.value,
+            })
+            
+            results = list(cursor)
+            self.logger.info(f"✅ Found {len(results)} KB links for record {record_id}")
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to get record KB links: {str(e)}")
+            raise
+
+    async def create_record_kb_link(
+        self,
+        record_id: str,
+        kb_id: str,
+        user_id: str,
+        transaction: Optional[TransactionDatabase] = None,
+    ) -> bool:
+        """
+        Create a belongs_to edge linking a record to a KB.
+        
+        Args:
+            record_id: Record ID
+            kb_id: Knowledge Base ID (record group key)
+            user_id: User ID who is creating the link
+            transaction: Optional transaction database
+            
+        Returns:
+            True if edge was created, False if it already exists
+        """
+        try:
+            db = transaction if transaction else self.db
+            self.logger.info(f"🔗 Creating KB link: record {record_id} -> KB {kb_id}")
+            
+            # Check if edge already exists
+            check_query = """
+            LET record_from = CONCAT('records/', @record_id)
+            LET kb_to = CONCAT('recordGroups/', @kb_id)
+            
+            FOR edge IN @@belongs_to
+                FILTER edge._from == record_from
+                FILTER edge._to == kb_to
+                FILTER edge.entityType == 'KB'
+                LIMIT 1
+                RETURN edge
+            """
+            
+            cursor = db.aql.execute(check_query, bind_vars={
+                "record_id": record_id,
+                "kb_id": kb_id,
+                "@belongs_to": CollectionNames.BELONGS_TO.value,
+            })
+            
+            existing = list(cursor)
+            if existing:
+                self.logger.info(f"⚠️ KB link already exists: record {record_id} -> KB {kb_id}")
+                return False
+            
+            # Create the edge
+            current_timestamp = get_epoch_timestamp_in_ms()
+            edge = {
+                "_from": f"{CollectionNames.RECORDS.value}/{record_id}",
+                "_to": f"{CollectionNames.RECORD_GROUPS.value}/{kb_id}",
+                "entityType": "KB",
+                "createdAtTimestamp": current_timestamp,
+                "updatedAtTimestamp": current_timestamp,
+                "createdBy": user_id,
+            }
+            
+            result = await self.batch_create_edges([edge], CollectionNames.BELONGS_TO.value, transaction=transaction)
+            
+            if result:
+                self.logger.info(f"✅ Successfully created KB link: record {record_id} -> KB {kb_id}")
+                return True
+            else:
+                self.logger.error(f"❌ Failed to create KB link: record {record_id} -> KB {kb_id}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to create record KB link: {str(e)}")
+            raise
+
+    async def delete_record_kb_link(
+        self,
+        record_id: str,
+        kb_id: str,
+        transaction: Optional[TransactionDatabase] = None,
+    ) -> bool:
+        """
+        Delete a belongs_to edge linking a record to a KB.
+        
+        Args:
+            record_id: Record ID
+            kb_id: Knowledge Base ID (record group key)
+            transaction: Optional transaction database
+            
+        Returns:
+            True if edge was deleted, False if not found
+        """
+        try:
+            db = transaction if transaction else self.db
+            self.logger.info(f"🗑️ Deleting KB link: record {record_id} -> KB {kb_id}")
+            
+            query = """
+            LET record_from = CONCAT('records/', @record_id)
+            LET kb_to = CONCAT('recordGroups/', @kb_id)
+            
+            FOR edge IN @@belongs_to
+                FILTER edge._from == record_from
+                FILTER edge._to == kb_to
+                FILTER edge.entityType == 'KB'
+                REMOVE edge IN @@belongs_to
+                RETURN OLD
+            """
+            
+            cursor = db.aql.execute(query, bind_vars={
+                "record_id": record_id,
+                "kb_id": kb_id,
+                "@belongs_to": CollectionNames.BELONGS_TO.value,
+            })
+            
+            deleted = list(cursor)
+            
+            if deleted:
+                self.logger.info(f"✅ Successfully deleted KB link: record {record_id} -> KB {kb_id}")
+                return True
+            else:
+                self.logger.warning(f"⚠️ KB link not found: record {record_id} -> KB {kb_id}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to delete record KB link: {str(e)}")
+            raise
+
     async def get_folder_record_by_id(self, folder_id: str, transaction: Optional[TransactionDatabase] = None) -> Optional[Dict]:
         """
         Get folder by ID. Folders are represented by RECORDS documents with associated FILES documents.

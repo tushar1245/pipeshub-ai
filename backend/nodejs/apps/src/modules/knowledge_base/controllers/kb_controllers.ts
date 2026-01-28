@@ -2058,6 +2058,143 @@ export const deleteRecord =
   };
 
 /**
+ * Get all KBs linked to a record via belongs_to edges
+ */
+export const getRecordKBLinks =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      // Call the Python service to get KB links
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/records/${recordId}/kb-links`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Getting record KB links',
+        'Failed to get KB links',
+      );
+
+      logger.info('Record KB links retrieved successfully');
+    } catch (error: any) {
+      logger.error('Error getting record KB links', {
+        recordId: req.params.recordId,
+        error,
+      });
+      const handleError = handleBackendError(error, 'get record KB links');
+      next(handleError);
+      return;
+    }
+  };
+
+/**
+ * Link a record to a Knowledge Base via belongs_to edge
+ */
+export const linkRecordToKB =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+      const { kbId } = req.body || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      // Validate request body
+      if (!kbId) {
+        throw new BadRequestError('kbId is required');
+      }
+
+      // Call the Python service to create KB link
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/records/${recordId}/kb-links`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        { kbId },
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Linking record to KB',
+        'Failed to link record to KB',
+      );
+
+      logger.info('Record linked to KB successfully');
+    } catch (error: any) {
+      logger.error('Error linking record to KB', {
+        recordId: req.params.recordId,
+        error,
+      });
+      const handleError = handleBackendError(error, 'link record to KB');
+      next(handleError);
+      return;
+    }
+  };
+
+/**
+ * Remove a link between a record and a Knowledge Base
+ */
+export const unlinkRecordFromKB =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId, kbId } = req.params as { recordId: string; kbId: string };
+      const { userId, orgId } = req.user || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      // Call the Python service to delete KB link
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/records/${recordId}/kb-links/${kbId}`,
+        HttpMethod.DELETE,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Removing KB link',
+        'Failed to remove KB link',
+      );
+
+      logger.info('KB link removed successfully');
+    } catch (error: any) {
+      logger.error('Error removing KB link', {
+        recordId: req.params.recordId,
+        kbId: req.params.kbId,
+        error,
+      });
+      const handleError = handleBackendError(error, 'remove KB link');
+      next(handleError);
+      return;
+    }
+  };
+
+/**
  * Create permissions for multiple users on a knowledge base
  */
 export const createKBPermission =

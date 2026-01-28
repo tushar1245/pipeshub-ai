@@ -100,6 +100,7 @@ belongs_to_schema = {
             },
             "createdAtTimestamp": {"type": "number"},
             "updatedAtTimestamp": {"type": "number"},
+            "createdBy": {"type": "string", "minLength": 1},
         },
         "additionalProperties": True,
     },
