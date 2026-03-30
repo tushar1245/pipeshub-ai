@@ -5,6 +5,7 @@ Handles agent instances, templates, chat, and permissions using graph-based arch
 
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from logging import Logger
@@ -145,20 +146,46 @@ class LLMInitializationError(AgentError):
 
 async def get_services(request: Request) -> dict[str, Any]:
     """Get all required services from container"""
+    t0 = time.perf_counter()
     container = request.app.container
 
+    t1 = time.perf_counter()
     retrieval_service = await container.retrieval_service()
+    retrieval_service_ms = (time.perf_counter() - t1) * 1000
+
+    t1 = time.perf_counter()
     graph_provider = await container.graph_provider()
+    graph_provider_ms = (time.perf_counter() - t1) * 1000
+
+    t1 = time.perf_counter()
     reranker_service = container.reranker_service()
+    reranker_service_ms = (time.perf_counter() - t1) * 1000
+
+    t1 = time.perf_counter()
     config_service = container.config_service()
+    config_service_ms = (time.perf_counter() - t1) * 1000
+
+    t1 = time.perf_counter()
     logger = container.logger()
+    logger_ms = (time.perf_counter() - t1) * 1000
 
     # Get and verify LLM
+    get_llm_instance_ms = 0.0
     llm = retrieval_service.llm
     if llm is None:
+        t_llm = time.perf_counter()
         llm = await retrieval_service.get_llm_instance()
+        get_llm_instance_ms = (time.perf_counter() - t_llm) * 1000
         if llm is None:
             raise LLMInitializationError()
+
+    total_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        f"get_services finished in {total_ms:.1f}ms "
+        f"(retrieval_service={retrieval_service_ms:.1f}ms, graph_provider={graph_provider_ms:.1f}ms, "
+        f"reranker_service={reranker_service_ms:.1f}ms, config_service={config_service_ms:.1f}ms, "
+        f"logger={logger_ms:.1f}ms, get_llm_instance={get_llm_instance_ms:.1f}ms)"
+    )
 
     return {
         "retrieval_service": retrieval_service,
@@ -905,7 +932,6 @@ def _parse_request_body(body: bytes) -> dict[str, Any]:
 async def askAI(request: Request, query_info: ChatQuery) -> JSONResponse:
     """Process chat query using LangGraph agent with optimizations"""
     try:
-        import time
         start_time = time.time()
 
         services = await get_services(request)
@@ -1727,15 +1753,38 @@ async def get_agent(request: Request, agent_id: str) -> JSONResponse:
 async def get_agents(request: Request) -> JSONResponse:
     """Get all agents"""
     try:
+        t0 = time.perf_counter()
         services = await get_services(request)
+        get_services_ms = (time.perf_counter() - t0) * 1000
+
+        logger = services["logger"]
+        t1 = time.perf_counter()
         user_context = _get_user_context(request)
         org_key = user_context["orgId"]
+        user_context_ms = (time.perf_counter() - t1) * 1000
 
-        user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], services["logger"])
+        t2 = time.perf_counter()
+        user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], logger)
+        get_user_document_ms = (time.perf_counter() - t2) * 1000
+
+        t3 = time.perf_counter()
         agents = await services["graph_provider"].get_all_agents(user_doc["_key"], org_key)
+        get_all_agents_ms = (time.perf_counter() - t3) * 1000
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        timing_detail = (
+            f"get_services={get_services_ms:.1f}ms, user_context={user_context_ms:.1f}ms, "
+            f"get_user_document={get_user_document_ms:.1f}ms, get_all_agents={get_all_agents_ms:.1f}ms"
+        )
         if not agents:
+            logger.info(
+                f"get_agents completed in {elapsed_ms:.1f}ms ({timing_detail}, no agents)"
+            )
             raise HTTPException(status_code=404, detail="No agents found")
+
+        logger.info(
+            f"get_agents completed in {elapsed_ms:.1f}ms ({timing_detail}, count={len(agents)})"
+        )
 
         return JSONResponse(
             status_code=200,

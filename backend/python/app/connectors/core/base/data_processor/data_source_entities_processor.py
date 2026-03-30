@@ -237,6 +237,29 @@ class DataSourceEntitiesProcessor:
                     relation_type = RecordRelations.PARENT_CHILD.value
                 await tx_store.create_record_relation(parent_record.id, record.id, relation_type)
 
+                # INHERIT_PERMISSIONS for records with parent: delete edge to parent or create edge to parent
+                await tx_store.delete_edges_from(record.id, CollectionNames.RECORDS.value, CollectionNames.INHERIT_PERMISSIONS.value)
+                if record.inherit_permissions:
+                    self.logger.debug(f"delete edges from: {record.id} to {parent_record.id} /n {parent_record}")
+                    await tx_store.create_inherit_permissions_relation_record(record.id, parent_record.id)
+        else:
+            self.logger.debug(f"parent_record is None: {record.record_name} ~ Parent is a record group")
+            if record.external_record_group_id:
+                record_group = await tx_store.get_record_group_by_external_id(connector_id=record.connector_id,
+                                                                              external_id=record.external_record_group_id)
+                if record_group:
+                    await tx_store.create_node_relation(
+                        from_id=record_group.id,
+                        to_id=record.id,
+                        from_collection=CollectionNames.RECORD_GROUPS.value,
+                        to_collection=CollectionNames.RECORDS.value,
+                        relationship_type=RecordRelations.PARENT_CHILD.value
+                    )
+                    if record.inherit_permissions:
+                        await tx_store.create_inherit_permissions_relation_record_group(record.id, record_group.id)
+                else:
+                    self.logger.warning(f"Record group with external ID {record.external_record_group_id} not found in database")
+
     async def _handle_related_external_records(
         self,
         record: Record,
@@ -373,10 +396,10 @@ class DataSourceEntitiesProcessor:
             # Create a edge between the record and the record group if it doesn't exist
             await tx_store.create_record_group_relation(record.id, record_group_id)
 
-            if record.inherit_permissions:
-                await tx_store.create_inherit_permissions_relation_record_group(record.id, record_group_id)
-            else:
-                await tx_store.delete_inherit_permissions_relation_record_group(record.id, record_group_id)
+            # if record.inherit_permissions:
+            #     await tx_store.create_inherit_permissions_relation_record_group(record.id, record_group_id)
+            # else:
+            #     await tx_store.delete_inherit_permissions_relation_record_group(record.id, record_group_id)
 
         if record.is_shared_with_me and record.shared_with_me_record_group_id is not None:
             shared_with_me_record_group = await tx_store.get_record_group_by_external_id(connector_id=record.connector_id, external_id=record.shared_with_me_record_group_id)

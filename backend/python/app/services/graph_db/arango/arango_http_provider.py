@@ -4046,6 +4046,40 @@ class ArangoHTTPProvider(IGraphDBProvider):
             transaction=transaction
         )
 
+    async def create_node_relation(
+        self,
+        from_id: str,
+        to_id: str,
+        from_collection: str,
+        to_collection: str,
+        relationship_type: str,
+        transaction: str | None = None
+    ) -> None:
+        """
+        Create a relation edge between two arbitrary nodes.
+
+        Args:
+            from_id: Source node ID
+            to_id: Target node ID
+            from_collection: Collection of the source node
+            to_collection: Collection of the target node
+            relationship_type: Type of relationship between the two nodes
+            transaction: Optional transaction ID
+        """
+        edge = {
+            "_from": f"{from_collection}/{from_id}",
+            "_to": f"{to_collection}/{to_id}",
+            "relationshipType": relationship_type,
+            "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+            "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+        }
+
+        await self.batch_create_edges(
+            [edge],
+            collection=CollectionNames.RECORD_RELATIONS.value,
+            transaction=transaction
+        )
+
     async def batch_upsert_record_groups(
         self,
         record_groups: list[RecordGroup],
@@ -18212,6 +18246,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
     async def get_all_agents(self, user_id: str, org_id: str, transaction: str | None = None) -> list[dict]:
         """Get all agents accessible to a user via individual, team, or org access - flattened response with deduplication"""
+        start_total = time.perf_counter()
         try:
             query = f"""
             LET user_key = @user_id
@@ -18320,10 +18355,18 @@ class ArangoHTTPProvider(IGraphDBProvider):
             }
 
             result = await self.execute_query(query, bind_vars=bind_vars, transaction=transaction)
-            return result if result else []
+            agents = result if result else []
+            total_ms = (time.perf_counter() - start_total) * 1000
+            self.logger.info(
+                f"get_all_agents finished in {total_ms:.2f} ms (count={len(agents)})"
+            )
+            return agents
 
         except Exception as e:
-            self.logger.error(f"Failed to get all agents: {str(e)}")
+            elapsed_err = (time.perf_counter() - start_total) * 1000
+            self.logger.error(
+                f"Failed to get all agents after {elapsed_err:.2f} ms: {str(e)}"
+            )
             return []
 
     async def update_agent(self, agent_id: str, agent_updates: dict[str, Any], user_id: str, org_id: str, transaction: str | None = None) -> bool | None:

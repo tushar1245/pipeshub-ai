@@ -188,6 +188,7 @@ class Record(BaseModel):
     shared_with_me_record_group_id: Optional[str] = None
     hide_weburl: bool = Field(default=False, description="Flag indicating if web URL should be hidden")
     is_internal: bool = Field(default=False, description="Flag indicating if record is internal")
+    has_restriction: bool = Field(default=False, description="Flag indicating if the record has access restrictions")
 
     # Processing flags
     is_vlm_ocr_processed: Optional[bool] = Field(default=False, description="Flag indicating if VLM OCR processing has been used to process the record")
@@ -278,6 +279,7 @@ class Record(BaseModel):
             "parentNodeId": self.parent_node_id,
             "hideWeburl": self.hide_weburl,
             "isInternal": self.is_internal,
+            "hasRestriction": self.has_restriction,
         }
 
     @staticmethod
@@ -326,6 +328,7 @@ class Record(BaseModel):
             is_internal=arango_base_record.get("isInternal", False),
             md5_hash=arango_base_record.get("md5Checksum"),
             size_in_bytes=arango_base_record.get("sizeInBytes"),
+            has_restriction=arango_base_record.get("hasRestriction", False),
         )
 
     def to_kafka_record(self) -> Dict:
@@ -1257,6 +1260,7 @@ class RecordGroup(BaseModel):
     source_updated_at: Optional[int] = Field(default=None, description="Epoch timestamp in milliseconds of the record group update in the source system")
     inherit_permissions: Optional[bool] = Field(default=False, description="Permissions for the record group")
     is_internal: Optional[bool] = Field(default=False, description="Flag indicating if the record group is for internal use")
+    has_restriction: bool = Field(default=False, description="Flag indicating if the record group has access restrictions")
 
     def to_arango_base_record_group(self) -> Dict:
         return {
@@ -1276,6 +1280,7 @@ class RecordGroup(BaseModel):
             "updatedAtTimestamp": self.updated_at,
             "sourceCreatedAtTimestamp": self.source_created_at,
             "sourceLastModifiedTimestamp": self.source_updated_at,
+            "hasRestriction": self.has_restriction,
         }
 
     @staticmethod
@@ -1297,6 +1302,7 @@ class RecordGroup(BaseModel):
             updated_at=arango_base_record_group.get("updatedAtTimestamp", get_epoch_timestamp_in_ms()),
             source_created_at=arango_base_record_group.get("sourceCreatedAtTimestamp"),
             source_updated_at=arango_base_record_group.get("sourceLastModifiedTimestamp"),
+            has_restriction=arango_base_record_group.get("hasRestriction", False),
         )
 
 class Anyone(BaseModel):

@@ -1957,6 +1957,29 @@ class IGraphDBProvider(ABC):
         pass
 
     @abstractmethod
+    async def create_node_relation(
+        self,
+        from_id: str,
+        to_id: str,
+        from_collection: str,
+        to_collection: str,
+        relation_type: str,
+        transaction: str | None = None
+    ) -> None:
+        """
+        Create a relation edge between two arbitrary nodes.
+
+        Args:
+            from_id (str): Source node ID
+            to_id (str): Target node ID
+            from_collection (str): Collection of the source node
+            to_collection (str): Collection of the target node
+            relation_type (str): Type of relation edge collection to use
+            transaction (Optional[str]): Optional transaction ID
+        """
+        pass
+
+    @abstractmethod
     async def batch_upsert_record_groups(
         self,
         record_groups: list,
@@ -2021,6 +2044,33 @@ class IGraphDBProvider(ABC):
             transaction (Optional[Any]): Optional transaction context
         """
         pass
+
+    # @abstractmethod
+    # async def get_accessible_records_for_app(
+    #     self,
+    #     user_id: str,
+    #     org_id: str,
+    #     app_id: str,
+    #     root_node_id: str | None = None,
+    #     root_node_type: str | None = None,
+    # ) -> list[str]:
+    #     """
+    #     Get all accessible record IDs for a user within an app (or within a subtree).
+
+    #     Uses top-down BFS with hasRestriction-aware permission checking.
+    #     Prunes entire subtrees when a node is not accessible.
+
+    #     Args:
+    #         user_id (str): The user ID
+    #         org_id (str): The organization ID
+    #         app_id (str): The app/connector ID
+    #         root_node_id (Optional[str]): If provided, start traversal from this node (subtree mode)
+    #         root_node_type (Optional[str]): Type of root node - "RecordGroup" or "Record" (required if root_node_id is set)
+
+    #     Returns:
+    #         list[str]: List of accessible record IDs
+    #     """
+    #     pass
 
     @abstractmethod
     async def get_accessible_virtual_record_ids(

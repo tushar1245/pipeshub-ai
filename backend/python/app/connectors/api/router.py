@@ -6693,3 +6693,56 @@ async def delete_oauth_config(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to delete OAuth configuration: {str(e)}"
         ) from e
+
+
+# ============================================================================
+# TEST ROUTE — remove before production
+# ============================================================================
+
+@router.get("/api/v1/test/accessible-records")
+async def test_fetch_accessible_descendant_records(
+    request: Request,
+    app_id: str = Query(..., description="App / connector ID"),
+    node_id: str | None = Query(None, description="Optional subtree root node ID"),
+    user_id: str | None = Query(None, description="Optional user ID"),
+    node_type: str | None = Query(None, description="Node type: RecordGroup or Record (required when node_id is set)"),
+) -> dict[str, Any]:
+    """
+    TEST ENDPOINT — calls fetch_accessible_descendant_records on the graph provider.
+    Not for production use.
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+
+    try:
+        user_context = _get_user_context(request)
+        # user_id = user_context["user_id"]
+        org_id = user_context["org_id"]
+
+        record_ids = await graph_provider.fetch_accessible_descendant_records(
+            user_id=user_id,
+            org_id=org_id,
+            app_id=app_id,
+            node_id=node_id,
+            node_type=node_type,
+        )
+
+        return {
+            "user_id": user_id,
+            "org_id": org_id,
+            "app_id": app_id,
+            "node_id": node_id,
+            "node_type": node_type,
+            "accessible_record_count": len(record_ids),
+            "accessible_record_ids": record_ids,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Test route error: {e}")
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=str(e),
+        ) from e

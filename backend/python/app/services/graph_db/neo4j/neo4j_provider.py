@@ -4144,6 +4144,42 @@ class Neo4jProvider(IGraphDBProvider):
             transaction=transaction
         )
 
+    async def create_node_relation(
+        self,
+        from_id: str,
+        to_id: str,
+        from_collection: str,
+        to_collection: str,
+        relationship_type: str,
+        transaction: str | None = None
+    ) -> None:
+        """
+        Create a relation edge between two arbitrary nodes.
+
+        Args:
+            from_id: Source node ID
+            to_id: Target node ID
+            from_collection: Collection of the source node
+            to_collection: Collection of the target node
+            relationship_type: Type of relationship between the two nodes
+            transaction: Optional transaction ID
+        """
+        edge = {
+            "from_id": from_id,
+            "from_collection": from_collection,
+            "to_id": to_id,
+            "to_collection": to_collection,
+            "relationshipType": relationship_type,
+            "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+            "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+        }
+
+        await self.batch_create_edges(
+            [edge],
+            collection=CollectionNames.RECORD_RELATIONS.value,
+            transaction=transaction
+        )
+
     async def batch_upsert_record_groups(
         self,
         record_groups: list[RecordGroup],
@@ -15975,7 +16011,9 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def get_all_agents(self, user_id: str, org_id: str, transaction: str | None = None) -> list[dict]:
         """Get all agents accessible to a user via individual, team, or org access - flattened response with deduplication"""
+        start_total = time.perf_counter()
         try:
+            t_query_prep = time.perf_counter()
             agent_label = collection_to_label(CollectionNames.AGENT_INSTANCES.value)
             user_label = collection_to_label(CollectionNames.USERS.value)
             team_label = collection_to_label(CollectionNames.TEAMS.value)
@@ -15985,97 +16023,101 @@ class Neo4jProvider(IGraphDBProvider):
             user_key = user_id
             org_key = org_id
 
-            # Get user's teams first (needed for team permission check)
-            user_teams_query = f"""
-            MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(t:{team_label})
-            WHERE p.type = 'USER'
-            RETURN collect(t.id) AS team_ids
+            # Single optimized query that:
+            # 1. Gets user's teams inline
+            # 2. Collects all agent permissions (INDIVIDUAL/TEAM/ORG) via UNION
+            # 3. Checks org-share status for each agent
+            # 4. Returns deduplicated agents with all metadata
+            unified_query = f"""
+            // Get user's teams inline
+            MATCH (u:{user_label} {{id: $user_key}})
+            OPTIONAL MATCH (u)-[up:{permission_rel}]->(t:{team_label})
+            WHERE up.type = 'USER'
+            WITH u, collect(t.id) AS team_ids
+
+            // Collect all agent permissions with priority
+            CALL {{
+                WITH u, team_ids
+                // Individual user permissions
+                MATCH (u)-[p:{permission_rel}]->(agent:{agent_label})
+                WHERE p.type = 'USER'
+                AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+                RETURN agent, p.role AS role, 'INDIVIDUAL' AS access_type, 1 AS priority
+
+                UNION ALL
+
+                WITH u, team_ids
+                // Team permissions
+                UNWIND team_ids AS team_id
+                MATCH (t:{team_label} {{id: team_id}})-[p:{permission_rel}]->(agent:{agent_label})
+                WHERE p.type = 'TEAM'
+                AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+                RETURN agent, p.role AS role, 'TEAM' AS access_type, 2 AS priority
+
+                UNION ALL
+
+                WITH u, team_ids
+                // Org permissions
+                MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(agent:{agent_label})
+                WHERE p.type = 'ORG'
+                AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+                RETURN agent, p.role AS role, 'ORG' AS access_type, 3 AS priority
+            }}
+
+            // Check if agent is shared with org
+            OPTIONAL MATCH (org:{org_label} {{id: $org_key}})-[org_perm:{permission_rel}]->(agent)
+            WHERE org_perm.type = 'ORG'
+
+            // Return with deduplication by agent.id, keeping highest priority (lowest number)
+            WITH agent, role, access_type, priority, (org_perm IS NOT NULL) AS share_with_org
+            ORDER BY agent.id, priority
+            WITH agent.id AS agent_id, 
+                 head(collect({{agent: agent, role: role, access_type: access_type, share_with_org: share_with_org}})) AS best_access
+            RETURN best_access.agent AS agent, 
+                   best_access.role AS role, 
+                   best_access.access_type AS access_type,
+                   best_access.share_with_org AS share_with_org
             """
+            query_prep_ms = (time.perf_counter() - t_query_prep) * 1000
 
-            user_teams_result = await self.client.execute_query(
-                user_teams_query,
-                parameters={"user_key": user_key},
-                txn_id=transaction
-            )
-            user_team_ids = user_teams_result[0]["team_ids"] if user_teams_result and user_teams_result[0].get("team_ids") else []
-
-            # Optimized query using UNION to combine all permission types in a single query
-            # Priority: INDIVIDUAL > TEAM > ORG (handled by ORDER BY and deduplication)
-            combined_query = f"""
-            // Individual user permissions
-            MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(agent:{agent_label})
-            WHERE p.type = 'USER'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
-            RETURN agent, p.role AS role, 'INDIVIDUAL' AS access_type, 1 AS priority
-
-            UNION ALL
-
-            // Team permissions
-            MATCH (t:{team_label})-[p:{permission_rel}]->(agent:{agent_label})
-            WHERE t.id IN $team_ids
-            AND p.type = 'TEAM'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
-            RETURN agent, p.role AS role, 'TEAM' AS access_type, 2 AS priority
-
-            UNION ALL
-
-            // Org permissions
-            MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(agent:{agent_label})
-            WHERE p.type = 'ORG'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
-            RETURN agent, p.role AS role, 'ORG' AS access_type, 3 AS priority
-            """
-
+            t_query = time.perf_counter()
             result = await self.client.execute_query(
-                combined_query,
-                parameters={"user_key": user_key, "org_key": org_key, "team_ids": user_team_ids},
+                unified_query,
+                parameters={"user_key": user_key, "org_key": org_key},
                 txn_id=transaction
             )
+            query_exec_ms = (time.perf_counter() - t_query) * 1000
 
-            # Deduplicate by agent ID, keeping highest priority (lowest priority number)
-            agents_dict = {}
+            # Process results
+            t_process = time.perf_counter()
+            agents = []
             if result:
                 for row in result:
                     agent_data = dict(row["agent"])
-                    agent_id = agent_data.get("id", "")
-                    if agent_id and (agent_id not in agents_dict or agents_dict[agent_id]["priority"] > row["priority"]):
-                        agent = self._neo4j_to_arango_node(agent_data, CollectionNames.AGENT_INSTANCES.value)
-                        agent["access_type"] = row["access_type"]
-                        agent["user_role"] = row["role"]
-                        agent["can_edit"] = row["role"] in ["OWNER", "WRITER", "ORGANIZER"]
-                        agent["can_delete"] = row["role"] == "OWNER"
-                        agent["can_share"] = row["role"] in ["OWNER", "ORGANIZER"]
-                        agent["can_view"] = True
-                        agents_dict[agent_id] = {"agent": agent, "priority": row["priority"]}
+                    agent = self._neo4j_to_arango_node(agent_data, CollectionNames.AGENT_INSTANCES.value)
+                    agent["access_type"] = row["access_type"]
+                    agent["user_role"] = row["role"]
+                    agent["can_edit"] = row["role"] in ["OWNER", "WRITER", "ORGANIZER"]
+                    agent["can_delete"] = row["role"] == "OWNER"
+                    agent["can_share"] = row["role"] in ["OWNER", "ORGANIZER"]
+                    agent["can_view"] = True
+                    agent["shareWithOrg"] = bool(row["share_with_org"])
+                    agents.append(agent)
+            process_ms = (time.perf_counter() - t_process) * 1000
 
-            # Convert dictionary to list (deduplicated)
-            agents = [agents_dict[key]["agent"] for key in agents_dict]
-
-            # Bulk-check which agents are shared with the org (edge-based, not stored in doc)
-            if agents and org_key:
-                agent_ids = list(agents_dict.keys())
-                org_share_query = f"""
-                MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(agent:{agent_label})
-                WHERE p.type = 'ORG'
-                AND agent.id IN $agent_ids
-                RETURN collect(agent.id) AS org_shared_ids
-                """
-                org_share_result = await self.client.execute_query(
-                    org_share_query,
-                    parameters={"org_key": org_key, "agent_ids": agent_ids},
-                    txn_id=transaction
-                )
-                org_shared_ids = set(org_share_result[0]["org_shared_ids"]) if org_share_result and org_share_result[0].get("org_shared_ids") else set()
-                for agent in agents:
-                    agent["shareWithOrg"] = agent.get("_key", "") in org_shared_ids
-            else:
-                for agent in agents:
-                    agent["shareWithOrg"] = False
-
+            total_ms = (time.perf_counter() - start_total) * 1000
+            self.logger.info(
+                f"get_all_agents finished in {total_ms:.2f}ms "
+                f"(query_prep={query_prep_ms:.2f}ms, query_exec={query_exec_ms:.2f}ms, "
+                f"process={process_ms:.2f}ms, count={len(agents)})"
+            )
             return agents
 
         except Exception as e:
-            self.logger.error(f"Failed to get all agents: {str(e)}")
+            elapsed_err = (time.perf_counter() - start_total) * 1000
+            self.logger.error(
+                f"Failed to get all agents after {elapsed_err:.2f} ms: {str(e)}"
+            )
             return []
 
 
@@ -17328,3 +17370,1091 @@ class Neo4jProvider(IGraphDBProvider):
         except Exception as e:
             self.logger.error("❌ Failed to get app creator user: %s", str(e))
             return None
+
+
+    # async def check_node_access(self, node_id: str, user_id: str, transaction: str | None = None) -> bool:
+    #     """
+    #     Check if user has access to a node
+    #     """
+    #     try:
+    #         node = await self.get_document(node_id, CollectionNames.NODES.value, transaction=transaction)
+    #         if node is None:
+    #             return False
+    #         return True
+    #     except Exception as e:
+    #         self.logger.error("❌ Failed to check node access: %s", str(e))
+    #         return False
+
+    # async def _get_user_permission_context(
+    #     self, user_id: str, org_id: str, app_id: str
+    # ) -> dict[str, Any]:
+    #     """
+    #     Pre-compute user's permission context for efficient batch permission checks.
+
+    #     Fetches user's groups, roles, teams, org, and app relation in a single query.
+
+    #     Returns:
+    #         dict with keys: userKey, groupIds, roleIds, teamIds, orgNodeId, hasAppRelation
+    #     """
+    #     try:
+    #         query = """
+    #         MATCH (u:User {id: $userId})
+    #         OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(g:Group)
+    #         OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(r:Role)
+    #         OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(t:Teams)
+    #         OPTIONAL MATCH (u)-[:BELONGS_TO {entityType: 'ORGANIZATION'}]->(o:Organization {id: $orgId})
+    #         OPTIONAL MATCH (u)-[appRel:USER_APP_RELATION]->(app:App {id: $appId})
+    #         RETURN u.id AS userKey,
+    #                collect(DISTINCT g.id) AS groupIds,
+    #                collect(DISTINCT r.id) AS roleIds,
+    #                collect(DISTINCT t.id) AS teamIds,
+    #                o.id AS orgNodeId,
+    #                CASE WHEN appRel IS NOT NULL THEN true ELSE false END AS hasAppRelation
+    #         """
+    #         params = {"userId": user_id, "orgId": org_id, "appId": app_id}
+    #         result = await self.client.execute_query(query, parameters=params)
+
+    #         if not result or not result[0]:
+    #             return {
+    #                 "userKey": None,
+    #                 "groupIds": [],
+    #                 "roleIds": [],
+    #                 "teamIds": [],
+    #                 "orgNodeId": None,
+    #                 "hasAppRelation": False,
+    #             }
+
+    #         record = result[0][0]
+    #         return {
+    #             "userKey": record.get("userKey"),
+    #             "groupIds": [gid for gid in record.get("groupIds", []) if gid is not None],
+    #             "roleIds": [rid for rid in record.get("roleIds", []) if rid is not None],
+    #             "teamIds": [tid for tid in record.get("teamIds", []) if tid is not None],
+    #             "orgNodeId": record.get("orgNodeId"),
+    #             "hasAppRelation": record.get("hasAppRelation", False),
+    #             "appId": app_id,
+    #         }
+    #     except Exception as e:
+    #         self.logger.error(f"❌ Failed to get user permission context: {e}")
+    #         return {
+    #             "userKey": None,
+    #             "groupIds": [],
+    #             "roleIds": [],
+    #             "teamIds": [],
+    #             "orgNodeId": None,
+    #             "hasAppRelation": False,
+    #         }
+
+    # async def _batch_check_direct_permission(
+    #     self,
+    #     node_ids: list[str],
+    #     node_type: str,
+    #     user_context: dict[str, Any],
+    # ) -> dict[str, bool]:
+    #     """
+    #     Batch check direct permissions for a list of nodes.
+
+    #     RecordGroups have 6 permission paths, Records have 4.
+
+    #     Returns:
+    #         dict mapping node_id -> has_direct_permission (bool)
+    #     """
+    #     if not node_ids or not user_context.get("userKey"):
+    #         return {nid: False for nid in node_ids}
+
+    #     try:
+    #         user_key = user_context["userKey"]
+    #         group_ids = user_context["groupIds"]
+    #         role_ids = user_context["roleIds"]
+    #         team_ids = user_context["teamIds"]
+    #         org_node_id = user_context["orgNodeId"]
+    #         has_app_relation = user_context["hasAppRelation"]
+    #         app_id = user_context["appId"]
+
+    #         if node_type == "RecordGroup":
+    #             query = """
+    #             MATCH (u:User {id: $userKey})
+    #             UNWIND $nodeIds AS nodeId
+    #             MATCH (n:RecordGroup {id: nodeId})
+
+    #             // Path 1: Direct user permission
+    #             OPTIONAL MATCH (u)-[p1:PERMISSION {type: 'USER'}]->(n)
+
+    #             // Path 2: Via Group
+    #             OPTIONAL MATCH (grp:Group)-[p2:PERMISSION]->(n)
+    #             WHERE grp.id IN $groupIds
+
+    #             // Path 3: Via Role
+    #             OPTIONAL MATCH (role:Role)-[p3:PERMISSION]->(n)
+    #             WHERE role.id IN $roleIds
+
+    #             // Path 4: Via Org
+    #             OPTIONAL MATCH (org:Organization)-[p4:PERMISSION {type: 'ORG'}]->(n)
+    #             WHERE org.id = $orgNodeId
+
+    #             // Path 5: Via Teams
+    #             OPTIONAL MATCH (team:Teams)-[p5:PERMISSION {type: 'TEAM'}]->(n)
+    #             WHERE team.id IN $teamIds
+
+    #             // Path 6: Via App inherit (only if user has app relation)
+    #             OPTIONAL MATCH (app:App {id: $appId})<-[inh:INHERIT_PERMISSIONS]-(n)
+
+    #             RETURN nodeId,
+    #                 (p1 IS NOT NULL OR p2 IS NOT NULL OR p3 IS NOT NULL
+    #                  OR p4 IS NOT NULL OR p5 IS NOT NULL
+    #                  OR (inh IS NOT NULL AND $hasAppRelation)) AS hasDirectPermission
+    #             """
+    #         else:  # Record
+    #             query = """
+    #             MATCH (u:User {id: $userKey})
+    #             UNWIND $nodeIds AS nodeId
+    #             MATCH (n:Record {id: nodeId})
+
+    #             // Path 1: Direct user permission
+    #             OPTIONAL MATCH (u)-[p1:PERMISSION {type: 'USER'}]->(n)
+
+    #             // Path 2: Via Group
+    #             OPTIONAL MATCH (grp:Group)-[p2:PERMISSION]->(n)
+    #             WHERE grp.id IN $groupIds
+
+    #             // Path 3: Via Role
+    #             OPTIONAL MATCH (role:Role)-[p3:PERMISSION]->(n)
+    #             WHERE role.id IN $roleIds
+
+    #             // Path 4: Via Org
+    #             OPTIONAL MATCH (org:Organization)-[p4:PERMISSION {type: 'ORG'}]->(n)
+    #             WHERE org.id = $orgNodeId
+
+    #             RETURN nodeId,
+    #                 (p1 IS NOT NULL OR p2 IS NOT NULL OR p3 IS NOT NULL
+    #                  OR p4 IS NOT NULL) AS hasDirectPermission
+    #             """
+
+    #         params = {
+    #             "userKey": user_key,
+    #             "nodeIds": node_ids,
+    #             "groupIds": group_ids,
+    #             "roleIds": role_ids,
+    #             "teamIds": team_ids,
+    #             "orgNodeId": org_node_id,
+    #             "hasAppRelation": has_app_relation,
+    #             "appId": app_id,
+    #         }
+
+    #         result = await self.client.execute_query(query, parameters=params)
+    #         return {record["nodeId"]: record["hasDirectPermission"] for record in result}
+
+    #     except Exception as e:
+    #         self.logger.error(f"❌ Failed to batch check direct permissions: {e}")
+    #         return {nid: False for nid in node_ids}
+
+    # async def _get_root_record_groups(
+    #     self, app_id: str, org_id: str, user_context: dict[str, Any]
+    # ) -> list[dict[str, Any]]:
+    #     """
+    #     Get root RecordGroups for an app with inheritance edge info.
+
+    #     Returns:
+    #         list of dicts with keys: nodeId, hasRestriction, nodeType, hasInheritEdge
+    #     """
+    #     try:
+    #         query = """
+    #         MATCH (rg:RecordGroup)-[:BELONGS_TO]->(app:App {id: $appId})
+    #         WHERE rg.orgId = $orgId
+    #         OPTIONAL MATCH (rg)-[inh:INHERIT_PERMISSIONS]->(app)
+    #         RETURN rg.id AS nodeId,
+    #                COALESCE(rg.hasRestriction, false) AS hasRestriction,
+    #                'RecordGroup' AS nodeType,
+    #                CASE WHEN inh IS NOT NULL THEN true ELSE false END AS hasInheritEdge
+    #         """
+    #         params = {"appId": app_id, "orgId": org_id}
+    #         result = await self.client.execute_query(query, parameters=params)
+
+    #         return [
+    #             {
+    #                 "nodeId": record["nodeId"],
+    #                 "hasRestriction": record["hasRestriction"],
+    #                 "nodeType": record["nodeType"],
+    #                 "hasInheritEdge": record["hasInheritEdge"],
+    #             }
+    #             for record in result
+    #         ]
+
+    #     except Exception as e:
+    #         self.logger.error(f"❌ Failed to get root record groups: {e}")
+    #         return []
+
+    # async def _batch_get_children_with_inherit_info(
+    #     self,
+    #     parent_ids: list[str],
+    # ) -> list[dict[str, Any]]:
+    #     """
+    #     Get all children of parent nodes via RECORD_RELATION (PARENT_CHILD).
+
+    #     Also fetches whether each child has an INHERIT_PERMISSIONS edge to its parent.
+
+    #     Returns:
+    #         list of dicts with keys: childId, parentId, hasRestriction, nodeType, hasInheritEdge
+    #     """
+    #     if not parent_ids:
+    #         return []
+
+    #     try:
+    #         query = """
+    #         UNWIND $parentIds AS parentId
+    #         MATCH (parent {id: parentId})-[:RECORD_RELATION {relationshipType: 'PARENT_CHILD'}]->(child)
+    #         OPTIONAL MATCH (child)-[inh:INHERIT_PERMISSIONS]->(parent)
+    #         RETURN child.id AS childId,
+    #                parentId,
+    #                COALESCE(child.hasRestriction, false) AS hasRestriction,
+    #                labels(child) AS nodeLabels,
+    #                CASE WHEN inh IS NOT NULL THEN true ELSE false END AS hasInheritEdge
+    #         """
+    #         params = {"parentIds": parent_ids}
+    #         result = await self.client.execute_query(query, parameters=params)
+
+    #         children = []
+    #         for record in result:
+    #             data = record
+    #             labels = data.get("nodeLabels", [])
+    #             node_type = "RecordGroup" if "RecordGroup" in labels else "Record"
+
+    #             children.append({
+    #                 "childId": data["childId"],
+    #                 "parentId": data["parentId"],
+    #                 "hasRestriction": data["hasRestriction"],
+    #                 "nodeType": node_type,
+    #                 "hasInheritEdge": data["hasInheritEdge"],
+    #             })
+
+    #         return children
+
+    #     except Exception as e:
+    #         self.logger.error(f"❌ Failed to get children with inherit info: {e}")
+    #         return []
+
+    # async def _get_subtree_root(
+    #     self,
+    #     node_id: str,
+    #     node_type: str,
+    #     user_context: dict[str, Any],
+    # ) -> list[dict[str, Any]]:
+    #     """
+    #     Get subtree root node with computed inherited permission.
+
+    #     Walks the full INHERIT_PERMISSIONS chain upward from the subtree root until
+    #     there are no more INHERIT_PERMISSIONS edges (the top ancestor). Then checks
+    #     if the user has direct permission at that top ancestor.
+
+    #     userHasInheritedPermission = True only if:
+    #       - An unbroken INHERIT_PERMISSIONS chain exists from the subtree root to a top ancestor
+    #       - AND the top ancestor has direct permission for the user
+
+    #     Returns:
+    #         list with single dict containing: nodeId, hasRestriction, nodeType, userHasInheritedPermission
+    #     """
+    #     try:
+    #         label = "RecordGroup" if node_type == "RecordGroup" else "Record"
+    #         user_key = user_context["userKey"]
+    #         group_ids = user_context["groupIds"]
+    #         role_ids = user_context["roleIds"]
+    #         team_ids = user_context["teamIds"]
+    #         org_node_id = user_context["orgNodeId"]
+    #         has_app_relation = user_context["hasAppRelation"]
+    #         app_id = user_context["appId"]
+
+    #         query = f"""
+    #         MATCH (n:{label} {{id: $nodeId}})
+    #         MATCH (u:User {{id: $userKey}})
+
+    #         // Walk the full INHERIT_PERMISSIONS chain upward to find the top ancestor.
+    #         // The top ancestor is the node reachable via 1+ hops that has NO further
+    #         // outgoing INHERIT_PERMISSIONS edge (i.e. the chain ends there).
+    #         OPTIONAL MATCH (n)-[:INHERIT_PERMISSIONS*1..]->(ancestor)
+    #         WHERE NOT (ancestor)-[:INHERIT_PERMISSIONS]->()
+
+    #         // Also check whether n has ANY outgoing INHERIT_PERMISSIONS edge at all,
+    #         // to distinguish "no chain" from "chain exists but ancestor has no direct perm".
+    #         OPTIONAL MATCH (n)-[directInh:INHERIT_PERMISSIONS]->()
+
+    #         WITH n, u, ancestor, directInh,
+    #              (directInh IS NOT NULL) AS hasInheritChain
+
+    #         // If no ancestor was found via the full chain (e.g. no inherit edge exists),
+    #         // inherited permission is false. Only proceed with permission check when
+    #         // a top ancestor exists.
+    #         OPTIONAL MATCH (u)-[pp1:PERMISSION {{type: 'USER'}}]->(ancestor)
+    #         WHERE ancestor IS NOT NULL
+
+    #         OPTIONAL MATCH (grp:Group)-[pp2:PERMISSION]->(ancestor)
+    #         WHERE ancestor IS NOT NULL AND grp.id IN $groupIds
+
+    #         OPTIONAL MATCH (role:Role)-[pp3:PERMISSION]->(ancestor)
+    #         WHERE ancestor IS NOT NULL AND role.id IN $roleIds
+
+    #         OPTIONAL MATCH (org:Organization)-[pp4:PERMISSION {{type: 'ORG'}}]->(ancestor)
+    #         WHERE ancestor IS NOT NULL AND org.id = $orgNodeId
+
+    #         // Teams path (only meaningful for RecordGroup ancestors)
+    #         OPTIONAL MATCH (team:Teams)-[pp5:PERMISSION {{type: 'TEAM'}}]->(ancestor)
+    #         WHERE ancestor IS NOT NULL AND team.id IN $teamIds
+    #           AND 'RecordGroup' IN labels(ancestor)
+
+    #         // App-inherit path (only meaningful for RecordGroup ancestors)
+    #         OPTIONAL MATCH (app:App {{id: $appId}})<-[pp6:INHERIT_PERMISSIONS]-(ancestor)
+    #         WHERE ancestor IS NOT NULL AND 'RecordGroup' IN labels(ancestor)
+
+    #         WITH n, hasInheritChain,
+    #              (pp1 IS NOT NULL OR pp2 IS NOT NULL OR pp3 IS NOT NULL
+    #               OR pp4 IS NOT NULL OR pp5 IS NOT NULL
+    #               OR (pp6 IS NOT NULL AND $hasAppRelation)) AS ancestorHasDirectPerm
+
+    #         RETURN n.id AS nodeId,
+    #                COALESCE(n.hasRestriction, false) AS hasRestriction,
+    #                $nodeType AS nodeType,
+    #                (hasInheritChain AND ancestorHasDirectPerm) AS userHasInheritedPermission
+    #         LIMIT 1
+    #         """
+
+    #         params = {
+    #             "nodeId": node_id,
+    #             "nodeType": node_type,
+    #             "userKey": user_key,
+    #             "groupIds": group_ids,
+    #             "roleIds": role_ids,
+    #             "teamIds": team_ids,
+    #             "orgNodeId": org_node_id,
+    #             "hasAppRelation": has_app_relation,
+    #             "appId": app_id,
+    #         }
+
+    #         result = await self.client.execute_query(query, parameters=params)
+
+    #         if not result:
+    #             return []
+
+    #         data = result[0]
+    #         return [{
+    #             "nodeId": data["nodeId"],
+    #             "hasRestriction": data["hasRestriction"],
+    #             "nodeType": data["nodeType"],
+    #             "userHasInheritedPermission": data.get("userHasInheritedPermission", False),
+    #         }]
+
+    #     except Exception as e:
+    #         self.logger.error(f"❌ Failed to get subtree root: {e}")
+    #         return []
+
+    # async def get_accessible_records_for_app(
+    #     self,
+    #     user_id: str,
+    #     org_id: str,
+    #     app_id: str,
+    #     root_node_id: str | None = None,
+    #     root_node_type: str | None = None,
+    # ) -> list[str]:
+    #     """
+    #     Get all accessible record IDs for a user within an app (or within a subtree).
+
+    #     Uses top-down BFS with hasRestriction-aware permission checking.
+    #     Prunes entire subtrees when a node is not accessible.
+
+    #     Args:
+    #         user_id: The user ID
+    #         org_id: The organization ID
+    #         app_id: The app/connector ID
+    #         root_node_id: If provided, start traversal from this node (subtree mode)
+    #         root_node_type: Type of root node - "RecordGroup" or "Record" (required if root_node_id is set)
+
+    #     Returns:
+    #         List of accessible record IDs
+    #     """
+    #     try:
+    #         # Step 1: Pre-compute user permission context
+    #         ctx = await self._get_user_permission_context(user_id, org_id, app_id)
+
+    #         if not ctx.get("userKey"):
+    #             self.logger.warning(f"User {user_id} not found")
+    #             return []
+
+    #         visited = set()
+    #         accessible_record_ids = []
+
+    #         # Step 2: Determine starting nodes
+    #         if root_node_id:
+    #             if not root_node_type:
+    #                 self.logger.error("root_node_type is required when root_node_id is provided")
+    #                 return []
+    #             queue = await self._get_subtree_root(root_node_id, root_node_type, ctx)
+    #         else:
+    #             root_rgs = await self._get_root_record_groups(app_id, org_id, ctx)
+    #             for rg in root_rgs:
+    #                 rg["userHasInheritedPermission"] = (
+    #                     rg["hasInheritEdge"] and ctx["hasAppRelation"]
+    #                 )
+    #             queue = root_rgs
+
+    #         # Step 3: BFS loop with top-down inheritance propagation
+    #         while queue:
+    #             # Separate by node type for permission check (6 vs 4 paths)
+    #             rg_nodes = [n for n in queue if n["nodeType"] == "RecordGroup"]
+    #             rec_nodes = [n for n in queue if n["nodeType"] == "Record"]
+
+    #             # Batch check direct permissions (separate queries for RG vs Record)
+    #             direct_perms = {}
+    #             if rg_nodes:
+    #                 direct_perms.update(await self._batch_check_direct_permission(
+    #                     [n["nodeId"] for n in rg_nodes], "RecordGroup", ctx
+    #                 ))
+    #             if rec_nodes:
+    #                 direct_perms.update(await self._batch_check_direct_permission(
+    #                     [n["nodeId"] for n in rec_nodes], "Record", ctx
+    #                 ))
+
+    #             # Classify each node
+    #             accessible_ids = []
+    #             for node in queue:
+    #                 nid = node["nodeId"]
+    #                 if nid in visited:
+    #                     continue
+    #                 visited.add(nid)
+
+    #                 has_direct = direct_perms.get(nid, False)
+    #                 has_inherited = node["userHasInheritedPermission"]
+
+    #                 if node["hasRestriction"]:  # Case 1: both required
+    #                     accessible = has_direct and has_inherited
+    #                 else:  # Case 2: either sufficient
+    #                     accessible = has_direct or has_inherited
+
+    #                 if accessible:
+    #                     accessible_ids.append(nid)
+    #                     if node["nodeType"] == "Record":
+    #                         accessible_record_ids.append(nid)
+
+    #             # Get children of all accessible nodes + their inherit edge info
+    #             if accessible_ids:
+    #                 children = await self._batch_get_children_with_inherit_info(accessible_ids)
+    #             else:
+    #                 break
+
+    #             # Propagate inherited permission to children
+    #             accessible_set = set(accessible_ids)
+    #             next_queue = []
+    #             for child in children:
+    #                 if child["childId"] in visited:
+    #                     continue
+    #                 child["userHasInheritedPermission"] = (
+    #                     child["hasInheritEdge"] and child["parentId"] in accessible_set
+    #                 )
+    #                 child["nodeId"] = child["childId"]
+    #                 next_queue.append(child)
+
+    #             queue = next_queue
+
+    #         self.logger.info(f"Found {len(accessible_record_ids)} accessible records for user {user_id} in app {app_id}")
+    #         return accessible_record_ids
+
+    #     except Exception as e:
+    #         self.logger.error(f"❌ Failed to get accessible records for app: {e}")
+    #         return []
+
+
+# ======================================================= #
+
+    async def _get_user_permission_context(
+        self, user_id: str, org_id: str, app_id: str
+    ) -> dict[str, Any]:
+        """
+        Pre-compute user's permission context for efficient permission check.
+        Fetches user's groups, roles, teams, org, and app relation.
+        Returns:
+            dict with keys: userKey, groupIds, roleIds, teamIds, orgNodeId, hasAppRelation, appId
+        """
+        try:
+            query = """
+            MATCH (u:User {userId: $userId})
+            OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(g:Group)
+            OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(r:Role)
+            OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(t:Teams)
+            OPTIONAL MATCH (u)-[appRel:USER_APP_RELATION]->(app:App {id: $appId})
+            RETURN u.id AS userKey,
+                   collect(DISTINCT g.id) AS groupIds,
+                   collect(DISTINCT r.id) AS roleIds,
+                   collect(DISTINCT t.id) AS teamIds,
+                   CASE WHEN appRel IS NOT NULL THEN true ELSE false END AS hasAppRelation
+            """
+            params = {"userId": user_id, "appId": app_id}
+            result = await self.client.execute_query(query, parameters=params)
+
+            self.logger.info(f"result: {result}")
+
+            if not result or not result[0]:
+                return {
+                    "groupIds": [],
+                    "roleIds": [],
+                    "teamIds": [],
+                    "hasAppRelation": False,
+                    "userKey": None,
+                }
+
+            record = result[0]
+            return {
+                "userKey": record.get("userKey"),
+                "groupIds": [gid for gid in record.get("groupIds", []) if gid is not None],
+                "roleIds": [rid for rid in record.get("roleIds", []) if rid is not None],
+                "teamIds": [tid for tid in record.get("teamIds", []) if tid is not None],
+                "hasAppRelation": record.get("hasAppRelation", False),
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to get user permission context: {e}")
+            return {
+                "groupIds": [],
+                "roleIds": [],
+                "teamIds": [],
+                "hasAppRelation": False,
+                "userKey": None,
+            }
+
+    def _build_direct_permission_cypher_no_return(
+        self,
+        node_var: str = "node",
+        user_var: str = "u",
+        include_rg_paths: bool = True,
+    ) -> str:
+        """
+        Build the OPTIONAL MATCH portion of the direct-permission check without
+        a RETURN clause, so callers can append their own RETURN that includes
+        additional columns alongside the permission variables.
+
+        Exposes relationship variables named perm_p1 … perm_p6 for use in the
+        caller's own RETURN clause.
+
+        Args:
+            node_var:         Cypher variable for the target node  (default: "node")
+            user_var:         Cypher variable for the user         (default: "u")
+            include_rg_paths: Include Teams (p5) and App-inherit (p6) paths,
+                              which only apply to RecordGroup targets.
+
+        Returns:
+            str: Cypher OPTIONAL MATCH fragment (no RETURN).
+        """
+        rg_paths = ""
+        if include_rg_paths:
+            rg_paths = f"""
+            // Path 5: via Teams (RecordGroup targets only)
+            OPTIONAL MATCH (perm_team:Teams)-[perm_p5:PERMISSION {{type: 'TEAM'}}]->({node_var})
+            WHERE perm_team.id IN $teamIds AND 'RecordGroup' IN labels({node_var})
+
+            // Path 6: via App inherit (RecordGroup targets only)
+            OPTIONAL MATCH (perm_app:App {{id: $appId}})<-[perm_p6:INHERIT_PERMISSIONS]-({node_var})
+            WHERE 'RecordGroup' IN labels({node_var})
+            """
+
+        return f"""
+            // Path 1: direct user permission
+            OPTIONAL MATCH ({user_var})-[perm_p1:PERMISSION {{type: 'USER'}}]->({node_var})
+
+            // Path 2: via Group
+            OPTIONAL MATCH (perm_grp:Group)-[perm_p2:PERMISSION]->({node_var})
+            WHERE perm_grp.id IN $groupIds
+
+            // Path 3: via Role
+            OPTIONAL MATCH (perm_role:Role)-[perm_p3:PERMISSION]->({node_var})
+            WHERE perm_role.id IN $roleIds
+
+            // Path 4: via Org
+            OPTIONAL MATCH (perm_org:Organization)-[perm_p4:PERMISSION {{type: 'ORG'}}]->({node_var})
+            WHERE perm_org.id = $orgNodeId
+            {rg_paths}
+        """
+
+    def _build_direct_permission_cypher(
+        self,
+        node_var: str = "node",
+        user_var: str = "u",
+        include_rg_paths: bool = True,
+    ) -> str:
+        """
+        Build a complete Cypher fragment — OPTIONAL MATCHes plus a RETURN clause —
+        that yields a single boolean column `hasPermission`.
+
+        Convenience wrapper around _build_direct_permission_cypher_no_return.
+        Use this when the permission result is the only thing you need.
+        Use _build_direct_permission_cypher_no_return when you need to combine
+        hasPermission with other columns in a single RETURN.
+
+        Required query parameters (supply via _get_permission_query_params):
+            $groupIds, $roleIds, $teamIds, $orgNodeId, $hasAppRelation, $appId
+
+        Args:
+            node_var:         Cypher variable for the target node  (default: "node")
+            user_var:         Cypher variable for the user         (default: "u")
+            include_rg_paths: Include Teams + App-inherit paths for RecordGroup targets.
+
+        Returns:
+            str: Cypher fragment ending with RETURN hasPermission LIMIT 1.
+        """
+        rg_return = (
+            " OR perm_p5 IS NOT NULL OR (perm_p6 IS NOT NULL AND $hasAppRelation)"
+            if include_rg_paths
+            else ""
+        )
+        body = self._build_direct_permission_cypher_no_return(node_var, user_var, include_rg_paths)
+        return f"""
+            {body}
+            RETURN (
+                perm_p1 IS NOT NULL OR
+                perm_p2 IS NOT NULL OR
+                perm_p3 IS NOT NULL OR
+                perm_p4 IS NOT NULL{rg_return}
+            ) AS hasPermission
+            LIMIT 1
+        """
+
+    def _get_permission_query_params(
+        self, user_context: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Extract the parameter keys required by fragments built with
+        _build_direct_permission_cypher / _build_direct_permission_cypher_no_return.
+
+        Returns:
+            dict with keys: userKey, groupIds, roleIds, teamIds, orgNodeId,
+                            hasAppRelation, appId
+        """
+        return {
+            "userKey":        user_context.get("userKey"),
+            "groupIds":       user_context.get("groupIds", []),
+            "roleIds":        user_context.get("roleIds", []),
+            "teamIds":        user_context.get("teamIds", []),
+            "orgNodeId":      user_context.get("orgNodeId"),
+            "hasAppRelation": user_context.get("hasAppRelation", False),
+            "appId":          user_context.get("appId"),
+        }
+
+    async def _check_subtree_root_permission_via_inheritance(
+        self,
+        node_id: str,
+        node_type: str,
+        user_context: dict[str, Any],
+    ) -> bool:
+        """
+        Check whether the user has inherited permission at a subtree root node.
+
+        Steps:
+          1. If the node has no outgoing INHERIT_PERMISSIONS edge, return False immediately
+             without touching the ancestor chain at all.
+          2. Walk INHERIT_PERMISSIONS upward until reaching the top ancestor — the node
+             that has no further outgoing INHERIT_PERMISSIONS edge.
+          3. At the top ancestor, check whether the user has direct permission via any
+             applicable path. Return True as soon as one path matches, False if none do.
+
+        Returns:
+            bool
+        """
+        user_key = user_context.get("userKey", "<unknown>")
+        self.logger.debug(
+            f"Checking subtree inheritance permission | node={node_id} type={node_type} user={user_key}"
+        )
+        try:
+            label = "RecordGroup" if node_type == "RecordGroup" else "Record"
+
+            # Step 1: early exit — non-optional MATCH returns zero rows if no edge exists
+            has_inherit_query = f"""
+            MATCH (n:{label} {{id: $nodeId}})-[:INHERIT_PERMISSIONS]->()
+            RETURN true AS hasEdge
+            LIMIT 1
+            """
+            has_inherit_result = await self.client.execute_query(
+                has_inherit_query, parameters={"nodeId": node_id}
+            )
+            if not has_inherit_result or not has_inherit_result[0]:
+                self.logger.debug(
+                    f"No INHERIT_PERMISSIONS edge found for {node_type} {node_id} — inherited permission: False"
+                )
+                return False
+
+            self.logger.debug(
+                f"INHERIT_PERMISSIONS edge exists for {node_type} {node_id} — walking ancestor chain"
+            )
+
+            # Step 2+3: walk to top ancestor and check permission via all paths
+            perm_fragment = self._build_direct_permission_cypher(
+                node_var="ancestor",
+                user_var="u",
+                include_rg_paths=True,
+            )
+            perm_query = f"""
+            MATCH (n:{label} {{id: $nodeId}})-[:INHERIT_PERMISSIONS*1..]->(ancestor)
+            WHERE NOT (ancestor)-[:INHERIT_PERMISSIONS]->()
+            MATCH (u:User {{id: $userKey}})
+            {perm_fragment}
+            """
+            params = {"nodeId": node_id, **self._get_permission_query_params(user_context)}
+            perm_result = await self.client.execute_query(perm_query, parameters=params)
+
+            if not perm_result or not perm_result[0]:
+                self.logger.debug(
+                    f"No top ancestor found or ancestor has no permission for {node_type} {node_id} user={user_key}"
+                )
+                return False
+
+            has_permission = bool(perm_result[0].get("hasPermission", False))
+            self.logger.debug(
+                f"Ancestor permission check for {node_type} {node_id} user={user_key}: {has_permission}"
+            )
+            return has_permission
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to check subtree root permission via inheritance | "
+                f"node={node_id} type={node_type} user={user_key} | error={e}"
+            )
+            return False
+
+    async def ensure_permission_from_ancestors(
+        self,
+        node_id: str,
+        node_type: str,
+        user_context: dict[str, Any],
+    ) -> bool:
+        """
+        Check whether the user is permitted to access a node, honouring hasRestriction.
+
+        Logic:
+            hasRestriction = False:
+                - Direct permission exists                              → True
+                - No direct permission, inherit chain leads to an
+                  ancestor with direct permission                       → True
+                - Neither                                               → False
+
+            hasRestriction = True:
+                - No direct permission                                  → False (early exit)
+                - Direct permission AND inherit chain leads to an
+                  ancestor with direct permission                       → True
+                - Direct permission but ancestor check fails            → False
+
+        Args:
+            node_id:      ID of the node to check
+            node_type:    "RecordGroup" or "Record"
+            user_context: pre-computed dict from _get_user_permission_context
+
+        Returns:
+            bool
+        """
+        user_key = user_context.get("userKey", "<unknown>")
+        self.logger.debug(
+            f"ensure_permission_from_ancestors | node={node_id} type={node_type} user={user_key}"
+        )
+        try:
+            label = "RecordGroup" if node_type == "RecordGroup" else "Record"
+            include_rg_paths = node_type == "RecordGroup"
+
+            # Single round trip: fetch hasRestriction + check all direct-permission
+            # paths on the same node.
+            perm_no_return = self._build_direct_permission_cypher_no_return(
+                node_var="n",
+                user_var="u",
+                include_rg_paths=include_rg_paths,
+            )
+            rg_extra = (
+                " OR perm_p5 IS NOT NULL OR (perm_p6 IS NOT NULL AND $hasAppRelation)"
+                if include_rg_paths
+                else ""
+            )
+            node_perm_query = f"""
+            MATCH (n:{label} {{id: $nodeId}})
+            MATCH (u:User {{id: $userKey}})
+            {perm_no_return}
+            RETURN
+                COALESCE(n.hasRestriction, false) AS hasRestriction,
+                (
+                    perm_p1 IS NOT NULL OR
+                    perm_p2 IS NOT NULL OR
+                    perm_p3 IS NOT NULL OR
+                    perm_p4 IS NOT NULL{rg_extra}
+                ) AS hasDirectPermission
+            LIMIT 1
+            """
+
+            params = {"nodeId": node_id, **self._get_permission_query_params(user_context)}
+            node_result = await self.client.execute_query(node_perm_query, parameters=params)
+
+            if not node_result:
+                self.logger.warning(
+                    f"Node not found or user not found | node={node_id} type={node_type} user={user_key} — denying access"
+                )
+                return False
+            self.logger.info(f"node_result: {node_result}")
+            row = node_result[0]
+            has_restriction: bool = row.get("hasRestriction", False)
+            has_direct: bool = row.get("hasDirectPermission", False)
+
+            self.logger.debug(
+                f"Node state | node={node_id} type={node_type} "
+                f"hasRestriction={has_restriction} hasDirectPermission={has_direct} user={user_key}"
+            )
+
+            if not has_restriction:
+                # hasRestriction = False: direct permission is sufficient
+                if has_direct:
+                    self.logger.debug(
+                        f"Access granted via direct permission (hasRestriction=False) | node={node_id} user={user_key}"
+                    )
+                    return True
+                # No direct permission — check whether an ancestor grants it
+                self.logger.debug(
+                    f"No direct permission (hasRestriction=False) — checking ancestor chain | node={node_id} user={user_key}"
+                )
+                result = await self._check_subtree_root_permission_via_inheritance(
+                    node_id, node_type, user_context
+                )
+                self.logger.debug(
+                    f"Ancestor chain result (hasRestriction=False) | node={node_id} user={user_key}: {result}"
+                )
+                return result
+            else:
+                # hasRestriction = True: both direct AND ancestor permission required
+                if not has_direct:
+                    self.logger.debug(
+                        f"Access denied — no direct permission (hasRestriction=True) | node={node_id} user={user_key}"
+                    )
+                    return False
+                self.logger.debug(
+                    f"Direct permission present (hasRestriction=True) — checking ancestor chain | node={node_id} user={user_key}"
+                )
+                result = await self._check_subtree_root_permission_via_inheritance(
+                    node_id, node_type, user_context
+                )
+                self.logger.debug(
+                    f"Ancestor chain result (hasRestriction=True) | node={node_id} user={user_key}: {result}"
+                )
+                return result
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to ensure permission from ancestors | "
+                f"node={node_id} type={node_type} user={user_key} | error={e}"
+            )
+            return False
+
+    async def _get_accessible_descendants_via_cypher(
+        self,
+        root_node_id: str,
+        user_context: dict[str, Any],
+    ) -> list[str]:
+        """
+        Traverse the descendant graph from root_node_id entirely inside Neo4j and
+        return IDs of all accessible Record nodes.
+
+        Algorithm (evaluated per path in Neo4j):
+          For every path root → ... → node via RECORD_RELATION (PARENT_CHILD) edges:
+            For each (parent → child) edge r in the path:
+
+              child.hasRestriction = true  (restricted):
+                accessible = has INHERIT_PERMISSIONS(child → parent)
+                             AND has direct permission
+
+              child.hasRestriction = false (not restricted):
+                accessible = has INHERIT_PERMISSIONS(child → parent)
+                             OR  has direct permission
+
+          A path is valid only if ALL edges satisfy the condition above.
+          Only valid paths whose terminal node is a Record contribute to the result.
+
+        Subtree pruning is implicit: Neo4j will not return any path that passes
+        through an inaccessible intermediate node, so those entire subtrees are skipped.
+
+        Direct permission paths checked per node:
+          - User  -[PERMISSION]->          node
+          - Group -[PERMISSION]->          node   (user's groups)
+          - Role  -[PERMISSION]->          node   (user's roles)
+          - Org   -[PERMISSION {ORG}]->    node
+          - Teams -[PERMISSION {TEAM}]->   node   (RecordGroup only)
+          - App   <-[INHERIT_PERMISSIONS]- node   (RecordGroup only, if hasAppRelation)
+        """
+        user_key = user_context.get("userKey")
+        group_ids = user_context.get("groupIds", [])
+        role_ids = user_context.get("roleIds", [])
+        team_ids = user_context.get("teamIds", [])
+        org_node_id = user_context.get("orgNodeId")
+        has_app_relation = user_context.get("hasAppRelation", False)
+        app_id = user_context.get("appId")
+
+        self.logger.debug(
+            f"_get_accessible_descendants_via_cypher | root={root_node_id} user={user_key}"
+        )
+
+        try:
+            query = """
+            MATCH (u:User {id: $userKey})
+            MATCH (root {id: $rootNodeId})
+
+            // Quantified Path Pattern (QPP — Neo4j 5.9+).
+            // Expands one hop at a time; if the WHERE fails for a child node, Neo4j
+            // stops expanding that branch (true subtree pruning, each edge evaluated once).
+            MATCH (root) (
+                (p)-[r:RECORD_RELATION]->(c)
+                WHERE
+                    r.relationshipType = 'PARENT_CHILD'
+                    AND (
+                        // CASE 1: Restricted — needs BOTH inherit edge AND direct permission
+                        (
+                            c.hasRestriction = true
+                            AND EXISTS { (c)-[:INHERIT_PERMISSIONS]->(p) }
+                            AND (
+                                   EXISTS { (u)-[:PERMISSION {type: 'USER'}]->(c) }
+                                OR EXISTS { (g:Group)-[:PERMISSION]->(c) WHERE g.id IN $groupIds }
+                                OR EXISTS { (rl:Role)-[:PERMISSION]->(c) WHERE rl.id IN $roleIds }
+                                OR EXISTS { (o:Organization)-[:PERMISSION {type: 'ORG'}]->(c) WHERE o.id = $orgNodeId }
+                                OR (
+                                    'RecordGroup' IN labels(c)
+                                    AND EXISTS { (t:Teams)-[:PERMISSION {type: 'TEAM'}]->(c) WHERE t.id IN $teamIds }
+                                )
+                                OR (
+                                    'RecordGroup' IN labels(c)
+                                    AND $hasAppRelation
+                                    AND EXISTS { (:App {id: $appId})<-[:INHERIT_PERMISSIONS]-(c) }
+                                )
+                            )
+                        )
+                        OR
+                        // CASE 2: Not restricted — needs EITHER inherit edge OR direct permission
+                        (
+                            COALESCE(c.hasRestriction, false) = false
+                            AND (
+                                EXISTS { (c)-[:INHERIT_PERMISSIONS]->(p) }
+                                OR EXISTS { (u)-[:PERMISSION {type: 'USER'}]->(c) }
+                                OR EXISTS { (g:Group)-[:PERMISSION]->(c) WHERE g.id IN $groupIds }
+                                OR EXISTS { (rl:Role)-[:PERMISSION]->(c) WHERE rl.id IN $roleIds }
+                                OR EXISTS { (o:Organization)-[:PERMISSION {type: 'ORG'}]->(c) WHERE o.id = $orgNodeId }
+                                OR (
+                                    'RecordGroup' IN labels(c)
+                                    AND EXISTS { (t:Teams)-[:PERMISSION {type: 'TEAM'}]->(c) WHERE t.id IN $teamIds }
+                                )
+                                OR (
+                                    'RecordGroup' IN labels(c)
+                                    AND $hasAppRelation
+                                    AND EXISTS { (:App {id: $appId})<-[:INHERIT_PERMISSIONS]-(c) }
+                                )
+                            )
+                        )
+                    )
+            )+ (target)
+
+            // Collect all accessible Record nodes at any depth
+            WHERE 'Record' IN labels(target)
+            RETURN DISTINCT target.id AS recordId
+            """
+
+            params = {
+                "userKey": user_key,
+                "rootNodeId": root_node_id,
+                "groupIds": group_ids,
+                "roleIds": role_ids,
+                "teamIds": team_ids,
+                "orgNodeId": org_node_id,
+                "hasAppRelation": has_app_relation,
+                "appId": app_id,
+            }
+
+            result = await self.client.execute_query(query, parameters=params)
+            accessible_ids = [row["recordId"] for row in result if row.get("recordId")]
+
+            self.logger.info(
+                f"_get_accessible_descendants_via_cypher | root={root_node_id} "
+                f"user={user_key} | accessible records={len(accessible_ids)}"
+            )
+            return accessible_ids
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ _get_accessible_descendants_via_cypher failed | "
+                f"root={root_node_id} user={user_key} | error={e}"
+            )
+            return []
+
+    async def fetch_accessible_descendant_records(
+        self,
+        user_id: str,
+        org_id: str,
+        app_id: str,
+        node_id: str | None = None,
+        node_type: str | None = None,
+    ) -> list[str]:
+        """
+        Fetch all accessible descendant records for a user within a subtree.
+
+        Steps:
+          1. Pre-compute user permission context (groups, roles, teams, org, app relation).
+          2. Check whether the given root node (node_id / node_type) is accessible via
+             ensure_permission_from_ancestors (honours hasRestriction + ancestor chain).
+          3. If the root is inaccessible, return [].
+          4. If the root is a Record (leaf), return [node_id].
+          5. If the root is a RecordGroup, delegate to Neo4j via
+             _get_accessible_descendants_via_cypher which traverses the entire descendant
+             graph in a single query, pruning inaccessible subtrees at the database level.
+
+        Returns:
+            List of accessible record IDs (str).
+        """
+        self.logger.info(
+            f"fetch_accessible_descendant_records | user={user_id} org={org_id} "
+            f"app={app_id} node={node_id} node_type={node_type}"
+        )
+        try:
+            ctx = await self._get_user_permission_context(user_id, org_id, app_id)
+
+            if not ctx.get("hasAppRelation"):
+                self.logger.warning(
+                    f"User {user_id} has no USER_APP_RELATION to app {app_id} — returning empty"
+                )
+                return []
+            if not ctx.get("userKey"):
+                self.logger.warning(f"User {user_id} not found in graph — returning empty")
+                return []
+
+            if not node_id or not node_type:
+                self.logger.warning(
+                    f"node_id or node_type not provided | node_id={node_id} node_type={node_type} — returning empty"
+                )
+                return []
+
+            # ── Step 1: Verify root node is accessible ─────────────────────────────
+            root_accessible = await self.ensure_permission_from_ancestors(node_id, node_type, ctx)
+            self.logger.debug(
+                f"Root accessible={root_accessible} | node={node_id} type={node_type} user={user_id}"
+            )
+            if not root_accessible:
+                self.logger.info(
+                    f"Root node {node_id} not accessible for user {user_id} — returning empty"
+                )
+                return []
+
+            # # ── Step 2: Leaf shortcut ──────────────────────────────────────────────
+            # if node_type == "Record":
+            #     self.logger.info(
+            #         f"Root is an accessible Record — returning ['{node_id}'] for user={user_id}"
+            #     )
+            #     return [node_id]
+
+            # ── Step 3: Traverse descendants entirely inside Neo4j ─────────────────
+            accessible_records = await self._get_accessible_descendants_via_cypher(
+                node_id, ctx
+            )
+
+            self.logger.info(
+                f"✅ fetch_accessible_descendant_records complete | "
+                f"user={user_id} app={app_id} root={node_id} "
+                f"accessible_records={len(accessible_records)}"
+            )
+            return accessible_records
+
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to fetch accessible descendant records | "
+                f"user={user_id} org={org_id} app={app_id} | error={e}"
+            )
+            return []
