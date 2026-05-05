@@ -17,7 +17,7 @@ import unicodedata
 import uuid
 from collections import defaultdict
 from logging import Logger
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import Request
 from app.config.configuration_service import ConfigurationService
@@ -478,16 +478,29 @@ class ArangoHTTPProvider(IGraphDBProvider):
         try:
             self.logger.info("🚀 Ensuring ArangoDB schema (collections, graph, departments)...")
 
+            # Build a lookup: collection name → schema (None means no validation schema)
+            schema_by_collection: Dict[str, Any] = {}
+            for col_name, col_schema in NODE_COLLECTIONS:
+                schema_by_collection[col_name] = col_schema
+            for col_name, col_schema in EDGE_COLLECTIONS:
+                schema_by_collection[col_name] = col_schema
+
             # 1. Create all collections (node + edge)
             edge_collection_names = {ed["edge_collection"] for ed in EDGE_DEFINITIONS}
             for col in CollectionNames:
                 name = col.value
                 is_edge = name in edge_collection_names
+                col_schema = schema_by_collection.get(name)
                 if not await self.http_client.has_collection(name):
-                    if not await self.http_client.create_collection(name, edge=is_edge):
+                    if not await self.http_client.create_collection(
+                        name, edge=is_edge, schema=col_schema
+                    ):
                         self.logger.warning(f"Failed to create collection '{name}', continuing")
                 else:
                     self.logger.debug(f"Collection '{name}' already exists")
+                    # Ensure schema is applied to pre-existing collections too
+                    if col_schema:
+                        await self.http_client.update_collection_schema(name, col_schema)
 
             # 2. Create knowledge graph if it doesn't exist
             has_knowledge = await self.http_client.has_graph(GraphNames.KNOWLEDGE_GRAPH.value)
