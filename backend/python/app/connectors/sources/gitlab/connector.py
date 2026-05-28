@@ -115,6 +115,7 @@ from app.utils.time_conversion import (
 
 GITLAB_CLOUD_URL = "https://gitlab.com"
 GITLAB_SEARCH_MIN_PARTIAL_CHARS = 3
+GITLAB_COMPARE_DIFF_LIMIT = 1000
 
 # Per-logical-call wall-clock budget. ``GitLabClientViaToken`` already passes
 # a per-HTTP-request ``timeout=30`` to python-gitlab, but a single
@@ -284,6 +285,7 @@ class RecordUpdate(BaseModel):
 
 class GitlabLiterals(str, Enum):
     LAST_SYNC_TIME = "last_sync_time"
+    LAST_COMMIT_SHA = "last_commit_sha"
     RECORD_GROUP = "record_group"
     GLOBAL = "global"
     UPDATED_AT = "updated_at"
@@ -1597,6 +1599,48 @@ class GitLabConnector(BaseConnector):
         )
         sync_point_data = {GitlabLiterals.LAST_SYNC_TIME.value: last_sync_time}
         await self.record_sync_point.update_sync_point(sync_point_key, sync_point_data)
+
+    async def _get_code_repo_checkpoint(self, project_id: int) -> str | None:
+        """Return the last synced HEAD commit SHA for a project's code repository."""
+        try:
+            group_project_id = f"{project_id}-code-repository"
+            sync_point_key = generate_record_sync_point_key(
+                Connectors.GITLAB.value, group_project_id, ""
+            )
+            sync_point_data = await self.record_sync_point.read_sync_point(
+                sync_point_key
+            )
+            if not sync_point_data:
+                return None
+            sha = sync_point_data.get(GitlabLiterals.LAST_COMMIT_SHA.value)
+            return str(sha) if sha else None
+        except Exception:
+            return None
+
+    async def _update_code_repo_checkpoint(
+        self, project_id: int, commit_sha: str
+    ) -> None:
+        """Persist the HEAD commit SHA after a successful code repository sync."""
+        group_project_id = f"{project_id}-code-repository"
+        sync_point_key = generate_record_sync_point_key(
+            Connectors.GITLAB.value, group_project_id, ""
+        )
+        sync_point_data = {GitlabLiterals.LAST_COMMIT_SHA.value: commit_sha}
+        await self.record_sync_point.update_sync_point(sync_point_key, sync_point_data)
+
+    @staticmethod
+    def _branch_head_commit_sha(branch_data: Any) -> str | None:
+        """Extract commit id from a python-gitlab branch or REST dict."""
+        commit = getattr(branch_data, "commit", None)
+        if commit is None and isinstance(branch_data, dict):
+            commit = branch_data.get("commit")
+        if commit is None:
+            return None
+        if isinstance(commit, dict):
+            sha = commit.get("id")
+            return str(sha) if sha else None
+        sha = getattr(commit, "id", None)
+        return str(sha) if sha else None
 
     async def run_sync(self) -> None:
         """syncing various entities"""
@@ -3110,13 +3154,69 @@ class GitLabConnector(BaseConnector):
             {GitlabLiterals.LAST_SYNC_TIME.value: current_timestamp},
         )
 
-    async def _sync_repo_main(self, project_id: int, project_path: str) -> None:
-        """Sync default branch files code.
-        PROCESS: 1. Sync all folders level wise via paginated graphql api.
-                 2. Sync all code repo. files via paginated graphql api.
-        REASON:  both can be in same api call but pagination to be separate.
-                 level wise files ordering not needed
-        """
+    async def _sync_repo_main(
+        self, project_id: int, project_path: str, default_branch: str
+    ) -> None:
+        """Sync code repository using incremental compare when a checkpoint exists."""
+        branch_res = await self._ds_call(
+            self.data_source.get_branch,
+            project_id=project_id,
+            branch=default_branch,
+        )
+        if not branch_res.success or not branch_res.data:
+            self.logger.error(
+                "Failed to fetch branch %s for project %s (%s): %s",
+                default_branch,
+                project_id,
+                project_path,
+                branch_res.error,
+            )
+            return
+
+        current_sha = self._branch_head_commit_sha(branch_res.data)
+        if not current_sha:
+            self.logger.error(
+                "No commit SHA on branch %s for project %s (%s)",
+                default_branch,
+                project_id,
+                project_path,
+            )
+            return
+
+        last_sha = await self._get_code_repo_checkpoint(project_id)
+        if last_sha is None:
+            self.logger.info(
+                "No code-repo checkpoint for project %s; running full sync",
+                project_id,
+            )
+            await self._sync_repo_full(project_id, project_path)
+            await self._update_code_repo_checkpoint(project_id, current_sha)
+            return
+
+        if last_sha == current_sha:
+            self.logger.info(
+                "Code repo unchanged for project %s (HEAD %s); skipping",
+                project_id,
+                current_sha[:8],
+            )
+            return
+
+        incremental_ok = await self._sync_repo_incremental(
+            project_id, project_path, last_sha, current_sha
+        )
+        if incremental_ok:
+            await self._update_code_repo_checkpoint(project_id, current_sha)
+            return
+
+        self.logger.warning(
+            "Incremental code sync failed for project %s; falling back to full sync",
+            project_id,
+        )
+        await self._sync_repo_full(project_id, project_path)
+        await self._update_code_repo_checkpoint(project_id, current_sha)
+
+    async def _sync_repo_full(self, project_id: int, project_path: str) -> None:
+        """Full sync of default-branch folders and blobs via paginated GraphQL."""
         # fetching file tree
         tree_list = []
         after_cursor = ""
@@ -3330,6 +3430,352 @@ class GitLabConnector(BaseConnector):
             after_cursor = page_info.get("endCursor", "")
             if not after_cursor:
                 break
+
+    @staticmethod
+    def _code_blob_web_path(
+        project_path: str, repo_path: str, ref: str = "HEAD"
+    ) -> str:
+        return f"/{project_path}/-/blob/{ref}/{repo_path}"
+
+    @staticmethod
+    def _code_tree_web_path(
+        project_path: str, repo_path: str, ref: str = "HEAD"
+    ) -> str:
+        return f"/{project_path}/-/tree/{ref}/{repo_path}"
+
+    @staticmethod
+    def _should_skip_dotfile_repo_path(repo_path: str) -> bool:
+        basename = repo_path.rsplit("/", 1)[-1]
+        return basename.startswith(".")
+
+    @staticmethod
+    def _compare_diff_entry(diff: Any, key: str) -> Any:
+        if isinstance(diff, dict):
+            return diff.get(key)
+        return getattr(diff, key, None)
+
+    def _partition_compare_diffs(
+        self, diffs: list[Any]
+    ) -> tuple[list[str], list[str]]:
+        """Split compare diffs into paths to delete and paths to upsert."""
+        deleted_paths: list[str] = []
+        upsert_paths: list[str] = []
+        seen_delete: set[str] = set()
+        seen_upsert: set[str] = set()
+
+        for diff in diffs:
+            old_path = self._compare_diff_entry(diff, "old_path") or ""
+            new_path = self._compare_diff_entry(diff, "new_path") or ""
+            is_deleted = bool(self._compare_diff_entry(diff, "deleted_file"))
+            is_renamed = bool(self._compare_diff_entry(diff, "renamed_file"))
+
+            if is_deleted:
+                if old_path and old_path not in seen_delete:
+                    if not self._should_skip_dotfile_repo_path(old_path):
+                        deleted_paths.append(old_path)
+                        seen_delete.add(old_path)
+                continue
+
+            if is_renamed:
+                if old_path and old_path not in seen_delete:
+                    if not self._should_skip_dotfile_repo_path(old_path):
+                        deleted_paths.append(old_path)
+                        seen_delete.add(old_path)
+                target = new_path or old_path
+            else:
+                target = new_path or old_path
+
+            if target and target not in seen_upsert:
+                if not self._should_skip_dotfile_repo_path(target):
+                    upsert_paths.append(target)
+                    seen_upsert.add(target)
+
+        return deleted_paths, upsert_paths
+
+    async def _sync_repo_incremental(
+        self,
+        project_id: int,
+        project_path: str,
+        from_sha: str,
+        to_sha: str,
+    ) -> bool:
+        """Apply repository/compare diffs between two commits. Returns False to fall back."""
+        compare_res = await self._ds_call(
+            self.data_source.compare_commits,
+            project_id=project_id,
+            from_sha=from_sha,
+            to_sha=to_sha,
+        )
+        if not compare_res.success or compare_res.data is None:
+            self.logger.warning(
+                "compare_commits failed for project %s: %s",
+                project_id,
+                compare_res.error,
+            )
+            return False
+
+        compare_data = compare_res.data
+        self.logger.debug(f"compare_data: {compare_data}")
+        if isinstance(compare_data, dict):
+            diffs = compare_data.get("diffs") or []
+        else:
+            diffs = getattr(compare_data, "diffs", None) or []
+
+        if len(diffs) >= GITLAB_COMPARE_DIFF_LIMIT:
+            self.logger.warning(
+                "Too many diffs (%s) for project %s; falling back to full sync",
+                len(diffs),
+                project_id,
+            )
+            return False
+
+        deleted_paths, upsert_paths = self._partition_compare_diffs(diffs)
+        self.logger.info(
+            "Incremental code sync for project %s: %s deletes, %s upserts",
+            project_id,
+            len(deleted_paths),
+            len(upsert_paths),
+        )
+
+        self.logger.debug(f"deleted_paths: {deleted_paths}")
+        self.logger.debug(f"upsert_paths: {upsert_paths}")
+
+        if deleted_paths:
+            await self._delete_code_files_by_paths(
+                project_id, project_path, deleted_paths
+            )
+        if upsert_paths:
+            await self._upsert_code_files_by_paths(
+                project_id, project_path, upsert_paths
+            )
+        return True
+
+    async def _delete_code_files_by_paths(
+        self, project_id: int, project_path: str, paths: list[str]
+    ) -> None:
+        for repo_path in paths:
+            external_id = self._code_blob_web_path(project_path, repo_path)
+            record = await self.data_entities_processor.get_record_by_external_id(
+                self.connector_id, external_id
+            )
+            if record:
+                await self.data_entities_processor.on_record_deleted(record.id)
+
+    async def _upsert_code_files_by_paths(
+        self, project_id: int, project_path: str, paths: list[str]
+    ) -> None:
+        unique_paths = list(dict.fromkeys(paths))
+        if not unique_paths:
+            return
+
+        await self._ensure_folder_records_for_paths(
+            project_id, project_path, unique_paths
+        )
+
+        nodes: list[dict[str, Any]] = []
+        by_parent: dict[str | None, list[str]] = {}
+        for repo_path in unique_paths:
+            if "/" in repo_path:
+                parent = repo_path.rpartition("/")[0]
+            else:
+                parent = None
+            by_parent.setdefault(parent, []).append(repo_path)
+
+        for parent, child_paths in by_parent.items():
+            tree_res = await self._ds_call(
+                self.data_source.list_repo_tree,
+                project_id=project_id,
+                ref="HEAD",
+                path=parent,
+                recursive=False,
+            )
+            if not tree_res.success or not tree_res.data:
+                self.logger.warning(
+                    "list_repo_tree failed for project %s path %r: %s",
+                    project_id,
+                    parent,
+                    tree_res.error,
+                )
+                continue
+
+            entries_by_path: dict[str, Any] = {}
+            for entry in tree_res.data:
+                entry_path = (
+                    entry.get("path")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "path", None)
+                )
+                if entry_path:
+                    entries_by_path[str(entry_path)] = entry
+
+            for repo_path in child_paths:
+                entry = entries_by_path.get(repo_path)
+                if entry is None:
+                    self.logger.warning(
+                        "Blob %r not found under parent %r for project %s",
+                        repo_path,
+                        parent,
+                        project_id,
+                    )
+                    continue
+                entry_type = (
+                    entry.get("type")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "type", None)
+                )
+                if entry_type != "blob":
+                    continue
+                blob_sha = (
+                    entry.get("id")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "id", None)
+                )
+                name = (
+                    entry.get("name")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "name", None)
+                )
+                if not blob_sha or not name:
+                    continue
+                web_path = self._code_blob_web_path(project_path, repo_path)
+                nodes.append(
+                    {
+                        "path": repo_path,
+                        "name": name,
+                        "sha": str(blob_sha),
+                        "type": "blob",
+                        "webPath": web_path,
+                        "webUrl": f"{self._gitlab_base_url}{web_path}",
+                    }
+                )
+
+        if nodes:
+            await self.build_code_file_records(nodes, project_id, project_path)
+
+    async def _ensure_folder_records_for_paths(
+        self, project_id: int, project_path: str, file_paths: list[str]
+    ) -> None:
+        """Create missing folder records for parent directories of changed files."""
+        prefixes: set[str] = set()
+        for repo_path in file_paths:
+            parts = repo_path.split("/")
+            for i in range(1, len(parts)):
+                prefixes.add("/".join(parts[:i]))
+
+        if not prefixes:
+            return
+
+        external_group_id = f"{project_id}-code-repository"
+        sorted_prefixes = sorted(prefixes, key=lambda p: p.count("/"))
+
+        for prefix in sorted_prefixes:
+            tree_external_id = self._code_tree_web_path(project_path, prefix)
+            existing = await self.data_entities_processor.get_record_by_external_id(
+                self.connector_id, tree_external_id
+            )
+            if existing:
+                continue
+
+            parent_prefix: str | None
+            if "/" in prefix:
+                parent_prefix = prefix.rpartition("/")[0]
+            else:
+                parent_prefix = None
+
+            tree_res = await self._ds_call(
+                self.data_source.list_repo_tree,
+                project_id=project_id,
+                ref="HEAD",
+                path=parent_prefix,
+                recursive=False,
+            )
+            if not tree_res.success or not tree_res.data:
+                self.logger.warning(
+                    "Could not list repo tree for folder %r in project %s",
+                    prefix,
+                    project_id,
+                )
+                continue
+
+            folder_entry = None
+            for entry in tree_res.data:
+                entry_path = (
+                    entry.get("path")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "path", None)
+                )
+                if entry_path != prefix:
+                    continue
+                entry_type = (
+                    entry.get("type")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "type", None)
+                )
+                if entry_type == "tree":
+                    folder_entry = entry
+                    break
+
+            if folder_entry is None:
+                continue
+
+            folder_name = (
+                folder_entry.get("name")
+                if isinstance(folder_entry, dict)
+                else getattr(folder_entry, "name", None)
+            )
+            folder_hash = (
+                folder_entry.get("id")
+                if isinstance(folder_entry, dict)
+                else getattr(folder_entry, "id", None)
+            )
+            if not folder_name:
+                continue
+
+            web_path = self._code_tree_web_path(project_path, prefix)
+            weburl = f"{self._gitlab_base_url}{web_path}"
+            if parent_prefix:
+                parent_external_record_id = self._code_tree_web_path(
+                    project_path, parent_prefix
+                )
+            else:
+                parent_external_record_id = None
+
+            tree_record = FileRecord(
+                id=str(uuid.uuid4()),
+                org_id=self.data_entities_processor.org_id,
+                record_name=str(folder_name),
+                record_type=RecordType.FILE.value,
+                connector_name=self.connector_name,
+                connector_id=self.connector_id,
+                external_record_id=web_path,
+                version=0,
+                origin=OriginTypes.CONNECTOR.value,
+                record_group_type=RecordGroupType.PROJECT.value,
+                external_record_group_id=external_group_id,
+                mime_type=MimeTypes.FOLDER.value,
+                external_revision_id=str(folder_hash) if folder_hash else "",
+                preview_renderable=False,
+                parent_external_record_id=parent_external_record_id,
+                parent_record_type=(
+                    RecordType.FILE if parent_external_record_id else None
+                ),
+                is_file=False,
+                inherit_permissions=True,
+                weburl=weburl,
+            )
+            record_update = RecordUpdate(
+                record=tree_record,
+                is_new=True,
+                is_updated=False,
+                is_deleted=False,
+                metadata_changed=False,
+                content_changed=False,
+                permissions_changed=False,
+                external_record_id=web_path,
+                new_permissions=[],
+                old_permissions=[],
+            )
+            await self._process_new_records([record_update])
 
     async def build_code_file_records(
         self, code_file_list: list[dict[str, Any]], project_id: int, project_path: str
@@ -3575,7 +4021,14 @@ class GitLabConnector(BaseConnector):
                 ("members", lambda: self._sync_project_members_as_pseudo(project)),
                 ("issues", lambda: self._fetch_issues_batched(project_id)),
                 ("merge_requests", lambda: self._fetch_prs_batched(project_id)),
-                ("code", lambda: self._sync_repo_main(project_id, project_path)),
+                (
+                    "code",
+                    lambda: self._sync_repo_main(
+                        project_id,
+                        project_path,
+                        project.default_branch or "main",
+                    ),
+                ),
             ):
                 try:
                     await step()
@@ -4497,7 +4950,7 @@ class GitLabConnector(BaseConnector):
 
 
     async def run_incremental_sync(self) -> None:
-        return
+        await self.run_sync()
 
     # ---------------------------Comments sync-----------------------------------#
 
