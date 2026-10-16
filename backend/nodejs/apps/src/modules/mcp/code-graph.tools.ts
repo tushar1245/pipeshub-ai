@@ -84,7 +84,8 @@ const edgeTypes = z
   );
 
 const COVERAGE =
-  'Cross-file CALLS/IMPORTS edges exist for Python, JavaScript and TypeScript only; ' +
+  'Cross-file CALLS/IMPORTS edges are resolved through imports for Python, JavaScript, ' +
+  'TypeScript and Java; other languages get calls matched by name. ' +
   'a `coverage` field says when an answer may be incomplete, so confirm with ' +
   'pipeshub_search before relying on an empty result.';
 

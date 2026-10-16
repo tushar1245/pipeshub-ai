@@ -921,8 +921,8 @@ class CodeGraph:
             "Functions and methods no code in the repo calls — routes, CLIs, jobs, "
             "framework hooks — with conventional names (main, handler, ...) and files "
             "(main.py, routes/, ...) first. A place to start reading an unfamiliar repo. "
-            "Only Python, JavaScript and TypeScript have call edges; `coverage` says when "
-            "a language has none."
+            "Python, JavaScript, TypeScript and Java calls are resolved through imports; "
+            "other languages' calls are matched by name, and `coverage` says when that applies."
         ),
         parameters=[
             ToolParameter(name="connector_id", type=ParameterType.STRING,

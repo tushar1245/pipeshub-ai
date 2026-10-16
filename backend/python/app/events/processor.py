@@ -1877,6 +1877,7 @@ class Processor:
                     record_group_id=record_group_id,
                     connector_id=connector_id,
                     language=language,
+                    file_path=file_path,
                 ),
                 block_containers=block_containers,
                 logger=self.logger,

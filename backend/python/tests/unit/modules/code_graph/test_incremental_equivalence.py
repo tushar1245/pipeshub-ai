@@ -110,7 +110,7 @@ async def project(graph: Graph, parser: CodeFileParser, repo: Repo, mod: str) ->
     await write_code_file_blocks_to_graph(
         graph_provider=graph,
         context=BlockProjectionContext(org_id=ORG_ID, record_id=rid(mod), record_group_id=GROUP_ID,
-                                       connector_id="conn1", language="python"),
+                                       connector_id="conn1", language="python", file_path=path),
         block_containers=container,
     )
 

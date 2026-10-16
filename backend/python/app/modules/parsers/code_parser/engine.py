@@ -336,6 +336,26 @@ def _imports_js(node: Node, src: bytes, out: list[PendingEdgeFact]) -> None:
                         ))
 
 
+def _imports_java(node: Node, src: bytes, out: list[PendingEdgeFact]) -> None:
+    """`import a.b.C;` names a class by its file path; `a.b.*` names a package, skipped."""
+    if node.type != "import_declaration":
+        return
+    if any(c.type == "asterisk" for c in node.children):
+        return
+    target = next((c for c in node.named_children if c.type in ("scoped_identifier", "identifier")), None)
+    if target is None:
+        return
+    line = node.start_point[0] + 1
+    dotted = _text(target, src)
+    static = any(c.type == "static" for c in node.children)
+    # `import static a.b.C.m;` imports a member of class a.b.C.
+    owner = dotted.rsplit(".", 1)[0] if static and "." in dotted else dotted
+    out.append(PendingEdgeFact(relation=Relation.IMPORTS_FROM, to_name=owner, line=line,
+                               to_kind="record"))
+    out.append(PendingEdgeFact(relation=Relation.IMPORTS, to_name=dotted.rsplit(".", 1)[-1],
+                               line=line, to_kind="block", qualified_prefix=owner))
+
+
 def _exports_js(node: Node, src: bytes, out: list[PendingEdgeFact]) -> None:
     """`export … from './m'` re-exports; `export function f` exports a local symbol."""
     line = node.start_point[0] + 1
@@ -425,8 +445,41 @@ def _heritage_ts(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int) -
                         ))
 
 
-_IMPORT_HANDLERS = {"python": _imports_python, "js": _imports_js}
-_HERITAGE_HANDLERS = {"python": _heritage_python, "js": _heritage_js, "ts": _heritage_ts}
+def _java_type_name(node: Node, src: bytes) -> str:
+    """`List<Owner>` -> `List`, `a.b.Base` -> `Base`, `Owner[]` -> `Owner`."""
+    return _text(node, src).split("<")[0].split("[")[0].strip().rsplit(".", 1)[-1]
+
+
+def _heritage_java(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int) -> None:
+    """`extends Base` and `implements A, B` on a class; `extends A, B` on an interface."""
+    line = node.start_point[0] + 1
+    for child in node.named_children:
+        if child.type == "superclass":
+            relation = Relation.INHERITS
+        elif child.type in ("super_interfaces", "extends_interfaces"):
+            relation = Relation.IMPLEMENTS if child.type == "super_interfaces" else Relation.EXTENDS
+        else:
+            continue
+        stack = list(child.named_children)
+        while stack:
+            item = stack.pop(0)
+            if item.type == "type_list":
+                stack.extend(item.named_children)
+            elif item.type in ("type_identifier", "generic_type", "scoped_type_identifier"):
+                raw = _text(item, src).split("<")[0]
+                out.append(PendingEdgeFact(
+                    relation=relation, to_name=raw.rsplit(".", 1)[-1], line=line, from_symbol=idx,
+                    qualified_prefix=raw.rsplit(".", 1)[0] if "." in raw else None,
+                ))
+
+
+_IMPORT_HANDLERS = {"python": _imports_python, "js": _imports_js, "java": _imports_java}
+_HERITAGE_HANDLERS = {"python": _heritage_python, "js": _heritage_js, "ts": _heritage_ts,
+                      "java": _heritage_java}
+# Handlers whose call sites are read as references (`a.b.c()` with its qualifier
+# and receiver). Every other grammar keeps the generic callee reader, even when
+# it has an import handler.
+_REFERENCE_CALLEE_HANDLERS = frozenset({"python", "js"})
 
 
 # --------------------------------------------------------------------------
@@ -504,10 +557,58 @@ def _collect_type_table_python(root: Node, src: bytes, table: dict[str, str]) ->
         stack.extend(node.named_children)
 
 
+def _collect_type_table_java(root: Node, src: bytes, table: dict[str, str]) -> None:
+    """`Owner owner`, as a field, a parameter or a local: calls on `owner` are on Owner."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in ("field_declaration", "local_variable_declaration", "formal_parameter",
+                         "spread_parameter"):
+            type_node = _field(node, "type")
+            if type_node is not None:
+                type_name = _java_type_name(type_node, src)
+                names = ([_field(node, "name")] if node.type != "field_declaration"
+                         and node.type != "local_variable_declaration"
+                         else [_field(d, "name") for d in node.named_children
+                               if d.type == "variable_declarator"])
+                for name in names:
+                    if name is not None and type_name[:1].isupper():
+                        table.setdefault(_text(name, src), type_name)
+        stack.extend(node.named_children)
+
+
+def _go_type_name(node: Node, src: bytes) -> str:
+    """`*Context` -> `Context`, `[]gin.Engine` -> `Engine`, `Box[T]` -> `Box`."""
+    return _text(node, src).lstrip("*&[]").split("[")[0].rsplit(".", 1)[-1]
+
+
+def _collect_type_table_go(root: Node, src: bytes, table: dict[str, str]) -> None:
+    """A method's receiver, parameters and typed `var`s: `c.Render()` in
+    `func (c *Context) JSON()` is Context.Render. A name bound to two types in
+    one file is dropped rather than guessed."""
+    seen: dict[str, set[str]] = {}
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in ("parameter_declaration", "var_spec"):
+            type_node = _field(node, "type")
+            if type_node is not None:
+                type_name = _go_type_name(type_node, src)
+                for child in node.named_children:
+                    if child.type == "identifier" and type_name[:1].isupper():
+                        seen.setdefault(_text(child, src), set()).add(type_name)
+        stack.extend(node.named_children)
+    for name, types in seen.items():
+        if len(types) == 1:
+            table.setdefault(name, next(iter(types)))
+
+
 _TYPE_TABLE_HANDLERS = {
     "python": _collect_type_table_python,
     "js": _collect_type_table_js,
     "ts": _collect_type_table_ts,
+    "java": _collect_type_table_java,
+    "go": _collect_type_table_go,
 }
 
 
@@ -519,7 +620,7 @@ def _callee_info(
     node: Node, src: bytes, cfg: LanguageConfig,
 ) -> tuple[str | None, bool, str | None, str | None]:
     """Return (name, is_member, receiver, qualified_prefix) for a call node."""
-    if not cfg.import_handler_name:
+    if cfg.import_handler_name not in _REFERENCE_CALLEE_HANDLERS:
         return _generic_callee(node, src, cfg)
     target = _field(node, cfg.call_function_field) or _field(node, "constructor")
     if target is None:

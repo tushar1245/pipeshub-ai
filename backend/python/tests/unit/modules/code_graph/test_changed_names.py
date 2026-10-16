@@ -165,7 +165,7 @@ async def test_a_method_moved_into_a_class_binds_its_callers_as_a_full_build_wou
         await write_code_file_blocks_to_graph(
             graph_provider=fresh,
             context=BlockProjectionContext(org_id=ORG_ID, record_id=rid, record_group_id=GROUP_ID,
-                                           connector_id="conn1", language="python"),
+                                           connector_id="conn1", language="python", file_path=path),
             block_containers=container)
     await _build(fresh)
 

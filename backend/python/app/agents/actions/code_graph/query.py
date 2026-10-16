@@ -548,8 +548,9 @@ async def entry_points_impl(
 
     Code with no caller in the graph is where control arrives from outside: a
     route, a CLI, a job, a framework hook. Conventional names and files rank
-    first; the rest follow by path. Only Python/JS/TS have CALLS edges, so in
-    other languages every function looks uncalled -- coverage says so.
+    first; the rest follow by path. Calls in languages without import resolution
+    are matched by name, and some are left unresolved, so a function there can
+    look uncalled when it isn't -- coverage says so.
     """
     if not connector_id:
         return {"error": CONNECTOR_ID_REQUIRED}

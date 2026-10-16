@@ -21,7 +21,7 @@ __all__ = [
 ]
 
 CALLABLE_KINDS = frozenset({"function", "method", "constructor"})
-TYPE_KINDS = frozenset({"class", "interface", "enum", "type_alias"})
+TYPE_KINDS = frozenset({"class", "interface", "enum", "type_alias", "struct", "trait"})
 
 # A family is the set of languages whose code can call each other's
 # definitions directly. JS and TS share a module system; C++ includes C

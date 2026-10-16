@@ -91,6 +91,10 @@ MAX_BLOCKS_PER_BUILD = max(1, env_int("CODE_EDGE_BUILD_MAX_BLOCKS", 300000))
 # than this is left unresolved: a proximity guess among that many is how god
 # nodes form, and scoring every candidate per call made builds quadratic.
 _MAX_HEURISTIC_CANDIDATES = 64
+# A package re-exporting a name re-exported by another: followed this many hops.
+_MAX_REEXPORT_HOPS = 4
+# Languages where a bare call inside a method may be a call on `this`.
+_IMPLICIT_THIS_FAMILIES = frozenset({"jvm", "csharp"})
 _MIN_MISSING_FACTS_TO_ABORT = 5
 
 logger = logging.getLogger(__name__)
@@ -391,6 +395,17 @@ class _Builder:
         if candidates:
             self.result.ambiguous_skipped += 1
             return
+        reexported = self._follow_reexport(target_file, name, family)
+        if reexported:
+            # `from django.urls import reverse`: the package re-exports it from base.py.
+            bindings[local] = reexported
+            self._add_edge(
+                self._source_key(block_id, fact), self._block_key(reexported),
+                RecordRelations.IMPORTS.value,
+                confidence=CONFIDENCE_EXTRACTED, line=fact.get("line"),
+                resolution=RESOLUTION_IMPORT,
+            )
+            return
         submodule = self._python_submodule(specifier, name, from_file, family)
         if submodule:
             # `from app.analytics import jobs`: the name is a module, not a symbol.
@@ -498,6 +513,19 @@ class _Builder:
                     self.result.unresolved += 1
                 continue
 
+            if relation in _CALL_RELATIONS and family in _IMPLICIT_THIS_FAMILIES:
+                # `getPet(id)` inside a Java method is `this.getPet(id)`: the class's
+                # own method or an inherited one, before any guess by name.
+                owner = self._enclosing_type(block_id)
+                target = self._resolve_self_method(owner, name) if owner else None
+                # `new Builder()` inside Builder names the class, not its constructor.
+                if target and not self._is_constructor(target):
+                    self._add_edge(
+                        self._source_key(block_id, fact), self._block_key(target), relation,
+                        confidence=CONFIDENCE_EXTRACTED, line=fact.get("line"),
+                        resolution=RESOLUTION_TYPE,
+                    )
+                    continue
             target, confidence, resolution = self._resolve_direct(
                 name, call_file, family, relation, fact.get("qualifiedPrefix"),
             )
@@ -707,13 +735,9 @@ class _Builder:
             if not target_file:
                 continue
             target_file = self.imports.walk_barrel_chain(target_file, self.re_exports)
-            target_record = self.index.record_by_file.get(target_file)
-            if not target_record:
-                continue
-            for candidate in self.index.blocks_by_record.get(target_record, ()):
-                row = self.index.rows.get(candidate)
-                if row and row.name == name and not row.parent_block_id:
-                    return candidate
+            hit = self._defined_or_reexported(target_file, name)
+            if hit:
+                return hit
         return None
 
     def _resolve_member_call(self, block_id: str, fact: dict, record_id: str,
@@ -733,6 +757,14 @@ class _Builder:
             owner = self._enclosing_type(block_id)
             if owner:
                 return self._resolve_self_method(owner, name), CONFIDENCE_INFERRED, RESOLUTION_TYPE
+        if not receiver_type and receiver in ("super()", "super"):
+            # `super().__init__()`, `super.save()`: the nearest base that defines it.
+            owner = self._enclosing_type(block_id)
+            for base in self._base_types_of(owner) if owner else ():
+                target = self._resolve_self_method(base, name)
+                if target:
+                    return target, CONFIDENCE_INFERRED, RESOLUTION_TYPE
+            return None, CONFIDENCE_INFERRED, None
         if not receiver_type and receiver:
             bound = self._resolve_bound_receiver(receiver, name, record_id)
             if bound is not None:
@@ -763,7 +795,7 @@ class _Builder:
         if module == _EXTERNAL:
             return None, CONFIDENCE_INFERRED, _EXTERNAL
         if module:
-            target = self._top_level_in_file(module, name)
+            target = self._defined_or_reexported(module, name)
             return target, CONFIDENCE_EXTRACTED, RESOLUTION_IMPORT if target else None
         bound = self.symbol_bindings.get(call_file, {}).get(receiver)
         if bound == _EXTERNAL:
@@ -784,6 +816,42 @@ class _Builder:
             row = self.index.rows.get(candidate)
             if row and row.name == name and not row.parent_block_id:
                 return candidate
+        return None
+
+    def _defined_or_reexported(self, file_path: str, name: str) -> str | None:
+        return self._top_level_in_file(file_path, name) or self._follow_reexport(
+            file_path, name, lang_family(None, file_path))
+
+    def _follow_reexport(self, file_path: str, name: str, family: str | None,
+                         depth: int = 0) -> str | None:
+        """The definition a module makes available under ``name`` by importing it.
+
+        `models.ForeignKey` with `from django.db import models`: models/__init__.py
+        defines nothing by that name; it imports it from fields/related.py. Read
+        from the file's own IMPORTS facts, which a package `__init__.py` keeps on
+        its nodes. Bounded, like barrel chains.
+        """
+        # Only a package `__init__.py` keeps its imports on its nodes; following any
+        # other module's imports would see them on a full build and not on an
+        # incremental one, and the two must agree.
+        if depth >= _MAX_REEXPORT_HOPS or not file_path.endswith("__init__.py"):
+            return None
+        record = self.index.record_by_file.get(file_path)
+        for block_id in self.index.blocks_by_record.get(record, ()):
+            row = self.index.rows.get(block_id)
+            for fact in row.pending_edges if row else ():
+                if fact.get("relation") != RecordRelations.IMPORTS.value:
+                    continue
+                if (fact.get("localName") or fact.get("toName")) != name:
+                    continue
+                source = self.imports.resolve(fact.get("qualifiedPrefix") or "", file_path, family)
+                if not source or source == file_path:
+                    continue
+                original = fact.get("toName") or name
+                hit = self._top_level_in_file(source, original) or self._follow_reexport(
+                    source, original, family, depth + 1)
+                if hit:
+                    return hit
         return None
 
     def _enclosing_type(self, block_id: str) -> str | None:
@@ -814,7 +882,8 @@ class _Builder:
         """
         if not method_name:
             return None
-        direct = self.index.method_index.get((owner, method_name))
+        direct = self.index.method_index.get((owner, method_name)) or self._method_by_owner_name(
+            owner, method_name)
         if direct:
             return direct
 
@@ -825,11 +894,26 @@ class _Builder:
             if base in seen:
                 continue
             seen.add(base)
-            inherited = self.index.method_index.get((base, method_name))
+            inherited = self.index.method_index.get((base, method_name)) or self._method_by_owner_name(
+                base, method_name)
             if inherited:
                 return inherited
             queue.extend(self._base_types_of(base))
         return None
+
+    def _method_by_owner_name(self, owner: str, method_name: str) -> str | None:
+        """A method declared outside its type's body (Go `func (c *Context) Render`):
+        named `method:Context.Render`, in the type's own package (its folder)."""
+        row = self.index.rows.get(owner)
+        if row is None or not row.name or not row.file_path:
+            return None
+        wanted = f"{row.name}.{method_name}"
+        folder = row.file_path.rsplit("/", 1)[0] if "/" in row.file_path else ""
+        hits = [cid for cid in self.index.candidates(method_name)
+                if (self.index.rows[cid].qualified_name or "").partition(":")[2] == wanted
+                and (self.index.file_by_block.get(cid, "").rsplit("/", 1)[0]
+                     if "/" in self.index.file_by_block.get(cid, "") else "") == folder]
+        return hits[0] if len(hits) == 1 else None
 
     def _base_types_of(self, type_block: str) -> list[str]:
         """Resolved base classes of a type, from its own heritage facts.
@@ -902,6 +986,11 @@ class _Builder:
             return None
         if bound in self.index.type_blocks:
             return bound
+        module = self.module_bindings.get(from_file, {}).get(qualified_prefix or "")
+        if module and module != _EXTERNAL:
+            hit = self._defined_or_reexported(module, name)
+            if hit in self.index.type_blocks:
+                return hit
         candidates = [
             cid for cid in self.index.candidates(name) if cid in self.index.type_blocks
         ]

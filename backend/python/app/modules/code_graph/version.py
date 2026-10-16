@@ -13,4 +13,6 @@ __all__ = ["CODE_GRAPH_VERSION"]
 # languages, JSX/require/decorator/annotation facts, nameFolded.
 # 2026.10.18: unnamed spans keyed by scope + content hash, not line range (P-10);
 # code embedding units (SC-9).
-CODE_GRAPH_VERSION = "2026.10.18"
+# 2026.10.19: Java imports, heritage and typed receivers; Go receiver types;
+# a package __init__.py keeps its imports on its nodes (re-exports).
+CODE_GRAPH_VERSION = "2026.10.19"

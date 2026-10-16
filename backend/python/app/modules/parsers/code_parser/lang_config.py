@@ -332,6 +332,9 @@ _JAVA = LanguageConfig(
     }),
     field_types=frozenset({"field_declaration"}),
     import_types=frozenset({"import_declaration", "package_declaration"}),
+    import_handler_name="java",
+    heritage_handler_name="java",
+    type_table_handler_name="java",
     name_fallback_child_types=("identifier", "type_identifier"),
     body_fallback_child_types=(
         "class_body", "interface_body", "enum_body", "annotation_type_body", "block",
@@ -407,6 +410,7 @@ _GO = LanguageConfig(
     field_types=frozenset({"field_declaration"}),
     decorator_wrapper_types=frozenset({"type_declaration"}),
     import_types=frozenset({"import_declaration", "package_clause"}),
+    type_table_handler_name="go",
     name_fallback_child_types=_C_FAMILY_NAMES,
     body_fallback_child_types=("block",),
     docstring_style=_LINE_DOC,

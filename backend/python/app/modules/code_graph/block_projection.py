@@ -75,6 +75,9 @@ class BlockProjectionContext:
     record_group_id: str | None
     connector_id: str | None
     language: str | None = None
+    # Repo-relative path; a Python package's `__init__.py` keeps its imports on
+    # the node (see RESIDENT_RELATIONS).
+    file_path: str | None = None
 
 
 def block_key_for(record_id: str, qualified_name: str) -> str:
@@ -159,7 +162,8 @@ def serialize_block_for_graph(
         "startLine": meta.start_line if meta else None,
         "endLine": meta.end_line if meta else None,
         "language": (meta.language or ctx.language) if meta else None,
-        "pendingEdges": (_resident_facts(meta.pending_edges) or None) if meta else None,
+        "pendingEdges": (_resident_facts(meta.pending_edges, package_init=_is_package_init(ctx.file_path)) or None)
+        if meta else None,
         # Both moved to the blob. Still written, as None, so a node projected
         # before that change is cleared instead of keeping a stale copy.
         "typeTable": None,
@@ -170,8 +174,15 @@ def serialize_block_for_graph(
     return doc
 
 
-def _resident_facts(facts: list[dict] | None) -> list[dict]:
-    return [fact for fact in facts or () if fact.get("relation") in RESIDENT_RELATIONS]
+def _is_package_init(file_path: str | None) -> bool:
+    return bool(file_path) and (file_path == "__init__.py" or file_path.endswith("/__init__.py"))
+
+
+def _resident_facts(facts: list[dict] | None, *, package_init: bool = False) -> list[dict]:
+    """A package `__init__.py`'s imports are its re-exports (`from .base import
+    Model` makes `models.Model`), which every build follows, so they stay too."""
+    keep = RESIDENT_RELATIONS | ({RecordRelations.IMPORTS.value} if package_init else frozenset())
+    return [fact for fact in facts or () if fact.get("relation") in keep]
 
 
 def _referenced_names(container: BlocksContainer, file_path: str | None = None) -> list[str] | None:

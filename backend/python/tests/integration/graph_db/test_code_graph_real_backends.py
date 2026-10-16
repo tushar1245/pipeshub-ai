@@ -126,7 +126,8 @@ async def _write_repo(graph: IGraphDBProvider, org_id: str, connector_id: str,
             graph_provider=graph,
             context=BlockProjectionContext(org_id=org_id, record_id=rid,
                                            record_group_id=group_id,
-                                           connector_id=connector_id, language="python"),
+                                           connector_id=connector_id, language="python",
+                                           file_path=path),
             block_containers=container,
         )
     return record_ids, blobs

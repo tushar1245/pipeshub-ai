@@ -226,6 +226,7 @@ def index_file(graph):
             record_group_id=GROUP_ID,
             connector_id="conn1",
             language=language,
+            file_path=file_path,
         )
         return await write_code_file_blocks_to_graph(
             graph_provider=graph, context=ctx, block_containers=container

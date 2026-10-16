@@ -31,6 +31,12 @@ _STDLIB_MODULES = frozenset(getattr(sys, "stdlib_module_names", ()))
 # `@scope/name`, so `@/` and `~/` cannot be one.
 _JS_ROOT_ALIASES = ("@/", "~/", "#/")
 
+# Folders a JS/TS monorepo keeps its workspace packages in. `@scope/element`
+# is resolved to `<root>/packages/element` only when exactly one such folder
+# holds a source entry, so a real npm package never lands on a repo folder.
+_JS_WORKSPACE_DIRS = frozenset({"packages", "apps", "libs", "modules"})
+_JVM_SOURCE_EXTENSIONS = (".java", ".kt", ".scala", ".groovy")
+
 # Bounded so a cycle of barrel files cannot spin forever.
 _MAX_BARREL_HOPS = 8
 
@@ -46,7 +52,24 @@ class ImportResolution:
         # was the quadratic part of a build).
         self._modules_by_suffix: dict[str, list[str]] = {}
         self._packages_by_suffix: dict[str, list[str]] = {}
+        # JVM: `com/acme/Owner` (and every shorter tail) -> source files.
+        self._jvm_by_suffix: dict[str, list[str]] = {}
+        # JS workspace package name (its folder's name) -> package root folders.
+        self._js_workspaces: dict[str, list[str]] = {}
         for path in file_paths:
+            if path.endswith(_JVM_SOURCE_EXTENSIONS):
+                parts = path.rsplit(".", 1)[0].split("/")
+                for i in range(len(parts)):
+                    self._jvm_by_suffix.setdefault("/".join(parts[i:]), []).append(path)
+                continue
+            segments = path.split("/")
+            for i in range(len(segments) - 2):
+                if segments[i] in _JS_WORKSPACE_DIRS:
+                    root = "/".join(segments[: i + 2])
+                    roots = self._js_workspaces.setdefault(segments[i + 1], [])
+                    if root not in roots:
+                        roots.append(root)
+                    break
             if path == "__init__.py" or path.endswith("/__init__.py"):
                 module, table = path[: -len("__init__.py")].rstrip("/"), self._packages_by_suffix
             elif path.endswith(".py"):
@@ -107,9 +130,38 @@ class ImportResolution:
         if specifier.startswith(_JS_ROOT_ALIASES):
             return self._resolve_js_alias(specifier[2:], from_file)
         if not specifier.startswith("."):
-            return None  # bare specifier: a package, not a repo file
+            # A bare specifier is a package; in a monorepo it can be one of the repo's own.
+            return self._resolve_js_workspace(specifier) if specifier.startswith("@") else None
         base = posixpath.normpath(posixpath.join(posixpath.dirname(from_file), specifier))
         return self._js_file(base)
+
+    def _resolve_js_workspace(self, specifier: str) -> str | None:
+        """`@excalidraw/element[/sub]` -> that workspace package's entry or sub-path.
+
+        tsconfig `paths` and package.json names are not read here (the build has
+        file paths only), so the package is matched by folder name, and only when
+        one workspace folder of that name holds the target.
+        """
+        parts = specifier.split("/")
+        if len(parts) < 2:
+            return None
+        rest = "/".join(parts[2:])
+        hits = set()
+        for root in self._js_workspaces.get(parts[1], ()):
+            for base in ((f"{root}/src/{rest}", f"{root}/{rest}") if rest
+                         else (f"{root}/src", root)):
+                hit = self._js_file(base)
+                if hit:
+                    hits.add(hit)
+                    break
+        return hits.pop() if len(hits) == 1 else None
+
+    # -- jvm ------------------------------------------------------------
+
+    def _resolve_jvm(self, specifier: str) -> str | None:
+        """`com.acme.Owner` -> the one source file whose path ends in com/acme/Owner."""
+        matches = self._jvm_by_suffix.get(specifier.replace(".", "/"), ())
+        return matches[0] if len(matches) == 1 else None
 
     def _resolve_js_alias(self, rest: str, from_file: str) -> str | None:
         """`@/lib/http` against the importing file's ancestors, then their `src/`.
@@ -154,6 +206,8 @@ class ImportResolution:
                 return self._resolve_python(specifier, from_file)
             if family in ("js", None):
                 return self._resolve_js(specifier, from_file)
+            if family == "jvm":
+                return self._resolve_jvm(specifier)
             # No resolver for this language's imports yet; JS rules would only
             # misread its specifiers.
             return None
