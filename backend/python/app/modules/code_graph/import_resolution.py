@@ -158,10 +158,19 @@ class ImportResolution:
 
     # -- jvm ------------------------------------------------------------
 
-    def _resolve_jvm(self, specifier: str) -> str | None:
-        """`com.acme.Owner` -> the one source file whose path ends in com/acme/Owner."""
+    def _resolve_jvm(self, specifier: str, from_file: str) -> str | None:
+        """`com.acme.Owner` -> the source file whose path ends in com/acme/Owner.
+
+        When copies of the package sit in several source trees (guava/ and
+        android/guava/), the one sharing the importer's tree wins, as in a build.
+        """
         matches = self._jvm_by_suffix.get(specifier.replace(".", "/"), ())
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) <= 1:
+            return matches[0] if matches else None
+        shared = {m: len(posixpath.commonpath([m, from_file])) for m in matches}
+        best = max(shared.values())
+        closest = [m for m, n in shared.items() if n == best]
+        return closest[0] if len(closest) == 1 else None
 
     def _resolve_js_alias(self, rest: str, from_file: str) -> str | None:
         """`@/lib/http` against the importing file's ancestors, then their `src/`.
@@ -207,7 +216,7 @@ class ImportResolution:
             if family in ("js", None):
                 return self._resolve_js(specifier, from_file)
             if family == "jvm":
-                return self._resolve_jvm(specifier)
+                return self._resolve_jvm(specifier, from_file)
             # No resolver for this language's imports yet; JS rules would only
             # misread its specifiers.
             return None

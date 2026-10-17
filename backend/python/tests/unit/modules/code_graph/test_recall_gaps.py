@@ -3,7 +3,7 @@
 django: calls and bases through a package's re-exports, `super()` calls.
 excalidraw: imports across workspace packages (`@scope/name`).
 gin: method calls on a typed receiver. spring-petclinic: Java imports, heritage,
-implicit `this` and typed receivers.
+implicit `this` and typed receivers. guava: a package copied into two source trees.
 """
 import pytest
 
@@ -107,3 +107,14 @@ async def test_java_imports_heritage_and_calls(graph, index_file) -> None:
             "src/main/java/org/x/owner/Pet.java::method:Pet.addVisit",
             "src/main/java/org/x/model/BaseEntity.java::method:BaseEntity.getId"} <= _targets(
         graph, CALLS, owner)
+
+
+async def test_a_java_import_prefers_the_copy_in_its_own_source_tree(graph, index_file) -> None:
+    for root in ("guava", "android/guava"):
+        await index_file(f"{root}-pre", f"{root}/src/com/x/base/Preconditions.java",
+                         b"package com.x.base;\npublic class Preconditions {}\n", "java")
+    await index_file("absent", "guava/src/com/x/base/Absent.java",
+                     b"package com.x.base;\nimport com.x.base.Preconditions;\npublic class Absent {}\n", "java")
+    await _build(graph)
+    assert _targets(graph, IMPORTS, "guava/src/com/x/base/Absent.java") == {
+        "guava/src/com/x/base/Preconditions.java::class:Preconditions"}
