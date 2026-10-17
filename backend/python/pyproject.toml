@@ -286,6 +286,9 @@ dependencies = [
     "python-arango==8.1.5",
     "python-docx==1.1.2",
     "neo4j>=5.0.0",
+    # Rust parameter packing for the driver, a drop-in that tracks its version: in a
+    # code-graph projection the pure-Python packer was 28% of the time (B2).
+    "neo4j-rust-ext>=5.0.0",
     "python-dotenv==1.2.2",
     "pyyaml>=6.0",
     "redshift_connector==2.1.8",
