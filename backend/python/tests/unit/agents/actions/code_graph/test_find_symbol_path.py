@@ -8,6 +8,7 @@ import pytest
 
 from app.agents.actions.code_graph import path as path_mod
 from app.agents.actions.code_graph.path import MAX_PATH_DEPTH, find_symbol_path_impl
+from app.agents.actions.code_graph.ops import STRUCTURAL_RELATIONS
 from app.agents.actions.code_graph.results import without_marker
 
 from .conftest import BLOCKS, CONN, ORG, USER, FakeGraphProvider
@@ -50,6 +51,10 @@ class TestDepth:
                 self, node_keys, node_collection, relationship_types, direction,
                 limit=5000, transaction=None, raise_on_error=False
             ) -> list[dict]:
+                # A directed walk asks for outbound edges once per hop, plus inbound
+                # containment while it climbs out of the start symbol; count the hops.
+                if direction != "outbound":
+                    return []
                 self.calls += 1
                 key = f"k_chain_{self.calls}"
                 # A readable block, so the per-hop access check lets the walk go on.
@@ -100,3 +105,23 @@ async def test_a_provider_failure_is_not_reported_as_no_path() -> None:
 
     with pytest.raises(RuntimeError, match="neo4j is down"):
         await _bfs_edges(_Broken(), "a", "b", max_depth=2, relations=["CALLS"])
+
+
+class TestDirectedWalkAsksOnlyForEdgesItCanTake:
+    """B2: a hub's thousands of callers were fetched and access-checked, then dropped."""
+
+    async def test_inbound_edges_are_asked_for_only_containment_while_climbing(self) -> None:
+        class Recording(FakeGraphProvider):
+            asked: list[tuple[str, tuple[str, ...]]] = []
+
+            async def get_neighbors_for_nodes_by_relationship_types(
+                self, node_keys, node_collection, relationship_types, direction,
+                limit=5000, transaction=None, raise_on_error=False
+            ) -> list[dict]:
+                self.asked.append((direction, tuple(relationship_types)))
+                return []
+
+        graph = Recording()
+        await _path(graph)
+        assert {d for d, _ in graph.asked} == {"outbound", "inbound"}
+        assert all(set(rels) <= set(STRUCTURAL_RELATIONS) for d, rels in graph.asked if d == "inbound")

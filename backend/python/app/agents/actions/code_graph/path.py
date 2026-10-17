@@ -216,23 +216,25 @@ async def _bfs_edges(
         phases_by_key: dict[str, list[int]] = {}
         for key, phase in frontier:
             phases_by_key.setdefault(key, []).append(phase)
-        # A provider failure propagates: `_run` turns it into an error, whereas
-        # `found: False` here would be read as "no path exists".
-        rows = list(await graph_provider.get_neighbors_for_nodes_by_relationship_types(
-            node_keys=list(phases_by_key),
-            node_collection=_BLOCKS,
-            relationship_types=all_relations,
-            direction="any",
-            limit=_FRONTIER_LIMIT,
-            raise_on_error=True,
-        ) or [])
-        if len(rows) >= _FRONTIER_LIMIT:
-            capped = True
+        rows, hit_cap = await _neighbour_rows(graph_provider, phases_by_key, all_relations,
+                                              undirected=undirected)
+        capped = capped or hit_cap
+        # The shape rules first, then the access check on what survives: checking
+        # every neighbour of a hub (thousands of callers a directed walk drops anyway)
+        # made each hop one large permission query (B2: up to 43 s on a 20k-file repo).
+        candidates = [
+            row for row in rows
+            if row.get("collection") == _BLOCKS and row.get("key") and row.get("anchorKey")
+            and any(
+                (step := _next_phase(phase, row, undirected=undirected)) is not None
+                and (row["key"], step) not in visited
+                for phase in phases_by_key.get(row["anchorKey"], ())
+            )
+        ]
         allowed = None
         if readable is not None:
-            allowed = await readable(
-                [r["key"] for r in rows if r.get("collection") == _BLOCKS and r.get("key")]
-            )
+            allowed = await readable([row["key"] for row in candidates])
+        rows = candidates
 
         next_frontier: list[tuple[str, int]] = []
         for row in rows:
@@ -263,6 +265,38 @@ async def _bfs_edges(
         frontier = next_frontier
 
     return None, capped
+
+
+async def _neighbour_rows(
+    graph_provider: Any,
+    phases_by_key: dict[str, list[int]],
+    relations: list[str],
+    *,
+    undirected: bool,
+) -> tuple[list[dict[str, Any]], bool]:
+    """The frontier's neighbours a walk in this shape can step to, and whether a cap bit.
+
+    A directed walk only ever takes outbound edges, plus inbound structural ones
+    while climbing out of the start symbol's containers (`_next_phase`), so it
+    asks for just those instead of every edge both ways.
+    """
+    # A provider failure propagates: `_run` turns it into an error, whereas
+    # `found: False` here would be read as "no path exists".
+    async def fetch(keys: list[str], rels: list[str], direction: str) -> list[dict[str, Any]]:
+        return list(await graph_provider.get_neighbors_for_nodes_by_relationship_types(
+            node_keys=keys, node_collection=_BLOCKS, relationship_types=rels,
+            direction=direction, limit=_FRONTIER_LIMIT, raise_on_error=True,
+        ) or [])
+
+    if undirected:
+        batches = [await fetch(list(phases_by_key), relations, "any")]
+    else:
+        batches = [await fetch(list(phases_by_key), relations, "outbound")]
+        climbing = [key for key, phases in phases_by_key.items() if _CLIMBING in phases]
+        structural = [rel for rel in relations if rel in STRUCTURAL_RELATIONS]
+        if climbing and structural:
+            batches.append(await fetch(climbing, structural, "inbound"))
+    return [row for batch in batches for row in batch], any(len(b) >= _FRONTIER_LIMIT for b in batches)
 
 
 # Where a directed path is in its shape: climbing out of the start symbol's
