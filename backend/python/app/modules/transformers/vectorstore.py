@@ -277,7 +277,8 @@ def _token_len(text: str) -> int:
     encoder = _token_encoder()
     if encoder is None:
         return len(text.encode("utf-8"))
-    return len(encoder.encode(text))
+    # Code and docs can hold `<|endoftext|>` literally; it is text to the embedder.
+    return len(encoder.encode(text, disallowed_special=()))
 
 
 def _exceeds_token_ceiling(text: str, ceiling: int) -> bool:
@@ -314,7 +315,7 @@ def _slice_on_character_boundaries(text: str, step: int) -> List[str]:
         raw = text.encode("utf-8")
         chunks = (raw[i : i + step] for i in range(0, len(raw), step))
     else:
-        tokens = encoder.encode(text)
+        tokens = encoder.encode(text, disallowed_special=())
         chunks = (
             encoder.decode_bytes(tokens[i : i + step])
             for i in range(0, len(tokens), step)
