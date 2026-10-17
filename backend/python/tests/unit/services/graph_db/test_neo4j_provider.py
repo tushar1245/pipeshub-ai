@@ -6155,7 +6155,7 @@ class TestRecordMoveIsOneStatement:
             "RETURN n.id",
         ]
         assert [query.index(step) for step in steps] == sorted(query.index(step) for step in steps)
-        assert parameters["nodes"][0]["externalParentId"] == "folder-2"
+        assert parameters["rows"][0]["node"]["externalParentId"] == "folder-2"
         assert (parameters["parent_child"], parameters["parent_id"]) == ("PARENT_CHILD", "folder-2")
         assert parameters["parent_edge"]["relationshipType"] == "PARENT_CHILD"
         assert call.kwargs["txn_id"] == "tx"
@@ -6372,3 +6372,32 @@ def test_a_type_doc_read_without_its_collection_is_decoded_by_record_type(
     with patch("app.services.graph_db.neo4j.neo4j_provider.SQLTableRecord.from_arango_record") as build:
         neo4j_provider._create_typed_record_from_neo4j(record, type_doc)
     assert build.call_args.args[0]["foreignKeys"] == [{"c": 1}]
+
+
+class TestBatchUpsertRecordsIsOneStatementPerType:
+    """B2: one statement per record cost ~4 ms each; a batch writes each record type in one."""
+
+    @staticmethod
+    def _file(i: int, record_type: RecordType = RecordType.FILE) -> FileRecord:
+        return FileRecord(
+            id=f"r{i}", org_id="org", record_name=f"f{i}", record_type=record_type,
+            external_record_id=f"ext-{i}", version=1, origin=OriginTypes.CONNECTOR,
+            connector_name=Connectors.GOOGLE_DRIVE, connector_id="c1", is_file=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_records_of_one_type_share_a_statement(self, neo4j_provider: Neo4jProvider) -> None:
+        neo4j_provider.client.execute_query = AsyncMock(return_value=[])
+        await neo4j_provider.batch_upsert_records([self._file(i) for i in range(3)])
+        neo4j_provider.client.execute_query.assert_awaited_once()
+        rows = neo4j_provider.client.execute_query.await_args.kwargs["parameters"]["rows"]
+        assert [r["node"]["id"] for r in rows] == ["r0", "r1", "r2"]
+        assert all(r["type_node"] for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_a_record_releases_only_other_trashed_holders(self, neo4j_provider: Neo4jProvider) -> None:
+        neo4j_provider.client.execute_query = AsyncMock(return_value=[])
+        await neo4j_provider.batch_upsert_records([self._file(1), self._file(2)],
+                                                  release_trashed_external_ids=True)
+        query = neo4j_provider.client.execute_query.await_args.args[0]
+        assert "holder.id <> node.id" in query

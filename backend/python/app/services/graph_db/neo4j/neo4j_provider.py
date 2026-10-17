@@ -1563,17 +1563,25 @@ class Neo4jProvider(IGraphDBProvider):
         return neo4j_nodes
 
     def _upsert_record_with_type_cypher(
-        self, record: Record, *, release_trashed_external_ids: bool
+        self, records: list[Record], *, release_trashed_external_ids: bool
     ) -> tuple[str, dict[str, Any]]:
-        """The statement of ``_upsert_record_with_type`` up to its RETURN, with the record bound as ``n``."""
-        node = self._nodes_for_upsert([record.to_arango_base_record()], CollectionNames.RECORDS.value)[0]
+        """The statement of ``_upsert_record_with_type`` up to its RETURN, each record bound as ``n``.
+
+        *records* share one type collection, so one statement writes them all.
+        """
+        collection = RECORD_TYPE_COLLECTION_MAPPING.get(records[0].record_type)
+        bases = self._nodes_for_upsert([r.to_arango_base_record() for r in records], CollectionNames.RECORDS.value)
+        types = (self._nodes_for_upsert([r.to_arango_record() for r in records], collection)
+                 if collection else [None] * len(records))
         parameters: dict[str, Any] = {
-            "nodes": [node], "ids": [node["id"]], "trashed_prefix": TRASHED_EXTERNAL_ID_PREFIX,
+            "rows": [{"node": b, "type_node": t} for b, t in zip(bases, types)],
+            "trashed_prefix": TRASHED_EXTERNAL_ID_PREFIX,
         }
+        # Each record releases only holders other than itself, as when records were written one at a time.
         release = """
-            WITH node, COLLECT {
+            WITH node, type_node, COLLECT {
                 MATCH (holder:Record {externalRecordId: node.externalRecordId, connectorId: node.connectorId})
-                WHERE holder.isDeleted = true AND NOT holder.id IN $ids
+                WHERE holder.isDeleted = true AND holder.id <> node.id
                 RETURN holder
             } AS holders
             FOREACH (holder IN holders |
@@ -1583,19 +1591,18 @@ class Neo4jProvider(IGraphDBProvider):
                 })
         """ if release_trashed_external_ids else ""
         typed = ""
-        collection = RECORD_TYPE_COLLECTION_MAPPING.get(record.record_type)
         if collection:
-            parameters["type_node"] = self._nodes_for_upsert([record.to_arango_record()], collection)[0]
             now = get_epoch_timestamp_in_ms()
             parameters["edge"] = {"createdAtTimestamp": now, "updatedAtTimestamp": now}
             typed = f"""
-            MERGE (t:{collection_to_label(collection)} {{id: $type_node.id}})
-            SET t += $type_node
+            MERGE (t:{collection_to_label(collection)} {{id: type_node.id}})
+            SET t += type_node
             MERGE (n)-[e:{edge_collection_to_relationship(CollectionNames.IS_OF_TYPE.value)}]->(t)
             SET e = $edge
             """
         return f"""
-            UNWIND $nodes AS node
+            UNWIND $rows AS row
+            WITH row.node AS node, row.type_node AS type_node
             {release}
             MERGE (n:Record {{id: node.id}})
             SET n += node
@@ -1613,7 +1620,7 @@ class Neo4jProvider(IGraphDBProvider):
         *release_trashed_external_ids* is set.
         """
         statement, parameters = self._upsert_record_with_type_cypher(
-            record, release_trashed_external_ids=release_trashed_external_ids
+            [record], release_trashed_external_ids=release_trashed_external_ids
         )
         await self.client.execute_query(
             f"{statement}\n            RETURN n.id", parameters=parameters, txn_id=transaction
@@ -7940,11 +7947,21 @@ class Neo4jProvider(IGraphDBProvider):
         *,
         release_trashed_external_ids: bool = False,
     ) -> None:
-        """Batch upsert records (base + specific type + IS_OF_TYPE edge)"""
+        """Batch upsert records (base + specific type + IS_OF_TYPE edge).
+
+        One statement per record type: one statement per record committed each
+        record on its own, about 4 ms apiece (B2: 110 s for a 29k-file repo).
+        """
         try:
+            by_type: dict[str | None, list[Record]] = {}
             for record in records:
-                await self._upsert_record_with_type(
-                    record, transaction, release_trashed_external_ids=release_trashed_external_ids
+                by_type.setdefault(RECORD_TYPE_COLLECTION_MAPPING.get(record.record_type), []).append(record)
+            for group in by_type.values():
+                statement, parameters = self._upsert_record_with_type_cypher(
+                    group, release_trashed_external_ids=release_trashed_external_ids
+                )
+                await self.client.execute_query(
+                    f"{statement}\n            RETURN n.id", parameters=parameters, txn_id=transaction
                 )
         except Exception as e:
             self.logger.error(f"❌ Batch upsert records failed: {str(e)}")
@@ -7983,7 +8000,7 @@ class Neo4jProvider(IGraphDBProvider):
         # One statement: the record carries externalParentId, which the path reads
         # check against the edge, so the two change together or not at all. Written
         # apart, a failure after the old edge was deleted left the item in no folder.
-        statement, parameters = self._upsert_record_with_type_cypher(record, release_trashed_external_ids=True)
+        statement, parameters = self._upsert_record_with_type_cypher([record], release_trashed_external_ids=True)
         relationship_type = edge_collection_to_relationship(CollectionNames.RECORD_RELATIONS.value)
         parameters["parent_child"] = RecordRelations.PARENT_CHILD.value
         carried = "n"
