@@ -1106,11 +1106,16 @@ async def build_code_graph_edges(
     builder.result.files_reresolved = len(reresolve)
 
     if facts_source is not None:
-        unknown = await _load_facts(facts_source, index, org_id, reresolve, builder.result, log)
+        # Only a file with blocks has stored facts. A sync touches docs, tests left
+        # unindexed by policy and emptied files too: counted as unreadable, a fresh
+        # repo's first build aborted on every retry (B3). They stay re-resolved, so
+        # an emptied file still loses its old edges.
+        with_blocks = {r for r in reresolve if r in index.blocks_by_record}
+        unknown = await _load_facts(facts_source, index, org_id, with_blocks, builder.result, log)
         if unknown and len(unknown) >= _MIN_MISSING_FACTS_TO_ABORT \
-                and len(unknown) > _MAX_MISSING_FACTS_SHARE * len(reresolve):
+                and len(unknown) > _MAX_MISSING_FACTS_SHARE * len(with_blocks):
             raise EdgeBuildAbortedError(
-                f"stored facts unreadable for {len(unknown)} of {len(reresolve)} files; "
+                f"stored facts unreadable for {len(unknown)} of {len(with_blocks)} files; "
                 "keeping the existing edges"
             )
         # A file whose facts are unknown keeps the edges it has: resolving it

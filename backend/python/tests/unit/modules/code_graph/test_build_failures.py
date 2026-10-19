@@ -115,3 +115,15 @@ async def test_a_rebuild_drops_only_the_edges_it_no_longer_finds(graph, index_fi
     assert _calls(graph) == []
     assert result.edges_removed == 1
     assert len({e["buildId"] for e in graph.code_edges()}) == 1
+
+
+@pytest.mark.asyncio
+async def test_touched_records_without_blocks_do_not_abort_the_build(graph, index_file) -> None:
+    """B3: a sync touches docs and unindexed tests too; they have no facts by design."""
+    await index_file("recA", "src/a.py", A, "python")
+    await index_file("recB", "src/b.py", B, "python")
+    docs = {f"doc{i}" for i in range(20)}  # records the sync touched that never get blocks
+    result = await build_code_graph_edges(graph_provider=graph, facts_source=graph, org_id=ORG_ID,
+                                          record_group_id=GROUP_ID, touched_record_ids={"recA", "recB", *docs})
+    assert _calls(graph) == ["function:foo"]
+    assert result.facts_missing == 0
