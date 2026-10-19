@@ -6401,3 +6401,17 @@ class TestBatchUpsertRecordsIsOneStatementPerType:
                                                   release_trashed_external_ids=True)
         query = neo4j_provider.client.execute_query.await_args.args[0]
         assert "holder.id <> node.id" in query
+
+
+class TestCompareAndSetIndexingStatusLocksBeforeChecking:
+    """B3: the status check read before the write lock, so a status the indexer committed
+    in between was overwritten and the record sat QUEUED forever."""
+
+    @pytest.mark.asyncio
+    async def test_the_write_lock_is_taken_before_the_expected_status_is_read(
+        self, neo4j_provider: Neo4jProvider
+    ) -> None:
+        neo4j_provider.client.execute_query = AsyncMock(return_value=[{"id": "r1"}])
+        await neo4j_provider.compare_and_set_indexing_status(["r1"], "NOT_STARTED", "QUEUED")
+        query = neo4j_provider.client.execute_query.await_args.args[0]
+        assert query.index("matchLock") < query.index("n.indexingStatus = $expected")

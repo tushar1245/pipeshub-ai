@@ -14946,11 +14946,17 @@ class Neo4jProvider(IGraphDBProvider):
                 if new_status == ProgressStatus.QUEUED.value
                 else ""
             )
-            # MATCH + SET in one statement; a read-then-write would let the
-            # indexing service advance a record in between and get clobbered.
+            # The lock comes first so the check reads a status the indexing service
+            # committed while this waited (Neo4j's lost-update pattern). Checked
+            # before the lock, a folder it finished in 10 ms was set back to QUEUED,
+            # which nothing consumes, and its repo's code graph never built again (B3).
             query = f"""
             MATCH (n:{label})
-            WHERE n.id IN $keys AND n.indexingStatus = $expected
+            WHERE n.id IN $keys
+            SET n.{_MATCH_LOCK} = true
+            REMOVE n.{_MATCH_LOCK}
+            WITH n
+            WHERE n.indexingStatus = $expected
             SET n.indexingStatus = $new_status{queued_stamp}
             RETURN n.id AS id
             """
