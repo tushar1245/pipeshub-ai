@@ -614,6 +614,53 @@ class TestRequestCodeEdges:
         handler.producer.send_event.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_request_after_the_claimed_build_ran_is_published(self) -> None:
+        """B3: the claimed build started and settled inside the window, so nothing in
+        flight reads this request; it used to wait for the reconciler's sweep."""
+        handler = _make_handler()
+        graph_provider = handler.event_processor.graph_provider
+        graph_provider.get_document = AsyncMock(return_value=self._record())
+        graph_provider.has_nodes_by_filters = AsyncMock(return_value=False)
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[{
+            "edgeBuildStatus": "ready", "edgeBuildPending": False,
+            "lastEdgeBuildAt": int(time.time() * 1000) - 5_000,
+        }])
+        graph_provider.upsert_sync_point = AsyncMock()
+        redis = MagicMock()
+        redis.set = AsyncMock(return_value=False)
+        redis.aclose = AsyncMock()
+        with patch(
+            "app.services.messaging.kafka.handlers.record.redis_from_config_service",
+            AsyncMock(return_value=redis),
+        ):
+            await handler._request_code_edge_build_if_repo_drained("record-1")
+
+        handler.producer.send_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_request_while_the_claimed_build_runs_is_left_to_it(self) -> None:
+        """A running build reads the fresh request id when it settles and goes again."""
+        handler = _make_handler()
+        graph_provider = handler.event_processor.graph_provider
+        graph_provider.get_document = AsyncMock(return_value=self._record())
+        graph_provider.has_nodes_by_filters = AsyncMock(return_value=False)
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[{
+            "edgeBuildStatus": "building", "edgeBuildPending": False,
+            "lastEdgeBuildAt": int(time.time() * 1000) - 5_000,
+        }])
+        graph_provider.upsert_sync_point = AsyncMock()
+        redis = MagicMock()
+        redis.set = AsyncMock(return_value=False)
+        redis.aclose = AsyncMock()
+        with patch(
+            "app.services.messaging.kafka.handlers.record.redis_from_config_service",
+            AsyncMock(return_value=redis),
+        ):
+            await handler._request_code_edge_build_if_repo_drained("record-1")
+
+        handler.producer.send_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_lost_request_gets_past_the_dedupe_window(self) -> None:
         """Pending with no fresh request stamp: the last ask was lost."""
         handler = _make_handler()

@@ -31,6 +31,7 @@ __all__ = [
     "BuildState",
     "BuildStateStore",
     "GraphStatus",
+    "claimed_build_already_ran",
     "PendingBuild",
     "RetryPolicy",
     "SYNC_POINT_SUFFIX",
@@ -187,6 +188,17 @@ def request_is_stale(state: BuildState, now_ms: int) -> bool:
     if state.requested_at is None:
         return True
     return now_ms - state.requested_at > REQUEST_IN_FLIGHT_MS
+
+
+def claimed_build_already_ran(state: BuildState, now_ms: int) -> bool:
+    """The build the current dedupe claim was taken for has started and settled.
+
+    A request that loses the claim relies on that build reading it. When the
+    build already started inside the window and none is running, nothing will:
+    the request sat pending until the reconciler's sweep (up to 10 min, B3).
+    """
+    return (state.outcome != BuildOutcome.BUILDING.value and state.last_build is not None
+            and now_ms - state.last_build < REQUEST_IN_FLIGHT_MS)
 
 
 def is_due(state: BuildState, now_ms: int) -> bool:

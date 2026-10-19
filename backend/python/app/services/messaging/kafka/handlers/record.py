@@ -45,7 +45,11 @@ from app.modules.indexing.connector_off_events import (
     resuming_enrichment as record_resuming_enrichment,
 )
 from app.modules.code_graph import edge_build_trigger
-from app.modules.code_graph.build_state import BuildStateStore, request_is_stale
+from app.modules.code_graph.build_state import (
+    BuildStateStore,
+    claimed_build_already_ran,
+    request_is_stale,
+)
 from app.modules.indexing.duplicate_reconcile import DuplicateReconciler
 from app.modules.indexing.rate_limit_deferral import (
     cleared_deferral,
@@ -802,7 +806,8 @@ class RecordEventHandler(BaseEventService):
         # Only a pending request older than the window, presumed lost, gets
         # past a lost claim.
         claimed = await edge_build_trigger.claim_publish(redis, org_id, record_group_id)
-        if not claimed and not request_is_stale(state, now_ms):
+        if not claimed and not request_is_stale(state, now_ms) \
+                and not claimed_build_already_ran(state, now_ms):
             self._edge_request_succeeded()
             return
         await self._publish_code_edges_event(
