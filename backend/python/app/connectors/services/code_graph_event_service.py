@@ -10,6 +10,10 @@ from app.connectors.core.sync.task_manager import (
 )
 from app.telemetry.modules import code_graph_metrics
 
+# Chained runs in a row before what is still owed is left to the reconciler: a pending
+# flag that never clears (a stale duplicate sync point did, B3) must not rebuild forever.
+_MAX_CHAINED_RUNS = 5
+
 if TYPE_CHECKING:
     from logging import Logger
 
@@ -28,6 +32,7 @@ class CodeGraphEventService:
         self._task_manager = task_manager
         # Strong references: the loop keeps only weak ones to tasks it runs.
         self._follow_ups: set[asyncio.Task] = set()
+        self._chained: dict[str, int] = {}
 
     async def process_event(
         self,
@@ -93,8 +98,19 @@ class CodeGraphEventService:
         as soon as this one's task is gone; it used to wait for the reconciler (up to 10 min, B3)."""
         still_owed = await self._runner.run(org_id=org_id, connector_id=connector_id,
                                             record_group_id=record_group_id, lease=lease)
+        repo = f"{org_id}:{record_group_id}"
         if not still_owed:
+            self._chained.pop(repo, None)
             return
+        chained = self._chained.get(repo, 0) + 1
+        if chained > _MAX_CHAINED_RUNS:
+            self._chained.pop(repo, None)
+            self._logger.warning(
+                "Code edge build for %s still owed after %d chained runs; leaving it to the reconciler",
+                repo, _MAX_CHAINED_RUNS,
+            )
+            return
+        self._chained[repo] = chained
         this_task = asyncio.current_task()
 
         async def follow_up() -> None:

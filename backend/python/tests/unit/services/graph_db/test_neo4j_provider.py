@@ -6415,3 +6415,24 @@ class TestCompareAndSetIndexingStatusLocksBeforeChecking:
         await neo4j_provider.compare_and_set_indexing_status(["r1"], "NOT_STARTED", "QUEUED")
         query = neo4j_provider.client.execute_query.await_args.args[0]
         assert query.index("matchLock") < query.index("n.indexingStatus = $expected")
+
+
+class TestSyncPointsAreOnePerKey:
+    """B3: a read-then-create upsert made two sync points for one key."""
+
+    @pytest.mark.asyncio
+    async def test_upsert_is_a_single_merge(self, neo4j_provider: Neo4jProvider) -> None:
+        neo4j_provider.client.execute_query = AsyncMock(return_value=[{"sp": {}}])
+        await neo4j_provider.upsert_sync_point("k1", {"a": 1}, "syncPoints")
+        neo4j_provider.client.execute_query.assert_awaited_once()
+        assert "MERGE (sp:" in neo4j_provider.client.execute_query.await_args.args[0]
+
+    def test_the_key_is_unique(self, neo4j_provider: Neo4jProvider) -> None:
+        assert any("syncPointKey IS UNIQUE" in q for q in neo4j_provider._generate_business_key_constraints())
+
+    @pytest.mark.asyncio
+    async def test_a_conditional_update_locks_before_it_checks(self, neo4j_provider: Neo4jProvider) -> None:
+        neo4j_provider.client.execute_query = AsyncMock(return_value=[{"updated": 1}])
+        await neo4j_provider.update_sync_point_if("k1", {"edgeBuildLeaseToken": "t"}, {"a": 1}, "syncPoints")
+        query = neo4j_provider.client.execute_query.await_args.args[0]
+        assert query.index("matchLock") < query.index("WHERE")

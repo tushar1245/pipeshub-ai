@@ -188,3 +188,30 @@ async def test_a_run_that_ends_still_owed_starts_the_next_at_once() -> None:
     await asyncio.wait_for(second_done.wait(), timeout=5)
     assert len(runs) == 2
     await manager.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_chained_runs_stop_at_the_bound() -> None:
+    """A pending flag that never clears must not rebuild forever; the reconciler takes over."""
+    from app.connectors.services import code_graph_event_service as module
+
+    runner = MagicMock()
+    runner.acquire = AsyncMock(return_value=("lock-key", "lock-token"))
+    runner.release = AsyncMock()
+    runs: list[int] = []
+
+    async def run(**_kwargs) -> bool:
+        runs.append(1)
+        return True  # always still owed
+
+    runner.run = run
+    manager = SyncTaskManager(label="Code edge build test")
+    service = CodeGraphEventService(MagicMock(), runner, manager)
+
+    await service.start_build("org-1", "connector-1", "repo-1")
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if len(runs) > module._MAX_CHAINED_RUNS and not service._follow_ups:
+            break
+    assert len(runs) == module._MAX_CHAINED_RUNS + 1
+    await manager.cancel_all()

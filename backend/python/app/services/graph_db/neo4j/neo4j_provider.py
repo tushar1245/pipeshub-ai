@@ -705,7 +705,12 @@ class Neo4jProvider(IGraphDBProvider):
         """
         return [
             "CREATE CONSTRAINT person_org_email_unique IF NOT EXISTS "
-            f"FOR (n:{Neo4jLabel.PEOPLE.value}) REQUIRE (n.orgId, n.email) IS UNIQUE"
+            f"FOR (n:{Neo4jLabel.PEOPLE.value}) REQUIRE (n.orgId, n.email) IS UNIQUE",
+            # A sync point key names one sync point: connectors embed their org and
+            # connector id, code-graph build state its record group's id. Without it
+            # two first upserts both created one, and reads returned either (B3).
+            "CREATE CONSTRAINT syncpoint_key_unique IF NOT EXISTS "
+            f"FOR (n:{collection_to_label(CollectionNames.SYNC_POINTS.value)}) REQUIRE n.syncPointKey IS UNIQUE",
         ]
 
     def _generate_performance_indexes(self) -> list[str]:
@@ -1149,6 +1154,12 @@ class Neo4jProvider(IGraphDBProvider):
 
             # Business-key uniqueness (e.g. Person.(orgId, email)). Creation fails on a
             # label that already holds duplicates, hence the same tolerant handling as above.
+            # The sync point key constraint cannot be created over duplicates the
+            # unconstrained upsert already made; keep each key's latest write.
+            try:
+                await self._remove_duplicate_sync_points()
+            except Exception as e:
+                self.logger.warning(f"Sync point de-duplication failed: {str(e)}")
             business_key_constraints = self._generate_business_key_constraints()
 
             for constraint_query in business_key_constraints:
@@ -8678,6 +8689,23 @@ class Neo4jProvider(IGraphDBProvider):
                 raise
             return None
 
+    async def _remove_duplicate_sync_points(self) -> int:
+        """Delete all but the latest-written sync point of each duplicated key."""
+        label = collection_to_label(CollectionNames.SYNC_POINTS.value)
+        rows = await self.client.execute_query(f"""
+            MATCH (sp:{label}) WHERE sp.syncPointKey IS NOT NULL
+            WITH sp ORDER BY coalesce(sp.updatedAtTimestamp, 0) DESC
+            WITH sp.syncPointKey AS key, collect(sp) AS points
+            WHERE size(points) > 1
+            UNWIND points[1..] AS extra
+            DETACH DELETE extra
+            RETURN count(*) AS removed
+        """)
+        removed = int(rows[0].get("removed") or 0) if rows else 0
+        if removed:
+            self.logger.warning(f"Removed {removed} duplicate sync point(s) before adding the key constraint")
+        return removed
+
     async def upsert_sync_point(
         self,
         sync_point_key: str,
@@ -8689,33 +8717,18 @@ class Neo4jProvider(IGraphDBProvider):
         try:
             label = collection_to_label(collection)
 
-            # Raising: a read that failed must not answer "no row here". The
-            # CREATE below is unconstrained -- nothing makes syncPointKey
-            # unique -- so a second sync point would land for the same key and
-            # the two would race to be the one LIMIT 1 returns.
-            existing = await self.get_sync_point(
-                sync_point_key, collection, transaction, raise_on_error=True
-            )
-
+            # One MERGE, backed by the syncPointKey uniqueness constraint: a read
+            # then a CREATE let two first upserts both create a sync point (B3).
+            now = get_epoch_timestamp_in_ms()
             sync_point_data["syncPointKey"] = sync_point_key
-            sync_point_data["updatedAtTimestamp"] = get_epoch_timestamp_in_ms()
-
-            if existing:
-                # Update
-                query = f"""
-                MATCH (sp:{label} {{syncPointKey: $key}})
-                SET sp += $data
-                RETURN sp
-                """
-                parameters = {"key": sync_point_key, "data": sync_point_data}
-            else:
-                # Create
-                query = f"""
-                CREATE (sp:{label} $data)
-                RETURN sp
-                """
-                sync_point_data["createdAtTimestamp"] = get_epoch_timestamp_in_ms()
-                parameters = {"data": sync_point_data}
+            sync_point_data["updatedAtTimestamp"] = now
+            query = f"""
+            MERGE (sp:{label} {{syncPointKey: $key}})
+            ON CREATE SET sp.createdAtTimestamp = $now
+            SET sp += $data
+            RETURN sp
+            """
+            parameters = {"key": sync_point_key, "data": sync_point_data, "now": now}
 
             await self.client.execute_query(query, parameters, txn_id=transaction)
             return True
@@ -8762,10 +8775,15 @@ class Neo4jProvider(IGraphDBProvider):
             "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
         }
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        # The lock comes first so the conditions read a write that committed while
+        # this waited, instead of overwriting it (Neo4j's lost-update pattern).
         query = f"""
         MATCH (sp:{label} {{syncPointKey: $key}})
-        {where}
         WITH sp LIMIT 1
+        SET sp.{_MATCH_LOCK} = true
+        REMOVE sp.{_MATCH_LOCK}
+        WITH sp
+        {where}
         SET sp += $data
         RETURN count(sp) AS updated
         """
