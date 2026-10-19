@@ -111,21 +111,21 @@ async def test_a_repo_the_caller_cannot_read_is_never_named() -> None:
     assert "admin" not in str(out)
 
 
-class _GoRepo(FakeGraphProvider):
+class _RustRepo(FakeGraphProvider):
     def __init__(self) -> None:
         super().__init__()
         for block in self.blocks.values():
             block["connectorId"] = CONN
             block["language"] = "python"
-        self.blocks["k_target"]["language"] = "go"
+        self.blocks["k_target"]["language"] = "rust"
 
 
 async def test_a_walk_in_a_language_without_edges_says_coverage_is_missing() -> None:
-    graph = _GoRepo()
-    go = await get_neighbour_impl(graph_provider=graph, connector_id=CONN, org_id=ORG,
-                                  user_id=USER, file_path="src/b.py",
-                                  qualified_name="function:target")
-    assert go["coverage"]["languages"] == ["go"]
+    graph = _RustRepo()
+    rust = await get_neighbour_impl(graph_provider=graph, connector_id=CONN, org_id=ORG,
+                                    user_id=USER, file_path="src/b.py",
+                                    qualified_name="function:target")
+    assert rust["coverage"]["languages"] == ["rust"]
     py = await get_neighbour_impl(graph_provider=graph, connector_id=CONN, org_id=ORG,
                                   user_id=USER, file_path="src/a.py",
                                   qualified_name="function:caller")
@@ -134,9 +134,9 @@ async def test_a_walk_in_a_language_without_edges_says_coverage_is_missing() -> 
 
 async def test_a_missed_path_through_such_a_language_says_so() -> None:
     out = await find_symbol_path_impl(
-        graph_provider=_GoRepo(), connector_id=CONN, org_id=ORG, user_id=USER,
+        graph_provider=_RustRepo(), connector_id=CONN, org_id=ORG, user_id=USER,
         file_path_a="src/b.py", qualified_name_a="function:target",
         file_path_b="web/ui/panel.ts", qualified_name_b="function:renderPanel",
     )
     assert out["found"] is False
-    assert out["coverage"]["languages"] == ["go"]
+    assert out["coverage"]["languages"] == ["rust"]

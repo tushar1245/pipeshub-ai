@@ -325,6 +325,11 @@ class _Builder:
         file record -- the innermost block containing a reference owns it.
         """
         self._collect_re_exports()
+        self.imports.learn_go_modules(
+            fact.get("toName") or "" for block_id, fact in work
+            if fact.get("relation") == RecordRelations.IMPORTS_FROM.value
+            and self.index.family_by_block.get(block_id) == "go"
+        )
         for block_id, fact in work:
             relation = fact.get("relation")
             if relation not in _MODULE_RELATIONS:
@@ -344,6 +349,13 @@ class _Builder:
             if not target_file:
                 # A bare specifier (`react`, `os`) resolves to no repo file.
                 self.result.external_refs += 1
+                continue
+            if family == "go":
+                # A Go import names a package, a folder of files, not one file.
+                self.module_imports.setdefault(from_file or "", set()).update(
+                    self.imports.go_package_files(target_file))
+                # shortcut: no IMPORTS_FROM edge, as the package has no one file to
+                # point at; add a package node if "who imports this" is needed for Go.
                 continue
             self.module_imports.setdefault(from_file or "", set()).add(target_file)
             target_record = self.index.record_by_file.get(target_file)
@@ -383,10 +395,18 @@ class _Builder:
                       if self.index.file_by_block.get(cid) == target_file]
         top_level = [cid for cid in candidates if not self._parent_of(cid)]
         candidates = top_level or candidates
+        # A member, not a nested type: `import a.Outer.Inner` still names Inner.
+        owner = (self._parent_of(candidates[0])
+                 if candidates and family == "jvm" and candidates[0] not in self.index.type_blocks
+                 else None)
+        if owner and all(self._parent_of(cid) == owner for cid in candidates):
+            # `import static ...Preconditions.checkNotNull` brings in every overload,
+            # and the statement names the class, so the edge goes to Preconditions.
+            candidates = candidates[:1]
         if len(candidates) == 1:
             bindings[local] = candidates[0]
             self._add_edge(
-                self._source_key(block_id, fact), self._block_key(candidates[0]),
+                self._source_key(block_id, fact), self._block_key(owner or candidates[0]),
                 RecordRelations.IMPORTS.value,
                 confidence=CONFIDENCE_EXTRACTED, line=fact.get("line"),
                 resolution=RESOLUTION_IMPORT,
@@ -653,7 +673,8 @@ class _Builder:
         if same_file:
             candidates, confidence, resolution = same_file, CONFIDENCE_EXTRACTED, RESOLUTION_SAME_FILE
         else:
-            imported = self._eligible(
+            # An unqualified Go name is never an imported package's: those take `pkg.`.
+            imported = [] if family == "go" else self._eligible(
                 [cid for module in sorted(self.module_imports.get(call_file, ()))
                  for cid in self._defined_in(module, name)],
                 family, relation,
@@ -695,6 +716,10 @@ class _Builder:
             typed = [cid for cid in candidates if cid in self.index.type_blocks]
             return typed or candidates
         if relation in _CALL_RELATIONS:
+            if family == "go":
+                # A bare Go call names a function: a method is only ever `x.m()`.
+                candidates = [cid for cid in candidates
+                              if (row := self.index.rows.get(cid)) is None or row.kind != "method"]
             # Class exclusion: `select(Model)` is not a call to Model.
             callable_only = [cid for cid in candidates
                              if cid in self.index.callable_blocks and not self._is_constructor(cid)]
@@ -774,6 +799,8 @@ class _Builder:
             return target, CONFIDENCE_INFERRED, RESOLUTION_MODULE if target else None
 
         family = self._family_of(block_id)
+        if family == "go":
+            return self._resolve_go_method(receiver_type, name, record_id)
         type_candidates = [
             cid for cid in self.index.candidates(receiver_type)
             if cid in self.index.type_blocks
@@ -785,6 +812,24 @@ class _Builder:
             return None, CONFIDENCE_INFERRED, None
         return (self._resolve_self_method(type_candidates[0], name),
                 CONFIDENCE_INFERRED, RESOLUTION_TYPE)
+
+    def _resolve_go_method(self, receiver_type: str, name: str, record_id: str,
+                           ) -> tuple[str | None, str, str | None]:
+        """`c.Get()` with `c *Client`: Go names a type by package, so `Client` is
+        this package's and `rest.Client` the imported rest package's."""
+        call_file = self.index.file_by_record.get(record_id) or ""
+        qualifier, _, type_name = receiver_type.rpartition(".")
+        if qualifier:
+            package = self.module_bindings.get(call_file, {}).get(qualifier)
+            if not package or package == _EXTERNAL:
+                return None, CONFIDENCE_INFERRED, _EXTERNAL if package else None
+        else:
+            package = call_file
+        owner = self._defined_or_reexported(package, type_name)
+        if owner not in self.index.type_blocks:
+            return None, CONFIDENCE_INFERRED, None
+        # INFERRED as for every language: the type table is per file, not per scope.
+        return self._resolve_self_method(owner, name), CONFIDENCE_INFERRED, RESOLUTION_TYPE
 
     def _resolve_bound_receiver(self, receiver: str, name: str, record_id: str,
                                 ) -> tuple[str | None, str, str | None] | None:
@@ -819,6 +864,13 @@ class _Builder:
         return None
 
     def _defined_or_reexported(self, file_path: str, name: str) -> str | None:
+        if file_path.endswith(".go"):
+            # A Go package's names are shared by every file in its folder.
+            files = self.imports.go_package_files(file_path)
+            if file_path not in files:  # a _test.go file sees its own names too
+                files = [file_path, *files]
+            hits = [hit for f in files if (hit := self._top_level_in_file(f, name))]
+            return hits[0] if len(hits) == 1 else None
         return self._top_level_in_file(file_path, name) or self._follow_reexport(
             file_path, name, lang_family(None, file_path))
 

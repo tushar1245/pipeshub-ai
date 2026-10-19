@@ -410,6 +410,7 @@ _GO = LanguageConfig(
     field_types=frozenset({"field_declaration"}),
     decorator_wrapper_types=frozenset({"type_declaration"}),
     import_types=frozenset({"import_declaration", "package_clause"}),
+    import_handler_name="go",
     type_table_handler_name="go",
     name_fallback_child_types=_C_FAMILY_NAMES,
     body_fallback_child_types=("block",),

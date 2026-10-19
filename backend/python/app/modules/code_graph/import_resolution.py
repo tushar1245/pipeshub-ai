@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import posixpath
 import sys
+from collections import Counter
+from collections.abc import Iterable
 
 __all__ = ["ImportResolution", "resolve_import_specifier"]
 
@@ -56,7 +58,19 @@ class ImportResolution:
         self._jvm_by_suffix: dict[str, list[str]] = {}
         # JS workspace package name (its folder's name) -> package root folders.
         self._js_workspaces: dict[str, list[str]] = {}
+        # Go: package folder -> its non-test files; folders holding a go.mod; and,
+        # once learnt from the repo's own imports, each module root's import path.
+        self._go_packages: dict[str, list[str]] = {}
+        self._go_roots: list[str] = []
+        self._go_modules: dict[str, str] = {}
         for path in file_paths:
+            if path.endswith(".go"):
+                if not path.endswith("_test.go"):
+                    self._go_packages.setdefault(posixpath.dirname(path), []).append(path)
+                continue
+            if path == "go.mod" or path.endswith("/go.mod"):
+                self._go_roots.append(posixpath.dirname(path))
+                continue
             if path.endswith(_JVM_SOURCE_EXTENSIONS):
                 parts = path.rsplit(".", 1)[0].split("/")
                 for i in range(len(parts)):
@@ -172,6 +186,53 @@ class ImportResolution:
         closest = [m for m, n in shared.items() if n == best]
         return closest[0] if len(closest) == 1 else None
 
+    def learn_go_modules(self, specifiers: Iterable[str]) -> None:
+        """Each go.mod folder's module path, by majority over the repo's imports.
+
+        The build sees file paths, not go.mod's text. A module path is the prefix
+        that, cut from the repo's own imports, leaves a folder under that go.mod;
+        an external import whose tail happens to name a repo folder
+        (`k8s.io/api/core/v1` beside `kubernetes/typed/core/v1`) is outvoted.
+        """
+        votes: Counter[tuple[str, str]] = Counter()
+        for specifier in set(specifiers):
+            parts = specifier.split("/")
+            # shortcut: the standard library is told apart by a dotless first
+            # element; a dotless module path (`module myapp`) is not resolved.
+            if "." not in parts[0]:
+                continue
+            for root in self._go_roots:
+                for i in range(1, len(parts) + 1):
+                    folder = posixpath.join(root, *parts[i:]) if i < len(parts) else root
+                    if folder in self._go_packages:
+                        votes[(root, "/".join(parts[:i]))] += 1
+        best: dict[str, tuple[int, list[str]]] = {}
+        for (root, module), n in votes.items():
+            top, names = best.get(root, (0, []))
+            if n > top:
+                best[root] = (n, [module])
+            elif n == top:
+                names.append(module)
+        self._go_modules = {root: names[0] for root, (_, names) in best.items() if len(names) == 1}
+
+    def _resolve_go(self, specifier: str) -> str | None:
+        """`k8s.io/client-go/tools/cache` -> a file of the repo's tools/cache package."""
+        for root, module in self._go_modules.items():
+            if specifier == module:
+                folder = root
+            elif specifier.startswith(module + "/"):
+                folder = posixpath.join(root, specifier[len(module) + 1:])
+            else:
+                continue
+            files = self._go_packages.get(folder)
+            if files:
+                return min(files)
+        return None
+
+    def go_package_files(self, file_path: str) -> list[str]:
+        """The non-test files of the Go package *file_path* belongs to."""
+        return self._go_packages.get(posixpath.dirname(file_path), [])
+
     def _resolve_js_alias(self, rest: str, from_file: str) -> str | None:
         """`@/lib/http` against the importing file's ancestors, then their `src/`.
 
@@ -217,6 +278,8 @@ class ImportResolution:
                 return self._resolve_js(specifier, from_file)
             if family == "jvm":
                 return self._resolve_jvm(specifier, from_file)
+            if family == "go":
+                return self._resolve_go(specifier)
             # No resolver for this language's imports yet; JS rules would only
             # misread its specifiers.
             return None

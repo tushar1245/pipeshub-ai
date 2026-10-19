@@ -66,10 +66,11 @@ async def test_a_name_never_crosses_languages(graph, index_file) -> None:
 
 
 def test_coverage_says_which_languages_are_name_matched() -> None:
-    assert {"go", "rust"} <= NAME_ONLY_LANGUAGES
+    assert {"rust", "kotlin"} <= NAME_ONLY_LANGUAGES
     assert "java" not in NAME_ONLY_LANGUAGES, "Java resolves imports and heritage now"
-    gap = coverage_for([{"language": "go"}, {"language": "dart"}])
-    assert gap["name_matched_calls"] == ["go"]
+    assert "go" not in NAME_ONLY_LANGUAGES, "Go resolves package imports now"
+    gap = coverage_for([{"language": "rust"}, {"language": "dart"}])
+    assert gap["name_matched_calls"] == ["rust"]
     assert "INFERRED" in gap["note"] and "dart" in gap["note"]
     assert coverage_for([{"language": "python"}]) is None
 

@@ -64,6 +64,10 @@ _BUILTIN_GLOBALS: dict[str, frozenset[str]] = {
         "clearTimeout", "clearInterval", "fetch", "alert", "structuredClone", "BigInt",
     }),
 }
+_BUILTIN_GLOBALS["go"] = frozenset({
+    "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make",
+    "max", "min", "new", "panic", "print", "println", "real", "recover",
+})
 _BUILTIN_GLOBALS["typescript"] = _BUILTIN_GLOBALS["javascript"]
 _BUILTIN_GLOBALS["tsx"] = _BUILTIN_GLOBALS["javascript"]
 
@@ -356,6 +360,29 @@ def _imports_java(node: Node, src: bytes, out: list[PendingEdgeFact]) -> None:
                                line=line, to_kind="block", qualified_prefix=owner))
 
 
+def _imports_go(node: Node, src: bytes, out: list[PendingEdgeFact]) -> None:
+    """`import m "k8s.io/x/y"` binds `m` (else the path's last element) to package x/y."""
+    if node.type != "import_declaration":
+        return
+    specs = [c for c in node.named_children if c.type == "import_spec"]
+    for group in node.named_children:
+        if group.type == "import_spec_list":
+            specs.extend(c for c in group.named_children if c.type == "import_spec")
+    for spec in specs:
+        path = _field(spec, "path")
+        specifier = _text(path, src).strip("\"`") if path is not None else ""
+        if not specifier:
+            continue
+        alias = _field(spec, "name")
+        local = _text(alias, src) if alias is not None else specifier.rsplit("/", 1)[-1]
+        out.append(PendingEdgeFact(
+            relation=Relation.IMPORTS_FROM, to_name=specifier, line=spec.start_point[0] + 1,
+            to_kind="record",
+            # `_` binds nothing; `.` merges the package's names into this file's scope.
+            local_name=None if local in ("_", ".") else local,
+        ))
+
+
 def _exports_js(node: Node, src: bytes, out: list[PendingEdgeFact]) -> None:
     """`export … from './m'` re-exports; `export function f` exports a local symbol."""
     line = node.start_point[0] + 1
@@ -473,7 +500,7 @@ def _heritage_java(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int)
                 ))
 
 
-_IMPORT_HANDLERS = {"python": _imports_python, "js": _imports_js, "java": _imports_java}
+_IMPORT_HANDLERS = {"python": _imports_python, "js": _imports_js, "java": _imports_java, "go": _imports_go}
 _HERITAGE_HANDLERS = {"python": _heritage_python, "js": _heritage_js, "ts": _heritage_ts,
                       "java": _heritage_java}
 # Handlers whose call sites are read as references (`a.b.c()` with its qualifier
@@ -577,9 +604,20 @@ def _collect_type_table_java(root: Node, src: bytes, table: dict[str, str]) -> N
         stack.extend(node.named_children)
 
 
+_GO_BUILTIN_TYPES = frozenset({
+    "any", "bool", "byte", "comparable", "complex64", "complex128", "error", "float32", "map",
+    "float64", "int", "int8", "int16", "int32", "int64", "rune", "string", "uint", "uint8",
+    "uint16", "uint32", "uint64", "uintptr",
+})
+
+
 def _go_type_name(node: Node, src: bytes) -> str:
-    """`*Context` -> `Context`, `[]gin.Engine` -> `Engine`, `Box[T]` -> `Box`."""
-    return _text(node, src).lstrip("*&[]").split("[")[0].rsplit(".", 1)[-1]
+    """`*Context` -> `Context`, `[]gin.Engine` -> `gin.Engine`, `Box[T]` -> `Box`.
+
+    The package qualifier is kept: `openapi.Client` and this package's `Client`
+    are different types.
+    """
+    return _text(node, src).lstrip("*&[]").split("[")[0]
 
 
 def _collect_type_table_go(root: Node, src: bytes, table: dict[str, str]) -> None:
@@ -595,7 +633,9 @@ def _collect_type_table_go(root: Node, src: bytes, table: dict[str, str]) -> Non
             if type_node is not None:
                 type_name = _go_type_name(type_node, src)
                 for child in node.named_children:
-                    if child.type == "identifier" and type_name[:1].isupper():
+                    # A named type, exported or not; `map[..]`, `func(..)` and builtins are skipped.
+                    if (child.type == "identifier" and type_name not in _GO_BUILTIN_TYPES
+                            and all(part.isidentifier() for part in type_name.split("."))):
                         seen.setdefault(_text(child, src), set()).add(type_name)
         stack.extend(node.named_children)
     for name, types in seen.items():
@@ -766,6 +806,7 @@ class _Walker:
             start = src.find(b"\n", start + 1)
         self.builtins = _BUILTIN_GLOBALS.get(cfg.name, frozenset())
         self.import_handler = _IMPORT_HANDLERS.get(cfg.import_handler_name)
+        self._scope_tables: dict[int, dict[str, str]] = {}
         self.heritage_handler = _HERITAGE_HANDLERS.get(cfg.heritage_handler_name)
 
     # -- symbols --------------------------------------------------------
@@ -1275,9 +1316,28 @@ class _Walker:
             to_kind="block",
             is_member_call=is_member,
             receiver=receiver,
-            receiver_type=self.out.type_table.get(receiver) if receiver else None,
+            receiver_type=self._receiver_type(node, receiver),
             qualified_prefix=qualifier,
         ))
+
+    def _receiver_type(self, node: Node, receiver: str | None) -> str | None:
+        """The receiver's type, from its own function first in Go: one file's
+        methods reuse `c` for `*Client` and `*Config`, which the file-wide table
+        has to drop."""
+        if not receiver:
+            return None
+        if self.cfg.type_table_handler_name == "go":
+            scope = node.parent
+            while scope is not None and scope.type not in ("function_declaration", "method_declaration"):
+                scope = scope.parent
+            if scope is not None:
+                table = self._scope_tables.get(scope.start_byte)
+                if table is None:
+                    table = self._scope_tables[scope.start_byte] = {}
+                    _collect_type_table_go(scope, self.src, table)
+                if receiver in table:
+                    return table[receiver]
+        return self.out.type_table.get(receiver)
 
     def _emit_reference(self, target: Node, enclosing: int) -> None:
         """A CALLS fact for something referenced as a callee without a call node."""
@@ -1288,7 +1348,7 @@ class _Walker:
             relation=Relation.CALLS, to_name=name, line=self._line_at(target.start_byte),
             byte_offset=target.start_byte, from_symbol=enclosing, to_kind="block",
             is_member_call=is_member, receiver=receiver,
-            receiver_type=self.out.type_table.get(receiver) if receiver else None,
+            receiver_type=self._receiver_type(target, receiver),
             qualified_prefix=qualifier,
         ))
 
