@@ -909,3 +909,24 @@ async def test_service_pipeline_forwards_the_record_file_path() -> None:
         pass
 
     assert parsing_client.parse.await_args.kwargs["file_path"] == "docs/reports/test.pdf"
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_code_file_loses_its_old_blocks() -> None:
+    """B3: the service path marked an emptied code file EMPTY but kept its last
+    version's blocks, so their calls and imports stayed in the code graph."""
+    parsing_client = MagicMock()
+    parsing_client.circuit_open = False
+    parsing_client.parse = AsyncMock(return_value=_make_parse_result(empty=True))
+    processor = MagicMock()
+    processor._drop_code_blocks = AsyncMock()
+    ep = _make_event_processor(parsing_client=parsing_client, processor=processor)
+
+    events = [e async for e in ep._orchestrate_via_services(
+        record_id="rec-1", org_id="org-1", virtual_record_id="v-1", record_name="m.py",
+        mime_type="text/x-python", extension="py", event_type="updateRecord",
+        prev_virtual_record_id=None, file_content=b"", is_code=True, file_path="a/m.py",
+    )]
+
+    processor._drop_code_blocks.assert_awaited_once_with("rec-1")
+    assert IndexingEvent.INDEXING_COMPLETE in [e.event for e in events]

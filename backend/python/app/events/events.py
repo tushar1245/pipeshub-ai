@@ -511,6 +511,10 @@ class EventProcessor:
             self.logger.info(
                 "⚠️ Empty document for %s — marking EMPTY", record_id
             )
+            if is_code:
+                # As process_code_document does: an emptied file kept its last
+                # version's blocks, and their calls and imports stayed (B3).
+                await self.processor._drop_code_blocks(record_id)
             await self.update_record_fields(
                 record_doc,
                 {
