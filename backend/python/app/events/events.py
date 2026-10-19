@@ -1401,6 +1401,9 @@ class EventProcessor:
                 file_content = file_content.strip()
 
             if not file_content or file_content == b"":
+                if is_code:
+                    # A file emptied to zero bytes is caught here, before parsing (B3).
+                    await self.processor._drop_code_blocks(record_id)
                 await self.mark_record_status(doc, ProgressStatus.EMPTY)
                 yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=record_id))
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=record_id))

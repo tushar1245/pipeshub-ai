@@ -3077,3 +3077,21 @@ class TestDedupHookBeforeReusedStatus:
 
         assert result.skip_indexing is True
         hook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_code_file_emptied_to_zero_bytes_loses_its_old_blocks():
+    """B3: a zero-byte file is marked EMPTY before parsing, so its last version's
+    blocks, and their calls and imports, stayed in the code graph."""
+    ep, _, processor, gp = _make_event_processor()
+    gp.get_document.return_value = {"_key": "rec-1", "recordType": "FILE"}
+    processor._drop_code_blocks = AsyncMock()
+    with patch.object(ep, "_check_duplicate_by_md5", new_callable=AsyncMock,
+                      return_value=DedupDecision(virtual_record_id=None, skip_indexing=False)), \
+         patch.object(ep, "mark_record_status", new_callable=AsyncMock) as mark:
+        await _drain(ep.on_event(_make_event_payload(
+            mime_type="text/x-python", extension="py", buffer=b"",
+            event_type=EventTypes.UPDATE_RECORD.value, record_name="m.py")))
+
+    processor._drop_code_blocks.assert_awaited_once_with("rec-1")
+    assert mark.await_args.args[1] == ProgressStatus.EMPTY
