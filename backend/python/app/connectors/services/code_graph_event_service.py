@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from app.config.constants.arangodb import EventTypes
@@ -25,6 +26,8 @@ class CodeGraphEventService:
         self._logger = logger
         self._runner = runner
         self._task_manager = task_manager
+        # Strong references: the loop keeps only weak ones to tasks it runs.
+        self._follow_ups: set[asyncio.Task] = set()
 
     async def process_event(
         self,
@@ -72,12 +75,7 @@ class CodeGraphEventService:
         try:
             task = await self._task_manager.start_if_idle(
                 f"{org_id}:{record_group_id}",
-                self._runner.run(
-                    org_id=org_id,
-                    connector_id=connector_id,
-                    record_group_id=record_group_id,
-                    lease=lease,
-                ),
+                self._run_then_follow_up(org_id, connector_id, record_group_id, lease),
             )
         except Exception:
             await self._runner.release(lease)
@@ -88,3 +86,22 @@ class CodeGraphEventService:
             await self._runner.release(lease)
             return False
         return True
+
+    async def _run_then_follow_up(self, org_id: str, connector_id: str, record_group_id: str,
+                                  lease: Any) -> None:
+        """A run that ends at its follow-up cap with a request still owed starts the next run
+        as soon as this one's task is gone; it used to wait for the reconciler (up to 10 min, B3)."""
+        still_owed = await self._runner.run(org_id=org_id, connector_id=connector_id,
+                                            record_group_id=record_group_id, lease=lease)
+        if not still_owed:
+            return
+        this_task = asyncio.current_task()
+
+        async def follow_up() -> None:
+            if this_task is not None:
+                await asyncio.wait({this_task})
+            await self.start_build(org_id, connector_id, record_group_id)
+
+        self._follow_ups.add(task := asyncio.get_running_loop().create_task(follow_up()))
+        task.add_done_callback(self._follow_ups.discard)
+

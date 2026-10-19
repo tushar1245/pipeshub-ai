@@ -163,3 +163,28 @@ async def test_malformed_event_is_acked_without_acquiring_lock() -> None:
 
     assert handled is True
     runner.acquire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_ends_still_owed_starts_the_next_at_once() -> None:
+    """B3: a run that hit its follow-up cap used to leave the rest to the reconciler (up to 10 min)."""
+    runner = MagicMock()
+    runner.acquire = AsyncMock(return_value=("lock-key", "lock-token"))
+    runner.release = AsyncMock()
+    runs: list[int] = []
+    second_done = asyncio.Event()
+
+    async def run(**_kwargs) -> bool:
+        runs.append(1)
+        if len(runs) == 2:
+            second_done.set()
+        return len(runs) == 1  # the first run ends at its cap still owed; the next settles
+
+    runner.run = run
+    manager = SyncTaskManager(label="Code edge build test")
+    service = CodeGraphEventService(MagicMock(), runner, manager)
+
+    await service.start_build("org-1", "connector-1", "repo-1")
+    await asyncio.wait_for(second_done.wait(), timeout=5)
+    assert len(runs) == 2
+    await manager.cancel_all()

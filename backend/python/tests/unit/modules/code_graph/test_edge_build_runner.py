@@ -27,10 +27,10 @@ def _runner(point: dict | None = None, *, touched=("rec-1",), drained=True
     return CodeEdgeBuildRunner(graph, redis, MagicMock()), graph
 
 
-async def _run(runner: CodeEdgeBuildRunner, build) -> None:
+async def _run(runner: CodeEdgeBuildRunner, build) -> bool:
     with patch(_BUILD, build):
-        await runner.run(org_id="org", connector_id="conn", record_group_id="g",
-                         lease=("lock", "token"))
+        return await runner.run(org_id="org", connector_id="conn", record_group_id="g",
+                                lease=("lock", "token"))
 
 
 def _point(graph: FakeSyncPoints) -> dict:
@@ -99,8 +99,8 @@ async def test_follow_up_builds_are_bounded() -> None:
         await BuildStateStore(graph).mark_requested("org", "conn", "g", 5000)
         return await build(**kwargs)
 
-    await _run(runner, always_requested)
-    assert build.await_count == 4, "the first build plus three follow-ups; the reconciler has the rest"
+    assert await _run(runner, always_requested) is True, "still owed: the caller starts the next run"
+    assert build.await_count == 4, "the first build plus three follow-ups"
 
 
 @pytest.mark.asyncio

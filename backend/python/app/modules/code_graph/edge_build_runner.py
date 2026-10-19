@@ -100,7 +100,12 @@ class CodeEdgeBuildRunner:
         connector_id: str,
         record_group_id: str,
         lease: BuildLease | None = None,
-    ) -> None:
+    ) -> bool:
+        """Build until nothing is owed or the follow-up cap is reached.
+
+        True when the cap was reached with a request still owed, so the caller can
+        start the next run at once instead of leaving it to the reconciler's sweep.
+        """
         owned_lease = lease or await self.acquire(
             org_id=org_id,
             record_group_id=record_group_id,
@@ -124,7 +129,8 @@ class CodeEdgeBuildRunner:
                     built = await self._build(org_id=org_id, connector_id=connector_id,
                                               record_group_id=record_group_id, lease=owned_lease)
                     if not built or not (await self._state.read_or_empty(org_id, record_group_id)).pending:
-                        break
+                        return False
+                return True
         except edge_build_trigger.LeaseLostError:
             code_graph_metrics.record_build("lease_lost")
             # The state now belongs to whichever build took the lock; it settles it.
