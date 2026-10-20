@@ -772,7 +772,17 @@ describe('MCP Controller — handleMCPRequest', () => {
       const res = createMockResponse()
       const next = createMockNext()
 
-      await handle(appConfig)(req, res as any, next)
+      // tools/list asks the query service whether the caller has code repos.
+      const fetchStub = sinon.stub(globalThis, 'fetch').resolves(
+        new Response(JSON.stringify({ repos: [] }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        }),
+      )
+      try {
+        await handle(appConfig)(req, res as any, next)
+      } finally {
+        fetchStub.restore()
+      }
 
       expect(infoStub.calledOnce).to.be.true
       expect(infoStub.firstCall.args[0]).to.equal('MCP request completed')
