@@ -75,7 +75,7 @@ class _CapturingProvider:
         self.docs.extend(docs)
         return True
 
-    async def batch_upsert_record_relations(self, edges: list, transaction: str | None = None) -> bool:
+    async def batch_upsert_node_relations(self, edges: list, transaction: str | None = None) -> bool:
         return True
 
     async def delete_edges_touching_nodes(self, *args: object, **kwargs: object) -> int:

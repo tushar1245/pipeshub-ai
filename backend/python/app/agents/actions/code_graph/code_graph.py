@@ -1,6 +1,6 @@
 """CodeGraph toolset — read the code knowledge graph.
 
-Four tools over the blocks + recordRelations graph the indexing pipeline builds:
+Four tools over the blocks + recordLinks graph the indexing pipeline builds:
 
   query_code_graph    — module structure, and the symbols a directory or file holds
   get_neighbour       — what reaches a file or symbol, and what it reaches

@@ -98,7 +98,7 @@ async def test_a_failed_write_keeps_the_previous_edges(graph, index_file) -> Non
 
     async def _fail(edges, transaction=None) -> bool:
         raise ConnectionError("graph unavailable")
-    graph.batch_upsert_record_relations = _fail
+    graph.batch_upsert_node_relations = _fail
 
     with pytest.raises(ConnectionError):
         await _build(graph)

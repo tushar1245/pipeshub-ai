@@ -59,7 +59,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.timeout(300)]
 ARANGO_DB = "code_graph_it"
 BLOCKS = CollectionNames.BLOCKS.value
 RECORDS = CollectionNames.RECORDS.value
-RELATIONS = CollectionNames.RECORD_RELATIONS.value
+RELATIONS = CollectionNames.RECORD_LINKS.value
 
 FILES = {
     "src/shop/b.py": "def target(x):\n    return helper(x)\n\n\ndef helper(x):\n    return x\n",

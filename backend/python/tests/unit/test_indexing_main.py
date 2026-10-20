@@ -1490,7 +1490,10 @@ class TestIndexingHealthCheck:
             result = await health_check(_make_health_request(governor=mock_governor))
 
         assert result.status_code == 200
-        assert json.loads(result.body) == {
+        body = json.loads(result.body)
+        # Slot stats are counters only, so nothing an exception says can reach them.
+        assert all(isinstance(v, (int, float)) for v in body.pop("indexing_llm").values())
+        assert body == {
             "status": "healthy",
             "timestamp": 1234567890,
             "resource_governor": {"error": "unavailable"},
@@ -2465,6 +2468,27 @@ class TestRepublishStrandedRecords:
             assert await _run_stranded(graph, producer) == 0
 
         producer.send_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [ProgressStatus.QUEUED.value, ProgressStatus.NOT_STARTED.value])
+    async def test_a_placeholder_is_never_republished(self, status: str) -> None:
+        """A stub ancestor has no content: the connector answers 422 to its
+        stream, so a resend only burns retries and ends the stub FAILED."""
+        graph = _sweep_graph(
+            {
+                status: [
+                    self._old_record(isPlaceholder=True),
+                    self._old_record(_key="r2"),
+                ]
+            },
+            active_ids={"live"},
+        )
+        producer = AsyncMock()
+
+        with _stranded_env():
+            assert await _run_stranded(graph, producer) == 1
+
+        assert [c.kwargs["payload"]["recordId"] for c in producer.send_event.await_args_list] == ["r2"]
 
     @pytest.mark.asyncio
     async def test_a_dedup_parked_duplicate_is_left_to_its_twin(self):

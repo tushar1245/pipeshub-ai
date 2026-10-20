@@ -229,5 +229,10 @@ deployment/docker-compose/bootstrap-first-run.env
 loom/
 
 node_modules
-.claude
-
+# Personal Claude Code state stays local; shared agent config at the repo root is tracked.
+*/**/.claude/
+/.claude/*
+!/.claude/settings.json
+!/.claude/rules/
+!/.claude/skills/
+!/.claude/agents/

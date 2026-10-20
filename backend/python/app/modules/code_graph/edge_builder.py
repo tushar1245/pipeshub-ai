@@ -1208,7 +1208,7 @@ async def build_code_graph_edges(
         now = int(time.time() * 1000)
         for chunk in _chunks(edges):
             await fence()
-            await graph_provider.batch_upsert_record_relations(
+            await graph_provider.batch_upsert_node_relations(
                 [builder.edge_document(key, meta, now) for key, meta in chunk])
         source_keys = _source_keys_for(index, reresolve)
         await fence()
@@ -1358,7 +1358,7 @@ async def _records_pointing_into(
     for chunk in _chunks(target_keys, 2000):
         rows = await graph_provider.get_edges_by_target_keys(
             target_keys=chunk,
-            edge_collection=CollectionNames.RECORD_RELATIONS.value,
+            edge_collection=CollectionNames.RECORD_LINKS.value,
             filters={
                 "source": CODE_GRAPH_SOURCE,
                 "orgId": org_id,
@@ -1395,7 +1395,7 @@ async def _delete_previous_edges(graph_provider: IGraphDBProvider, org_id: str,
     for chunk in _chunks(source_keys, 2000):
         removed += await graph_provider.delete_edges_by_source_keys(
             source_keys=chunk,
-            edge_collection=CollectionNames.RECORD_RELATIONS.value,
+            edge_collection=CollectionNames.RECORD_LINKS.value,
             filters={
                 "source": CODE_GRAPH_SOURCE,
                 "orgId": org_id,

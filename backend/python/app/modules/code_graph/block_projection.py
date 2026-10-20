@@ -416,7 +416,7 @@ async def write_code_file_blocks_to_graph(
         )
     for chunk in _chunks(edges):
         await _with_retry(
-            lambda c=chunk: graph_provider.batch_upsert_record_relations(c),
+            lambda c=chunk: graph_provider.batch_upsert_node_relations(c),
             what="upsert structural edges", log=log,
         )
 
@@ -505,6 +505,6 @@ async def _delete_edges_for_blocks(
         await graph_provider.delete_edges_touching_nodes(
             node_keys=chunk,
             node_collection=CollectionNames.BLOCKS.value,
-            edge_collection=CollectionNames.RECORD_RELATIONS.value,
+            edge_collection=CollectionNames.RECORD_LINKS.value,
         )
 

@@ -23,6 +23,7 @@ from app.agent_loop_lib.core.responses import StopReason
 from app.agent_loop_lib.core.streaming import StreamCompleteEvent, TextDeltaEvent
 from app.agent_loop_lib.core.tool_schema import ToolSchema
 from app.agents.agent_loop import langchain_transport as transport_module
+from app.agents.agent_loop.error_classification import classify_error
 from app.agents.agent_loop.langchain_transport import (
     LangChainTransport,
     _supports_multipart_tool_result,
@@ -166,6 +167,22 @@ class TestComplete:
         assert model.bind_tools_called_with is not None
         assert len(model.bind_tools_called_with) == 1
 
+    async def test_openai_family_tools_are_not_strict(self) -> None:
+        # Named like LangChain's class: the transport recognises the family by class name.
+        class AzureChatOpenAI(_FakeModel):
+            pass
+
+        model = AzureChatOpenAI()
+        schema = ToolSchema(name="t", description="d", input_schema={"type": "object", "properties": {}})
+        await LangChainTransport(model).complete([UserMessage(content="hi")], tools=[schema])
+        assert model.bind_tools_called_with[0]["function"]["strict"] is False
+
+    async def test_other_providers_tools_carry_no_strict_key(self) -> None:
+        model = _FakeModel()
+        schema = ToolSchema(name="t", description="d", input_schema={"type": "object", "properties": {}})
+        await LangChainTransport(model).complete([UserMessage(content="hi")], tools=[schema])
+        assert "strict" not in model.bind_tools_called_with[0]["function"]
+
     async def test_no_tools_does_not_bind(self) -> None:
         model = _FakeModel()
         transport = LangChainTransport(model)
@@ -238,6 +255,13 @@ class TestComplete:
         with pytest.raises(TransportError) as exc_info:
             await transport.complete([UserMessage(content="hi")])
         assert exc_info.value.retryable is True
+
+    async def test_empty_message_error_keeps_its_class_name(self) -> None:
+        transport = LangChainTransport(_FakeModel(raise_on_invoke=TimeoutError()))
+        with pytest.raises(TransportError) as exc_info:
+            await transport.complete([UserMessage(content="hi")])
+        assert "TimeoutError" in str(exc_info.value)
+        assert classify_error(f"LLM call failed: {exc_info.value}")[0] == "timeout"
 
     async def test_unrelated_exception_with_no_status_code_is_not_retryable(self) -> None:
         transport = LangChainTransport(_FakeModel(raise_on_invoke=ValueError("bad input")))
@@ -476,6 +500,17 @@ def _requesty_conflict_error() -> RuntimeError:
     return exc
 
 
+def _azure_tools_conflict_error() -> RuntimeError:
+    """Azure OpenAI's wording, for gpt-6 models sent tools on Chat Completions."""
+    exc = RuntimeError(
+        "Error code: 400 - {'error': {'message': \"Function tools with reasoning_effort are "
+        "not supported for this model in /v1/chat/completions. To use function tools, use "
+        "/v1/responses or set reasoning_effort to 'none'.\", 'type': 'invalid_request_error'}}"
+    )
+    exc.status_code = 400
+    return exc
+
+
 def _tool_choice_conflict_error() -> RuntimeError:
     exc = RuntimeError("Invalid parameter: 'tool_choice.function' is not supported here.")
     exc.status_code = 400
@@ -545,6 +580,34 @@ class TestApiShapeFallbackComplete:
         assert pinned.reasoning_effort is None
         assert store.recorded == [
             ("model-key-2", "some-model", LLMApiMode.RESPONSES.value),
+        ]
+
+    async def test_azure_wording_moves_an_unticked_model_to_responses_api(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A gpt-6 model added with Reasoning unticked carries no reasoning
+        setting, yet Azure still refuses its tools on Chat Completions. The
+        retry goes to the Responses API with the model's own default effort."""
+        store = _FakeApiModeStore()
+        monkeypatch.setattr(transport_module, "get_llm_api_mode_store", lambda: store)
+
+        model = _FakeApiShapeModel(
+            use_responses_api=None,
+            fail_when_responses_api=False, error=_azure_tools_conflict_error(),
+            response=AIMessage(content="worked via responses api"),
+        )
+        transport = LangChainTransport(model, model_name="gpt-6.1-sol", model_key="model-key-3")
+        schema = ToolSchema(name="t", description="d", input_schema={"type": "object", "properties": {}})
+
+        response = await transport.complete([UserMessage(content="hi")], tools=[schema])
+
+        assert response.message.text == "worked via responses api"
+        pinned = transport._llm
+        assert pinned.use_responses_api is True
+        assert pinned.reasoning is None
+        assert pinned.reasoning_effort is None
+        assert store.recorded == [
+            ("model-key-3", "gpt-6.1-sol", LLMApiMode.RESPONSES.value),
         ]
 
     async def test_unrelated_500_does_not_trigger_fallback(
@@ -1800,3 +1863,56 @@ class TestStreamCancellationDuringProviderStall:
             pass
 
         assert model.aclose_called is True
+
+
+_KEY_SENTINEL = "AIzaSyLOGSENTINEL0123456789abcdefghijkl"
+_BEARER_SENTINEL = "BEARERSENTINEL-4d1c"
+
+
+def _conflict_error_echoing_credentials() -> RuntimeError:
+    """A provider conflict whose text echoes the request URL, as an httpx
+    `HTTPStatusError` does, with the API key in the query string, and the
+    request's Authorization header."""
+    exc = _requesty_conflict_error()
+    exc.args = (
+        f"{exc.args[0]} (POST https://generativelanguage.googleapis.com/v1beta/models:generate"
+        f"?key={_KEY_SENTINEL}; headers: Authorization: Bearer {_BEARER_SENTINEL})",
+    )
+    return exc
+
+
+class TestProviderErrorLogsAreRedacted:
+    """The retry warnings log the provider's error text; a credential it
+    echoes must not reach the log."""
+
+    async def test_complete_conflict_warning(self, monkeypatch, caplog) -> None:
+        monkeypatch.setattr(transport_module, "get_llm_api_mode_store", lambda: _FakeApiModeStore())
+        model = _FakeApiShapeModel(
+            use_responses_api=True, reasoning={"effort": "high"},
+            fail_when_responses_api=True, error=_conflict_error_echoing_credentials(),
+            response=AIMessage(content="ok"),
+        )
+        transport = LangChainTransport(model, model_name="gemini-x", model_key="k")
+
+        with caplog.at_level("WARNING", logger=transport_module.logger.name):
+            await transport.complete([UserMessage(content="hi")])
+
+        assert "provider conflict" in caplog.text
+        assert _KEY_SENTINEL not in caplog.text
+        assert _BEARER_SENTINEL not in caplog.text
+
+    async def test_stream_conflict_warning(self, monkeypatch, caplog) -> None:
+        monkeypatch.setattr(transport_module, "get_llm_api_mode_store", lambda: _FakeApiModeStore())
+        model = _FakeApiShapeModel(
+            use_responses_api=True, reasoning={"effort": "high"},
+            fail_when_responses_api=True, error=_conflict_error_echoing_credentials(),
+            stream_chunks=[AIMessageChunk(content="ok")],
+        )
+        transport = LangChainTransport(model, model_name="gemini-x", model_key="k")
+
+        with caplog.at_level("WARNING", logger=transport_module.logger.name):
+            _ = [e async for e in transport.stream([UserMessage(content="hi")])]
+
+        assert "provider conflict" in caplog.text
+        assert _KEY_SENTINEL not in caplog.text
+        assert _BEARER_SENTINEL not in caplog.text

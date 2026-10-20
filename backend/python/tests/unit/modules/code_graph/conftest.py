@@ -155,7 +155,7 @@ class FakeGraphProvider:
     async def delete_blocks_for_records(self, record_ids, transaction=None) -> None:
         doomed = [k for k, b in self.blocks.items() if b.get("recordId") in set(record_ids)]
         await self.delete_edges_touching_nodes(doomed, CollectionNames.BLOCKS.value,
-                                               CollectionNames.RECORD_RELATIONS.value)
+                                               CollectionNames.RECORD_LINKS.value)
         records = {f"{CollectionNames.RECORDS.value}/{r}" for r in record_ids}
         self.edges = [e for e in self.edges if e["_from"] not in records and e["_to"] not in records]
         for key in doomed:
@@ -173,7 +173,7 @@ class FakeGraphProvider:
             self.blocks.pop(key, None)
         return True
 
-    async def batch_upsert_record_relations(self, edges, transaction=None):
+    async def batch_upsert_node_relations(self, edges, transaction=None):
         # Both providers update a matching edge in place.
         index = {(e["_from"], e["_to"], e["relationshipType"]): e for e in self.edges}
         for edge in edges:

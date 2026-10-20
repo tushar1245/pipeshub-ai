@@ -43,14 +43,12 @@ from app.agents.agent_loop.hooks.progressive_tools import (
     entity_tools_used_in_history,
     progressive_entity_tools,
 )
-# from app.agents.agent_loop.hooks.repo_instructions import (
-#     repo_instructions_after_tools,
-#     repo_instructions_on_turn,
-# )
+from app.agents.agent_loop.hooks.repeated_reads import RepeatedReadGuard
 from app.agents.agent_loop.hooks.result_accumulation import (
     result_accumulation,
     stash_tool_call_metadata,
 )
+from app.agents.agent_loop.hooks.retrieval_context import retrieval_context_emission
 from app.agents.agent_loop.hooks.retry_with_status import retry_with_status
 from app.agents.agent_loop.hooks.tool_blocking import ToolErrorTracker
 
@@ -59,6 +57,7 @@ __all__ = [
     "ENTITY_TOOL_NAMES",
     "PROGRESSIVE_FIND_RECORDS_TOOL_NAME",
     "PROGRESSIVE_TOOL_NAMES",
+    "RepeatedReadGuard",
     "ToolErrorTracker",
     "artifact_context_reminder",
     "ask_user_question_sse",
@@ -80,6 +79,7 @@ __all__ = [
     # "repo_instructions_after_tools",
     # "repo_instructions_on_turn",
     "result_accumulation",
+    "retrieval_context_emission",
     "retry_with_status",
     "stash_tool_call_metadata",
 ]

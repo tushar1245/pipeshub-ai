@@ -42,7 +42,6 @@ or a record's identity. Source timestamps live in ``timestamps.py``.
 from __future__ import annotations
 
 import base64
-import time
 import uuid
 from collections import deque
 from typing import TYPE_CHECKING, Any
@@ -121,10 +120,6 @@ def _git_tree_entries(prefix: str, tree: Any) -> list[tuple[str, str, str, int |
     return entries
 
 
-# How long a streamed file's repository lookup is reused. Long enough to cover
-# one indexing burst; a rename inside it surfaces as a 404 that drops the entry.
-_STREAM_REPO_TTL_SECONDS = 300.0
-
 
 def _oversized(file_path: str, repo_name: str, size: int) -> HTTPException:
     # 413 is TERMINAL for the indexing consumer: the record fails once with this
@@ -148,9 +143,6 @@ class ReposSync:
         self.timestamps = TimestampBackfill(connector)
         # Per repo, loaded at the start of each run.
         self._policy = PathPolicy()
-        # repo id -> (fetched at, repo). Indexing streams every file of a repo
-        # in a burst, and a lookup per file was a third of the content budget.
-        self._stream_repos: dict[int, tuple[float, GhObject]] = {}
 
     # ------------------------------------------------------------------
     # 1. Entry point: dispatch + checkpoints
@@ -1062,7 +1054,17 @@ class ReposSync:
                 f"Cannot resolve repo path for record {record.id}",
             )
 
-        repo = await self._stream_repo(repo_id)
+        repo_res = await c.runtime.get_repo_by_id(repo_id)
+        if not repo_res.success or not repo_res.data:
+            raise_for_stream_fetch(
+                success=repo_res.success,
+                has_payload=bool(repo_res.data),
+                connector=c.display_name,
+                status=repo_res.status_code,
+                retry_after=repo_res.retry_after_seconds,
+                message=repo_res.error,
+            )
+        repo = repo_res.data
 
         # A full sync records each blob's size, so its file is one Git Blob call
         # by sha. The Contents API costs the same call plus a second for files
@@ -1077,8 +1079,6 @@ class ReposSync:
             content = await self._fetch_blob_by_sha(repo, record, file_path)
             if content is not None:
                 return content
-            self._stream_repos.pop(repo_id, None)
-            repo = await self._stream_repo(repo_id)
 
         # At the commit the record was synced at, not the moving branch head:
         # the content indexed is the content the record describes (P-8).
@@ -1086,6 +1086,32 @@ class ReposSync:
             c.data_source.get_file_contents, repo.owner.login, repo.name, file_path,
             getattr(record, "commit_sha", None) or repo.default_branch,
         )
+        if content_res.status_code == HttpStatusCode.NOT_FOUND.value:
+            # The lookup may be remembered from before the default branch was
+            # renamed; the old ref 404s and the record would fail for good.
+            # Ask again, and retry once only if the answer changed. A 404 on
+            # the current branch is a file that is really gone.
+            await c.runtime.forget_repo_lookup(repo_id)
+            fresh_res = await c.runtime.get_repo_by_id(repo_id)
+            if not fresh_res.success or not fresh_res.data:
+                # A failed lookup (rate limit, auth, 5xx) proves nothing about
+                # the file. Report it, so indexing can retry, not the 404.
+                raise_for_stream_fetch(
+                    success=fresh_res.success,
+                    has_payload=bool(fresh_res.data),
+                    connector=c.display_name,
+                    status=fresh_res.status_code,
+                    retry_after=fresh_res.retry_after_seconds,
+                    message=fresh_res.error,
+                )
+            fresh = fresh_res.data
+            if (fresh.owner.login, fresh.name, fresh.default_branch) != (
+                repo.owner.login, repo.name, repo.default_branch,
+            ):
+                repo = fresh
+                content_res = await c.runtime.ds_call(
+                    c.data_source.get_file_contents, repo.owner.login, repo.name, file_path, repo.default_branch,
+                )
         if not content_res.success or content_res.data is None:
             raise_for_stream_fetch(
                 success=content_res.success,
@@ -1134,25 +1160,6 @@ class ReposSync:
                 )
             return content
         return b""
-
-    async def _stream_repo(self, repo_id: int) -> GhObject:
-        """The repository a streamed file belongs to, looked up once per burst."""
-        c = self.c
-        cached = self._stream_repos.get(repo_id)
-        if cached and time.monotonic() - cached[0] < _STREAM_REPO_TTL_SECONDS:
-            return cached[1]
-        repo_res = await c.runtime.ds_call(c.data_source.get_repo_by_id, repo_id)
-        if not repo_res.success or not repo_res.data:
-            raise_for_stream_fetch(
-                success=repo_res.success,
-                has_payload=bool(repo_res.data),
-                connector=c.display_name,
-                status=repo_res.status_code,
-                retry_after=repo_res.retry_after_seconds,
-                message=repo_res.error,
-            )
-        self._stream_repos[repo_id] = (time.monotonic(), repo_res.data)
-        return repo_res.data
 
     async def _fetch_blob_by_sha(
         self, repo: Any, record: CodeFileRecord, file_path: str,
