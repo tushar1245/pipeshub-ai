@@ -540,25 +540,38 @@ async def impact_impl(
     are affected and how near they are, so a change's blast radius reads as a
     list of files to check rather than a flat list of edges.
     """
-    walk = await get_neighbour_impl(
-        graph_provider=graph_provider, connector_id=connector_id, org_id=org_id,
-        user_id=user_id, file_path=file_path, qualified_name=qualified_name,
-        direction="inbound", edge_types=IMPACT_RELATIONS, depth=depth,
-        limit=_IMPACT_ROWS, include_tests=include_tests, repo=repo,
-    )
+    def walk_with(tests: bool):
+        return get_neighbour_impl(
+            graph_provider=graph_provider, connector_id=connector_id, org_id=org_id,
+            user_id=user_id, file_path=file_path, qualified_name=qualified_name,
+            direction="inbound", edge_types=IMPACT_RELATIONS, depth=depth,
+            limit=_IMPACT_ROWS, include_tests=tests, repo=repo,
+        )
+
+    walk = await walk_with(include_tests)
     if "error" in walk or "neighbors" not in walk:
         return walk
+    out = {k: v for k, v in walk.items() if k not in ("neighbors", "chain", "note", "next", "hidden_tests")}
+    files = _by_file(walk["neighbors"])
+    out.update({"impacted_files": files, "impacted_symbols": sum(len(f["symbols"]) for f in files)})
+    if not include_tests and walk.get("hidden_tests"):
+        # The tests a change reaches are the ones to run: listed apart, not just counted,
+        # so "what breaks" needs no second call.
+        everything = await walk_with(True)
+        shown = {(n.get("file_path"), n.get("qualified_name")) for n in walk["neighbors"]}
+        tests = [n for n in everything.get("neighbors", ())
+                 if (n.get("file_path"), n.get("qualified_name")) not in shown]
+        out["impacted_tests"] = _by_file(tests)
+        out["truncated"] = out.get("truncated") or bool(everything.get("truncated"))
+    return out
+
+
+def _by_file(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_file: dict[str, dict[str, Any]] = {}
-    for row in walk["neighbors"]:
+    for row in rows:
         path = row.get("file_path") or ""
         entry = by_file.setdefault(path, {"file_path": path, "symbols": [], "nearest_hop": 9})
         if row.get("qualified_name") not in entry["symbols"]:
             entry["symbols"].append(row.get("qualified_name"))
         entry["nearest_hop"] = min(entry["nearest_hop"], row.get("hop") or 1)
-    files = sorted(by_file.values(), key=lambda f: (f["nearest_hop"], f["file_path"]))
-    out = {k: v for k, v in walk.items() if k not in ("neighbors", "chain", "note", "next")}
-    out.update({
-        "impacted_files": files,
-        "impacted_symbols": sum(len(f["symbols"]) for f in files),
-    })
-    return out
+    return sorted(by_file.values(), key=lambda f: (f["nearest_hop"], f["file_path"]))

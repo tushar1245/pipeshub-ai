@@ -105,3 +105,13 @@ async def test_outline_says_when_the_file_did_not_parse_cleanly() -> None:
     assert out["parse_error_line"] == 5 and "line 5" in out["note"]
     clean = await outline_impl(**_ctx(QueryGraphProvider()), blob_store=_blobs(), file_path="src/b.py")
     assert "parse_error_line" not in clean
+
+
+async def test_impact_lists_the_tests_a_change_reaches_apart() -> None:
+    """The tests to run after a change are part of its blast radius, not only a count."""
+    out = without_marker(await impact_impl(**_ctx(QueryGraphProvider(file_roles={"rec-a": "test"})),
+                                           file_path="src/b.py", qualified_name="function:target"))
+    assert out["impacted_files"] == []
+    assert out["impacted_tests"] == [
+        {"file_path": "src/a.py", "symbols": ["function:caller"], "nearest_hop": 1}]
+    assert "hidden_tests" not in out

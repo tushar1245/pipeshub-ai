@@ -864,7 +864,8 @@ class CodeGraph:
             "The blast radius of changing a symbol: everything that calls it, imports "
             "it, or builds on it (inherits, implements, overrides), followed backwards "
             f"up to `depth` hops (default {DEFAULT_IMPACT_DEPTH}), grouped by file with "
-            "the nearest hop. Only edges the parser could prove; `coverage` says when a "
+            "the nearest hop. Test files it reaches are listed apart in `impacted_tests` "
+            "(the tests to run). Only edges the parser could prove; `coverage` says when a "
             "language has none."
         ),
         parameters=[
