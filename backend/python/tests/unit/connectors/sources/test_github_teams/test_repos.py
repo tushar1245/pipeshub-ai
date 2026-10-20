@@ -1226,6 +1226,21 @@ class TestStreamBudget:
             raise AssertionError(f"unexpected ds_call for {method!r}")
 
         c.runtime.ds_call.side_effect = dispatch
+        looked_up: list[int] = []
+
+        # The runtime remembers a lookup per repository (its own tests cover that), so
+        # only the first one reaches GitHub.
+        async def get_repo_by_id(repo_id: int) -> object:
+            if repo_id not in looked_up:
+                looked_up.append(repo_id)
+                return dispatch(c.data_source.get_repo_by_id, repo_id)
+            return ok_response(repo)
+
+        async def forget_repo_lookup(repo_id: int) -> None:
+            looked_up.remove(repo_id)
+
+        c.runtime.get_repo_by_id = get_repo_by_id
+        c.runtime.forget_repo_lookup = forget_repo_lookup
         return calls
 
     async def test_full_sync_files_cost_one_call_each_after_the_first(self) -> None:
@@ -1269,8 +1284,8 @@ class TestStreamBudget:
         calls = self._wire(c, blob=failed_response("gone", status_code=HttpStatusCode.NOT_FOUND.value))
 
         assert await ReposSync(c).fetch_code_file_content(self._record()) == b"head"
-        # The repository is looked up again: a 404 is also what a rename answers.
-        assert calls == ["get_repo_by_id", "get_git_blob", "get_repo_by_id", "get_file_contents"]
+        # The lookup is refreshed only if the Contents API 404s too, which a rename also does.
+        assert calls == ["get_repo_by_id", "get_git_blob", "get_file_contents"]
 
     async def test_a_rate_limited_blob_is_reported_as_429_not_retried_elsewhere(self) -> None:
         c = make_mock_connector()
