@@ -22,7 +22,7 @@ from typing import Any
 from app.config.constants.arangodb import CollectionNames, RecordRelations
 from app.models.blocks import Block, BlockGroup, BlocksContainer
 from app.modules.code_graph.module_refs import module_ref
-from app.modules.code_graph.version import CODE_GRAPH_VERSION
+from app.modules.code_graph.version import PARSER_VERSION
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 
 __all__ = [
@@ -45,7 +45,6 @@ FILE_SUMMARY_QUALIFIED_NAME = "file_summary:1"
 # and come from the record's blob, which holds this same parse.
 RESIDENT_RELATIONS = frozenset({
     RecordRelations.INHERITS.value,
-    RecordRelations.EXTENDS.value,
     RecordRelations.IMPLEMENTS.value,
     RecordRelations.RE_EXPORTS.value,
 })
@@ -141,7 +140,7 @@ def serialize_block_for_graph(
         # which the backfill uses.
         "nameFolded": item.name.lower() if item.name else None,
         # The parser and projection this block was made by (O-10).
-        "parserVersion": CODE_GRAPH_VERSION,
+        "parserVersion": PARSER_VERSION,
         "index": item.index,
         "isBlockGroup": is_block_group,
         "isExternal": False,

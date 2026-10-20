@@ -18,6 +18,7 @@ from app.modules.code_graph.block_projection import (
     FILE_SUMMARY_QUALIFIED_NAME,
     block_key_for,
 )
+from app.modules.code_graph.version import PARSER_VERSION
 
 if TYPE_CHECKING:
     from app.modules.transformers.blob_storage import BlobStorage
@@ -45,6 +46,9 @@ class RecordFacts:
     # facts are unknown, not empty: rebuilding from it would delete the file's
     # call and import edges.
     recognised: bool = True
+    # PARSER_VERSION the blob was parsed under. A blob stored before the stamp
+    # existed reads as current: until 2026.10.19 nothing told them apart.
+    facts_version: str = PARSER_VERSION
 
 
 class CodeFactsSource(Protocol):
@@ -65,6 +69,9 @@ def facts_from_blob_record(record_id: str, record: dict[str, Any]) -> RecordFact
     if not isinstance(container, dict):
         out.recognised = False
         return out
+    stamp = container.get("code_facts_version")
+    if isinstance(stamp, str) and stamp:
+        out.facts_version = stamp
     items = [*(container.get("block_groups") or []), *(container.get("blocks") or [])]
     if items and not any(_code_metadata(item) for item in items):
         out.recognised = False

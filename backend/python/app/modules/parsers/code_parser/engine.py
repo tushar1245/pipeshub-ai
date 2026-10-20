@@ -435,7 +435,7 @@ def _heritage_js(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int) -
             if item.type in ("identifier", "member_expression", "type_identifier"):
                 raw = _text(item, src)
                 out.append(PendingEdgeFact(
-                    relation=Relation.EXTENDS, to_name=raw.rsplit(".", 1)[-1],
+                    relation=Relation.INHERITS, to_name=raw.rsplit(".", 1)[-1],
                     line=line, from_symbol=idx,
                 ))
 
@@ -447,7 +447,7 @@ def _heritage_ts(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int) -
             for item in child.named_children:
                 if item.type in ("type_identifier", "generic_type", "identifier"):
                     out.append(PendingEdgeFact(
-                        relation=Relation.EXTENDS,
+                        relation=Relation.INHERITS,
                         to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
                         line=line, from_symbol=idx,
                     ))
@@ -458,7 +458,7 @@ def _heritage_ts(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int) -
                 for item in clause.named_children:
                     if item.type in ("identifier", "member_expression", "generic_type", "type_identifier"):
                         out.append(PendingEdgeFact(
-                            relation=Relation.EXTENDS,
+                            relation=Relation.INHERITS,
                             to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
                             line=line, from_symbol=idx,
                         ))
@@ -484,7 +484,7 @@ def _heritage_java(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int)
         if child.type == "superclass":
             relation = Relation.INHERITS
         elif child.type in ("super_interfaces", "extends_interfaces"):
-            relation = Relation.IMPLEMENTS if child.type == "super_interfaces" else Relation.EXTENDS
+            relation = Relation.IMPLEMENTS if child.type == "super_interfaces" else Relation.INHERITS
         else:
             continue
         stack = list(child.named_children)

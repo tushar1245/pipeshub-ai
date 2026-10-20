@@ -682,7 +682,6 @@ class RecordRelations(Enum):
     RE_EXPORTS = "RE_EXPORTS"
     EXPORTS = "EXPORTS"
     INHERITS = "INHERITS"
-    EXTENDS = "EXTENDS"
 
 
 class EntityRelations(Enum):

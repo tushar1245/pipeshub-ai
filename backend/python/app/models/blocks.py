@@ -546,6 +546,8 @@ class BlockGroups(BaseModel):
 class BlocksContainer(BaseModel):
     block_groups: list[BlockGroup] = Field(default_factory=list)
     blocks: list[Block] = Field(default_factory=list)
+    # PARSER_VERSION of a code parse, so a stored blob says which fact schema it holds.
+    code_facts_version: Optional[str] = None
 
     def extend(self, other: 'BlocksContainer') -> None:
         """Append *other*'s content, rebasing its indices onto this container.

@@ -3,12 +3,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.migrations import code_graph_backfill
 from app.migrations.code_graph_backfill import (
     MIGRATION_FLAG_PREFIX,
     find_stale_repos,
     run_code_graph_backfill,
 )
-from app.modules.code_graph.version import CODE_GRAPH_VERSION
+from app.modules.code_graph import version
+from app.modules.code_graph.version import PARSER_VERSION
 
 pytestmark = pytest.mark.asyncio
 
@@ -56,10 +58,34 @@ async def test_each_stale_repo_is_asked_to_reindex_once_per_version() -> None:
     assert event["eventType"] == "githubteams.reindex"
     assert event["payload"] == {"orgId": "org", "connectorId": "c-never", "connector": "githubteams",
                                 "recordGroupId": "never", "depth": -1}
-    config.set_config.assert_awaited_once_with(f"{MIGRATION_FLAG_PREFIX}{CODE_GRAPH_VERSION}",
+    config.set_config.assert_awaited_once_with(f"{MIGRATION_FLAG_PREFIX}{PARSER_VERSION}",
                                                {"done": True, "repos": 1})
 
     config.get_config = AsyncMock(return_value={"done": True})
     kafka.publish_event.reset_mock()
     assert await run_code_graph_backfill(config, graph, kafka, MagicMock(), pause_seconds=0) == 0
     kafka.publish_event.assert_not_awaited()
+
+
+def _blocks_at(parser_version: str) -> MagicMock:
+    """One repo whose blocks all carry ``parser_version``; counts honour the filter."""
+    graph = MagicMock()
+    graph.get_documents_paginated = AsyncMock(return_value=[_record("r1", "repo")])
+
+    async def count(collection, filters) -> int:
+        wanted = filters.get("parserVersion")
+        return 0 if wanted is not None and wanted != parser_version else 10
+
+    graph.count_nodes_by_filters = AsyncMock(side_effect=count)
+    return graph
+
+
+async def test_an_edge_rules_bump_reindexes_nothing(monkeypatch) -> None:
+    monkeypatch.setattr(version, "EDGE_RULES_VERSION", "2099.01.01")
+    assert await find_stale_repos(_blocks_at(PARSER_VERSION)) == []
+
+
+async def test_a_parser_bump_marks_the_repo_stale(monkeypatch) -> None:
+    graph = _blocks_at(PARSER_VERSION)
+    monkeypatch.setattr(code_graph_backfill, "PARSER_VERSION", "2099.01.01")
+    assert [s.record_group_id for s in await find_stale_repos(graph)] == ["repo"]

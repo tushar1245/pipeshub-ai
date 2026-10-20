@@ -6,6 +6,8 @@ what an inbound walk follows to the implementation. The same pass decides
 `INHERITS` vs `IMPLEMENTS`: `class Foo(ABC)` yields the base's name, and
 whether that name is a contract is known once it resolves to a block.
 """
+import json
+
 import pytest
 
 from app.config.constants.arangodb import RecordRelations
@@ -177,6 +179,42 @@ class TestDeclaredInterface:
         linked = {dst for _, dst in _pairs(graph, OVERRIDES)}
         assert "method:Store.get" in linked
         assert "method:Store.put" in linked
+
+
+    @pytest.mark.asyncio
+    async def test_an_interface_extending_an_interface_inherits_it(
+        self, graph, index_file
+    ) -> None:
+        """Only a class realises a contract; one interface building on another inherits it."""
+        await index_file("recS", "src/store.ts", TS_INTERFACE, "typescript")
+        await index_file("recC", "src/cache.ts", TS_SUB_INTERFACE, "typescript")
+        await _build(graph)
+
+        assert ("interface:CacheStore", "interface:Store") in _pairs(graph, INHERITS)
+        assert not _pairs(graph, IMPLEMENTS)
+
+
+TS_SUB_INTERFACE = b'''
+import { Store } from "./store";
+
+export interface CacheStore extends Store {
+  evict(key: string): void;
+}
+'''
+
+
+@pytest.mark.asyncio
+async def test_facts_stored_as_extends_are_built_as_inherits(graph, index_file) -> None:
+    """Blobs and nodes parsed before EXTENDS merged into INHERITS are not re-indexed."""
+    await index_file("recS", "src/plain_base.py", PLAIN_BASE, "python")
+    await index_file("recQ", "src/square.py", PLAIN_CHILD, "python")
+    legacy = lambda doc: json.loads(json.dumps(doc).replace('"INHERITS"', '"EXTENDS"'))  # noqa: E731
+    graph.blocks = {k: legacy(d) for k, d in graph.blocks.items()}
+    graph.blobs = {k: legacy(b) for k, b in graph.blobs.items()}
+    await _build(graph)
+
+    assert ("class:Square", "class:Shape") in _pairs(graph, INHERITS)
+    assert not graph.code_edges("EXTENDS")
 
 
 A_SRC = b'''

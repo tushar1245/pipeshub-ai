@@ -1,13 +1,13 @@
 """Re-index code repositories whose blocks predate the code graph or its current version (O-10).
 
 A repo indexed before the code graph existed has code file records and no
-blocks; one indexed under an older CODE_GRAPH_VERSION has blocks that miss
+blocks; one indexed under an older PARSER_VERSION has blocks that miss
 what the current parser extracts. Either way its edges are built against a
 partial or stale symbol table until every file changes. This asks the
 repo's connector to re-index it -- the same event the "Reindex" action
 sends -- and the build that follows the drain does the rest.
 
-Runs once per CODE_GRAPH_VERSION (the flag carries it), in the connectors
+Runs once per PARSER_VERSION (the flag carries it), in the connectors
 service's post-startup task. Repos are asked one at a time, a few seconds
 apart, so an install with many repos does not flood indexing at once.
 """
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from app.config.constants.arangodb import CollectionNames, ProgressStatus, RecordTypes
 from app.connectors.services.reindex_events import build_reindex_event
-from app.modules.code_graph.version import CODE_GRAPH_VERSION
+from app.modules.code_graph.version import PARSER_VERSION
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ async def find_stale_repos(graph_provider: IGraphDBProvider) -> list[StaleRepo]:
         scope = {"orgId": org_id, "recordGroupId": group}
         blocks = await graph_provider.count_nodes_by_filters(CollectionNames.BLOCKS.value, scope)
         current = await graph_provider.count_nodes_by_filters(
-            CollectionNames.BLOCKS.value, {**scope, "parserVersion": CODE_GRAPH_VERSION},
+            CollectionNames.BLOCKS.value, {**scope, "parserVersion": PARSER_VERSION},
         )
         if blocks == 0 or current < blocks:
             stale.append(StaleRepo(org_id, connector_id, connector_name, group, blocks, current))
@@ -88,7 +88,7 @@ async def run_code_graph_backfill(
     Returns how many repos were asked. A failure leaves the flag unset, so the
     next start tries again; asking twice is harmless (the reindex task dedupes).
     """
-    flag_key = f"{MIGRATION_FLAG_PREFIX}{CODE_GRAPH_VERSION}"
+    flag_key = f"{MIGRATION_FLAG_PREFIX}{PARSER_VERSION}"
     try:
         flag = await config_service.get_config(flag_key, use_cache=False)
     except Exception:
@@ -109,7 +109,7 @@ async def run_code_graph_backfill(
             "payload": event["payload"],
         })
         logger.info("Code graph backfill: re-indexing %s (%d of %d blocks at %s)",
-                    repo.record_group_id, repo.current_blocks, repo.blocks, CODE_GRAPH_VERSION)
+                    repo.record_group_id, repo.current_blocks, repo.blocks, PARSER_VERSION)
         if i + 1 < len(stale):
             await asyncio.sleep(pause_seconds)
 
@@ -118,5 +118,5 @@ async def run_code_graph_backfill(
     except Exception:
         logger.warning("Code graph backfill finished but its flag was not saved; "
                        "it will look again on the next start", exc_info=True)
-    logger.info("Code graph backfill for %s: %d repo(s) re-indexed", CODE_GRAPH_VERSION, len(stale))
+    logger.info("Code graph backfill for %s: %d repo(s) re-indexed", PARSER_VERSION, len(stale))
     return len(stale)

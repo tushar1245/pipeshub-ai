@@ -14,8 +14,7 @@ from .test_import_binding import _build, _package, _targets
 CALLS = RecordRelations.CALLS.value
 IMPORTS = RecordRelations.IMPORTS.value
 IMPORTS_FROM = RecordRelations.IMPORTS_FROM.value
-HERITAGE = {RecordRelations.INHERITS.value, RecordRelations.IMPLEMENTS.value,
-            RecordRelations.EXTENDS.value}
+HERITAGE = {RecordRelations.INHERITS.value, RecordRelations.IMPLEMENTS.value}
 
 pytestmark = pytest.mark.asyncio
 
