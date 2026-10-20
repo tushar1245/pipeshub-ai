@@ -3136,23 +3136,16 @@ class TestDuplicateAndSyncOperations:
         found = await neo4j_provider.get_sync_point("k1", "syncPoints", transaction="txn-sp")
         assert found == {"_key": "k1"}
 
-        neo4j_provider.get_sync_point = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        # One MERGE: createdAtTimestamp only on create, updatedAtTimestamp on every write.
         neo4j_provider.client.execute_query = AsyncMock(return_value=[])
         with patch("app.services.graph_db.neo4j.neo4j_provider.get_epoch_timestamp_in_ms", return_value=200):
-            created = await neo4j_provider.upsert_sync_point("k1", {"cursor": "c1"}, "syncPoints")
-        assert created is True
-        create_parameters = neo4j_provider.client.execute_query.await_args.args[1]
-        assert create_parameters["data"]["createdAtTimestamp"] == 200
-        assert create_parameters["data"]["updatedAtTimestamp"] == 200
-
-        neo4j_provider.get_sync_point = AsyncMock(return_value={"_key": "k1"})  # type: ignore[method-assign]
-        neo4j_provider.client.execute_query = AsyncMock(return_value=[])
-        with patch("app.services.graph_db.neo4j.neo4j_provider.get_epoch_timestamp_in_ms", return_value=300):
-            updated = await neo4j_provider.upsert_sync_point("k1", {"cursor": "c2"}, "syncPoints")
-        assert updated is True
-        update_parameters = neo4j_provider.client.execute_query.await_args.args[1]
-        assert "createdAtTimestamp" not in update_parameters["data"]
-        assert update_parameters["data"]["updatedAtTimestamp"] == 300
+            upserted = await neo4j_provider.upsert_sync_point("k1", {"cursor": "c1"}, "syncPoints")
+        assert upserted is True
+        query, parameters = neo4j_provider.client.execute_query.await_args.args[:2]
+        assert "MERGE" in query and "ON CREATE SET sp.createdAtTimestamp = $now" in query
+        assert parameters["key"] == "k1" and parameters["now"] == 200
+        assert "createdAtTimestamp" not in parameters["data"]
+        assert parameters["data"]["updatedAtTimestamp"] == 200
 
         neo4j_provider.client.execute_query = AsyncMock(return_value=[])
         await neo4j_provider.remove_sync_point("k1", "syncPoints", transaction="txn-rm")
@@ -3178,28 +3171,20 @@ class TestDuplicateAndSyncOperations:
     async def test_upsert_does_not_create_a_second_sync_point_when_its_read_fails(
         self, neo4j_provider: Neo4jProvider
     ):
-        """The read that decides insert-or-update failing must not look like
-        "no row here". Nothing makes syncPointKey unique and the CREATE sets no
-        id, so the duplicate would land, and reads that LIMIT 1 would then race
-        between two checkpoints for one key.
-
-        get_sync_point is deliberately not stubbed: the fix is the flag it is
-        called with, and a stub would answer the same either way.
-        """
+        """No read decides insert-or-update any more: the upsert is one MERGE
+        on syncPointKey, so a failing graph raises and nothing else is written."""
         queries: list[str] = []
 
         async def graph_flapping(query, *_args, **_kwargs):
             queries.append(query)
-            if "MATCH" in query:
-                raise RuntimeError("graph is restarting")
-            return []  # the write that would create the duplicate succeeds
+            raise RuntimeError("graph is restarting")
 
         neo4j_provider.client.execute_query = AsyncMock(side_effect=graph_flapping)
 
         with pytest.raises(RuntimeError):
             await neo4j_provider.upsert_sync_point("k1", {"cursor": "c1"}, "syncPoints")
 
-        assert not any("CREATE" in q for q in queries), queries
+        assert len(queries) == 1 and "MERGE" in queries[0], queries
 
 
 class TestVirtualAccessAndRecordLookup:
