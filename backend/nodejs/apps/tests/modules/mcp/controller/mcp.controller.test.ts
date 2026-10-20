@@ -212,9 +212,14 @@ describe('MCP Controller — handleMCPRequest', () => {
   // Token extraction
   // =========================================================================
   describe('code-graph tools', () => {
-    it('registers the code-graph tools on the server before it connects', async () => {
-      const registered: string[] = []
-      let connectedAfter = -1
+    let fetchStub: sinon.SinonStub
+    let registered: string[]
+    let connectedAfter: number
+
+    beforeEach(() => {
+      fetchStub = sinon.stub(globalThis, 'fetch')
+      registered = []
+      connectedAfter = -1
       mcpServerExports.createMCPServer = sinon.stub().returns({
         server: {
           registerTool: (name: string) => { registered.push(name) },
@@ -225,11 +230,61 @@ describe('MCP Controller — handleMCPRequest', () => {
       sdkTransportExports.StreamableHTTPServerTransport = class {
         async handleRequest() {}
       }
-      const req = createMockRequest({ headers: { authorization: 'Bearer t' }, body: {} })
+    })
+
+    const repos = (list: unknown[]) =>
+      new Response(JSON.stringify({ repos: list }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    // A distinct user per test: the repo check is cached per caller.
+    const serve = async (userId: string, body: unknown, user: Record<string, unknown> = {}) => {
+      const req = createMockRequest({
+        headers: { authorization: 'Bearer t' },
+        user: { userId, orgId: 'org-1', ...user },
+        body,
+      })
       await handleMCPRequest(appConfig)(req, createMockResponse() as any, createMockNext())
+    }
+    const list = { jsonrpc: '2.0', id: 1, method: 'tools/list' }
+
+    it('registers them before connecting when the caller can read a repo', async () => {
+      fetchStub.resolves(repos([{ repo: 'acme/shop' }]))
+      await serve('cg-has-repo', list)
 
       expect(registered).to.deep.equal([...CODE_GRAPH_TOOL_NAMES])
       expect(connectedAfter).to.equal(registered.length)
+      expect(fetchStub.firstCall.args[0]).to.match(/\/api\/v1\/code-graph\/repos$/)
+    })
+
+    it('leaves them out when the caller can read no repo', async () => {
+      fetchStub.resolves(repos([]))
+      await serve('cg-no-repo', list)
+      expect(registered).to.deep.equal([])
+    })
+
+    it('leaves them out for an OAuth token without code:read, without asking', async () => {
+      await serve('cg-no-scope', list, { isOAuth: true, oauthScopes: ['semantic:read', 'connector:read'] })
+      expect(registered).to.deep.equal([])
+      expect(fetchStub.called).to.equal(false)
+    })
+
+    it('registers them for an OAuth token with code:read', async () => {
+      fetchStub.resolves(repos([{ repo: 'acme/shop' }]))
+      await serve('cg-scoped', list, { isOAuth: true, oauthScopes: ['code:read'] })
+      expect(registered).to.deep.equal([...CODE_GRAPH_TOOL_NAMES])
+    })
+
+    it('registers them for a call to a code tool', async () => {
+      fetchStub.resolves(repos([{ repo: 'acme/shop' }]))
+      await serve('cg-call', { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'pipeshub_code_read' } })
+      expect(registered).to.deep.equal([...CODE_GRAPH_TOOL_NAMES])
+    })
+
+    it('does not check repos for requests that cannot reach a code tool', async () => {
+      await serve('cg-other', { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+      await serve('cg-other', { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'pipeshub_search' } })
+      expect(fetchStub.called).to.equal(false)
+      expect(registered).to.deep.equal([])
     })
   })
 

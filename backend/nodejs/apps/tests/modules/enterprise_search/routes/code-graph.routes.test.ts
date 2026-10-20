@@ -13,7 +13,7 @@ function jsonResponse(status: number, body: unknown): Response {
   })
 }
 
-function reposHandler(): (req: any, res: any, next: any) => Promise<void> {
+function reposStack(): any[] {
   const container = new Container()
   container.bind<AuthMiddleware>('AuthMiddleware').toConstantValue({
     authenticate: (_req: any, _res: any, next: any) => next(),
@@ -23,8 +23,11 @@ function reposHandler(): (req: any, res: any, next: any) => Promise<void> {
     (l: any) => l.route?.path === '/repos' && l.route.methods.get,
   ) as any
   // authenticate, requireScopes, handler
-  return layer.route.stack[2].handle
+  return layer.route.stack.map((l: any) => l.handle)
 }
+
+const reposHandler = () => reposStack()[2]
+const reposScopeCheck = () => reposStack()[1]
 
 describe('Code-graph dashboard route', () => {
   let fetchStub: sinon.SinonStub
@@ -60,5 +63,24 @@ describe('Code-graph dashboard route', () => {
     expect(next.calledOnce).to.equal(true)
     expect(next.firstCall.args[0]).to.be.instanceOf(Error)
     expect(res.json.called).to.equal(false)
+  })
+
+  it('needs code:read on an OAuth token, not semantic:read', () => {
+    const check = reposScopeCheck()
+    const oauth = (oauthScopes: string[]) => ({ user: { isOAuth: true, oauthScopes } })
+
+    const refused = sinon.spy()
+    check(oauth(['semantic:read', 'connector:read']), {}, refused)
+    expect(refused.firstCall.args[0]?.message).to.include('code:read')
+
+    const allowed = sinon.spy()
+    check(oauth(['code:read']), {}, allowed)
+    expect(allowed.firstCall.args).to.deep.equal([])
+  })
+
+  it('lets a signed-in dashboard session through without scopes', () => {
+    const next = sinon.spy()
+    reposScopeCheck()({ user: { userId: 'u1', orgId: 'o1' } }, {}, next)
+    expect(next.firstCall.args).to.deep.equal([])
   })
 })

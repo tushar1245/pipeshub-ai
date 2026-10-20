@@ -242,11 +242,21 @@ async def test_repos_route_reports_each_repos_graph_status() -> None:
     assert by_repo["acme/admin"]["last_error"] == "boom"
 
 
-async def test_an_oauth_token_without_connector_read_is_refused() -> None:
-    user = {"orgId": ORG, "userId": USER, "isOAuth": True, "oauthScopes": ["semantic:write"],
+@pytest.mark.parametrize("scopes", [["semantic:write"], ["connector:read", "semantic:read"]])
+async def test_an_oauth_token_without_code_read_is_refused(scopes: list[str]) -> None:
+    """Tokens minted before code:read existed lose access until re-issued."""
+    user = {"orgId": ORG, "userId": USER, "isOAuth": True, "oauthScopes": scopes,
             "token_type": "regular"}
     res = _client(Repos(), user=user).get("/api/v1/code-graph/repos")
     assert res.status_code == 403
+    assert "code:read" in res.json()["detail"]
+
+
+async def test_an_oauth_token_with_code_read_is_served() -> None:
+    user = {"orgId": ORG, "userId": USER, "isOAuth": True, "oauthScopes": ["code:read"],
+            "token_type": "regular"}
+    res = _client(Repos(), user=user).get("/api/v1/code-graph/repos")
+    assert res.status_code == 200
 
 
 async def test_a_storage_failure_is_explicit() -> None:

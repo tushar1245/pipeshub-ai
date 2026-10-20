@@ -4,7 +4,8 @@
  * The curated tools come from @pipeshub-ai/mcp, which has none for code; these
  * are registered beside them on the same per-request server. Each forwards the
  * caller's own bearer token to the query service's `/api/v1/code-graph`
- * routes, which check the OAuth scope and every record's ACL.
+ * routes, which check the OAuth scope (`code:read`) and every record's ACL.
+ * The controller registers them only for callers who can use them.
  */
 
 import { z } from 'zod';
@@ -43,6 +44,9 @@ const READ_ONLY = {
 };
 
 const TIMEOUT_MS = 60_000;
+
+// The code graph is new; hosts show this to the model and the user.
+const EXPERIMENTAL = '[Experimental] ';
 
 const repo = z
   .string()
@@ -141,6 +145,45 @@ export const CODE_GRAPH_TOOL_NAMES = [
   'pipeshub_code_entry_points',
 ] as const;
 
+const REPOS_CHECK_TIMEOUT_MS = 5_000;
+const REPOS_CHECK_TTL_MS = 60_000;
+const REPOS_CHECK_MAX_ENTRIES = 10_000;
+// shortcut: per-process cache, so a newly connected repo can take up to the TTL
+// to show its tools on each replica; move to Redis if that lag matters.
+const reposCheckCache = new Map<string, { has: boolean; at: number }>();
+
+/**
+ * Whether the caller can read at least one indexed repo, so a client in an org
+ * without a code connector is not shown nine tools that can only fail. Asks
+ * the same `/repos` route pipeshub_code_repos does, cached per caller. When the
+ * query service cannot answer, counts as yes: the tools then report the outage
+ * themselves instead of silently vanishing.
+ */
+export async function callerHasCodeRepos(
+  deps: CodeGraphToolDeps,
+  cacheKey: string,
+): Promise<boolean> {
+  const hit = reposCheckCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < REPOS_CHECK_TTL_MS) return hit.has;
+  try {
+    const response = await new AIServiceCommand<{ repos?: unknown[] }>({
+      uri: `${deps.aiBackend}/api/v1/code-graph/repos`,
+      method: HttpMethod.GET,
+      headers: { Authorization: deps.authorization },
+      timeoutMs: REPOS_CHECK_TIMEOUT_MS,
+      maxAttempts: 1,
+    }).execute();
+    if (response.statusCode === 401 || response.statusCode === 403) return false;
+    if (response.statusCode >= 400) return true;
+    const has = (response.data?.repos?.length ?? 0) > 0;
+    if (reposCheckCache.size >= REPOS_CHECK_MAX_ENTRIES) reposCheckCache.clear();
+    reposCheckCache.set(cacheKey, { has, at: Date.now() });
+    return has;
+  } catch {
+    return true;
+  }
+}
+
 export function registerCodeGraphTools(
   server: ToolRegistrar,
   deps: CodeGraphToolDeps,
@@ -149,7 +192,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_repos',
     {
       description:
-        'List the indexed code repositories you can read. Every other ' +
+        EXPERIMENTAL + 'List the indexed code repositories you can read. Every other ' +
         'pipeshub_code_* tool takes one of these names as `repo`.',
       annotations: READ_ONLY,
     },
@@ -160,7 +203,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_symbols',
     {
       description:
-        'What a directory or file in an indexed repo holds. `select` a directory ' +
+        EXPERIMENTAL + 'What a directory or file in an indexed repo holds. `select` a directory ' +
         '(lists its children), a file (the symbols it defines, with line ranges) ' +
         'or a glob (`src/**`). Results are ranked by how connected each symbol is.',
       inputSchema: {
@@ -197,7 +240,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_neighbours',
     {
       description:
-        'Callers, callees, imports and inheritance of a file or symbol: what ' +
+        EXPERIMENTAL + 'Callers, callees, imports and inheritance of a file or symbol: what ' +
         'reaches it (`direction: "inbound"`) and what it reaches (`"outbound"`). Each row ' +
         `has repo, file_path, line range and qualified name. ${COVERAGE}`,
       inputSchema: {
@@ -227,7 +270,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_read',
     {
       description:
-        'Read indexed source: one symbol (`qualified_name`), a line range ' +
+        EXPERIMENTAL + 'Read indexed source: one symbol (`qualified_name`), a line range ' +
         '(`lines: "380-420"`), or a whole file (bounded by `max_lines`; the result ' +
         'says where it stopped). Reads the indexed copy, which can lag the repo.',
       inputSchema: {
@@ -252,7 +295,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_path',
     {
       description:
-        'How symbol A reaches symbol B in one repo, hop by hop with a sentence ' +
+        EXPERIMENTAL + 'How symbol A reaches symbol B in one repo, hop by hop with a sentence ' +
         'per hop. If only B reaches A, that path comes back with `reversed: true`. ' +
         `Edges across languages or over HTTP are not in the graph. ${COVERAGE}`,
       inputSchema: {
@@ -290,7 +333,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_search',
     {
       description:
-        'Find code without knowing its file. `mode: "identifier"` (default) lists every ' +
+        EXPERIMENTAL + 'Find code without knowing its file. `mode: "identifier"` (default) lists every ' +
         'definition with that name. `mode: "text"` or `"regex"` finds lines in file bodies ' +
         '(a string, a call site, a config key); these need `path` and read at most 100 files.',
       inputSchema: {
@@ -314,7 +357,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_outline',
     {
       description:
-        "A file's classes, functions and methods with signatures, decorators, first doc " +
+        EXPERIMENTAL + "A file's classes, functions and methods with signatures, decorators, first doc " +
         'line and line ranges — no bodies. Read before pipeshub_code_read to pick what to read.',
       inputSchema: {
         repo,
@@ -331,7 +374,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_impact',
     {
       description:
-        'What changing a symbol can break: everything that calls, imports or builds on it, ' +
+        EXPERIMENTAL + 'What changing a symbol can break: everything that calls, imports or builds on it, ' +
         `followed backwards up to \`depth\` hops, grouped by file. ${COVERAGE}`,
       inputSchema: {
         repo,
@@ -350,7 +393,7 @@ export function registerCodeGraphTools(
     'pipeshub_code_entry_points',
     {
       description:
-        'Where control enters a repo: functions nothing in it calls (routes, CLIs, jobs, ' +
+        EXPERIMENTAL + 'Where control enters a repo: functions nothing in it calls (routes, CLIs, jobs, ' +
         `hooks), conventional names and files first. ${COVERAGE}`,
       inputSchema: {
         repo: repoRequired,

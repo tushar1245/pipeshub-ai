@@ -40,7 +40,7 @@ ToolCall = Callable[[CodeGraph, CodeRepo], Awaitable[tuple[bool, str]]]
 
 router = APIRouter(
     prefix="/code-graph",
-    dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))],
+    dependencies=[Depends(require_scopes(OAuthScopes.CODE_READ))],
 )
 
 # Claude Code warns on a tool result past 10k tokens and cuts it at 25k; at
