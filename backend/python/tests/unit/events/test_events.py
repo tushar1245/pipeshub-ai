@@ -467,6 +467,58 @@ def _make_multi_collection_event_processor():
     return ep, graph_provider
 
 
+class TestCheckDuplicateMd5UnscannedTwin:
+    """A code file must not inherit a twin indexed before secret redaction:
+    its vectors and blob hold the raw content."""
+
+    @staticmethod
+    def _setup(twin_mark):
+        ep, _, _, gp = _make_event_processor()
+        twin = {
+            "_key": "twin", "virtualRecordId": "vr-shared", "recordType": "CODE_FILE",
+            "indexingStatus": ProgressStatus.COMPLETED.value,
+            "extractionStatus": ProgressStatus.COMPLETED.value,
+        }
+        if twin_mark is not None:
+            twin["secretsRedacted"] = twin_mark
+        gp.find_duplicate_records.return_value = [twin]
+        doc = {
+            "_key": "r1", "orgId": "org-1", "virtualRecordId": "vr-shared",
+            "md5Checksum": "abc", "recordType": "CODE_FILE", "sizeInBytes": 10,
+        }
+        return ep, gp, doc
+
+    @pytest.mark.asyncio
+    async def test_unscanned_completed_twin_is_not_reused(self):
+        ep, gp, doc = self._setup(twin_mark=None)
+
+        result = await ep._check_duplicate_by_md5(b"x", doc, scans_for_secrets=True)
+
+        assert result.skip_indexing is False
+        assert result.rebuild_shared_vrid is True
+        gp.copy_document_relationships.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mark", [0, 2])
+    async def test_scanned_twin_is_still_reused_and_lends_its_mark(self, mark):
+        ep, gp, doc = self._setup(twin_mark=mark)
+
+        with patch("app.events.events.get_epoch_timestamp_in_ms", return_value=100):
+            result = await ep._check_duplicate_by_md5(b"x", doc, scans_for_secrets=True)
+
+        assert result.skip_indexing is True
+        assert doc["secretsRedacted"] == mark
+
+    @pytest.mark.asyncio
+    async def test_records_not_scanned_reuse_any_twin(self):
+        ep, _, doc = self._setup(twin_mark=None)
+
+        with patch("app.events.events.get_epoch_timestamp_in_ms", return_value=100):
+            result = await ep._check_duplicate_by_md5(b"x", doc)
+
+        assert result.skip_indexing is True
+
+
 class TestCheckDuplicateMd5CrossCollectionMatrix:
     @pytest.mark.asyncio
     async def test_same_collection_completed_duplicate_skips_indexing(self):
@@ -2840,6 +2892,7 @@ def _finished_duplicate(calls: list | None = None) -> Callable[..., Awaitable[De
     async def _check(
         content: object, doc: dict,
         before_reusing_status: Callable[[], Awaitable[None]] | None = None,
+        **_: object,
     ) -> DedupDecision:
         if before_reusing_status is not None:
             await before_reusing_status()

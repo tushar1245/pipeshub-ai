@@ -285,7 +285,7 @@ async def test_secrets_are_redacted_before_the_parsing_service_sees_the_bytes() 
     assert b"CANARYSECRET" not in payload
 
 
-async def test_a_clean_file_writes_no_redaction_count() -> None:
+async def test_a_clean_file_records_that_it_was_scanned() -> None:
     processor = _legacy_processor()
     ep = _make_event_processor(processor=processor)
     _as_code_file(ep, "text/plain")
@@ -293,7 +293,8 @@ async def test_a_clean_file_writes_no_redaction_count() -> None:
     await _drain(ep, _repository_event("main.py", "text/plain", b"x = 1\n"))
 
     assert processor.process_code_document.call_args.kwargs["code_binary"] == b"x = 1\n"
-    assert _recorded_redactions(ep) == []
+    # 0, not absent: dedup reuses only twins that carry the mark.
+    assert _recorded_redactions(ep) == [0]
 
 
 _LEAKY_COMPOSE = b'services:\n  db:\n    environment:\n      DB_PASSWORD: "CANARYSECRET-7f3a9c1e5b2d4086"\n'

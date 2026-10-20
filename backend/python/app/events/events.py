@@ -424,7 +424,8 @@ class EventProcessor:
                 "Redacted %s secret(s) (%s) from %s before indexing",
                 result.count, ", ".join(result.kinds), record_name,
             )
-        if result.count != (doc.get("secretsRedacted") or 0):
+        # Written even when 0: its presence is what tells dedup the content was scanned.
+        if result.count != doc.get("secretsRedacted"):
             await self.update_record_fields(doc, {"secretsRedacted": result.count})
         return redacted if result.count else content
 
@@ -852,6 +853,8 @@ class EventProcessor:
         content: bytes | str | dict | list | None,
         doc: dict[str, Any],
         before_reusing_status: Callable[[], Awaitable[None]] | None = None,
+        *,
+        scans_for_secrets: bool = False,
     ) -> DedupDecision:
         """Check for duplicate records by MD5 hash and decide whether to skip indexing.
 
@@ -867,6 +870,9 @@ class EventProcessor:
         ``before_reusing_status`` runs just before a finished duplicate's
         ``indexingStatus`` is copied onto this record, for work that has to be
         in place by the time the record reads as done.
+
+        ``scans_for_secrets`` records are not attached to a finished twin
+        that was never scanned: its vectors and blob hold the raw content.
         """
         # Calculate MD5 from content
         existing_md5_checksum = doc.get("md5Checksum")
@@ -933,7 +939,9 @@ class EventProcessor:
             return DedupDecision()
 
         if match.is_processed:
-            return await self._reuse_finished_duplicate(doc, match, before_reusing_status)
+            return await self._reuse_finished_duplicate(
+                doc, match, before_reusing_status, scans_for_secrets=scans_for_secrets
+            )
 
         if not match.same_collection:
             # In flight, but for a different collection — waiting would buy
@@ -987,6 +995,7 @@ class EventProcessor:
                 doc,
                 DuplicateMatch(record=twin, same_collection=True, is_processed=True),
                 before_reusing_status,
+                scans_for_secrets=scans_for_secrets,
             )
         if will_promote_queued_copies(twin, enrichment_live_after_ms):
             return DedupDecision(skip_indexing=True)
@@ -1021,8 +1030,22 @@ class EventProcessor:
         doc: dict[str, Any],
         match: DuplicateMatch,
         before_reusing_status: Callable[[], Awaitable[None]] | None = None,
+        *,
+        scans_for_secrets: bool = False,
     ) -> DedupDecision:
         attached_vrid = match.record.get("virtualRecordId")
+
+        if scans_for_secrets and match.record.get("secretsRedacted") is None:
+            # Indexed before redaction existed: reusing it would keep the
+            # secrets searchable for good. Rebuilding a shared VRID redacts
+            # the twin's copy too.
+            self.logger.info(
+                "Duplicate %s was never scanned for secrets; indexing %s instead of reusing it",
+                _record_key(match.record), _record_key(doc),
+            )
+            return DedupDecision(
+                rebuild_shared_vrid=doc.get("virtualRecordId") == attached_vrid
+            )
 
         if (
             attached_vrid
@@ -1132,6 +1155,11 @@ class EventProcessor:
                     {
                         "virtualRecordId": vrid,
                         "summaryDocumentId": twin.get("summaryDocumentId"),
+                        # Lets this copy be reused as a scanned twin in turn.
+                        **(
+                            {"secretsRedacted": twin["secretsRedacted"]}
+                            if twin.get("secretsRedacted") is not None else {}
+                        ),
                     },
                 ),
                 "Failed to persist duplicate record fields",
@@ -1337,6 +1365,12 @@ class EventProcessor:
             self.logger.debug(f"file_content type: {type(file_content)} length: {content_len}")
             record_type = doc.get("recordType")
             is_code = _is_code_file(mime_type, code_ext)
+            reads_as_code_file = self._reads_as_code_file(
+                record_type, mime_type, code_ext, record_name
+            )
+            scans_for_secrets = self._scans_for_secrets(
+                record_type, reads_as_code_file=reads_as_code_file
+            )
 
             # The blob and the vectors are shared through the duplicate's
             # virtualRecordId, but block nodes are keyed by record, so a deduped
@@ -1375,7 +1409,8 @@ class EventProcessor:
             # Calculate MD5 hash and check for duplicates for ALL record types
             try:
                 dedup_decision = await self._check_duplicate_by_md5(
-                    file_content, doc, before_reusing_status=before_reusing_status
+                    file_content, doc, before_reusing_status=before_reusing_status,
+                    scans_for_secrets=scans_for_secrets,
                 )
                 if dedup_decision.skip_indexing:
                     self.logger.info("Duplicate record detected, skipping processing")
@@ -1561,10 +1596,7 @@ class EventProcessor:
                 ),
             )
 
-            reads_as_code_file = self._reads_as_code_file(
-                record_type, mime_type, code_ext, record_name
-            )
-            if self._scans_for_secrets(record_type, reads_as_code_file=reads_as_code_file):
+            if scans_for_secrets:
                 # Once, ahead of both pipelines: blocks, embeddings, LLM
                 # extraction and read_code all derive from these bytes.
                 file_content = await self._redact_code_secrets(doc, record_name, file_content)
