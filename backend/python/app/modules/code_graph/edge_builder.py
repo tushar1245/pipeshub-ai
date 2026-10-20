@@ -883,6 +883,8 @@ class _Builder:
         from the file's own IMPORTS facts, which a package `__init__.py` keeps on
         its nodes. Bounded, like barrel chains.
         """
+        if family == "js":
+            return self._follow_barrel(file_path, name, {file_path}, depth)
         # Only a package `__init__.py` keeps its imports on its nodes; following any
         # other module's imports would see them on a full build and not on an
         # incremental one, and the two must agree.
@@ -905,6 +907,27 @@ class _Builder:
                 if hit:
                     return hit
         return None
+
+    def _follow_barrel(self, file_path: str, name: str, seen: set[str], depth: int = 0) -> str | None:
+        """`import { f } from "@pkg/common"` with an index.ts of `export * from "./a"`, `"./b"`, …:
+        the one module behind the barrel that defines ``f``.
+
+        `walk_barrel_chain` stops at a barrel with several re-exports, where the name's
+        module is decided by the name itself. Two definitions behind it is ambiguous and
+        binds nothing. Read from `re_exports`, which every row feeds, so an incremental
+        build follows the same chains as a full one.
+        """
+        if depth >= _MAX_REEXPORT_HOPS:
+            return None
+        hits = set()
+        for onward in sorted(self.re_exports.get(file_path, ())):
+            if onward in seen:
+                continue
+            hit = self._top_level_in_file(onward, name) or self._follow_barrel(
+                onward, name, seen | {onward}, depth + 1)
+            if hit:
+                hits.add(hit)
+        return hits.pop() if len(hits) == 1 else None
 
     def _enclosing_type(self, block_id: str) -> str | None:
         """The class a block sits in, through any intermediate scopes.
