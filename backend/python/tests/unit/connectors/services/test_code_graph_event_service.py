@@ -215,3 +215,15 @@ async def test_chained_runs_stop_at_the_bound() -> None:
             break
     assert len(runs) == module._MAX_CHAINED_RUNS + 1
     await manager.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_disabled_code_graph_acks_without_building(monkeypatch) -> None:
+    from app.modules.code_graph import enabled
+    monkeypatch.setattr(enabled, "CODE_GRAPH_ENABLED", False)
+    runner = MagicMock()
+    runner.acquire = AsyncMock()
+    service = CodeGraphEventService(MagicMock(), runner, SyncTaskManager(label="t"))
+    assert await service.process_event(EventTypes.BUILD_CODE_EDGES.value, {
+        "orgId": "org-1", "connectorId": "connector-1", "recordGroupId": "repo-1"})
+    runner.acquire.assert_not_awaited()

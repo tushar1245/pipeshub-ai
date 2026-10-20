@@ -236,3 +236,13 @@ async def test_the_sweep_loop_survives_a_failed_sweep_and_stops_when_cancelled(m
     log.exception.assert_called_once()
     assert 30 <= sleeps[0] <= 90
     assert all(100 <= s <= 110 for s in sleeps[1:])
+
+
+@pytest.mark.asyncio
+async def test_disabled_code_graph_runs_no_sweep(monkeypatch) -> None:
+    from app.modules.code_graph import enabled
+    monkeypatch.setattr(enabled, "CODE_GRAPH_ENABLED", False)
+    sweeps = AsyncMock()
+    monkeypatch.setattr(edge_build_reconciler, "reconcile_once", sweeps)
+    await edge_build_reconciler.reconcile_forever(MagicMock(), MagicMock(), MagicMock())
+    sweeps.assert_not_awaited()

@@ -3,6 +3,7 @@ import asyncio
 from types import SimpleNamespace
 
 from app.modules.parsers.code_parser.code_file_parser import CodeFileParser
+from app.modules.transformers import code_units as code_units_module
 from app.modules.transformers.vectorstore import _SPARSE_EXTRA, _build_code_documents
 
 
@@ -32,7 +33,7 @@ def test_a_nested_function_is_embedded_once() -> None:
 
 
 def test_a_long_symbol_is_split_and_every_piece_names_it(monkeypatch) -> None:
-    monkeypatch.setenv("CODE_EMBED_UNIT_TOKENS", "64")
+    monkeypatch.setattr(code_units_module, "UNIT_TOKENS", 64)
     body = "\n".join(f"    total_{i} = compute_line_value({i}, factor)" for i in range(60))
     docs = _docs(f'def long_report(factor):\n    """Build the report."""\n{body}\n    return total_0\n',
                  "r.py")

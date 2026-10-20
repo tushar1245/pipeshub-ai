@@ -16,6 +16,7 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+from app.modules.code_graph import enabled as code_graph_switch
 from app.modules.code_graph.build_state import BuildStateStore, PendingBuild, is_due
 from app.telemetry.modules import code_graph_metrics
 from app.utils.env_config import env_seconds
@@ -152,6 +153,9 @@ async def reconcile_forever(
     crash-looping on a build from starting that build again the moment it
     comes up; jitter keeps replicas that restarted together out of lockstep.
     """
+    if not code_graph_switch.CODE_GRAPH_ENABLED:
+        log.info("CODE_GRAPH_ENABLED is false; code edge build reconciler not running")
+        return
     await asyncio.sleep(random.uniform(*_FIRST_SWEEP_DELAY_SECONDS))
     while True:
         try:

@@ -13,6 +13,11 @@ from app.modules.code_graph.version import CODE_GRAPH_VERSION
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _backfill_on(monkeypatch) -> None:
+    monkeypatch.setenv("CODE_GRAPH_BACKFILL", "true")
+
+
 def _graph(records: list[dict], blocks: dict[str, tuple[int, int]]) -> MagicMock:
     """``blocks``: group -> (all blocks, blocks at the current version)."""
     graph = MagicMock()
@@ -62,4 +67,27 @@ async def test_each_stale_repo_is_asked_to_reindex_once_per_version() -> None:
     config.get_config = AsyncMock(return_value={"done": True})
     kafka.publish_event.reset_mock()
     assert await run_code_graph_backfill(config, graph, kafka, MagicMock(), pause_seconds=0) == 0
+    kafka.publish_event.assert_not_awaited()
+
+
+async def test_without_the_flag_nothing_is_reindexed(monkeypatch) -> None:
+    """Off by default: re-indexing every repo on deploy is an admin's call."""
+    monkeypatch.delenv("CODE_GRAPH_BACKFILL")
+    graph = _graph([_record("r1", "never")], {})
+    kafka = MagicMock()
+    kafka.publish_event = AsyncMock()
+    log = MagicMock()
+    assert await run_code_graph_backfill(MagicMock(), graph, kafka, log, pause_seconds=0) == 0
+    kafka.publish_event.assert_not_awaited()
+    graph.get_documents_paginated.assert_not_awaited()
+    assert "CODE_GRAPH_BACKFILL=true" in log.info.call_args.args[0]
+
+
+async def test_the_kill_switch_skips_it_even_with_the_flag(monkeypatch) -> None:
+    from app.modules.code_graph import enabled
+    monkeypatch.setattr(enabled, "CODE_GRAPH_ENABLED", False)
+    graph = _graph([_record("r1", "never")], {})
+    kafka = MagicMock()
+    kafka.publish_event = AsyncMock()
+    assert await run_code_graph_backfill(MagicMock(), graph, kafka, MagicMock(), pause_seconds=0) == 0
     kafka.publish_event.assert_not_awaited()
