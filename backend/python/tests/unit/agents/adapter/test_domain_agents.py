@@ -559,7 +559,7 @@ class TestSharedToolNames:
 
         assert "codegraph__get_neighbour" in registry.resolve_by_name("coding_agent")._spec.tool_names
         assert "codegraph__get_neighbour" not in (
-            registry.resolve_by_name("calculator_agent")._spec.tool_names)
+            registry.resolve_by_name("web_agent")._spec.tool_names)
         assert "codegraph__get_neighbour" in top_names
 
     def test_defaults_to_empty_and_changes_nothing(self) -> None:

@@ -1504,7 +1504,7 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
             # Also create _id for compatibility
             arango_node["_id"] = f"{collection}/{arango_node['id']}"
 
-        return self._decode_json_fields(arango_node, collection)
+        return Neo4jProvider._decode_json_fields(arango_node, collection)
 
     @staticmethod
     def _decode_json_fields(node: dict, collection: str) -> dict:
