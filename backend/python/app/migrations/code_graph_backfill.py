@@ -7,9 +7,18 @@ partial or stale symbol table until every file changes. This asks the
 repo's connector to re-index it -- the same event the "Reindex" action
 sends -- and the build that follows the drain does the rest.
 
-Runs once per PARSER_VERSION (the flag carries it), in the connectors
-service's post-startup task. Repos are asked one at a time, a few seconds
-apart, so an install with many repos does not flood indexing at once.
+Off by default: it runs only with CODE_GRAPH_BACKFILL=true (and
+CODE_GRAPH_ENABLED not false), since it re-indexes every such repo at once on
+deploy. Then it runs once per PARSER_VERSION (the flag carries it), in the
+connectors service's post-startup task, one repo at a time a few seconds apart
+so an install with many repos does not flood indexing at once.
+
+Without the flag an admin builds a repo's graph by re-indexing it: the
+record-group reindex (POST /api/v1/record-groups/{id}/reindex, depth -1) sends
+the event this module sends, or the connector reindex with statusFilters
+["COMPLETED"] (without filters it re-indexes FAILED records only). Each code
+file re-indexed is projected to blocks before it is marked COMPLETED, and the
+edge build requested once the repo drains writes the edges.
 """
 from __future__ import annotations
 
@@ -18,7 +27,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from app.config.constants.arangodb import CollectionNames, ProgressStatus, RecordTypes
 from app.connectors.services.reindex_events import build_reindex_event
+from app.modules.code_graph import enabled as code_graph_switch
 from app.modules.code_graph.version import PARSER_VERSION
+from app.utils.env_utils import env_bool
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 if TYPE_CHECKING:
@@ -88,6 +99,13 @@ async def run_code_graph_backfill(
     Returns how many repos were asked. A failure leaves the flag unset, so the
     next start tries again; asking twice is harmless (the reindex task dedupes).
     """
+    if not code_graph_switch.CODE_GRAPH_ENABLED:
+        logger.info("Code graph backfill skipped: CODE_GRAPH_ENABLED is false")
+        return 0
+    if not env_bool("CODE_GRAPH_BACKFILL", False):
+        logger.info("Code graph backfill skipped: set CODE_GRAPH_BACKFILL=true or reindex "
+                    "a connector to build its code graph")
+        return 0
     flag_key = f"{MIGRATION_FLAG_PREFIX}{PARSER_VERSION}"
     try:
         flag = await config_service.get_config(flag_key, use_cache=False)

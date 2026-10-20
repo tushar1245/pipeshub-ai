@@ -33,6 +33,7 @@ from app.models.blocks import (
     Point,
 )
 from app.models.entities import Record, RecordType
+from app.modules.code_graph import enabled as code_graph_switch
 from app.modules.code_graph.block_projection import (
     BlockProjectionContext,
     drop_code_file_blocks,
@@ -1857,6 +1858,8 @@ class Processor:
         table the file is missing from, which yields wrong edges rather than
         absent ones.
         """
+        if not code_graph_switch.CODE_GRAPH_ENABLED:
+            return
         try:
             if not file_path:
                 file_path = await self._lookup_code_file_path(record_id)

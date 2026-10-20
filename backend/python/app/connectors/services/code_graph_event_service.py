@@ -8,6 +8,7 @@ from app.connectors.core.sync.task_manager import (
     SyncTaskManager,
     code_edge_build_task_manager,
 )
+from app.modules.code_graph import enabled as code_graph_switch
 from app.telemetry.modules import code_graph_metrics
 
 # Chained runs in a row before what is still owed is left to the reconciler: a pending
@@ -41,6 +42,9 @@ class CodeGraphEventService:
     ) -> bool:
         if event_type != EventTypes.BUILD_CODE_EDGES.value:
             self._logger.error("Unknown code graph event type: %s", event_type)
+            return True
+        if not code_graph_switch.CODE_GRAPH_ENABLED:
+            self._logger.debug("CODE_GRAPH_ENABLED is false; dropping buildCodeEdges")
             return True
 
         scope = (

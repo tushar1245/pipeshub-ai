@@ -778,6 +778,18 @@ class TestRequestCodeEdges:
             assert "edgeBuildFullRequestId" not in call.kwargs["sync_point_data"]
 
     @pytest.mark.asyncio
+    async def test_disabled_code_graph_asks_for_nothing(self, monkeypatch) -> None:
+        from app.modules.code_graph import enabled
+        monkeypatch.setattr(enabled, "CODE_GRAPH_ENABLED", False)
+        handler = _make_handler()
+        await handler._request_code_edge_build_for_deleted({
+            "recordId": "record-1", "orgId": "org-1", "connectorId": "connector-1",
+            "recordGroupId": "repo-1-code-repository", "connectorName": "GitLab",
+        })
+        handler.event_processor.graph_provider.upsert_sync_point.assert_not_awaited()
+        handler.producer.send_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_deleting_anything_else_asks_for_nothing(self) -> None:
         handler = _make_handler()
         await handler._request_code_edge_build_for_deleted({

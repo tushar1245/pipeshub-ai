@@ -3809,6 +3809,15 @@ class TestProjectCodeBlocksToGraph:
              pytest.raises(RuntimeError, match="graph down"):
             await proc.project_code_blocks_to_graph(**self._kwargs(propagate_failure=True))
 
+    @pytest.mark.asyncio
+    async def test_disabled_code_graph_projects_nothing(self, monkeypatch) -> None:
+        from app.modules.code_graph import enabled
+        monkeypatch.setattr(enabled, "CODE_GRAPH_ENABLED", False)
+        proc, _, _, _ = _make_processor()
+        with patch("app.events.processor.write_code_file_blocks_to_graph", AsyncMock()) as write:
+            await proc.project_code_blocks_to_graph(**self._kwargs(propagate_failure=True))
+        write.assert_not_awaited()
+
 
 class TestProcessCodeDocumentProjection:
     @pytest.mark.asyncio

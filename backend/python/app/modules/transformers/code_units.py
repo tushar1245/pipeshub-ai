@@ -12,8 +12,6 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from app.utils.env_config import env_int
-
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -28,10 +26,9 @@ _FILLER_KINDS = frozenset({"statements", "imports", "comment", "header"})
 _ELIDED = "    …"
 
 
-def unit_token_budget() -> int:
-    """Tokens per code unit. Defaults to 512, the window of the default local
-    embedding model; a larger remote model only gains from smaller, focused units."""
-    return max(64, env_int("CODE_EMBED_UNIT_TOKENS", 512))
+# Tokens per code unit: the window of the default local embedding model. Not a
+# setting, since changing it mixes unit sizes in the vector index until a re-embed.
+UNIT_TOKENS = 512
 
 
 @dataclass(frozen=True)
@@ -49,7 +46,7 @@ def code_units(blocks: list, header_of: Callable[[Any], str], *,
                budget: int | None = None) -> list[CodeUnit]:
     """``exceeds(text, n)`` is the cheap over-n-tokens test; ``token_len`` and
     ``split_long_line`` are only used on a symbol that has to be split."""
-    budget = budget or unit_token_budget()
+    budget = budget or UNIT_TOKENS
     nested = _nested_line_ranges(blocks)
     units: list[CodeUnit] = []
     for block in blocks:

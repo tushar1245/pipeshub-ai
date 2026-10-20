@@ -100,6 +100,7 @@ from app.models.permission import (
     RETIRED_ROLES,
     read_role,
 )
+from app.modules.code_graph.build_state import SYNC_POINT_SUFFIX as CODE_EDGE_BUILD_SUFFIX
 from app.modules.code_graph.edge_build_trigger import is_code_record
 from app.modules.named_entities.graph_ops import (
     NamedEntityGraphMixin,
@@ -1368,12 +1369,22 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
             # Business-key uniqueness (e.g. Person.(orgId, email)). Creation fails on a
             # label that already holds duplicates, hence the same tolerant handling as above.
             # The sync point key constraint cannot be created over duplicates the
-            # unconstrained upsert already made; keep each key's latest write.
+            # unconstrained upsert already made. Only code-edge-build points are
+            # ours to collapse; another connector's duplicates are left alone and
+            # the constraint skipped until they are resolved.
+            sync_point_duplicates_remain = True
             try:
                 await self._remove_duplicate_sync_points()
+                sync_point_duplicates_remain = await self._count_duplicate_sync_point_keys() > 0
             except Exception as e:
                 self.logger.warning(f"Sync point de-duplication failed: {str(e)}")
             business_key_constraints = self._generate_business_key_constraints()
+            if sync_point_duplicates_remain:
+                self.logger.warning(
+                    "Skipping syncpoint_key_unique: sync points of other connectors share a "
+                    "syncPointKey; they are not deleted automatically")
+                business_key_constraints = [
+                    q for q in business_key_constraints if "syncpoint_key_unique" not in q]
 
             for constraint_query in business_key_constraints:
                 try:
@@ -9059,21 +9070,35 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
             return None
 
     async def _remove_duplicate_sync_points(self) -> int:
-        """Delete all but the latest-written sync point of each duplicated key."""
+        """Delete all but the latest-written code-edge-build sync point of each
+        duplicated key. Other sync points carry connector state and are never touched."""
         label = collection_to_label(CollectionNames.SYNC_POINTS.value)
         rows = await self.client.execute_query(f"""
-            MATCH (sp:{label}) WHERE sp.syncPointKey IS NOT NULL
+            MATCH (sp:{label}) WHERE sp.syncPointKey ENDS WITH $suffix
             WITH sp ORDER BY coalesce(sp.updatedAtTimestamp, 0) DESC
             WITH sp.syncPointKey AS key, collect(sp) AS points
             WHERE size(points) > 1
             UNWIND points[1..] AS extra
+            WITH key, extra
             DETACH DELETE extra
-            RETURN count(*) AS removed
-        """)
-        removed = int(rows[0].get("removed") or 0) if rows else 0
+            RETURN key, count(*) AS removed
+        """, {"suffix": f"/{CODE_EDGE_BUILD_SUFFIX}"})
+        removed = sum(int(r.get("removed") or 0) for r in rows or [])
         if removed:
-            self.logger.warning(f"Removed {removed} duplicate sync point(s) before adding the key constraint")
+            self.logger.warning(
+                f"Removed {removed} duplicate code-edge-build sync point(s) before adding the "
+                f"key constraint: {[r.get('key') for r in rows]}")
         return removed
+
+    async def _count_duplicate_sync_point_keys(self) -> int:
+        label = collection_to_label(CollectionNames.SYNC_POINTS.value)
+        rows = await self.client.execute_query(f"""
+            MATCH (sp:{label}) WHERE sp.syncPointKey IS NOT NULL
+            WITH sp.syncPointKey AS key, count(sp) AS n
+            WHERE n > 1
+            RETURN count(key) AS keys
+        """)
+        return int(rows[0].get("keys") or 0) if rows else 0
 
     async def upsert_sync_point(
         self,

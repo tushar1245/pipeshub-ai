@@ -168,8 +168,10 @@ spec:
               value: {{ .Values.config.codeEdgeBuildMaxBlocks | quote }}
             - name: CODE_EDGE_BUILD_MAX_FAILURES
               value: {{ .Values.config.codeEdgeBuildMaxFailures | quote }}
-            - name: CODE_EMBED_UNIT_TOKENS
-              value: {{ .Values.config.codeEmbedUnitTokens | quote }}
+            - name: CODE_GRAPH_ENABLED
+              value: {{ .Values.config.codeGraphEnabled | quote }}
+            - name: CODE_GRAPH_BACKFILL
+              value: {{ .Values.config.codeGraphBackfill | quote }}
             - name: GOVERNOR_INDEX_HEADROOM
               value: {{ .Values.config.governorIndexHeadroom | quote }}
             - name: GOVERNOR_INDEX_MAX

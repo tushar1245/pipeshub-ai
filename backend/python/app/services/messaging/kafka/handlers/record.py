@@ -46,6 +46,7 @@ from app.modules.indexing.connector_off_events import (
     resuming_enrichment as record_resuming_enrichment,
 )
 from app.modules.code_graph import edge_build_trigger
+from app.modules.code_graph import enabled as code_graph_switch
 from app.modules.code_graph.build_state import (
     BuildStateStore,
     claimed_build_already_ran,
@@ -809,6 +810,8 @@ class RecordEventHandler(BaseEventService):
     async def _ask_for_code_edge_build(
         self, org_id: str, connector_id: str, record_group_id: str, *, full: bool = False
     ) -> None:
+        if not code_graph_switch.CODE_GRAPH_ENABLED:
+            return
         graph_provider = self.event_processor.graph_provider
         store = BuildStateStore(graph_provider, self.logger)
         if full:

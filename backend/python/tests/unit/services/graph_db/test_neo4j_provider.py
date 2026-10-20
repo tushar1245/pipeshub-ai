@@ -6197,3 +6197,45 @@ class TestGetUserKbPermissionLogging:
 
         assert any("No permission found" in r.getMessage() for r in caplog.records)
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+class TestStartupDedupeTouchesOnlyCodeEdgeBuildSyncPoints:
+    """A boot deleted all but the newest sync point of every duplicated key, for every connector."""
+
+    @staticmethod
+    def _mock_client(provider: Neo4jProvider, duplicate_keys_left: int) -> None:
+        async def run(query, parameters=None, **_):
+            if "DETACH DELETE extra" in query:
+                return []
+            if "RETURN count(key) AS keys" in query:
+                return [{"keys": duplicate_keys_left}]
+            return []
+        provider.client.execute_query = AsyncMock(side_effect=run)
+        provider.heal_taxonomy_alias_nodes = AsyncMock()
+        provider._initialize_departments = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_the_delete_is_scoped_to_code_edge_build_keys(self, neo4j_provider: Neo4jProvider) -> None:
+        neo4j_provider.client.execute_query = AsyncMock(return_value=[{"key": "rg1/code-edge-build", "removed": 2}])
+        assert await neo4j_provider._remove_duplicate_sync_points() == 2
+        call = neo4j_provider.client.execute_query.await_args
+        assert "sp.syncPointKey ENDS WITH $suffix" in call.args[0]
+        assert call.args[1] == {"suffix": "/code-edge-build"}
+
+    @pytest.mark.asyncio
+    async def test_other_connectors_duplicates_skip_the_constraint_instead(
+        self, neo4j_provider: Neo4jProvider
+    ) -> None:
+        self._mock_client(neo4j_provider, duplicate_keys_left=1)
+        assert await neo4j_provider.ensure_schema()
+        queries = [c.args[0] for c in neo4j_provider.client.execute_query.await_args_list]
+        deletes = [q for q in queries if "DETACH DELETE" in q]
+        assert len(deletes) == 1 and "ENDS WITH $suffix" in deletes[0]
+        assert not any("syncpoint_key_unique" in q for q in queries)
+
+    @pytest.mark.asyncio
+    async def test_without_other_duplicates_the_constraint_is_created(self, neo4j_provider: Neo4jProvider) -> None:
+        self._mock_client(neo4j_provider, duplicate_keys_left=0)
+        assert await neo4j_provider.ensure_schema()
+        queries = [c.args[0] for c in neo4j_provider.client.execute_query.await_args_list]
+        assert any("syncpoint_key_unique" in q for q in queries)
