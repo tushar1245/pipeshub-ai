@@ -7,6 +7,7 @@ Covers:
 """
 from __future__ import annotations
 
+import base64
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -474,3 +475,23 @@ class TestMrCommentAdditionalPaths:
         )
         assert len(blocks) == 1
         assert "[New file]" in blocks[0].data
+
+    async def test_secrets_in_file_content_and_diff_are_redacted(self) -> None:
+        c, helper = self._make_mr_helper()
+        key = "AKIAIOSFODNN7EXAMPLA"
+        file_change = {
+            "new_path": "cfg.py", "diff": f"+AWS_KEY = '{key}'", "new_file": True,
+            "deleted_file": False, "generated_file": False, "too_large": False,
+        }
+        file_obj = MagicMock()
+        file_obj.content = base64.b64encode(f"AWS_KEY = '{key}'\n".encode()).decode()
+        c.runtime.ds_call = AsyncMock(side_effect=[
+            _ok_res([]), _ok_res({"changes": [file_change]}), _ok_res(MagicMock(sha="abc")),
+            _ok_res(file_obj),
+        ])
+
+        blocks, _ = await helper.build_merge_request_comment_blocks(
+            "https://gitlab.com/ns/proj/-/merge_requests/1", 0, _make_record()
+        )
+        assert key not in blocks[0].data
+        assert blocks[0].data.count("«REDACTED:aws-access-key»") == 2
