@@ -59,7 +59,7 @@ class FakeGraphProvider:
             return {"_key": key, "filePath": self.code_files[key], **self.changed_names.get(key, {})}
         return None
 
-    async def update_node(self, key, collection, updates, transaction=None):
+    async def update_node(self, key, collection, updates, transaction=None) -> bool:
         if collection == CollectionNames.CODE_FILES.value:
             if "referencedNames" in updates:
                 self.referenced_names[key] = tuple(updates["referencedNames"] or ())
@@ -161,19 +161,19 @@ class FakeGraphProvider:
         for key in doomed:
             self.blocks.pop(key)
 
-    async def batch_upsert_nodes(self, nodes, collection, transaction=None):
+    async def batch_upsert_nodes(self, nodes, collection, transaction=None) -> bool:
         for node in nodes:
             doc = dict(node)
             doc["_key"] = doc.pop("id")
             self.blocks[doc["_key"]] = doc
         return True
 
-    async def delete_nodes(self, keys, collection, transaction=None):
+    async def delete_nodes(self, keys, collection, transaction=None) -> bool:
         for key in keys:
             self.blocks.pop(key, None)
         return True
 
-    async def batch_upsert_node_relations(self, edges, transaction=None):
+    async def batch_upsert_node_relations(self, edges, transaction=None) -> bool:
         # Both providers update a matching edge in place.
         index = {(e["_from"], e["_to"], e["relationshipType"]): e for e in self.edges}
         for edge in edges:

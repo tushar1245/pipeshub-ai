@@ -12,7 +12,10 @@ from __future__ import annotations
 import posixpath
 import sys
 from collections import Counter
-from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 __all__ = ["ImportResolution", "resolve_import_specifier"]
 

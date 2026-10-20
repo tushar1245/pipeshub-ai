@@ -7,8 +7,8 @@ came back as a plain `found: False`, which reads as "no path exists".
 import pytest
 
 from app.agents.actions.code_graph import path as path_mod
-from app.agents.actions.code_graph.path import MAX_PATH_DEPTH, find_symbol_path_impl
 from app.agents.actions.code_graph.ops import STRUCTURAL_RELATIONS
+from app.agents.actions.code_graph.path import MAX_PATH_DEPTH, find_symbol_path_impl
 from app.agents.actions.code_graph.results import without_marker
 
 from .conftest import BLOCKS, CONN, ORG, USER, FakeGraphProvider

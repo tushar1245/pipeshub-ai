@@ -6,7 +6,6 @@ from app.config.constants.arangodb import CollectionNames, ProgressStatus
 from app.services.graph_db.arango.arango_http_provider import ArangoHTTPProvider
 from app.services.graph_db.neo4j.neo4j_provider import Neo4jProvider
 
-
 FILTERS = {"orgId": "org-1", "recordGroupId": "repo-1"}
 IN_FILTERS = {
     "indexingStatus": [

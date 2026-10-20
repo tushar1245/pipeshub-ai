@@ -231,7 +231,7 @@ def test_qualified_names_survive_an_edit_above_them():
 
 
 
-def test_an_unnamed_span_keeps_its_key_when_lines_shift_above_it():
+def test_an_unnamed_span_keeps_its_key_when_lines_shift_above_it() -> None:
     """Keyed by scope and content, not line range (P-10): an edit above a
     statement must not re-key it, and an edit to it must."""
     def key(src, kind):
@@ -282,13 +282,13 @@ def test_tiles_real_repository_files(suffix):
 class TestNesting:
     """Only a top-level type is a group; everything nested is a block."""
 
-    def test_a_top_level_class_is_a_group_even_with_no_members(self):
+    def test_a_top_level_class_is_a_group_even_with_no_members(self) -> None:
         src = b"class Foo:\n    pass\n"
         container = parse(src, "m.py")
         assert [g.name for g in container.block_groups] == ["Foo"]
         assert reconstruct(container).encode() == src
 
-    def test_a_nested_class_is_a_block_not_a_group(self):
+    def test_a_nested_class_is_a_block_not_a_group(self) -> None:
         src = b"class A:\n    class B:\n        def c(self):\n            pass\n"
         container = parse(src, "m.py")
         assert [g.name for g in container.block_groups] == ["A"]
@@ -298,7 +298,7 @@ class TestNesting:
         assert kinds["c"] == "method"
         assert reconstruct(container).encode() == src
 
-    def test_nested_definitions_are_excluded_from_the_tiling(self):
+    def test_nested_definitions_are_excluded_from_the_tiling(self) -> None:
         """A nested definition repeats bytes its parent already owns, so it
         carries parent_block_index and stays out of the reconstruction."""
         src = b"def outer():\n    def inner():\n        return 1\n    return inner()\n"
@@ -308,7 +308,7 @@ class TestNesting:
         assert by_name["inner"].data["text"] in by_name["outer"].data["text"]
         assert reconstruct(container).encode() == src
 
-    def test_a_local_variable_never_becomes_a_field(self):
+    def test_a_local_variable_never_becomes_a_field(self) -> None:
         # Fields belong to types. Tiling a callable's body would turn every
         # local into one, which DEFINES would then point at.
         src = b"def go():\n    x = 1\n    return x\n"
@@ -317,7 +317,7 @@ class TestNesting:
                 if b.type is BlockType.CODE] == ["function"]
 
 
-def test_a_syntax_error_is_recorded_on_the_file_summary():
+def test_a_syntax_error_is_recorded_on_the_file_summary() -> None:
     container = parse(b"def ok():\n    return 1\n\ndef broken(:\n    pass\n", "m.py", "src/m.py")
     summary = next(b for b in container.blocks if b.type is BlockType.RECORD_SUMMARY)
     assert summary.data["parse_error_line"] == 4

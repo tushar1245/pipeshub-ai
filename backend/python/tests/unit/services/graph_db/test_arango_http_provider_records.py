@@ -3522,7 +3522,7 @@ class TestDeleteConnectorInstance:
         assert result["success"] is True
         assert result["connector_id"] == "c1"
 
-    async def test_blocks_go_before_the_transaction_opens(self, connected_provider):
+    async def test_blocks_go_before_the_transaction_opens(self, connected_provider) -> None:
         """A code connector's blocks, deleted inside the transaction, could exceed
         its size or time limit and roll the whole delete back on every retry."""
         order: list[str] = []
@@ -3929,11 +3929,11 @@ class TestCheckConnectorNameExists:
 # ===================================================================
 
 class TestDeleteBlocksForRecords:
-    async def test_empty_record_ids_is_a_noop(self, connected_provider):
+    async def test_empty_record_ids_is_a_noop(self, connected_provider) -> None:
         assert await connected_provider.delete_blocks_for_records([]) == 0
         connected_provider.http_client.execute_aql.assert_not_called()
 
-    async def test_deletes_edges_before_blocks(self, connected_provider):
+    async def test_deletes_edges_before_blocks(self, connected_provider) -> None:
         connected_provider.http_client.execute_aql = AsyncMock(
             side_effect=[["b1", "b2"], [1, 1, 1], [1, 1]]
         )
@@ -3952,7 +3952,7 @@ class TestDeleteBlocksForRecords:
         for call in (select_call, edge_call, node_call):
             assert call.kwargs["txn_id"] == "txn1"
 
-    async def test_a_large_delete_pages_until_a_short_batch(self, connected_provider, monkeypatch):
+    async def test_a_large_delete_pages_until_a_short_batch(self, connected_provider, monkeypatch) -> None:
         from app.services.graph_db.arango import arango_http_provider as module
 
         monkeypatch.setattr(module, "BLOCK_DELETE_BATCH_SIZE", 2)

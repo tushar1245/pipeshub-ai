@@ -54,7 +54,7 @@ def _make_parse_result(*, empty: bool = False) -> ParseResult:
 def _project_code_blocks_mock() -> AsyncMock:
     """Autospec'd: a caller passing a kwarg the real processor does not accept
     fails here instead of at runtime."""
-    from app.events.processor import Processor  # noqa: PLC0415
+    from app.events.processor import Processor
 
     return create_autospec(Processor, instance=True).project_code_blocks_to_graph
 

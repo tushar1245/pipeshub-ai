@@ -288,7 +288,10 @@ class TestInternalToolsetKeys:
     def test_no_real_internal_tool_reads_as_a_live_service(self) -> None:
         """Every tool path an internal toolset declares, as the agent names it."""
         from app.agents.registry.toolset_registry import get_toolset_registry
-        from app.modules.agents.context.tool_surface import _FALLBACK_INTERNAL_PREFIXES, _tool_prefixes
+        from app.modules.agents.context.tool_surface import (
+            _FALLBACK_INTERNAL_PREFIXES,
+            _tool_prefixes,
+        )
 
         registry = get_toolset_registry()
         snapshot = dict(registry._toolsets)

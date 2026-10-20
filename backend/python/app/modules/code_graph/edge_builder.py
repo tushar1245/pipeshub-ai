@@ -14,7 +14,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from app.config.constants.arangodb import CollectionNames, RecordRelations, RecordTypes
-from app.modules.code_graph.facts_source import CodeFactsSource
 from app.modules.code_graph.guards import (
     lang_family,
     path_proximity_winner,
@@ -23,11 +22,13 @@ from app.modules.code_graph.guards import (
 from app.modules.code_graph.import_resolution import ImportResolution
 from app.modules.code_graph.module_refs import module_refs_of_path
 from app.modules.code_graph.symbol_index import SymbolIndex
-from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.env_config import env_int
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable, Iterator
+
+    from app.modules.code_graph.facts_source import CodeFactsSource
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 
 __all__ = ["CODE_GRAPH_SOURCE", "EdgeBuildAbortedError", "EdgeBuildResult", "build_code_graph_edges"]
 
@@ -1127,7 +1128,7 @@ class _Builder:
         return False
 
 
-def _chunks(items: list, size: int = _WRITE_CHUNK):
+def _chunks(items: list, size: int = _WRITE_CHUNK) -> Iterator[list]:
     for start in range(0, len(items), size):
         yield items[start:start + size]
 

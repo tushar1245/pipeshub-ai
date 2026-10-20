@@ -20,7 +20,10 @@ from typing import TYPE_CHECKING, Any
 from app.models.entities import RecordType
 
 if TYPE_CHECKING:
-    from app.agent_loop_lib.hooks.middleware.context import ToolResultContext, TurnContext
+    from app.agent_loop_lib.hooks.middleware.context import (
+        ToolResultContext,
+        TurnContext,
+    )
     from app.agent_loop_lib.hooks.middleware.pipeline import Middleware, Next
     from app.agents.agent_loop.context import AgentContext
 

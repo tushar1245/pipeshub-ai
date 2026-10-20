@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.config.constants.arangodb import CollectionNames
+from app.modules.code_graph import build_state
 from app.modules.code_graph.build_state import (
     BuildOutcome,
     BuildState,
@@ -20,7 +21,6 @@ from app.modules.code_graph.build_state import (
     still_owed,
     sync_point_key_for,
 )
-from app.modules.code_graph import build_state
 from app.modules.code_graph.version import EDGE_RULES_VERSION
 from tests.unit.modules.code_graph.sync_point_fakes import FakeSyncPoints
 

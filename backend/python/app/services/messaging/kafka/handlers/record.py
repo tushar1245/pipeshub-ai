@@ -113,6 +113,7 @@ from app.utils.user_errors import (
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
+
     from app.modules.transformers.entity_vectorstore import EntityVectorStore
 
 RECONCILE_ATTEMPTS = 2

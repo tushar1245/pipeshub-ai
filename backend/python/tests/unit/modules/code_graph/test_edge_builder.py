@@ -59,7 +59,7 @@ def _import_target_files(graph) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_cross_file_call_resolves_with_import_evidence(graph, index_file):
+async def test_cross_file_call_resolves_with_import_evidence(graph, index_file) -> None:
     await index_file("recH", "src/helpers.py", HELPERS, "python")
     await index_file("recC", "src/client.py", CLIENT, "python")
     await _build(graph)
@@ -74,7 +74,7 @@ async def test_cross_file_call_resolves_with_import_evidence(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_member_call_resolves_through_the_type_table(graph, index_file):
+async def test_member_call_resolves_through_the_type_table(graph, index_file) -> None:
     await index_file("recH", "src/helpers.py", HELPERS, "python")
     await index_file("recC", "src/client.py", CLIENT, "python")
     await _build(graph)
@@ -83,7 +83,7 @@ async def test_member_call_resolves_through_the_type_table(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_imports_are_sourced_from_the_imports_block(graph, index_file):
+async def test_imports_are_sourced_from_the_imports_block(graph, index_file) -> None:
     """The innermost block containing the statement owns the edge.
 
     Sourcing this from the file record would attribute the dependency to the
@@ -105,7 +105,7 @@ async def test_imports_are_sourced_from_the_imports_block(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_name_emits_no_edge(graph, index_file):
+async def test_ambiguous_name_emits_no_edge(graph, index_file) -> None:
     # Two files define handle(); a third calls it with no import to disambiguate.
     await index_file("recA", "src/a.py", b"def handle(x):\n    return x\n", "python")
     await index_file("recB", "src/b.py", b"def handle(x):\n    return x\n", "python")
@@ -117,7 +117,7 @@ async def test_ambiguous_name_emits_no_edge(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_cross_language_calls_do_not_bind(graph, index_file):
+async def test_cross_language_calls_do_not_bind(graph, index_file) -> None:
     await index_file("recPy", "src/a.py", b"def validate(x):\n    return x\n", "python")
     await index_file(
         "recTs", "src/b.ts", b"export function go(){ return validate(1); }\n", "typescript"
@@ -128,7 +128,7 @@ async def test_cross_language_calls_do_not_bind(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_package_import_does_not_bind_to_a_same_named_repo_symbol(graph, index_file):
+async def test_package_import_does_not_bind_to_a_same_named_repo_symbol(graph, index_file) -> None:
     """`import { Box } from "@mui/material"` names a package, not a repo file.
 
     With no file to point at, the name alone is all that is left, and the one
@@ -148,7 +148,7 @@ async def test_package_import_does_not_bind_to_a_same_named_repo_symbol(graph, i
 
 
 @pytest.mark.asyncio
-async def test_js_call_without_import_is_dropped(graph, index_file):
+async def test_js_call_without_import_is_dropped(graph, index_file) -> None:
     # ES modules have no implicit cross-module scope.
     await index_file("recA", "src/a.ts", b"export function helper(){ return 1; }\n", "typescript")
     await index_file("recB", "src/b.ts", b"export function use(){ return helper(); }\n", "typescript")
@@ -163,7 +163,7 @@ async def _index_barrel_repo(index_file) -> None:
 
 
 @pytest.mark.asyncio
-async def test_barrel_chain_resolves_to_the_defining_module(graph, index_file):
+async def test_barrel_chain_resolves_to_the_defining_module(graph, index_file) -> None:
     await _index_barrel_repo(index_file)
     await _build(graph)
 
@@ -172,7 +172,7 @@ async def test_barrel_chain_resolves_to_the_defining_module(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_barrel_chain_survives_an_incremental_rebuild(graph, index_file):
+async def test_barrel_chain_survives_an_incremental_rebuild(graph, index_file) -> None:
     """Only the importer changed, so the barrel is not in the re-resolve set.
 
     Its re-export hop still has to be on the table, or the walk stops at
@@ -188,7 +188,7 @@ async def test_barrel_chain_survives_an_incremental_rebuild(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_module_qualified_call_resolves(graph, index_file):
+async def test_module_qualified_call_resolves(graph, index_file) -> None:
     """`import analysis; analysis.analyze_game()`.
 
     The receiver is a module, so the type table can never carry it -- this has
@@ -205,7 +205,7 @@ async def test_module_qualified_call_resolves(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_module_qualified_call_to_unknown_module_emits_nothing(graph, index_file):
+async def test_module_qualified_call_to_unknown_module_emits_nothing(graph, index_file) -> None:
     # chess.engine is third-party: no file in the repo, so no edge.
     await index_file("recA", "analysis.py", b"def popen_uci(x):\n    return x\n", "python")
     await index_file(
@@ -218,7 +218,7 @@ async def test_module_qualified_call_to_unknown_module_emits_nothing(graph, inde
 
 
 @pytest.mark.asyncio
-async def test_inheritance_resolves_across_files(graph, index_file):
+async def test_inheritance_resolves_across_files(graph, index_file) -> None:
     await index_file("recBase", "src/base.py", b"class Base:\n    pass\n", "python")
     await index_file("recSub", "src/sub.py", b"from .base import Base\n\nclass Sub(Base):\n    pass\n", "python")
     await _build(graph)
@@ -226,7 +226,7 @@ async def test_inheritance_resolves_across_files(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_non_test_definition_wins_the_tie(graph, index_file):
+async def test_non_test_definition_wins_the_tie(graph, index_file) -> None:
     await index_file("recSrc", "src/impl.py", b"def shared():\n    return 1\n", "python")
     await index_file("recTest", "tests/impl.py", b"def shared():\n    return 2\n", "python")
     await index_file("recUse", "src/use.py", b"def go():\n    return shared()\n", "python")
@@ -239,7 +239,7 @@ async def test_non_test_definition_wins_the_tie(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_dry_run_writes_nothing(graph, index_file):
+async def test_dry_run_writes_nothing(graph, index_file) -> None:
     await index_file("recH", "src/helpers.py", HELPERS, "python")
     await index_file("recC", "src/client.py", CLIENT, "python")
     result = await _build(graph, dry_run=True)
@@ -249,7 +249,7 @@ async def test_dry_run_writes_nothing(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_rebuild_is_idempotent(graph, index_file):
+async def test_rebuild_is_idempotent(graph, index_file) -> None:
     await index_file("recH", "src/helpers.py", HELPERS, "python")
     await index_file("recC", "src/client.py", CLIENT, "python")
     first = await _build(graph)
@@ -272,7 +272,7 @@ class TestIncrementalInvalidation:
     B_WITHOUT = b"def other(x):\n    return x\n"
     B_RENAMED = b"def bar(x):\n    return x\n"
 
-    async def _setup(self, index_file, graph):
+    async def _setup(self, index_file, graph) -> None:
         await index_file("recA", "src/a.py", self.CALLER, "python")
         await index_file("recB", "src/b.py", self.B_WITH, "python")
         await build_code_graph_edges(
@@ -281,7 +281,7 @@ class TestIncrementalInvalidation:
         assert graph.edge_targets(RecordRelations.CALLS.value) == ["function:foo"]
 
     @pytest.mark.asyncio
-    async def test_target_deleted_drops_the_edge(self, graph, index_file):
+    async def test_target_deleted_drops_the_edge(self, graph, index_file) -> None:
         await self._setup(index_file, graph)
         await index_file("recB", "src/b.py", self.B_WITHOUT, "python")
         await build_code_graph_edges(
@@ -292,7 +292,7 @@ class TestIncrementalInvalidation:
         assert graph.edge_targets(RecordRelations.CALLS.value) == []
 
     @pytest.mark.asyncio
-    async def test_target_added_creates_the_edge(self, graph, index_file):
+    async def test_target_added_creates_the_edge(self, graph, index_file) -> None:
         await self._setup(index_file, graph)
         await index_file("recB", "src/b.py", self.B_WITHOUT, "python")
         await build_code_graph_edges(
@@ -307,7 +307,7 @@ class TestIncrementalInvalidation:
         assert graph.edge_targets(RecordRelations.CALLS.value) == ["function:foo"]
 
     @pytest.mark.asyncio
-    async def test_target_renamed_drops_the_edge(self, graph, index_file):
+    async def test_target_renamed_drops_the_edge(self, graph, index_file) -> None:
         await self._setup(index_file, graph)
         await index_file("recB", "src/b.py", self.B_RENAMED, "python")
         await build_code_graph_edges(
@@ -317,7 +317,7 @@ class TestIncrementalInvalidation:
         assert graph.edge_targets(RecordRelations.CALLS.value) == []
 
     @pytest.mark.asyncio
-    async def test_untouched_files_keep_their_edges(self, graph, index_file):
+    async def test_untouched_files_keep_their_edges(self, graph, index_file) -> None:
         await self._setup(index_file, graph)
         await index_file("recC", "src/c.py", b"def unrelated():\n    return 1\n", "python")
         await build_code_graph_edges(

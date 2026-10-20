@@ -45,7 +45,7 @@ def test_parsing_is_deterministic():
     assert hashes(first) == hashes(second)
 
 
-def test_only_a_top_level_container_becomes_a_group():
+def test_only_a_top_level_container_becomes_a_group() -> None:
     # A nested class is a block like a method -- one span, addressable, with its
     # own members hung off it. Groups never nest.
     container = CodeFileParser().parse_to_blocks(NESTED_PY, "mod.py", "src/mod.py", "python")
@@ -59,7 +59,7 @@ def test_only_a_top_level_container_becomes_a_group():
     assert inner.parent_block_index is None
 
 
-def test_a_nested_definition_hangs_off_the_block_enclosing_it():
+def test_a_nested_definition_hangs_off_the_block_enclosing_it() -> None:
     container = CodeFileParser().parse_to_blocks(NESTED_PY, "mod.py", "src/mod.py", "python")
     by_name = _blocks_by_name(container)
     run, inner = by_name["run"], by_name["Inner"]
@@ -71,7 +71,7 @@ def test_a_nested_definition_hangs_off_the_block_enclosing_it():
     assert run.code_metadata.qualified_name == "method:Outer.Inner.run"
 
 
-def test_a_function_nested_in_a_function_is_a_block_of_its_own():
+def test_a_function_nested_in_a_function_is_a_block_of_its_own() -> None:
     src = b"def outer():\n    def inner():\n        return 1\n    return inner()\n"
     container = CodeFileParser().parse_to_blocks(src, "m.py", "src/m.py", "python")
     by_name = _blocks_by_name(container)
@@ -80,7 +80,7 @@ def test_a_function_nested_in_a_function_is_a_block_of_its_own():
     assert by_name["inner"].code_metadata.qualified_name == "function:outer.inner"
 
 
-def test_an_empty_class_is_still_a_group():
+def test_an_empty_class_is_still_a_group() -> None:
     # Nothing to tile, but it stays a group so members added later have a home
     # and the record keeps one node per top-level type.
     container = CodeFileParser().parse_to_blocks(
@@ -184,13 +184,13 @@ async def test_parse_prefers_the_file_name_over_the_extension_it_was_given() -> 
     assert result.metadata["language"] == "python"
 
 
-def test_calls_attach_to_the_enclosing_symbol():
+def test_calls_attach_to_the_enclosing_symbol() -> None:
     container = CodeFileParser().parse_to_blocks(NESTED_PY, "mod.py", "src/mod.py", "python")
     run = _blocks_by_name(container)["run"]
     assert [e["toName"] for e in run.code_metadata.pending_edges] == ["helper"]
 
 
-def test_builtin_method_calls_on_untyped_receivers_are_dropped():
+def test_builtin_method_calls_on_untyped_receivers_are_dropped() -> None:
     """`d.get()` / `s.lower()` can never resolve -- resolution needs a receiver
     type, and these receivers are language primitives. Recording them would only
     bloat a traversed node."""
@@ -205,7 +205,7 @@ def go(payload, label):
     assert [e["toName"] for e in go.code_metadata.pending_edges] == ["custom"]
 
 
-def test_typed_receiver_keeps_a_builtin_named_method():
+def test_typed_receiver_keeps_a_builtin_named_method() -> None:
     # `client.get()` where client is a repo type must survive: it is resolvable.
     src = b'''
 def go():
@@ -218,7 +218,7 @@ def go():
     assert get["receiverType"] == "Client"
 
 
-def test_builtins_do_not_become_edges():
+def test_builtins_do_not_become_edges() -> None:
     src = b"def go():\n    print(len([1]))\n    return custom()\n"
     container = CodeFileParser().parse_to_blocks(src, "a.py", "src/a.py", "python")
     go = _blocks_by_name(container)["go"]
@@ -226,7 +226,7 @@ def test_builtins_do_not_become_edges():
     assert names == ["custom"]
 
 
-def test_typescript_heritage_and_type_table():
+def test_typescript_heritage_and_type_table() -> None:
     src = b'''
 export class Service extends Base implements Runnable {
   run(id: string) {

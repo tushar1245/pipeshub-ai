@@ -449,7 +449,7 @@ class TestStartMessagingProducer:
 class TestStartKafkaConsumers:
     """Tests for start_kafka_consumers()."""
 
-    async def test_success_all_consumers(self):
+    async def test_success_all_consumers(self) -> None:
         from app.connectors_main import start_kafka_consumers
 
         mock_container = _make_container()
@@ -481,7 +481,7 @@ class TestStartKafkaConsumers:
         assert consumers[1] == ("sync", mock_sync_consumer)
         assert consumers[2] == ("code_graph", mock_code_graph_consumer)
 
-    async def test_a_code_graph_consumer_failure_keeps_the_sync_consumers(self):
+    async def test_a_code_graph_consumer_failure_keeps_the_sync_consumers(self) -> None:
         """The code graph is optional; it must not take entity and sync events down."""
         from app.connectors_main import start_kafka_consumers
 
@@ -507,7 +507,7 @@ class TestStartKafkaConsumers:
         mock_entity_consumer.stop.assert_not_awaited()
         mock_sync_consumer.stop.assert_not_awaited()
 
-    async def test_a_failed_code_graph_consumer_is_retried_until_it_runs(self):
+    async def test_a_failed_code_graph_consumer_is_retried_until_it_runs(self) -> None:
         """A boot-time broker hiccup used to leave the code graph without a
         consumer until the next restart."""
         import asyncio
@@ -706,13 +706,13 @@ class TestOptionalComponentRetry:
     """The reconciler and code-graph consumer retry with backoff instead of
     staying down until a restart."""
 
-    async def test_the_delay_doubles_and_status_clears_on_success(self):
+    async def test_the_delay_doubles_and_status_clears_on_success(self) -> None:
         import app.connectors_main as cm
 
         attempt = AsyncMock(side_effect=[RuntimeError("a"), RuntimeError("b"), None])
         sleeps = []
 
-        async def fake_sleep(delay):
+        async def fake_sleep(delay) -> None:
             sleeps.append(delay)
 
         with patch("app.connectors_main.asyncio.sleep", side_effect=fake_sleep):
@@ -722,13 +722,13 @@ class TestOptionalComponentRetry:
         assert attempt.await_count == 3
         assert "code_edge_reconciler" not in cm._component_status
 
-    async def test_the_delay_is_capped(self):
+    async def test_the_delay_is_capped(self) -> None:
         import app.connectors_main as cm
 
         attempt = AsyncMock(side_effect=[RuntimeError("x")] * 8 + [None])
         sleeps = []
 
-        async def fake_sleep(delay):
+        async def fake_sleep(delay) -> None:
             sleeps.append(delay)
 
         with patch("app.connectors_main.asyncio.sleep", side_effect=fake_sleep):
@@ -736,7 +736,7 @@ class TestOptionalComponentRetry:
 
         assert max(sleeps) == cm._RETRY_MAX_DELAY_SECONDS
 
-    async def test_shutdown_cancels_a_pending_retry(self):
+    async def test_shutdown_cancels_a_pending_retry(self) -> None:
         import asyncio
 
         import app.connectors_main as cm
@@ -1411,7 +1411,7 @@ class TestConnectorHealthCheck:
             ({"entity": True, "sync": False, "code_graph": True}, 503, "fail"),
         ],
     )
-    async def test_health_tells_required_from_optional_consumers(self, running, status_code, status):
+    async def test_health_tells_required_from_optional_consumers(self, running, status_code, status) -> None:
         import app.connectors_main as cm
 
         cm._started_consumers[:] = [
@@ -1426,7 +1426,7 @@ class TestConnectorHealthCheck:
         assert result.status_code == status_code
         assert body["status"] == status
 
-    async def test_a_retrying_reconciler_is_degraded_not_down(self):
+    async def test_a_retrying_reconciler_is_degraded_not_down(self) -> None:
         import app.connectors_main as cm
 
         cm._component_status["code_edge_reconciler"] = {"state": "retrying", "attempts": 2, "error": "boom"}
@@ -1440,7 +1440,7 @@ class TestConnectorHealthCheck:
         assert body["status"] == "degraded"
         assert body["components"]["code_edge_reconciler"]["attempts"] == 2
 
-    async def test_consumers_that_failed_to_start_fail_health(self):
+    async def test_consumers_that_failed_to_start_fail_health(self) -> None:
         import app.connectors_main as cm
 
         cm._component_status["message_consumers"] = {"state": "failed", "error": "kafka down"}

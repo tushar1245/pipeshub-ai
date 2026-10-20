@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Any, Never
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1500,7 +1500,7 @@ class TestConnectorFlagsReachChatState:
     async def _captured_kwargs(self, **connectors) -> dict[str, Any]:
         seen: dict[str, Any] = {}
 
-        def _capture(*args, **kwargs):
+        def _capture(*args, **kwargs) -> Never:
             seen.update(kwargs)
             raise RuntimeError("stop here — the call is what is under test")
 

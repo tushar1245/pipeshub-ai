@@ -58,7 +58,7 @@ def _make_text_block(text, index=0):
 class TestFindCodeSummaryBlock:
     """The discriminator both pipelines use to pick the code prompt."""
 
-    def test_detects_parsed_source_file(self):
+    def test_detects_parsed_source_file(self) -> None:
         from app.modules.transformers.document_extraction import (
             find_code_summary_block,
         )
@@ -69,7 +69,7 @@ class TestFindCodeSummaryBlock:
         assert block.data["file_path"] == "app/services/vector/store.py"
         assert block.code_metadata.language == "python"
 
-    def test_returns_none_for_a_document(self):
+    def test_returns_none_for_a_document(self) -> None:
         from app.modules.transformers.document_extraction import (
             find_code_summary_block,
         )
@@ -94,32 +94,32 @@ class TestPrepareCodeContent:
             container.blocks, summary_block, context_length, container.block_groups
         )
 
-    def test_includes_import_statements(self):
+    def test_includes_import_statements(self) -> None:
         """external_dependencies is unanswerable without the import text."""
         content = self._render()
 
         assert "from qdrant_client import QdrantClient" in content
         assert "import os" in content
 
-    def test_includes_cross_file_edges(self):
+    def test_includes_cross_file_edges(self) -> None:
         content = self._render()
 
         assert "## References to other files" in content
         assert "INHERITS: Base" in content
 
-    def test_includes_container_docstring_from_block_groups(self):
+    def test_includes_container_docstring_from_block_groups(self) -> None:
         """Top-level classes are BlockGroups, not Blocks."""
         content = self._render()
 
         assert "Persists vectors." in content
 
-    def test_includes_symbol_signature_and_docstring(self):
+    def test_includes_symbol_signature_and_docstring(self) -> None:
         content = self._render()
 
         assert "Store.upsert" in content
         assert "Write points to Qdrant." in content
 
-    def test_is_smaller_than_raw_source_for_a_large_file(self):
+    def test_is_smaller_than_raw_source_for_a_large_file(self) -> None:
         """The point of sending the symbol table instead of the file."""
         import inspect
 
@@ -137,7 +137,7 @@ class TestPrepareCodeContent:
 
         assert 0 < len(content) < len(source) / 2
 
-    def test_respects_the_token_budget(self):
+    def test_respects_the_token_budget(self) -> None:
         """A tiny context window must not produce an oversized payload."""
         from app.modules.transformers.document_extraction import count_tokens
 
@@ -172,7 +172,7 @@ class TestToSemanticMetadata:
         kwargs.update(overrides)
         return CodeClassification(**kwargs)
 
-    def test_code_fields_survive_the_mapping(self):
+    def test_code_fields_survive_the_mapping(self) -> None:
         from app.modules.transformers.document_extraction import to_semantic_metadata
 
         metadata = to_semantic_metadata(self._code_classification())
@@ -183,7 +183,7 @@ class TestToSemanticMetadata:
         assert metadata.categories == ["Indexing"]
         assert metadata.sub_category_level_1 == "Vector Store"
 
-    def test_departments_and_languages_are_lists_not_none(self):
+    def test_departments_and_languages_are_lists_not_none(self) -> None:
         """save_metadata_to_db iterates both; None raises TypeError there."""
         from app.modules.transformers.document_extraction import to_semantic_metadata
 
@@ -192,7 +192,7 @@ class TestToSemanticMetadata:
         assert metadata.departments == []
         assert metadata.languages == []
 
-    def test_blank_category_yields_no_category(self):
+    def test_blank_category_yields_no_category(self) -> None:
         """A blank one would create a Categories node named ''."""
         from app.modules.transformers.document_extraction import to_semantic_metadata
 
@@ -200,7 +200,7 @@ class TestToSemanticMetadata:
 
         assert metadata.categories == []
 
-    def test_document_classification_still_maps(self):
+    def test_document_classification_still_maps(self) -> None:
         from app.modules.transformers.document_extraction import (
             DocumentClassification,
             SubCategories,
@@ -247,7 +247,7 @@ class TestApplyRouting:
         )
 
     @pytest.mark.asyncio
-    async def test_code_file_takes_the_code_branch(self):
+    async def test_code_file_takes_the_code_branch(self) -> None:
         ext = _build_extractor()
         container = _parse()
 
@@ -267,7 +267,7 @@ class TestApplyRouting:
         assert record.semantic_metadata.architecture_role == "Service"
 
     @pytest.mark.asyncio
-    async def test_document_still_takes_the_document_branch(self):
+    async def test_document_still_takes_the_document_branch(self) -> None:
         ext = _build_extractor()
         ext.process_code_document = AsyncMock()
         ext.process_document = AsyncMock(return_value=None)
@@ -286,7 +286,7 @@ class TestApplyRouting:
         assert record.semantic_metadata is None
 
     @pytest.mark.asyncio
-    async def test_plain_file_record_never_reaches_the_code_prompt(self):
+    async def test_plain_file_record_never_reaches_the_code_prompt(self) -> None:
         """The code prompt is keyed on the record type: a source file that
         arrived as a plain FILE (a .py uploaded to a knowledge base) parses to
         a summary block but still takes the document prompt."""
@@ -307,7 +307,7 @@ class TestApplyRouting:
         ext.process_document.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_code_file_without_summary_block_falls_back(self):
+    async def test_code_file_without_summary_block_falls_back(self) -> None:
         """A CODE_FILE with no tree-sitter grammar (or a repo README) parses
         as prose, so there is no summary block for the code prompt to use."""
         ext = _build_extractor()
@@ -356,7 +356,7 @@ class TestGraphWriteAcceptsCodeMetadata:
         return transformer, tx_store
 
     @pytest.mark.asyncio
-    async def test_none_departments_do_not_raise(self):
+    async def test_none_departments_do_not_raise(self) -> None:
         """Regression: unguarded iteration failed every code record here."""
         from app.models.blocks import SemanticMetadata
 
@@ -372,9 +372,9 @@ class TestGraphWriteAcceptsCodeMetadata:
         assert status_doc["extractionStatus"] == "COMPLETED"
 
     @pytest.mark.asyncio
-    async def test_blank_category_creates_no_category_node(self):
-        from app.models.blocks import SemanticMetadata
+    async def test_blank_category_creates_no_category_node(self) -> None:
         from app.config.constants.arangodb import CollectionNames
+        from app.models.blocks import SemanticMetadata
 
         transformer, tx_store = self._transformer_with_store()
 

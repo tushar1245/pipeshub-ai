@@ -289,24 +289,24 @@ class CodeClassification(BaseModel):
     subcategories: SubCategories = Field(
         description="Nested feature/domain path for the file"
     )
-    topics: List[str] = Field(
+    topics: list[str] = Field(
         description="3 to 6 cross-cutting technical concepts as lowercase noun phrases"
     )
     summary: str = Field(
         description="2 to 4 sentence capability statement for a developer searching the codebase"
     )
-    design_patterns: List[str] = Field(
+    design_patterns: list[str] = Field(
         default_factory=list,
         description="Structural design patterns genuinely present in the file (0 to 3)",
     )
-    external_dependencies: List[str] = Field(
+    external_dependencies: list[str] = Field(
         default_factory=list,
         description="External systems, services and APIs this file talks to",
     )
 
 
 def to_semantic_metadata(
-    classification: Union[DocumentClassification, CodeClassification],
+    classification: DocumentClassification | CodeClassification,
 ) -> SemanticMetadata:
     """Map either classification shape onto the shared SemanticMetadata model.
 
@@ -359,7 +359,7 @@ def _classifies_as_code(record_type: Optional[str]) -> bool:
     return record_type == RecordType.CODE_FILE.value
 
 
-def find_code_summary_block(blocks: List[Block]) -> Optional[Block]:
+def find_code_summary_block(blocks: list[Block]) -> Optional[Block]:
     """Return the file-summary block CodeFileParser emits, if there is one.
 
     This locates the code prompt's input, it does not decide the branch — that
@@ -539,8 +539,8 @@ class DocumentExtraction(Transformer):
         departments: list[str] | None = None,
         record_name: str = "",
         record_type: str = "",
-        block_groups: Optional[List[BlockGroup]] = None,
-    ) -> Optional[Union[DocumentClassification, CodeClassification]]:
+        block_groups: Optional[list[BlockGroup]] = None,
+    ) -> Optional[DocumentClassification | CodeClassification]:
         """Extract metadata using pre-fetched *departments*.
 
         This variant is intended for use by the standalone Extraction Service
@@ -708,9 +708,9 @@ class DocumentExtraction(Transformer):
 
     async def process_code_document(
         self,
-        blocks: List[Block],
+        blocks: list[Block],
         summary_block: Block,
-        block_groups: Optional[List[BlockGroup]] = None,
+        block_groups: Optional[list[BlockGroup]] = None,
     ) -> Optional[CodeClassification]:
         """Classify a source file using the code-specific prompt.
 
@@ -771,10 +771,10 @@ class DocumentExtraction(Transformer):
 
     def _prepare_code_content(
         self,
-        blocks: List[Block],
+        blocks: list[Block],
         summary_block: Block,
         context_length: int,
-        block_groups: Optional[List[BlockGroup]] = None,
+        block_groups: Optional[list[BlockGroup]] = None,
     ) -> str:
         """Render the parsed file as structured text for the LLM.
 
@@ -791,7 +791,7 @@ class DocumentExtraction(Transformer):
         """
         MAX_TOKENS = int(context_length * CONTENT_TOKEN_RATIO)
         total_tokens = 0
-        sections: List[str] = []
+        sections: list[str] = []
 
         def add(section: str) -> bool:
             """Append *section* if it fits. Returns False once the budget is spent."""
@@ -810,8 +810,8 @@ class DocumentExtraction(Transformer):
             overview.append(f"Top-level symbols: {', '.join(symbols)}")
         add("\n".join(overview))
 
-        raw_sections: List[str] = []
-        symbol_sections: List[str] = []
+        raw_sections: list[str] = []
+        symbol_sections: list[str] = []
         edges: dict[str, list[str]] = {}
 
         # Groups first so a container is listed above the members it owns.

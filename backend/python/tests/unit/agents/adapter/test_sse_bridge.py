@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Never
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_loop_lib.events.base import AgentEvent, EventType, RunContext, ToolCallStatus
@@ -1409,7 +1409,7 @@ class TestConnectorFlagsReachChatState:
     async def _captured_kwargs(self, instances: list[dict[str, Any]]) -> dict[str, Any]:
         seen: dict[str, Any] = {}
 
-        def _capture(*args, **kwargs):
+        def _capture(*args, **kwargs) -> Never:
             seen.update(kwargs)
             raise RuntimeError("stop here — the call is what is under test")
 

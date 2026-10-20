@@ -4904,7 +4904,7 @@ class TestEnsureIndexes:
         assert walks[0].kwargs.get("sparse", False) is False
 
     @pytest.mark.asyncio
-    async def test_block_indexes_cover_every_query_shape(self, connected_provider):
+    async def test_block_indexes_cover_every_query_shape(self, connected_provider) -> None:
         """Each of these backs a query that is otherwise a full collection scan.
 
         The bare count above fails on any index change without saying which one;

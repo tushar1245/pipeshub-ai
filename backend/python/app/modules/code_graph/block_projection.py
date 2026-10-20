@@ -17,13 +17,17 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config.constants.arangodb import CollectionNames, RecordRelations
-from app.models.blocks import Block, BlockGroup, BlocksContainer
 from app.modules.code_graph.module_refs import module_ref
 from app.modules.code_graph.version import PARSER_VERSION
-from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterator
+
+    from app.models.blocks import Block, BlockGroup, BlocksContainer
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 
 __all__ = [
     "BlockProjectionContext",
@@ -256,12 +260,12 @@ def _assert_projection_size(doc: dict[str, Any], log: logging.Logger) -> None:
     )
 
 
-async def _with_retry(coro_factory, *, what: str, log: logging.Logger):
+async def _with_retry[T](coro_factory: Callable[[], Awaitable[T]], *, what: str, log: logging.Logger) -> T:
     last: Exception | None = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
             return await coro_factory()
-        except Exception as exc:  # noqa: BLE001 - retried then re-raised
+        except Exception as exc:  # retried then re-raised
             last = exc
             if delay is None:
                 break
@@ -270,7 +274,7 @@ async def _with_retry(coro_factory, *, what: str, log: logging.Logger):
     raise last  # type: ignore[misc]
 
 
-def _chunks(items: list, size: int = _WRITE_CHUNK):
+def _chunks(items: list, size: int = _WRITE_CHUNK) -> Iterator[list]:
     for start in range(0, len(items), size):
         yield items[start:start + size]
 
@@ -342,7 +346,7 @@ async def write_code_file_blocks_to_graph(
             f"{CollectionNames.BLOCKS.value}/{parent_id}" if parent_id else record_key
         )
         relation = _local_relation_for(
-            meta.kind if meta else None, parent_id is not None,
+            meta.kind if meta else None, has_parent=parent_id is not None,
             nested=parent_bid is not None,
         )
         edges.append(_structural_edge(parent_key, bid, relation, context))
@@ -466,7 +470,7 @@ async def drop_code_file_blocks(
     await graph_provider.delete_blocks_for_records([record_id])
 
 
-def _local_relation_for(kind: str | None, has_parent: bool, *, nested: bool = False) -> str:
+def _local_relation_for(kind: str | None, *, has_parent: bool, nested: bool = False) -> str:
     """Structural relation pointing from a block's parent to the block.
 
     ``nested`` means the parent is a block rather than a group -- a definition

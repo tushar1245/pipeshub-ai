@@ -30,13 +30,13 @@ def _edges(graph):
     return sorted((e["_from"], e["_to"], e["relationshipType"]) for e in graph.code_edges())
 
 
-async def _index_all(index_file):
+async def _index_all(index_file) -> None:
     await index_file("recA", "src/a.py", A, "python")
     await index_file("recB", "src/b.py", B, "python")
     await index_file("recC", "src/c.py", C, "python")
 
 
-def _put_full_facts_on_nodes(graph):
+def _put_full_facts_on_nodes(graph) -> None:
     """Shape a node the way the projection wrote it before the residue change."""
     for record_id, blob in graph.blobs.items():
         facts = facts_from_blob_record(record_id, blob)
@@ -51,7 +51,7 @@ def _put_full_facts_on_nodes(graph):
 
 
 @pytest.mark.asyncio
-async def test_blob_facts_key_to_the_projected_nodes(graph, index_file):
+async def test_blob_facts_key_to_the_projected_nodes(graph, index_file) -> None:
     await _index_all(index_file)
     facts = facts_from_blob_record("recA", graph.blobs["recA"])
 
@@ -64,7 +64,7 @@ async def test_blob_facts_key_to_the_projected_nodes(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_residue_plus_blob_matches_full_facts_on_nodes(graph, index_file):
+async def test_residue_plus_blob_matches_full_facts_on_nodes(graph, index_file) -> None:
     await _index_all(index_file)
     with_blob = await build_code_graph_edges(
         graph_provider=graph, facts_source=graph, org_id=ORG_ID, record_group_id=GROUP_ID,
@@ -83,7 +83,7 @@ async def test_residue_plus_blob_matches_full_facts_on_nodes(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_legacy_nodes_are_selected_incrementally_without_a_name_list(graph, index_file):
+async def test_legacy_nodes_are_selected_incrementally_without_a_name_list(graph, index_file) -> None:
     """A repo indexed before the residue change has full facts and no
     `referencedNames`; the touched-name scan must still find its dependents."""
     await index_file("recA", "src/a.py", A, "python")
@@ -102,7 +102,7 @@ async def test_legacy_nodes_are_selected_incrementally_without_a_name_list(graph
 
 
 @pytest.mark.asyncio
-async def test_missing_blob_keeps_heritage_and_drops_calls(graph, index_file):
+async def test_missing_blob_keeps_heritage_and_drops_calls(graph, index_file) -> None:
     await _index_all(index_file)
     del graph.blobs["recA"]
     result = await build_code_graph_edges(
@@ -117,7 +117,7 @@ async def test_missing_blob_keeps_heritage_and_drops_calls(graph, index_file):
 
 
 @pytest.mark.asyncio
-async def test_a_blob_says_which_parser_version_wrote_its_facts(graph, index_file):
+async def test_a_blob_says_which_parser_version_wrote_its_facts(graph, index_file) -> None:
     await index_file("recB", "src/b.py", B, "python")
     stored = graph.blobs["recB"]
     assert stored["block_containers"]["code_facts_version"] == PARSER_VERSION
@@ -127,7 +127,7 @@ async def test_a_blob_says_which_parser_version_wrote_its_facts(graph, index_fil
 
 
 @pytest.mark.asyncio
-async def test_a_blob_stored_before_the_stamp_loads_as_the_current_version(graph, index_file):
+async def test_a_blob_stored_before_the_stamp_loads_as_the_current_version(graph, index_file) -> None:
     await index_file("recB", "src/b.py", B, "python")
     stamped = facts_from_blob_record("recB", graph.blobs["recB"])
     del graph.blobs["recB"]["block_containers"]["code_facts_version"]
@@ -156,7 +156,7 @@ class TestBlobCodeFactsSource:
         return BlobCodeFactsSource(blob, graph_provider, MagicMock()), blob
 
     @pytest.mark.asyncio
-    async def test_loads_by_virtual_record_id_with_one_mapping_query(self):
+    async def test_loads_by_virtual_record_id_with_one_mapping_query(self) -> None:
         record = {"block_containers": {"blocks": [
             {"code_metadata": {"qualified_name": "function:run",
                                "pending_edges": [{"relation": CALLS, "toName": "foo"}]}},
@@ -170,7 +170,7 @@ class TestBlobCodeFactsSource:
         blob.get_document_ids_by_virtual_record_ids.assert_awaited_once_with(["v1"])
 
     @pytest.mark.asyncio
-    async def test_unreadable_records_are_left_out_not_raised(self):
+    async def test_unreadable_records_are_left_out_not_raised(self) -> None:
         source, _ = self._source(
             {"v1": None, "v2": RuntimeError("storage down")},
             {"r1": "v1", "r2": "v2"},  # r3 has no virtual id at all
@@ -178,13 +178,13 @@ class TestBlobCodeFactsSource:
         assert await source.load(ORG_ID, {"r1", "r2", "r3"}) == {}
 
     @pytest.mark.asyncio
-    async def test_empty_request_touches_nothing(self):
+    async def test_empty_request_touches_nothing(self) -> None:
         source, blob = self._source({}, {})
         assert await source.load(ORG_ID, set()) == {}
         blob.get_document_ids_by_virtual_record_ids.assert_not_called()
 
 
-def test_facts_from_blob_record_tolerates_odd_shapes():
+def test_facts_from_blob_record_tolerates_odd_shapes() -> None:
     assert facts_from_blob_record("r", {}).pending_edges == {}
     assert facts_from_blob_record("r", {"block_containers": "junk"}).pending_edges == {}
     record = {"block_containers": {

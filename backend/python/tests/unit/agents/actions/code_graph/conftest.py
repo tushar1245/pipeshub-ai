@@ -43,7 +43,7 @@ def _block(key, record_id, file_path, symbol_id, name, kind="function"):
 class FakeGraphProvider:
     """Implements only what the CodeGraph ops call."""
 
-    def __init__(self, *, allow_user=USER, deny_records=(), file_roles=None):
+    def __init__(self, *, allow_user=USER, deny_records=(), file_roles=None) -> None:
         self.allow_user = allow_user
         self.deny_records = set(deny_records)
         # `fileRole` per record, as `codeFiles` stores it; absent means source.
@@ -199,7 +199,7 @@ class FakeGraphProvider:
 
 
 class FakeBlobStore:
-    def __init__(self, records=None):
+    def __init__(self, records=None) -> None:
         self.records = records if records is not None else {
             "v-b": {
                 "block_containers": {
