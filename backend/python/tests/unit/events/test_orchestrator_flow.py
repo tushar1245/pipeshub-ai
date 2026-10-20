@@ -966,6 +966,8 @@ async def test_an_emptied_code_file_loses_its_old_blocks() -> None:
     processor = MagicMock()
     processor._drop_code_blocks = AsyncMock()
     ep = _make_event_processor(parsing_client=parsing_client, processor=processor)
+    # Another record holds the content, so the emptied record's vectors are not dropped here.
+    ep.graph_provider.get_records_by_virtual_record_id = AsyncMock(return_value=["rec-2"])
 
     events = [e async for e in ep._orchestrate_via_services(
         record_id="rec-1", org_id="org-1", virtual_record_id="v-1", record_name="m.py",

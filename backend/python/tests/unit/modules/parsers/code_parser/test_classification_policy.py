@@ -55,6 +55,10 @@ async def test_a_test_file_is_indexed_without_an_llm_call(path: str, classified:
     sink.index = AsyncMock()
     sink.enrich = AsyncMock()
     sink.blob_storage.apply = AsyncMock()
+    # Named-entity extraction runs as a task alongside classification.
+    sink.extract_named_entities = AsyncMock(return_value=None)
+    sink.resolve_entities = AsyncMock()
+    sink.persist_named_entities = AsyncMock()
     processor = MagicMock()
     processor.project_code_blocks_to_graph = _project_code_blocks_mock()
     ep = _make_event_processor(parsing_client=parsing_client, extraction_client=extraction_client,
