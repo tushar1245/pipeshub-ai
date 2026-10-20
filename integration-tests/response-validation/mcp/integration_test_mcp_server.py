@@ -39,12 +39,20 @@ CURATED_TOOLS = {
     "pipeshub_get_record_content",
     "pipeshub_directory",
     "pipeshub_agents",
-    # Registered by PipesHub itself (modules/mcp/code-graph.tools.ts), not the package.
+}
+
+# Registered by PipesHub itself (modules/mcp/code-graph.tools.ts), not the
+# package, and only for a caller with code:read who can read an indexed repo.
+CODE_TOOLS = {
     "pipeshub_code_repos",
     "pipeshub_code_symbols",
     "pipeshub_code_neighbours",
     "pipeshub_code_read",
     "pipeshub_code_path",
+    "pipeshub_code_search",
+    "pipeshub_code_outline",
+    "pipeshub_code_impact",
+    "pipeshub_code_entry_points",
 }
 
 # The mcp-server repo caps every description so hosts keep room for their own
@@ -101,7 +109,11 @@ class TestMcpSurfaceMatchesGolden:
         assert actual == expected, "instructions differ:\n" + _diff(expected, actual, "instructions")
 
     def test_tool_names(self, mcp_surface: dict, mcp_golden: dict) -> None:
-        assert [t["name"] for t in mcp_surface["tools"]] == [t["name"] for t in mcp_golden["tools"]]
+        served = [t["name"] for t in mcp_surface["tools"]]
+        golden = [t["name"] for t in mcp_golden["tools"]]
+        if not CODE_TOOLS & set(served):
+            golden = [n for n in golden if n not in CODE_TOOLS]
+        assert served == golden
 
     def test_tool_descriptions(self, mcp_surface: dict, mcp_golden: dict) -> None:
         served, golden = _by_name(mcp_surface["tools"]), _by_name(mcp_golden["tools"])
@@ -148,7 +160,13 @@ class TestMcpSurfaceMatchesGolden:
 @pytest.mark.mcp
 class TestMcpSurfaceInvariants:
     def test_exactly_the_curated_tools(self, mcp_surface: dict) -> None:
-        assert {t["name"] for t in mcp_surface["tools"]} == CURATED_TOOLS
+        """The code tools come all together or not at all (no repo, or no code:read)."""
+        assert {t["name"] for t in mcp_surface["tools"]} in (CURATED_TOOLS, CURATED_TOOLS | CODE_TOOLS)
+
+    def test_code_tools_are_marked_experimental(self, mcp_surface: dict) -> None:
+        for tool in mcp_surface["tools"]:
+            if tool["name"] in CODE_TOOLS:
+                assert tool["description"].startswith("[Experimental] "), tool["name"]
 
     def test_every_tool_has_description_schema_and_annotations(self, mcp_surface: dict) -> None:
         for tool in mcp_surface["tools"]:

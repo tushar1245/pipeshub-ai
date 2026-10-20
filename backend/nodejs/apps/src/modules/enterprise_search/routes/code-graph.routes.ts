@@ -24,7 +24,7 @@ export function createCodeGraphRouter(container: Container): Router {
   router.get(
     '/repos',
     authMiddleware.authenticate,
-    requireScopes(OAuthScopeNames.SEMANTIC_READ),
+    requireScopes(OAuthScopeNames.CODE_READ),
     async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
       try {
         const response = await new AIServiceCommand<Record<string, unknown>>({
