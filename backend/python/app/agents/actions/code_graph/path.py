@@ -325,7 +325,6 @@ _HOP_VERBS = {
     RecordRelations.RE_EXPORTS.value: "re-exports",
     RecordRelations.EXPORTS.value: "exports",
     RecordRelations.INHERITS.value: "inherits from",
-    RecordRelations.EXTENDS.value: "extends",
     RecordRelations.IMPLEMENTS.value: "implements",
     RecordRelations.OVERRIDES.value: "overrides",
     RecordRelations.CONTAINS.value: "contains",

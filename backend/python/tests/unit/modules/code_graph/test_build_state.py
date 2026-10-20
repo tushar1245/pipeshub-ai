@@ -14,11 +14,14 @@ from app.modules.code_graph.build_state import (
     full_build_still_owed,
     graph_status,
     is_due,
+    needs_full_build,
     record_group_id_from_key,
     request_is_stale,
     still_owed,
     sync_point_key_for,
 )
+from app.modules.code_graph import build_state
+from app.modules.code_graph.version import EDGE_RULES_VERSION
 from tests.unit.modules.code_graph.sync_point_fakes import FakeSyncPoints
 
 ORG, CONN, REPO = "org-1", "connector-1", "repo-1"
@@ -30,6 +33,23 @@ def _store(points: FakeSyncPoints, **kw) -> BuildStateStore:
 
 def _point(points: FakeSyncPoints) -> dict:
     return points.points[sync_point_key_for(REPO)]
+
+
+class TestEdgeRulesVersion:
+    def _built(self, version: object) -> BuildState:
+        return build_state._state_from_row({"lastEdgeBuildAt": 1, "edgeBuildVersion": version})
+
+    def test_a_build_under_the_current_rules_is_incremental(self) -> None:
+        assert not needs_full_build(self._built(EDGE_RULES_VERSION))
+
+    def test_an_edge_rules_bump_owes_a_full_rebuild(self, monkeypatch) -> None:
+        state = self._built(EDGE_RULES_VERSION)
+        monkeypatch.setattr(build_state, "EDGE_RULES_VERSION", "2099.01.01")
+        assert needs_full_build(state)
+
+    @pytest.mark.parametrize("stored", [3, "2026.10.19", None])
+    def test_a_version_stored_before_the_split_loads_and_rebuilds(self, stored) -> None:
+        assert needs_full_build(self._built(stored))
 
 
 class TestRetryPolicy:

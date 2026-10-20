@@ -514,7 +514,6 @@ IMPACT_RELATIONS = [
     RecordRelations.CALLS.value,
     RecordRelations.IMPORTS_FROM.value,
     RecordRelations.INHERITS.value,
-    RecordRelations.EXTENDS.value,
     RecordRelations.IMPLEMENTS.value,
     RecordRelations.OVERRIDES.value,
 ]

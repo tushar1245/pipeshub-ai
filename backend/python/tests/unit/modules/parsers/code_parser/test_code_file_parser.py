@@ -238,7 +238,7 @@ export class Service extends Base implements Runnable {
     container = CodeFileParser().parse_to_blocks(src, "svc.ts", "src/svc.ts", "typescript")
     service = _blocks_by_name(container)["Service"]
     relations = {(e["relation"], e["toName"]) for e in service.code_metadata.pending_edges}
-    assert ("EXTENDS", "Base") in relations
+    assert ("INHERITS", "Base") in relations
     assert ("IMPLEMENTS", "Runnable") in relations
 
     run = _blocks_by_name(container)["run"]

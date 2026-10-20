@@ -389,12 +389,12 @@ class CodeGraph:
     @tool(
         path="/tools/codegraph/get_neighbour",
         short_description=(
-            "Walk a symbol's edges: CALLS, METHOD/CONTAINS, INHERITS/EXTENDS/"
+            "Walk a symbol's edges: CALLS, METHOD/CONTAINS, INHERITS/"
             "IMPLEMENTS, OVERRIDES, IMPORTS_FROM. A read shows none of these."
         ),
         description=(
             "Walk edges of a file or symbol: METHOD/CONTAINS (its class), CALLS, "
-            "INHERITS/EXTENDS/IMPLEMENTS, OVERRIDES, IMPORTS_FROM. A read shows none "
+            "INHERITS/IMPLEMENTS, OVERRIDES, IMPORTS_FROM. A read shows none "
             "of these.\n\n"
             "Give it something you already hold — a `record_id`, a `file_path` on its "
             "own, or `(file_path, qualified_name)`. Direction: 'inbound', 'outbound', "
@@ -468,7 +468,7 @@ class CodeGraph:
                     "Leave unset on the first walk. Setting ['CALLS'] alone hides "
                     "METHOD/CONTAINS/INHERITS so you cannot chain. Narrow only "
                     "after a full walk, e.g. ['CALLS'] for call sites, "
-                    "['INHERITS','EXTENDS','IMPLEMENTS'] for heritage. Full set "
+                    "['INHERITS','IMPLEMENTS'] for heritage. Full set "
                     f"when omitted: {', '.join(CODE_RELATIONS)}."
                 ),
                 items={"type": "string"},

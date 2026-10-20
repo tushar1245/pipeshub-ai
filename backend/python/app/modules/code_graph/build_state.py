@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
 from app.config.constants.arangodb import CollectionNames
-from app.modules.code_graph.version import CODE_GRAPH_VERSION
+from app.modules.code_graph.version import EDGE_RULES_VERSION
 from app.utils.env_config import env_int
 
 if TYPE_CHECKING:
@@ -100,7 +100,7 @@ class BuildState(NamedTuple):
     last_error: str | None = None
     lease_token: str | None = None
     last_full_build: int | None = None
-    # CODE_GRAPH_VERSION of the last full build; another means rebuild in full.
+    # EDGE_RULES_VERSION of the last full build; another means rebuild in full.
     build_version: str | None = None
 
 
@@ -215,7 +215,7 @@ def is_due(state: BuildState, now_ms: int) -> bool:
 def needs_full_build(state: BuildState) -> bool:
     """A full rebuild is owed, never built, or the last one ran under another version."""
     return (state.full_request_id is not None or state.last_build is None
-            or state.build_version != CODE_GRAPH_VERSION)
+            or state.build_version != EDGE_RULES_VERSION)
 
 
 def graph_status(state: BuildState | None) -> GraphStatus:
@@ -362,7 +362,7 @@ class BuildStateStore:
                 out["lastEdgeBuildAt"] = started_at_ms
                 if full:
                     out["lastFullEdgeBuildAt"] = started_at_ms
-                    out["edgeBuildVersion"] = CODE_GRAPH_VERSION
+                    out["edgeBuildVersion"] = EDGE_RULES_VERSION
                     if not full_build_still_owed(now, start.full_request_id):
                         out["edgeBuildFullRequestId"] = None
             if result is not None:

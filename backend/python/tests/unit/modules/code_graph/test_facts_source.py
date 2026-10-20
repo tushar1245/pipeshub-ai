@@ -15,6 +15,7 @@ from app.modules.code_graph.facts_source import (
     BlobCodeFactsSource,
     facts_from_blob_record,
 )
+from app.modules.code_graph.version import PARSER_VERSION
 
 from .conftest import GROUP_ID, ORG_ID
 
@@ -113,6 +114,26 @@ async def test_missing_blob_keeps_heritage_and_drops_calls(graph, index_file):
     # extend something even though its calls could not be resolved.
     svc = next(d for d in graph.blocks.values() if d.get("qualifiedName") == "class:Svc")
     assert [f["relation"] for f in svc["pendingEdges"]] == [RecordRelations.INHERITS.value]
+
+
+@pytest.mark.asyncio
+async def test_a_blob_says_which_parser_version_wrote_its_facts(graph, index_file):
+    await index_file("recB", "src/b.py", B, "python")
+    stored = graph.blobs["recB"]
+    assert stored["block_containers"]["code_facts_version"] == PARSER_VERSION
+
+    stored["block_containers"]["code_facts_version"] = "2099.01.01"
+    assert facts_from_blob_record("recB", stored).facts_version == "2099.01.01"
+
+
+@pytest.mark.asyncio
+async def test_a_blob_stored_before_the_stamp_loads_as_the_current_version(graph, index_file):
+    await index_file("recB", "src/b.py", B, "python")
+    stamped = facts_from_blob_record("recB", graph.blobs["recB"])
+    del graph.blobs["recB"]["block_containers"]["code_facts_version"]
+    old = facts_from_blob_record("recB", graph.blobs["recB"])
+    assert old.recognised and old.facts_version == PARSER_VERSION
+    assert old.pending_edges == stamped.pending_edges
 
 
 class TestBlobCodeFactsSource:

@@ -23,6 +23,7 @@ from app.models.blocks import (
     GroupSubType,
     GroupType,
 )
+from app.modules.code_graph.version import PARSER_VERSION
 from app.modules.parsers import parse_pool
 from app.modules.parsers.code_parser.engine import parse_code
 from app.modules.parsers.code_parser.lang_config import (
@@ -331,7 +332,7 @@ class CodeFileParser:
             )
         )
 
-        return BlocksContainer(blocks=blocks, block_groups=groups)
+        return BlocksContainer(blocks=blocks, block_groups=groups, code_facts_version=PARSER_VERSION)
 
     @staticmethod
     def _nearest_group(parent: int | None, symbols: list[ParsedSymbol],

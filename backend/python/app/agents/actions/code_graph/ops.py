@@ -58,7 +58,6 @@ CROSS_FILE_RELATIONS = [
     RecordRelations.RE_EXPORTS.value,
     RecordRelations.EXPORTS.value,
     RecordRelations.INHERITS.value,
-    RecordRelations.EXTENDS.value,
     RecordRelations.IMPLEMENTS.value,
     # The polymorphic hop. A call site typed to an interface binds to the
     # abstract method, so without this an inbound walk from a concrete
@@ -70,7 +69,6 @@ CROSS_FILE_RELATIONS = [
 # that want only that slice; `get_neighbour` defaults to CODE_RELATIONS below.
 HERITAGE_RELATIONS = frozenset({
     RecordRelations.INHERITS.value,
-    RecordRelations.EXTENDS.value,
     RecordRelations.IMPLEMENTS.value,
     RecordRelations.OVERRIDES.value,
 })

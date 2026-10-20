@@ -720,7 +720,6 @@ class RecordRelations(Enum):
     RE_EXPORTS = "RE_EXPORTS"
     EXPORTS = "EXPORTS"
     INHERITS = "INHERITS"
-    EXTENDS = "EXTENDS"
 
 
 #: The relation types that are hierarchy. Every other type is a link, stored

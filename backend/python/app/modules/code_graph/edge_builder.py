@@ -51,9 +51,12 @@ _MODULE_RELATIONS = {
     RecordRelations.IMPORTS_FROM.value,
     RecordRelations.RE_EXPORTS.value,
 }
+# Facts parsed before EXTENDS merged into INHERITS still say EXTENDS (that
+# merge re-indexes nothing); they resolve, and are written, as INHERITS.
+_LEGACY_EXTENDS = "EXTENDS"
 _TYPE_RELATIONS = {
     RecordRelations.INHERITS.value,
-    RecordRelations.EXTENDS.value,
+    _LEGACY_EXTENDS,
     RecordRelations.IMPLEMENTS.value,
 }
 
@@ -496,6 +499,8 @@ class _Builder:
     def resolve_rest(self, work: list[tuple[str, dict]]) -> None:
         for block_id, fact in work:
             relation = fact.get("relation")
+            if relation == _LEGACY_EXTENDS:
+                relation = RecordRelations.INHERITS.value
             if relation in _MODULE_RELATIONS or relation == RecordRelations.IMPORTS.value:
                 continue
             name = fact.get("toName") or ""
@@ -553,22 +558,27 @@ class _Builder:
                 continue
             self._add_edge(
                 self._source_key(block_id, fact), self._block_key(target),
-                self._heritage_relation(relation, target),
+                self._heritage_relation(relation, block_id, target),
                 confidence=confidence, line=fact.get("line"), resolution=resolution,
             )
 
-    def _heritage_relation(self, relation: str, target: str) -> str:
+    def _heritage_relation(self, relation: str, source: str, target: str) -> str:
         """`INHERITS` becomes `IMPLEMENTS` when the base turns out to be a contract.
 
         Only decidable here. The parser sees `class Foo(ABC)` and can emit the
         base's NAME; whether that name is an interface is known once it
         resolves to a block. A base that resolves to nothing stays `INHERITS` --
-        a third-party class we cannot inspect is not evidence of a contract.
+        a third-party class we cannot inspect is not evidence of a contract,
+        and neither is an interface extending another one.
         """
-        if relation != RecordRelations.INHERITS.value:
+        if relation != RecordRelations.INHERITS.value or self._declared_interface(source):
             return relation
         return (RecordRelations.IMPLEMENTS.value if self._is_interface(target)
                 else relation)
+
+    def _declared_interface(self, block_id: str) -> bool:
+        row = self.index.rows.get(block_id)
+        return bool(row) and (row.kind or "").lower() in _INTERFACE_KINDS
 
     def _is_interface(self, block_id: str) -> bool:
         """Whether a resolved type block is an interface or an abstract base."""

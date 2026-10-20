@@ -7,7 +7,7 @@ from app.modules.code_graph import edge_build_trigger
 from app.modules.code_graph.build_state import BuildStateStore, sync_point_key_for
 from app.modules.code_graph.edge_build_runner import CodeEdgeBuildRunner
 from app.modules.code_graph.edge_builder import EdgeBuildResult, EdgeBuildTooLargeError
-from app.modules.code_graph.version import CODE_GRAPH_VERSION
+from app.modules.code_graph.version import EDGE_RULES_VERSION
 from tests.unit.modules.code_graph.sync_point_fakes import FakeSyncPoints
 
 _BUILD = "app.modules.code_graph.edge_build_runner.build_code_graph_edges"
@@ -38,7 +38,7 @@ def _point(graph: FakeSyncPoints) -> dict:
 
 
 OWED = {"lastEdgeBuildAt": 1000, "edgeBuildPending": True, "edgeBuildRequestId": "r1",
-        "edgeBuildVersion": CODE_GRAPH_VERSION}
+        "edgeBuildVersion": EDGE_RULES_VERSION}
 
 
 @pytest.mark.asyncio
@@ -201,7 +201,7 @@ async def test_a_repo_built_by_another_code_graph_version_is_rebuilt_in_full() -
     build = AsyncMock(return_value=EdgeBuildResult())
     await _run(runner, build)
     assert build.await_args.kwargs["touched_record_ids"] is None
-    assert _point(graph)["edgeBuildVersion"] == CODE_GRAPH_VERSION
+    assert _point(graph)["edgeBuildVersion"] == EDGE_RULES_VERSION
 
 
 
