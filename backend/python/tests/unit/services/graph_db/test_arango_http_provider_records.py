@@ -2237,6 +2237,8 @@ class TestDeleteRecordsAndRelations:
         connected_provider.http_client.get_document.return_value = _arango_record(key="r1")
         connected_provider._edge_collections_of_graph = AsyncMock(return_value=["inheritPermissions", "entityRelations"])
         connected_provider.http_client.execute_aql.return_value = []
+        # Code blocks go in their own statements; this record has none.
+        connected_provider.delete_blocks_for_records = AsyncMock(return_value=0)
 
         assert await connected_provider.delete_records_and_relations("r1", hard_delete=True) is True
 
