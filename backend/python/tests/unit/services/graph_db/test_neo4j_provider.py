@@ -11,7 +11,10 @@ from app.services.graph_db.interface.graph_db_provider import (
     DUPLICATE_RECONCILE_GRACE_MS,
     MoveDestinationMissing,
 )
-from app.services.graph_db.neo4j.neo4j_provider import BLOCK_DELETE_BATCH_SIZE, Neo4jProvider
+from app.services.graph_db.neo4j.neo4j_provider import (
+    BLOCK_DELETE_BATCH_SIZE,
+    Neo4jProvider,
+)
 
 
 @pytest.fixture
@@ -6189,7 +6192,7 @@ class TestStartupDedupeTouchesOnlyCodeEdgeBuildSyncPoints:
 
     @staticmethod
     def _mock_client(provider: Neo4jProvider, duplicate_keys_left: int) -> None:
-        async def run(query, parameters=None, **_):
+        async def run(query, parameters=None, **_) -> list[dict]:
             if "DETACH DELETE extra" in query:
                 return []
             if "RETURN count(key) AS keys" in query:

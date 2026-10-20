@@ -472,7 +472,7 @@ class TestCheckDuplicateMd5UnscannedTwin:
     its vectors and blob hold the raw content."""
 
     @staticmethod
-    def _setup(twin_mark):
+    def _setup(twin_mark) -> tuple:
         ep, _, _, gp = _make_event_processor()
         twin = {
             "_key": "twin", "virtualRecordId": "vr-shared", "recordType": "CODE_FILE",

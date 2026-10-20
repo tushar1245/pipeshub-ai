@@ -963,7 +963,7 @@ class ReposSync:
         path: str,
         sha: str | None,
         code_files_enabled: bool,
-        test_files_enabled: bool,
+        test_files_enabled: bool,  # noqa: FBT001 - callers pass it positionally, like code_files_enabled
         size: int | None = None,
         commit_sha: str | None = None,
     ) -> CodeFileRecord:

@@ -34,6 +34,13 @@ from app.events.processor import convert_record_dict_to_record
 from app.exceptions.indexing_exceptions import IndexingError, ProcessingError
 from app.models.blocks import BlocksContainer, SemanticMetadata
 from app.models.entities import EntityType
+from app.modules.code_graph import edge_build_trigger
+from app.modules.code_graph import enabled as code_graph_switch
+from app.modules.code_graph.build_state import (
+    BuildStateStore,
+    claimed_build_already_ran,
+    request_is_stale,
+)
 from app.modules.indexing.connector_off_events import (
     ConnectorState,
     already_indexed,
@@ -44,13 +51,6 @@ from app.modules.indexing.connector_off_events import (
 )
 from app.modules.indexing.connector_off_events import (
     resuming_enrichment as record_resuming_enrichment,
-)
-from app.modules.code_graph import edge_build_trigger
-from app.modules.code_graph import enabled as code_graph_switch
-from app.modules.code_graph.build_state import (
-    BuildStateStore,
-    claimed_build_already_ran,
-    request_is_stale,
 )
 from app.modules.indexing.duplicate_reconcile import DuplicateReconciler
 from app.modules.indexing.rate_limit_deferral import (

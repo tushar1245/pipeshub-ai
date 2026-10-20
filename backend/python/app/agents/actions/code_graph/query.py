@@ -19,7 +19,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config.constants.arangodb import CollectionNames, RecordRelations
 from app.modules.parsers.code_parser.models import FILLER_KINDS
@@ -39,6 +39,9 @@ from .ops import (
     get_record_roles,
     repo_names,
 )
+
+if TYPE_CHECKING:
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +127,7 @@ def _looks_like_locator(select: str) -> bool:
 
 
 async def files_by_pattern(
-    graph_provider: Any, org_id: str, pattern: str,
+    graph_provider: IGraphDBProvider, org_id: str, pattern: str,
 ) -> tuple[dict[str, str], bool]:
     """``(record id -> path, scan_capped)`` for the code files a glob or prefix matches.
 
@@ -156,7 +159,7 @@ async def files_by_pattern(
 
 
 async def _select_by_path(
-    graph_provider: Any, org_id: str, pattern: str, connector_id: str
+    graph_provider: IGraphDBProvider, org_id: str, pattern: str, connector_id: str
 ) -> tuple[list[dict], bool]:
     """Blocks of the files whose path matches a glob (or a literal prefix).
 
@@ -194,7 +197,7 @@ async def _select_by_path(
 
 
 async def _visible_record_ids(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     user_id: str,
     connector_id: str,
@@ -231,7 +234,7 @@ async def _visible_record_ids(
 
 
 async def _list_children(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     user_id: str,
     prefix: str,
@@ -319,7 +322,7 @@ def _rank_by_degree(blocks: list[dict], degrees: dict[str, int]) -> list[dict]:
 
 async def query_code_graph_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     user_id: str,
     connector_id: str,
@@ -536,7 +539,7 @@ DEFAULT_ENTRY_LIMIT = 30
 
 async def entry_points_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     connector_id: str,
     org_id: str,
     user_id: str,

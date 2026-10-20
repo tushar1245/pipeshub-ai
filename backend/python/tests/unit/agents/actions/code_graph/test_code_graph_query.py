@@ -15,7 +15,7 @@ from .conftest import CONN, ORG, USER, QueryGraphProvider
 pytestmark = pytest.mark.asyncio
 
 
-def _ctx(graph, user=USER, connector=CONN):
+def _ctx(graph, user=USER, connector=CONN) -> dict:
     return {"graph_provider": graph, "org_id": ORG, "user_id": user, "connector_id": connector}
 
 

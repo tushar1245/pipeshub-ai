@@ -24,6 +24,7 @@ Options
 A build takes the same Redis lock as the automatic build and exits 3 if one is
 already running for the repo. Requires backend/python/.env, same as the other scripts.
 """
+# ruff: noqa: T201 - a CLI script; print is its output
 from __future__ import annotations
 
 import argparse
@@ -45,6 +46,7 @@ from app.modules.code_graph.build_state import (  # noqa: E402
     needs_full_build,
 )
 from app.modules.code_graph.edge_builder import (  # noqa: E402
+    EdgeBuildResult,
     build_code_graph_edges,
 )
 from app.modules.code_graph.facts_source import BlobCodeFactsSource  # noqa: E402
@@ -179,7 +181,7 @@ async def run(args: argparse.Namespace) -> int:
             await disconnect()
 
 
-def _print_summary(result, *, dry_run: bool) -> None:
+def _print_summary(result: EdgeBuildResult, *, dry_run: bool) -> None:
     header = "DRY RUN — nothing written" if dry_run else "Edge build complete"
     print(f"\n{header}")
     print(f"  files (total/touched/re-resolved): "

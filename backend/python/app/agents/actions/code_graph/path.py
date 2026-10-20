@@ -26,6 +26,8 @@ from .results import touched
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["DEFAULT_MAX_DEPTH", "MAX_PATH_DEPTH", "find_symbol_path_impl"]
@@ -44,7 +46,7 @@ _FRONTIER_LIMIT = 2000
 
 async def find_symbol_path_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     connector_id: str,
     org_id: str,
     user_id: str,
@@ -169,7 +171,7 @@ async def find_symbol_path_impl(
 
 
 async def _bfs_edges(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     start_key: str,
     end_key: str,
     *,
@@ -268,7 +270,7 @@ async def _bfs_edges(
 
 
 async def _neighbour_rows(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     phases_by_key: dict[str, list[int]],
     relations: list[str],
     *,

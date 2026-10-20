@@ -20,11 +20,13 @@ from typing import TYPE_CHECKING, Any
 from app.models.entities import RecordType
 
 if TYPE_CHECKING:
+    from app.agent_loop_lib.core.scope import RunScope
     from app.agent_loop_lib.hooks.middleware.context import (
         ToolResultContext,
         TurnContext,
     )
     from app.agent_loop_lib.hooks.middleware.pipeline import Middleware, Next
+    from app.agent_loop_lib.tools.registry import ToolRegistry
     from app.agents.agent_loop.context import AgentContext
 
 CODE_GRAPH_TOOLSET = "codegraph"
@@ -32,7 +34,7 @@ _UNLOCK_FLAG = "unlock_code_graph"
 _CODE_FILE = RecordType.CODE_FILE.value
 
 
-def record_is_code_file(record: Any) -> bool:
+def record_is_code_file(record: object) -> bool:
     """Public because `repo_instructions` gates on the same predicate; keeping
     a second copy there would let the two drift apart."""
     if not isinstance(record, dict):
@@ -76,7 +78,7 @@ def has_code_intent(query: str, virtual_records: dict[str, Any] | None) -> bool:
     return bool(records) and sum(map(record_is_code_file, records)) * 2 > len(records)
 
 
-def unlock_code_graph_tools(run_scope: Any, registry: Any) -> list[str]:
+def unlock_code_graph_tools(run_scope: RunScope | None, registry: ToolRegistry | None) -> list[str]:
     """Add every granted `codegraph` tool to ``run_scope.visible_tools``.
 
     No-op when the toolset was never loaded, or when the agent's permission
@@ -112,7 +114,7 @@ def unlock_code_graph_tools(run_scope: Any, registry: Any) -> list[str]:
     return allowed
 
 
-def _maybe_unlock(context: "AgentContext", run_scope: Any) -> list[str]:
+def _maybe_unlock(context: "AgentContext", run_scope: RunScope | None) -> list[str]:
     records = context.tool_state.get("virtual_record_id_to_result") or {}
     code_hits = virtual_records_include_code(records) and has_code_intent(
         getattr(context, "query", "") or "", records,

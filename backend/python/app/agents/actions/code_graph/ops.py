@@ -22,6 +22,8 @@ from app.modules.parsers.code_parser.lang_config import LANGUAGES
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -169,7 +171,7 @@ class SymbolRef(dict):
 
 
 async def resolve_symbol(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     file_path: str,
     qualified_name: str,
@@ -227,7 +229,7 @@ async def resolve_symbol(
 
 
 async def _records_for_path(
-    graph_provider: Any, org_id: str, file_path: str
+    graph_provider: IGraphDBProvider, org_id: str, file_path: str
 ) -> list[str]:
     """Record ids for a repo-relative path.
 
@@ -246,7 +248,7 @@ async def _records_for_path(
 
 
 async def _choose_records(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     record_ids: list[str],
     connector_id: str,
@@ -284,7 +286,7 @@ async def _choose_records(
 
 
 async def _raise_if_several_repos(
-    graph_provider: Any, org_id: str, file_path: str, rows: list[dict[str, Any]],
+    graph_provider: IGraphDBProvider, org_id: str, file_path: str, rows: list[dict[str, Any]],
 ) -> None:
     groups = {row.get("recordGroupId") for row in rows}
     if len(groups) < 2:
@@ -305,7 +307,7 @@ def _repo_matches(repo: str, group_id: str | None, names: dict[str, str]) -> boo
 
 
 async def repo_names(
-    graph_provider: Any, org_id: str, group_ids: "Iterable[str | None]",
+    graph_provider: IGraphDBProvider, org_id: str, group_ids: "Iterable[str | None]",
 ) -> dict[str, str]:
     """Repo name per record group, e.g. ``acme/shop``.
 
@@ -347,7 +349,7 @@ async def repo_names(
 
 
 async def _attach_repos(
-    graph_provider: Any, org_id: str, blocks: "Iterable[dict[str, Any]]",
+    graph_provider: IGraphDBProvider, org_id: str, blocks: "Iterable[dict[str, Any]]",
 ) -> None:
     blocks = list(blocks)
     names = await repo_names(graph_provider, org_id, (b.get("recordGroupId") for b in blocks))
@@ -364,7 +366,7 @@ def _with_file_path(block: dict[str, Any], file_path: str | None) -> dict[str, A
 
 
 async def _resolve_case_insensitive(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     record_ids: list[str],
     file_path: str,
@@ -394,7 +396,7 @@ async def _resolve_case_insensitive(
 
 
 async def _user_can_read(
-    graph_provider: Any, user_id: str, org_id: str, record_id: str | None
+    graph_provider: IGraphDBProvider, user_id: str, org_id: str, record_id: str | None
 ) -> bool:
     """Gate every result on the caller's access to the owning record.
 
@@ -428,7 +430,7 @@ async def _readable_only(
 
 
 async def _readable_blocks(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     access: RecordAccess,
     keys: list[str],
@@ -462,7 +464,7 @@ async def _readable_blocks(
 
 
 async def _readable_keys(
-    graph_provider: Any, org_id: str, access: RecordAccess, keys: "Iterable[str]",
+    graph_provider: IGraphDBProvider, org_id: str, access: RecordAccess, keys: "Iterable[str]",
 ) -> set[str]:
     """The keys among ``keys`` of blocks in this org whose file the caller may read.
 
@@ -486,7 +488,7 @@ async def _readable_keys(
 
 
 async def attach_file_paths(
-    graph_provider: Any, org_id: str, blocks: "Iterable[dict[str, Any]]"
+    graph_provider: IGraphDBProvider, org_id: str, blocks: "Iterable[dict[str, Any]]"
 ) -> None:
     """Fill in each block's ``filePath`` from its owning record.
 
@@ -514,7 +516,7 @@ def _key_of(block: dict) -> str:
 
 
 async def _degrees(
-    graph_provider: Any, blocks: list[dict], relations: list[str],
+    graph_provider: IGraphDBProvider, blocks: list[dict], relations: list[str],
     org_id: str, access: RecordAccess,
 ) -> tuple[dict[str, int], bool]:
     """How many edges touch each block, in one batched call.
@@ -565,7 +567,7 @@ async def _degrees(
 
 
 async def path_for_record(
-    graph_provider: Any, org_id: str, record_id: str
+    graph_provider: IGraphDBProvider, org_id: str, record_id: str
 ) -> str | None:
     """The repo-relative path of a code record, for callers holding only its id.
 
@@ -595,7 +597,7 @@ def _unwrap(row: dict) -> dict:
 
 
 async def get_record_roles(
-    graph_provider: Any, org_id: str, record_ids: set[str] | list[str]
+    graph_provider: IGraphDBProvider, org_id: str, record_ids: set[str] | list[str]
 ) -> dict[str, str]:
     """``fileRole`` per record, read from ``codeFiles``.
 
@@ -638,7 +640,7 @@ class RecordAccess:
     A failed check raises: an empty answer would read as "nothing here".
     """
 
-    def __init__(self, graph_provider: Any, org_id: str, user_id: str) -> None:
+    def __init__(self, graph_provider: IGraphDBProvider, org_id: str, user_id: str) -> None:
         self._graph_provider = graph_provider
         self._org_id = org_id
         self._user_id = user_id
@@ -659,7 +661,7 @@ class RecordAccess:
 
 
 async def _record_in_connector(
-    graph_provider: Any, org_id: str, record_ids: list[str], connector_id: str
+    graph_provider: IGraphDBProvider, org_id: str, record_ids: list[str], connector_id: str
 ) -> str | None:
     """Pick the record from *record_ids* that belongs to this connector."""
     if not record_ids:

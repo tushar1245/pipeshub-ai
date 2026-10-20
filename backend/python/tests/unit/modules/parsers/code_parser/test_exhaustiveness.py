@@ -234,7 +234,7 @@ def test_qualified_names_survive_an_edit_above_them():
 def test_an_unnamed_span_keeps_its_key_when_lines_shift_above_it() -> None:
     """Keyed by scope and content, not line range (P-10): an edit above a
     statement must not re-key it, and an edit to it must."""
-    def key(src, kind):
+    def key(src, kind) -> list[str]:
         container = parse(src, "m.py", "src/m.py")
         return [b.code_metadata.qualified_name for b in container.blocks
                 if b.code_metadata and b.code_metadata.kind == kind]

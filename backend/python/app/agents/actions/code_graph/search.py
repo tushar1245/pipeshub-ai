@@ -30,6 +30,9 @@ from .read import _outer_spans
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from app.modules.transformers.blob_storage import BlobStorage
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["DEFAULT_SEARCH_LIMIT", "SEARCH_MODES", "search_code_impl"]
@@ -51,8 +54,8 @@ _NESTED_QUANTIFIER = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*{]")
 
 async def search_code_impl(
     *,
-    graph_provider: Any,
-    blob_store: Any,
+    graph_provider: IGraphDBProvider,
+    blob_store: BlobStorage,
     connector_id: str,
     org_id: str,
     user_id: str,
@@ -95,7 +98,7 @@ async def search_code_impl(
 
 
 async def _by_identifier(
-    graph_provider: Any, org_id: str, connector_id: str, name: str, path: str | None,
+    graph_provider: IGraphDBProvider, org_id: str, connector_id: str, name: str, path: str | None,
     repo: str | None, limit: int, *, include_tests: bool, access: RecordAccess,
 ) -> dict[str, Any]:
     """Every definition named ``name`` (case-insensitive), exactly, from the index."""
@@ -139,7 +142,7 @@ async def _by_identifier(
 
 
 async def _by_text(
-    graph_provider: Any, blob_store: Any, org_id: str, connector_id: str,
+    graph_provider: IGraphDBProvider, blob_store: BlobStorage, org_id: str, connector_id: str,
     matcher: re.Pattern[str], mode: str, path: str, repo: str | None, limit: int,
     *, include_tests: bool, access: RecordAccess,
 ) -> dict[str, Any]:

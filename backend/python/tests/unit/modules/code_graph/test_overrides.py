@@ -11,7 +11,7 @@ import json
 import pytest
 
 from app.config.constants.arangodb import RecordRelations
-from app.modules.code_graph.edge_builder import build_code_graph_edges
+from app.modules.code_graph.edge_builder import EdgeBuildResult, build_code_graph_edges
 
 from .conftest import GROUP_ID, ORG_ID
 
@@ -83,13 +83,13 @@ export class RedisStore implements Store {
 '''
 
 
-async def _build(graph):
+async def _build(graph) -> EdgeBuildResult:
     return await build_code_graph_edges(
         graph_provider=graph, facts_source=graph, org_id=ORG_ID, record_group_id=GROUP_ID,
     )
 
 
-def _pairs(graph, relation):
+def _pairs(graph, relation) -> list[tuple]:
     """(from, to) as qualified names, so assertions read like the source."""
     out = []
     for edge in graph.code_edges(relation):
@@ -288,7 +288,7 @@ class Child(Outer.Inner):
 '''
 
 
-def _target_paths(graph, relation, source_name):
+def _target_paths(graph, relation, source_name) -> list[str]:
     """File path of each edge target whose source qualified name matches."""
     paths = []
     for edge in graph.code_edges(relation):

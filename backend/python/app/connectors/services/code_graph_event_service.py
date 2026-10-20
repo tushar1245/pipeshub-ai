@@ -18,7 +18,7 @@ _MAX_CHAINED_RUNS = 5
 if TYPE_CHECKING:
     from logging import Logger
 
-    from app.modules.code_graph.edge_build_runner import CodeEdgeBuildRunner
+    from app.modules.code_graph.edge_build_runner import BuildLease, CodeEdgeBuildRunner
 
 
 class CodeGraphEventService:
@@ -97,7 +97,7 @@ class CodeGraphEventService:
         return True
 
     async def _run_then_follow_up(self, org_id: str, connector_id: str, record_group_id: str,
-                                  lease: Any) -> None:
+                                  lease: BuildLease) -> None:
         """A run that ends at its follow-up cap with a request still owed starts the next run
         as soon as this one's task is gone; it used to wait for the reconciler (up to 10 min, B3)."""
         still_owed = await self._runner.run(org_id=org_id, connector_id=connector_id,

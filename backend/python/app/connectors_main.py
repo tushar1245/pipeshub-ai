@@ -83,7 +83,7 @@ from app.edition_services import (
     stop_sync_reaper,
     sync_executor_enabled,
 )
-from app.modules.code_graph.edge_build_reconciler import reconcile_forever
+from app.modules.code_graph.edge_build_reconciler import reconcile_forever  # noqa: E402 - after set_service_suffix(), like the imports around it
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider  # noqa: E402 - like the imports around it, after set_service_suffix()
 from app.services.messaging.config import ConsumerType, MessageBrokerType, Topic, get_message_broker_type
 from app.services.messaging.kafka.utils.utils import KafkaUtils

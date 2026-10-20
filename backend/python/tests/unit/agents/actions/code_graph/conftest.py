@@ -20,7 +20,7 @@ USER = "user-1"
 CONN = "conn-1"
 
 
-def _block(key, record_id, file_path, symbol_id, name, kind="function"):
+def _block(key, record_id, file_path, symbol_id, name, kind="function") -> dict:
     return {
         "_key": key,
         "id": key,
@@ -93,7 +93,7 @@ class FakeGraphProvider:
             for record_id, path in self.code_files.items()
         ]
 
-    async def get_nodes_by_filters(self, collection, filters, return_fields=None, transaction=None, raise_on_error=False):
+    async def get_nodes_by_filters(self, collection, filters, return_fields=None, transaction=None, raise_on_error=False) -> list[dict]:
         if collection == CODE_FILES:
             return [d for d in self._code_file_docs()
                     if all(d.get(k) == v for k, v in filters.items())]
@@ -110,7 +110,7 @@ class FakeGraphProvider:
         }
 
     async def get_nodes_by_field_in(self, collection, field_name, field_values,
-                                    return_fields=None, transaction=None, raise_on_error=False):
+                                    return_fields=None, transaction=None, raise_on_error=False) -> list[dict]:
         wanted = set(field_values)
         if collection == RECORDS:
             docs = self.records.values()
@@ -120,7 +120,7 @@ class FakeGraphProvider:
             docs = self.blocks.values()
         return [d for d in docs if d.get(field_name) in wanted]
 
-    async def get_document(self, document_key, collection, raise_on_error=False):
+    async def get_document(self, document_key, collection, raise_on_error=False) -> dict | None:
         return self.records.get(document_key)
 
     async def get_documents_paginated(self, collection, skip=0, limit=50, filters=None,
@@ -137,7 +137,7 @@ class FakeGraphProvider:
     async def search_nodes_by_field_terms(
         self, collection, field_name, terms, filters=None, limit=400,
         transaction=None, raise_on_error=False
-    ):
+    ) -> list[dict]:
         """Substring matching, like the provider's non-full-text fallback.
 
         On the base fake because both `query.py` and `get_neighbour`'s name-only
@@ -156,14 +156,14 @@ class FakeGraphProvider:
             return set()
         return {r for r in record_ids if r in self.records and r not in self.deny_records}
 
-    async def check_record_access_with_details(self, user_id, org_id, record_id):
+    async def check_record_access_with_details(self, user_id, org_id, record_id) -> dict | None:
         if user_id != self.allow_user or record_id in self.deny_records:
             return None
         return {"record": {"_key": record_id}}
 
     async def get_neighbors_by_relationship_types(self, node_key, node_collection,
                                                   relationship_types, direction,
-                                                  limit=25, transaction=None):
+                                                  limit=25, transaction=None) -> list[dict]:
         anchor = f"{node_collection}/{node_key}"
         anchor_f, other_f = ("_from", "_to") if direction == "outbound" else ("_to", "_from")
         out = []
@@ -179,7 +179,7 @@ class FakeGraphProvider:
 
     async def get_neighbors_for_nodes_by_relationship_types(self, node_keys, node_collection,
                                                             relationship_types, direction,
-                                                            limit=5000, transaction=None, raise_on_error=False):
+                                                            limit=5000, transaction=None, raise_on_error=False) -> list[dict]:
         anchors = {f"{node_collection}/{k}" for k in node_keys}
         out = []
         for edge in self.edges:
@@ -213,17 +213,17 @@ class FakeBlobStore:
             }
         }
 
-    async def get_record_from_storage(self, virtual_record_id, org_id):
+    async def get_record_from_storage(self, virtual_record_id, org_id) -> dict | None:
         return self.records.get(virtual_record_id)
 
 
 @pytest.fixture
-def graph():
+def graph() -> FakeGraphProvider:
     return FakeGraphProvider()
 
 
 @pytest.fixture
-def blob():
+def blob() -> FakeBlobStore:
     return FakeBlobStore()
 
 
@@ -231,12 +231,12 @@ class QueryGraphProvider(FakeGraphProvider):
     """Adds the query operations used by `query.py`."""
 
     async def get_accessible_virtual_record_ids(self, user_id, org_id, filters=None,
-                                                time_range=None, raise_on_error=False):
+                                                time_range=None, raise_on_error=False) -> dict[str, str]:
         if user_id != self.allow_user:
             return {}
         return {f"v-{r}": r for r in self.records if r not in self.deny_records}
 
-    def _rollup(self, prefix, relations, direction, limit):
+    def _rollup(self, prefix, relations, direction, limit) -> list[dict]:
         """What the DB-side rollup returns: one row per file edge, keyed by the
         record at each end so the caller can drop what it may not read and
         resolve the paths in one batch."""
@@ -269,7 +269,7 @@ class QueryGraphProvider(FakeGraphProvider):
     async def get_nodes_by_field_prefix(
         self, collection, field_name, prefix, filters=None, limit=400,
         transaction=None, raise_on_error=False
-    ):
+    ) -> list[dict]:
         docs = self._code_file_docs() if collection == CODE_FILES else self.blocks.values()
         return [
             doc for doc in docs
@@ -280,12 +280,12 @@ class QueryGraphProvider(FakeGraphProvider):
     async def get_edge_rollup_by_file_prefix(
         self, org_id, file_path_prefix, relationship_types, direction,
         connector_id, limit=100000, transaction=None,
-    ):
+    ) -> list[dict]:
         return self._rollup(
             file_path_prefix, relationship_types, direction, limit
         )
 
 
 @pytest.fixture
-def query_graph():
+def query_graph() -> QueryGraphProvider:
     return QueryGraphProvider()

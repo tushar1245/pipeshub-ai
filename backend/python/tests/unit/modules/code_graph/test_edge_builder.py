@@ -7,7 +7,7 @@ the graph far more than the missing edges cost.
 import pytest
 
 from app.config.constants.arangodb import RecordRelations
-from app.modules.code_graph.edge_builder import build_code_graph_edges
+from app.modules.code_graph.edge_builder import EdgeBuildResult, build_code_graph_edges
 
 from .conftest import GROUP_ID, ORG_ID
 
@@ -40,7 +40,7 @@ export class S { go(){ const r: Repo = x; return r.find(); }
 '''
 
 
-async def _build(graph, touched=None, dry_run=False):
+async def _build(graph, touched=None, dry_run=False) -> EdgeBuildResult:
     return await build_code_graph_edges(
         graph_provider=graph,
         facts_source=graph,

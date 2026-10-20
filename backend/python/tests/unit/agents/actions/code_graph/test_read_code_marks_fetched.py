@@ -7,6 +7,7 @@ figure the model could see was wrong is what teaches it to ignore the accurate
 ones.
 """
 import json
+from collections.abc import Awaitable, Callable
 
 import pytest
 
@@ -24,13 +25,13 @@ def _make_instance(state: dict) -> cg.CodeGraph:
 
 
 @pytest.fixture
-def read_code(monkeypatch):
+def read_code(monkeypatch) -> Callable[..., Awaitable[tuple[dict, dict]]]:
     """Returns (invoke, state). `invoke` runs the tool over a stubbed impl."""
     state: dict = {}
     instance = _make_instance(state)
 
-    async def run(impl_result, **kwargs):
-        async def fake_impl(**_):
+    async def run(impl_result, **kwargs) -> tuple[dict, dict]:
+        async def fake_impl(**_) -> dict:
             return dict(impl_result)
 
         monkeypatch.setattr(cg, "read_code_impl", fake_impl)

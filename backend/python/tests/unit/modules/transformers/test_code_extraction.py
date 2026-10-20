@@ -6,11 +6,19 @@ write that consumes it.
 """
 
 import logging
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.models.blocks import Block, BlockType, DataFormat
+
+if TYPE_CHECKING:
+    from app.models.blocks import BlocksContainer
+    from app.modules.transformers.document_extraction import (
+        CodeClassification,
+        DocumentExtraction,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -31,7 +39,7 @@ class Store(Base):
 '''
 
 
-def _parse(source=SAMPLE_SOURCE, path="app/services/vector/store.py"):
+def _parse(source=SAMPLE_SOURCE, path="app/services/vector/store.py") -> "BlocksContainer | None":
     """Run the real CodeFileParser so the blocks match production shape."""
     from app.modules.parsers.code_parser import CodeFileParser
 
@@ -40,7 +48,7 @@ def _parse(source=SAMPLE_SOURCE, path="app/services/vector/store.py"):
     )
 
 
-def _build_extractor():
+def _build_extractor() -> "DocumentExtraction":
     from app.modules.transformers.document_extraction import DocumentExtraction
 
     return DocumentExtraction(
@@ -48,7 +56,7 @@ def _build_extractor():
     )
 
 
-def _make_text_block(text, index=0):
+def _make_text_block(text, index=0) -> Block:
     return Block(type=BlockType.TEXT, format=DataFormat.TXT, data=text, index=index)
 
 
@@ -83,7 +91,7 @@ class TestFindCodeSummaryBlock:
 class TestPrepareCodeContent:
     """The LLM input built from parser output rather than raw source."""
 
-    def _render(self, context_length=128000):
+    def _render(self, context_length=128000) -> str:
         from app.modules.transformers.document_extraction import (
             find_code_summary_block,
         )
@@ -152,7 +160,7 @@ class TestPrepareCodeContent:
 class TestToSemanticMetadata:
     """Both classification shapes map onto the one persisted model."""
 
-    def _code_classification(self, **overrides):
+    def _code_classification(self, **overrides) -> "CodeClassification":
         from app.modules.transformers.document_extraction import (
             CodeClassification,
             SubCategories,
@@ -232,7 +240,7 @@ class TestApplyRouting:
     """apply picks the branch from the record type, not from the blocks alone."""
 
     @staticmethod
-    def _code_classification():
+    def _code_classification() -> "CodeClassification":
         from app.modules.transformers.document_extraction import (
             CodeClassification,
             SubCategories,
@@ -333,7 +341,7 @@ class TestApplyRouting:
 class TestGraphWriteAcceptsCodeMetadata:
     """The graph write is what a code record's empty taxonomy reaches next."""
 
-    def _transformer_with_store(self):
+    def _transformer_with_store(self) -> tuple:
         from app.modules.transformers.graphdb import GraphDBTransformer
 
         transformer = GraphDBTransformer(

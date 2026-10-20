@@ -16,35 +16,35 @@ CTX = {"graph_provider": None, "org_id": "org-1", "user_id": "user-1", "connecto
 
 
 @pytest.fixture
-def query_graph():
+def query_graph() -> object:
     """One source file holding one method — enough to reach `_degrees`."""
 
     class _Graph:
         async def get_nodes_by_field_prefix(self, collection, field_name, prefix,
-                                            filters=None, limit=None, raise_on_error=False):
+                                            filters=None, limit=None, raise_on_error=False) -> list[dict]:
             if collection != CollectionNames.CODE_FILES.value:
                 return []
             return [{"_key": "rec-1", "filePath": "app/events/events.py", "fileRole": "source"}]
 
         async def get_nodes_by_field_in(self, collection, field_name, field_values,
-                                        return_fields=None, raise_on_error=False):
+                                        return_fields=None, raise_on_error=False) -> list[dict]:
             return [{
                 "_key": "b1", "id": "b1", "orgId": "org-1", "connectorId": "conn-1",
                 "recordId": "rec-1", "qualifiedName": "method:EventProcessor.on_event",
                 "kind": "method", "name": "on_event", "startLine": 1, "endLine": 9,
             }]
 
-        async def get_neighbors_for_nodes_by_relationship_types(self, **kwargs):
+        async def get_neighbors_for_nodes_by_relationship_types(self, **kwargs) -> list[dict]:
             return [{"anchorKey": "b1", "key": "b2", "collection": "blocks"}]
 
         async def filter_accessible_record_ids(self, record_ids, *a, **k) -> set:
             return set(record_ids)
 
-        async def check_record_access_with_details(self, *a, **k):
+        async def check_record_access_with_details(self, *a, **k) -> dict:
             return {"record": {"_key": "rec-1"}}
 
         async def get_nodes_by_filters(self, collection, filters, return_fields=None,
-                                       transaction=None, raise_on_error=False):
+                                       transaction=None, raise_on_error=False) -> list[dict]:
             return []
 
         async def get_file_paths_for_records(self, org_id, record_ids, transaction=None,
@@ -55,34 +55,34 @@ def query_graph():
 
 
 @pytest.fixture
-def empty_graph():
+def empty_graph() -> object:
     """A repo the prefix scan finds nothing in."""
 
     class _Graph:
-        async def get_nodes_by_field_prefix(self, **kwargs):
+        async def get_nodes_by_field_prefix(self, **kwargs) -> list[dict]:
             return []
 
-        async def get_nodes_by_field_in(self, **kwargs):
+        async def get_nodes_by_field_in(self, **kwargs) -> list[dict]:
             return []
 
         async def filter_accessible_record_ids(self, record_ids, *a, **k) -> set:
             return set(record_ids)
 
-        async def get_nodes_by_filters(self, **kwargs):
+        async def get_nodes_by_filters(self, **kwargs) -> list[dict]:
             return []
 
     return _Graph()
 
 
 @pytest.fixture
-def repo_root_graph():
+def repo_root_graph() -> object:
     """Paths are stored repo-relative, so `backend` carries no slash."""
 
     paths = ["backend/python/app/events/events.py", "backend/nodejs/apps/src/app.ts"]
 
     class _Graph:
         async def get_nodes_by_field_prefix(self, collection, field_name, prefix,
-                                            filters=None, limit=None, raise_on_error=False):
+                                            filters=None, limit=None, raise_on_error=False) -> list[dict]:
             return [{"_key": p, "filePath": p, "fileRole": "source"}
                     for p in paths if p.startswith(prefix)]
 
@@ -103,7 +103,7 @@ def repo_root_graph():
     return _Graph()
 
 
-async def _select(select):
+async def _select(select) -> dict:
     return await query_code_graph_impl(**CTX, select=select)
 
 
@@ -227,31 +227,31 @@ class _CappedGraph:
     """Two files where the scan only looks at one."""
 
     async def get_nodes_by_field_prefix(self, collection, field_name, prefix,
-                                        filters=None, limit=None, raise_on_error=False):
+                                        filters=None, limit=None, raise_on_error=False) -> list[dict]:
         if collection != CollectionNames.CODE_FILES.value:
             return []
         return [{"_key": f"rec-{i}", "filePath": f"app/events/e{i}.py",
                  "fileRole": "source"} for i in range(2)][:limit]
 
     async def get_nodes_by_field_in(self, collection, field_name, field_values,
-                                    return_fields=None, raise_on_error=False):
+                                    return_fields=None, raise_on_error=False) -> list[dict]:
         return [{
             "_key": "b1", "id": "b1", "orgId": "org-1", "connectorId": "conn-1",
             "recordId": "rec-0", "qualifiedName": "function:handle",
             "kind": "function", "name": "handle", "startLine": 1, "endLine": 9,
         }]
 
-    async def get_neighbors_for_nodes_by_relationship_types(self, **kwargs):
+    async def get_neighbors_for_nodes_by_relationship_types(self, **kwargs) -> list[dict]:
         return []
 
     async def filter_accessible_record_ids(self, record_ids, *a, **k) -> set:
         return set(record_ids)
 
-    async def check_record_access_with_details(self, *a, **k):
+    async def check_record_access_with_details(self, *a, **k) -> dict:
         return {"record": {"_key": "rec-0"}}
 
     async def get_nodes_by_filters(self, collection, filters, return_fields=None,
-                                   transaction=None, raise_on_error=False):
+                                   transaction=None, raise_on_error=False) -> list[dict]:
         return []
 
     async def get_file_paths_for_records(self, org_id, record_ids, transaction=None,

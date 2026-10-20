@@ -22,11 +22,11 @@ VRID = "vrid-1"
 ORG = "org-1"
 
 
-def _record(name, external_id):
+def _record(name, external_id) -> SimpleNamespace:
     return SimpleNamespace(record_name=name, external_record_id=external_id)
 
 
-def _code_block(text, qualified_name=None, block_id="b1", index=0):
+def _code_block(text, qualified_name=None, block_id="b1", index=0) -> SimpleNamespace:
     return SimpleNamespace(
         id=block_id,
         index=index,

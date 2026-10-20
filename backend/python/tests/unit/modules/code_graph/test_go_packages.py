@@ -1,4 +1,6 @@
 """Go calls resolve through package imports and receiver types (B1 client-go)."""
+from collections.abc import Awaitable, Callable
+
 import pytest
 
 from app.config.constants.arangodb import RecordRelations
@@ -10,7 +12,7 @@ MOD = b"module example.com/app\n"
 
 
 @pytest.fixture
-def go_repo(graph, index_file):
+def go_repo(graph, index_file) -> Callable[[dict[str, bytes]], Awaitable[None]]:
     async def _repo(files: dict[str, bytes]) -> None:
         graph.code_files["gomod"] = "go.mod"
         for i, (path, source) in enumerate(files.items()):

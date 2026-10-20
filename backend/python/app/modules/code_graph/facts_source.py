@@ -89,7 +89,7 @@ def facts_from_blob_record(record_id: str, record: dict[str, Any]) -> RecordFact
     return out
 
 
-def _code_metadata(item: Any) -> dict[str, Any]:
+def _code_metadata(item: object) -> dict[str, Any]:
     meta = item.get("code_metadata") if isinstance(item, dict) else None
     return meta if isinstance(meta, dict) else {}
 

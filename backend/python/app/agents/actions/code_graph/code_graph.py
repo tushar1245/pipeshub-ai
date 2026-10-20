@@ -62,6 +62,8 @@ from .results import as_untrusted, attach_graph_status, without_marker
 from .search import DEFAULT_SEARCH_LIMIT, search_code_impl
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from app.modules.agents.qna.chat_state import ChatState
 
 logger = logging.getLogger(__name__)
@@ -212,7 +214,7 @@ class CodeGraph:
         return not is_error, json.dumps(result, default=str, separators=(",", ":"))
 
     async def _run(
-        self, name: str, connector_id: str, call: Any, failure: str,
+        self, name: str, connector_id: str, call: Callable[[], Awaitable[dict[str, Any]]], failure: str,
     ) -> dict[str, Any]:
         denied = self._in_scope(connector_id or "")
         if denied:
@@ -371,6 +373,7 @@ class CodeGraph:
         select: str,
         kinds: list[str] | None = None,
         limit: int = DEFAULT_QUERY_LIMIT,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:
@@ -515,6 +518,7 @@ class CodeGraph:
         depth: int = 1,
         limit: int = DEFAULT_NEIGHBOR_LIMIT,
         offset: int = 0,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:
@@ -627,6 +631,7 @@ class CodeGraph:
         qualified_name: str | None = None,
         lines: str | None = None,
         max_lines: int | None = None,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:
@@ -735,6 +740,7 @@ class CodeGraph:
         qualified_name_b: str,
         max_depth: int = DEFAULT_MAX_DEPTH,
         edge_types: list[str] | None = None,
+        *,
         include_tests: bool = False,
         undirected: bool = False,
         repo: str | None = None,
@@ -795,6 +801,7 @@ class CodeGraph:
         mode: str = "identifier",
         path: str | None = None,
         limit: int = DEFAULT_SEARCH_LIMIT,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:
@@ -839,6 +846,7 @@ class CodeGraph:
         connector_id: str,
         file_path: str | None = None,
         record_id: str | None = None,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:
@@ -896,6 +904,7 @@ class CodeGraph:
         record_id: str | None = None,
         qualified_name: str | None = None,
         depth: int = DEFAULT_IMPACT_DEPTH,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:
@@ -941,6 +950,7 @@ class CodeGraph:
         self,
         connector_id: str,
         limit: int = DEFAULT_ENTRY_LIMIT,
+        *,
         include_tests: bool = False,
         repo: str | None = None,
     ) -> tuple[bool, str]:

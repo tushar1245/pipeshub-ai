@@ -14,6 +14,7 @@ accept a bare path.
 """
 import pytest
 
+from app.agent_loop_lib.tools.decorators import ToolMeta
 from app.agents.actions.code_graph.code_graph import CodeGraph
 
 HANDOFFS = [
@@ -24,7 +25,7 @@ HANDOFFS = [
 ]
 
 
-def _meta(name):
+def _meta(name) -> ToolMeta:
     return getattr(CodeGraph, name)._agent_tool_meta
 
 

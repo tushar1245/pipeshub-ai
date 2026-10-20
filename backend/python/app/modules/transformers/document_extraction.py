@@ -2,7 +2,7 @@ import base64
 import io
 import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, field_validator

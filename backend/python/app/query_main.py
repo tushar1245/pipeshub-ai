@@ -30,7 +30,7 @@ from app.utils.request_context import set_service_suffix
 
 set_service_suffix("-qs")
 from app.api.routes.ai_models_registry import router as ai_models_registry_router
-from app.api.routes.code_graph import router as code_graph_router
+from app.api.routes.code_graph import router as code_graph_router  # noqa: E402 - after set_service_suffix(), like the imports around it
 from app.api.routes.openai_models import router as openai_models_router
 from app.api.routes.health import router as health_router
 from app.api.routes.skills import router as skills_router

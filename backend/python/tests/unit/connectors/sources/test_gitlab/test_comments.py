@@ -15,7 +15,6 @@ from fastapi import HTTPException
 
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.sources.gitlab.comments import CommentsHelper
-from app.connectors.sources.gitlab.constants import MR_FILE_INLINE_CONTENT_MAX_BYTES
 
 from .conftest import make_mock_connector, failed_res
 

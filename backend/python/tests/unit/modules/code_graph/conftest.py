@@ -3,6 +3,8 @@
 Implements only what block projection and edge resolution actually call, so the
 resolution ladder can be exercised without a database.
 """
+from collections.abc import Awaitable, Callable
+
 import pytest
 
 from app.config.constants.arangodb import CollectionNames
@@ -54,7 +56,7 @@ class FakeGraphProvider:
             if record_id in wanted
         }
 
-    async def get_document(self, key, collection, transaction=None, *, raise_on_error=False):
+    async def get_document(self, key, collection, transaction=None, *, raise_on_error=False) -> dict | None:
         if collection == CollectionNames.CODE_FILES.value and key in self.code_files:
             return {"_key": key, "filePath": self.code_files[key], **self.changed_names.get(key, {})}
         return None
@@ -72,7 +74,7 @@ class FakeGraphProvider:
 
     async def get_documents_paginated(self, collection, skip=0, limit=50, filters=None,
                                       sort_field=None, transaction=None, raise_on_error=False,
-                                      after_key=None, return_fields=None):
+                                      after_key=None, return_fields=None) -> list[dict]:
         if collection != CollectionNames.BLOCKS.value:
             return []
         rows = [
@@ -89,7 +91,7 @@ class FakeGraphProvider:
     async def get_edges_by_target_keys(
         self, target_keys, edge_collection, filters=None, return_field="_from",
         transaction=None, raise_on_error=False,
-    ):
+    ) -> list:
         targets = set(target_keys)
         return sorted({
             edge[return_field]
@@ -103,7 +105,7 @@ class FakeGraphProvider:
 
     async def delete_edges_by_source_keys(
         self, source_keys, edge_collection, filters=None, transaction=None, exclude=None,
-    ):
+    ) -> int:
         sources = set(source_keys)
         keep, removed = [], 0
         for edge in self.edges:
@@ -124,7 +126,7 @@ class FakeGraphProvider:
 
     async def delete_edges_touching_nodes(
         self, node_keys, node_collection, edge_collection, transaction=None,
-    ):
+    ) -> int:
         node_ids = {f"{node_collection}/{key}" for key in node_keys}
         original_count = len(self.edges)
         self.edges = [
@@ -135,7 +137,7 @@ class FakeGraphProvider:
         return original_count - len(self.edges)
 
     async def get_nodes_by_filters(self, collection, filters, return_fields=None, transaction=None,
-                                   *, raise_on_error=False):
+                                   *, raise_on_error=False) -> list[dict]:
         if collection == CollectionNames.RECORDS.value:
             # The repo's code files, empty ones included, as the builder lists them.
             return [{"_key": record_id} for record_id in self.code_files]
@@ -187,14 +189,14 @@ class FakeGraphProvider:
 
     # -- assertions helpers ---------------------------------------------
 
-    def code_edges(self, relation=None):
+    def code_edges(self, relation=None) -> list[dict]:
         return [
             e for e in self.edges
             if e.get("source") == "code_graph"
             and (relation is None or e["relationshipType"] == relation)
         ]
 
-    def edge_targets(self, relation):
+    def edge_targets(self, relation) -> list:
         out = []
         for edge in self.code_edges(relation):
             _, _, ident = edge["_to"].partition("/")
@@ -204,15 +206,15 @@ class FakeGraphProvider:
 
 
 @pytest.fixture
-def graph():
+def graph() -> FakeGraphProvider:
     return FakeGraphProvider()
 
 
 @pytest.fixture
-def index_file(graph):
+def index_file(graph) -> Callable[..., Awaitable[dict[str, int]]]:
     parser = CodeFileParser()
 
-    async def _index(record_id, file_path, source, language, name=None):
+    async def _index(record_id, file_path, source, language, name=None) -> dict[str, int]:
         container = parser.parse_to_blocks(
             source, name or file_path.rsplit("/", 1)[-1], file_path, language
         )

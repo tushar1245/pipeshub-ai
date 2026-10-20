@@ -31,11 +31,11 @@ class FakeGraphProvider(_BaseFake):
 
 
 @pytest.fixture
-def graph():
+def graph() -> FakeGraphProvider:
     return FakeGraphProvider()
 
 
-async def _neighbours(graph, **kwargs):
+async def _neighbours(graph, **kwargs) -> dict:
     return await get_neighbour_impl(
         graph_provider=graph, connector_id=CONN, org_id=ORG, user_id=USER,
         file_path="src/a.py", qualified_name="function:caller", **kwargs,
@@ -331,7 +331,7 @@ class TestPagination:
     12k-token blob. `offset` pages it, and `next` tells the model where the
     following page starts, the same way `read_code` reports a stopped file."""
 
-    async def _page(self, graph, **kw):
+    async def _page(self, graph, **kw) -> dict:
         return await get_neighbour_impl(
             graph_provider=graph, connector_id=CONN, org_id=ORG, user_id=USER,
             file_path="src/b.py", direction="any", **kw,
@@ -357,7 +357,9 @@ class TestPagination:
             offset += 1
         # Pages partition rank order; the full result is displayed anchor-
         # grouped. Same edges, so compare as a multiset, not a sequence.
-        key = lambda n: (n["file_path"], n["qualified_name"], n["relation"])
+        def key(n: dict) -> tuple:
+            return (n["file_path"], n["qualified_name"], n["relation"])
+
         assert sorted(map(key, pages)) == sorted(map(key, full["neighbors"]))
 
     @pytest.mark.asyncio
@@ -448,7 +450,7 @@ class TestNameOnlyAnchor:
     what left this tool uncalled on set-shaped questions."""
 
     @staticmethod
-    async def _by_name(graph, name, **kwargs):
+    async def _by_name(graph, name, **kwargs) -> dict:
         return await get_neighbour_impl(
             graph_provider=graph, connector_id=CONN, org_id=ORG, user_id=USER,
             qualified_name=name, **kwargs,

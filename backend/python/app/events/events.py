@@ -43,7 +43,9 @@ from app.exceptions.indexing_exceptions import (
     IndexingError,
     ProcessingError,
 )
-from app.modules.parsers.code_parser.classification_policy import code_classification_skip_reason
+from app.modules.parsers.code_parser.classification_policy import (
+    code_classification_skip_reason,
+)
 from app.modules.parsers.code_parser.file_role import is_generated_file_name
 from app.modules.parsers.code_parser.routing import CodeFileRoute, plan_code_file
 from app.modules.parsers.code_parser.secret_scan import redact_secrets_bytes

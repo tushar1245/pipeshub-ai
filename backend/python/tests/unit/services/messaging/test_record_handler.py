@@ -527,7 +527,7 @@ class TestRequestCodeEdges:
     """The publish side: which finished record asks for a repo's edge build."""
 
     @staticmethod
-    def _record(**overrides):
+    def _record(**overrides) -> dict:
         record = {
             "_key": "record-1",
             "connectorName": "GitLab",
@@ -540,7 +540,7 @@ class TestRequestCodeEdges:
         return record
 
     @staticmethod
-    async def _request(handler, record, *, unfinished=False, pending=False, claimed=True):
+    async def _request(handler, record, *, unfinished=False, pending=False, claimed=True) -> tuple:
         graph_provider = handler.event_processor.graph_provider
         graph_provider.get_document = AsyncMock(return_value=record)
         graph_provider.has_nodes_by_filters = AsyncMock(return_value=unfinished)

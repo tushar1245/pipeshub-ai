@@ -100,7 +100,9 @@ from app.models.permission import (
     RETIRED_ROLES,
     read_role,
 )
-from app.modules.code_graph.build_state import SYNC_POINT_SUFFIX as CODE_EDGE_BUILD_SUFFIX
+from app.modules.code_graph.build_state import (
+    SYNC_POINT_SUFFIX as CODE_EDGE_BUILD_SUFFIX,
+)
 from app.modules.code_graph.edge_build_trigger import is_code_record
 from app.modules.named_entities.graph_ops import (
     NamedEntityGraphMixin,

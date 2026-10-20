@@ -111,7 +111,7 @@ class TestKnowledgeToolsetGate:
         ), messages
 
 
-def _patch_codegraph_toolset_registry():
+def _patch_codegraph_toolset_registry() -> tuple:
     """Mock the toolset registry to include the CodeGraph class."""
     from app.agents.actions.code_graph.code_graph import CodeGraph
 

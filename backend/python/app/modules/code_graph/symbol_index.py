@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.modules.code_graph.guards import CALLABLE_KINDS, TYPE_KINDS, lang_family
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 __all__ = ["BlockRow", "SymbolIndex", "build_symbol_index"]
 
 
-def _ensure_list(value: Any) -> list[dict]:
+def _ensure_list(value: object) -> list[dict]:
     """Accept a list or a JSON string (Neo4j stores complex props as strings)."""
     if isinstance(value, list):
         return value
@@ -32,13 +34,13 @@ def _ensure_list(value: Any) -> list[dict]:
     return []
 
 
-def _ensure_str_list(value: Any) -> tuple[str, ...]:
+def _ensure_str_list(value: object) -> tuple[str, ...]:
     if isinstance(value, list):
         return tuple(item for item in value if isinstance(item, str))
     return ()
 
 
-def _ensure_dict(value: Any) -> dict[str, str]:
+def _ensure_dict(value: object) -> dict[str, str]:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):

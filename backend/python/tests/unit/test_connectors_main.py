@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import types
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,7 +26,7 @@ def _no_inherited_worker_healthcheck_timeout(monkeypatch: pytest.MonkeyPatch) ->
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _reset_component_registry():
+def _reset_component_registry() -> Iterator[None]:
     """start_kafka_consumers and the retries share module-level state with /health."""
     import app.connectors_main as cm
 

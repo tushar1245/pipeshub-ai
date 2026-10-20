@@ -6,9 +6,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from typing_extensions import TypedDict
 
-
-from app.modules.code_graph.connectors import agent_knowledge_has_code_connector
 from app.config.configuration_service import ConfigurationService
+from app.modules.code_graph.connectors import agent_knowledge_has_code_connector
 from app.modules.reranker.reranker import RerankerService
 from app.modules.retrieval.retrieval_service import RetrievalService
 from app.modules.transformers.blob_storage import BlobStorage

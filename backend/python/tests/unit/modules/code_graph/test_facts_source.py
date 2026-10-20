@@ -26,7 +26,7 @@ B = b"def foo(x):\n    return x\n"
 C = b"def bar(x):\n    return x\n"
 
 
-def _edges(graph):
+def _edges(graph) -> list[tuple]:
     return sorted((e["_from"], e["_to"], e["relationshipType"]) for e in graph.code_edges())
 
 
@@ -137,7 +137,7 @@ async def test_a_blob_stored_before_the_stamp_loads_as_the_current_version(graph
 
 
 class TestBlobCodeFactsSource:
-    def _source(self, records: dict[str, dict | None], virtual_ids: dict[str, str]):
+    def _source(self, records: dict[str, dict | None], virtual_ids: dict[str, str]) -> tuple[BlobCodeFactsSource, MagicMock]:
         graph_provider = MagicMock()
         graph_provider.get_virtual_record_ids_for_record_ids = AsyncMock(return_value=virtual_ids)
         blob = MagicMock()
@@ -145,7 +145,7 @@ class TestBlobCodeFactsSource:
             return_value={v: {"record_doc_id": f"doc-{v}"} for v in virtual_ids.values()}
         )
 
-        async def fetch(virtual_id, org_id, lookup_result=None):
+        async def fetch(virtual_id, org_id, lookup_result=None) -> dict | None:
             assert lookup_result == {"record_doc_id": f"doc-{virtual_id}"}
             value = records[virtual_id]
             if isinstance(value, Exception):

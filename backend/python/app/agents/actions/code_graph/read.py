@@ -19,7 +19,8 @@ from .ops import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from app.modules.transformers.blob_storage import BlobStorage
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,9 @@ MAX_READ_LINES = 3000
 
 async def read_code_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     connector_id: str,
-    blob_store: Any,
+    blob_store: BlobStorage,
     org_id: str,
     user_id: str,
     file_path: str,
@@ -138,8 +139,8 @@ def line_link(web_url: str | None, start: int | None, end: int | None) -> str | 
 
 async def _load_blob(
     *,
-    graph_provider: Any,
-    blob_store: Any,
+    graph_provider: IGraphDBProvider,
+    blob_store: BlobStorage,
     org_id: str,
     connector_id: str,
     file_path: str,
@@ -196,9 +197,9 @@ async def _load_blob(
 
 async def outline_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     connector_id: str,
-    blob_store: Any,
+    blob_store: BlobStorage,
     org_id: str,
     user_id: str,
     file_path: str,

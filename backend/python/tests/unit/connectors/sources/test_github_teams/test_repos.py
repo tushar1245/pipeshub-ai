@@ -643,7 +643,7 @@ def _persisted_paths(c) -> set[str]:
     }
 
 
-def _gitattributes_response(text: str):
+def _gitattributes_response(text: str) -> MagicMock:
     import base64
 
     return ok_response(SimpleNamespace(content=base64.b64encode(text.encode()).decode(), encoding="base64"))
@@ -687,7 +687,7 @@ class TestExcludedTrees:
         ])
         fetched: list[str] = []
 
-        async def dispatch(_fn, _owner, _name, sha, recursive):
+        async def dispatch(_fn, _owner, _name, sha, recursive) -> MagicMock:
             fetched.append(sha)
             if sha == "head-sha":
                 return ok_response(root)

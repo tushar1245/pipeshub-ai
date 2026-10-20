@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from app.agent_loop_lib.agent.spec import AgentSpec
     from app.agent_loop_lib.core.types import Goal, Todo
     from app.agent_loop_lib.runtime.runtime import AgentRuntime
+    from app.agent_loop_lib.tools.registry import ToolRegistry
     from app.agents.agent_loop.context import AgentContext
     from app.modules.agents.context.source_catalog import SourceCatalog
 
@@ -211,7 +212,7 @@ def _collect_leaf_toolsets(registry, *, exclude: frozenset[str] = frozenset()) -
     return lines
 
 
-def _toolsets_covering(registry, tool_names: frozenset[str]) -> frozenset[str]:
+def _toolsets_covering(registry: ToolRegistry, tool_names: frozenset[str]) -> frozenset[str]:
     """Toolset group names that already have at least one tool in ``tool_names``."""
     if not tool_names:
         return frozenset()
@@ -224,7 +225,7 @@ def _toolsets_covering(registry, tool_names: frozenset[str]) -> frozenset[str]:
 
 def _bound_tool_view(
     tool_names: list[str],
-    registry,
+    registry: ToolRegistry,
     pinned_toolsets: list[str] | None,
     state: dict[str, Any],
 ) -> tuple[list[str], frozenset[str]]:

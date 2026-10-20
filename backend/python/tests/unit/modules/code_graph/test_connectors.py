@@ -59,7 +59,7 @@ class TestOrgLevelCheck:
             self.instances = instances
             self.raises = raises
 
-        async def get_user_connector_instances(self, **_kwargs):
+        async def get_user_connector_instances(self, **_kwargs) -> list:
             if self.raises:
                 raise RuntimeError("graph is down")
             return self.instances

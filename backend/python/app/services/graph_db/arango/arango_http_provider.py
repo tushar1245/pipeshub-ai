@@ -3818,13 +3818,13 @@ class ArangoHTTPProvider(NamedEntityGraphMixin, IGraphDBProvider):
         """Equality and membership filters as AQL predicates on ``var`` plus their bind vars."""
         conditions: list[str] = []
         bind_vars: dict[str, Any] = {}
-        for field, value in (filters or {}).items():
-            parameter = f"filter_{field}"
-            conditions.append(f"{var}.{field} == @{parameter}")
+        for field_name, value in (filters or {}).items():
+            parameter = f"filter_{field_name}"
+            conditions.append(f"{var}.{field_name} == @{parameter}")
             bind_vars[parameter] = value
-        for field, values in (in_filters or {}).items():
-            parameter = f"in_filter_{field}"
-            conditions.append(f"{var}.{field} IN @{parameter}")
+        for field_name, values in (in_filters or {}).items():
+            parameter = f"in_filter_{field_name}"
+            conditions.append(f"{var}.{field_name} IN @{parameter}")
             bind_vars[parameter] = values
         return conditions, bind_vars
 
@@ -4069,9 +4069,9 @@ class ArangoHTTPProvider(NamedEntityGraphMixin, IGraphDBProvider):
         filters = filters or {}
         conditions = ["edge._to IN @target_keys"]
         bind_vars: dict[str, Any] = {"target_keys": target_keys}
-        for field, value in filters.items():
-            parameter = f"filter_{field}"
-            conditions.append(f"edge.{field} == @{parameter}")
+        for field_name, value in filters.items():
+            parameter = f"filter_{field_name}"
+            conditions.append(f"edge.{field_name} == @{parameter}")
             bind_vars[parameter] = value
         query = f"""
         FOR edge IN {edge_collection}
@@ -4102,13 +4102,13 @@ class ArangoHTTPProvider(NamedEntityGraphMixin, IGraphDBProvider):
         filters = filters or {}
         conditions = ["edge._from IN @source_keys"]
         bind_vars: dict[str, Any] = {"source_keys": source_keys}
-        for field, value in filters.items():
-            parameter = f"filter_{field}"
-            conditions.append(f"edge.{field} == @{parameter}")
+        for field_name, value in filters.items():
+            parameter = f"filter_{field_name}"
+            conditions.append(f"edge.{field_name} == @{parameter}")
             bind_vars[parameter] = value
-        for field, value in (exclude or {}).items():
-            parameter = f"exclude_{field}"
-            conditions.append(f"edge.{field} != @{parameter}")
+        for field_name, value in (exclude or {}).items():
+            parameter = f"exclude_{field_name}"
+            conditions.append(f"edge.{field_name} != @{parameter}")
             bind_vars[parameter] = value
         query = f"""
         FOR edge IN {edge_collection}
@@ -9139,10 +9139,10 @@ class ArangoHTTPProvider(NamedEntityGraphMixin, IGraphDBProvider):
         """Compare-and-set update of a sync point; see the interface."""
         conditions = []
         bind_vars: dict[str, Any] = {"@collection": collection, "key": sync_point_key}
-        for i, (field, value) in enumerate(expected.items()):
+        for i, (field_name, value) in enumerate(expected.items()):
             # == null also matches a missing attribute, which is what None means here.
             conditions.append(f"doc[@f{i}] == @v{i}")
-            bind_vars[f"f{i}"] = field
+            bind_vars[f"f{i}"] = field_name
             bind_vars[f"v{i}"] = value
         bind_vars["data"] = {
             **sync_point_data,

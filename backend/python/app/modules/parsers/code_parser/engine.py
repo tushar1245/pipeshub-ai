@@ -444,32 +444,38 @@ def _heritage_ts(node: Node, src: bytes, out: list[PendingEdgeFact], idx: int) -
     line = node.start_point[0] + 1
     for child in node.named_children:
         if child.type == "extends_type_clause":
-            for item in child.named_children:
-                if item.type in ("type_identifier", "generic_type", "identifier"):
-                    out.append(PendingEdgeFact(
-                        relation=Relation.INHERITS,
-                        to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
-                        line=line, from_symbol=idx,
-                    ))
+            out.extend(
+                PendingEdgeFact(
+                    relation=Relation.INHERITS,
+                    to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
+                    line=line, from_symbol=idx,
+                )
+                for item in child.named_children
+                if item.type in ("type_identifier", "generic_type", "identifier")
+            )
         if child.type != "class_heritage":
             continue
         for clause in child.named_children:
             if clause.type == "extends_clause":
-                for item in clause.named_children:
-                    if item.type in ("identifier", "member_expression", "generic_type", "type_identifier"):
-                        out.append(PendingEdgeFact(
-                            relation=Relation.INHERITS,
-                            to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
-                            line=line, from_symbol=idx,
-                        ))
+                out.extend(
+                    PendingEdgeFact(
+                        relation=Relation.INHERITS,
+                        to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
+                        line=line, from_symbol=idx,
+                    )
+                    for item in clause.named_children
+                    if item.type in ("identifier", "member_expression", "generic_type", "type_identifier")
+                )
             elif clause.type == "implements_clause":
-                for item in clause.named_children:
-                    if item.type in ("type_identifier", "generic_type", "identifier"):
-                        out.append(PendingEdgeFact(
-                            relation=Relation.IMPLEMENTS,
-                            to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
-                            line=line, from_symbol=idx,
-                        ))
+                out.extend(
+                    PendingEdgeFact(
+                        relation=Relation.IMPLEMENTS,
+                        to_name=_text(item, src).split("<")[0].rsplit(".", 1)[-1],
+                        line=line, from_symbol=idx,
+                    )
+                    for item in clause.named_children
+                    if item.type in ("type_identifier", "generic_type", "identifier")
+                )
 
 
 def _java_type_name(node: Node, src: bytes) -> str:
@@ -1245,7 +1251,7 @@ class _Walker:
             else:
                 self._emit_reference(expr, enclosing)
 
-    def _run_handler(self, node, idx: int) -> None:
+    def _run_handler(self, node: Node, idx: int) -> None:
         cfg = self.cfg
         before = len(self.out.pending)
         if node.type in cfg.export_types:
@@ -1300,7 +1306,7 @@ class _Walker:
                     self._emit_reference(tag, enclosing)
             stack.extend(reversed(child.named_children))
 
-    def _emit_call(self, node, enclosing: int) -> None:
+    def _emit_call(self, node: Node, enclosing: int) -> None:
         if self.cfg.import_handler_name == "js" and self._emit_js_dynamic_import(node, enclosing):
             return
         name, is_member, receiver, qualifier = _callee_info(node, self.src, self.cfg)

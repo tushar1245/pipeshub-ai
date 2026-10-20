@@ -31,7 +31,9 @@ from .ops import (
 from .results import touched
 
 if TYPE_CHECKING:
-    pass
+    from collections.abc import Awaitable
+
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,7 @@ _HOP_ROW_LIMIT = 5000
 # ---------------------------------------------------------------------------
 
 async def _resolve_anchors(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     file_path: str,
     qualified_name: str | None,
@@ -120,7 +122,7 @@ def _bare_name(qualified_name: str) -> str:
 
 
 async def _resolve_anchors_by_name(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     org_id: str,
     qualified_name: str,
     connector_id: str,
@@ -200,13 +202,14 @@ def _chain_targets(neighbors: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _name_candidates(
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     anchors: list[dict[str, Any]],
     relations: list[str],
     qualified_name: str,
     direction: str,
     connector_id: str,
     org_id: str,
+    *,
     include_tests: bool,
     access: RecordAccess,
 ) -> dict[str, Any]:
@@ -256,7 +259,7 @@ async def _name_candidates(
 
 async def get_neighbour_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     connector_id: str,
     org_id: str,
     user_id: str,
@@ -319,7 +322,7 @@ async def get_neighbour_impl(
     if by_name and len(anchors) > 1:
         return await _name_candidates(
             graph_provider, anchors, relations, qualified_name, direction,
-            connector_id, org_id, include_tests, access,
+            connector_id, org_id, include_tests=include_tests, access=access,
         )
     fanout_capped = len(anchors) > _NEIGHBOUR_FANOUT
     anchors = anchors[:_NEIGHBOUR_FANOUT]
@@ -523,7 +526,7 @@ _IMPACT_ROWS = 500
 
 async def impact_impl(
     *,
-    graph_provider: Any,
+    graph_provider: IGraphDBProvider,
     connector_id: str,
     org_id: str,
     user_id: str,
@@ -539,7 +542,7 @@ async def impact_impl(
     are affected and how near they are, so a change's blast radius reads as a
     list of files to check rather than a flat list of edges.
     """
-    def walk_with(tests: bool):
+    def walk_with(*, tests: bool) -> Awaitable[dict[str, Any]]:
         return get_neighbour_impl(
             graph_provider=graph_provider, connector_id=connector_id, org_id=org_id,
             user_id=user_id, file_path=file_path, qualified_name=qualified_name,
@@ -547,7 +550,7 @@ async def impact_impl(
             limit=_IMPACT_ROWS, include_tests=tests, repo=repo,
         )
 
-    walk = await walk_with(include_tests)
+    walk = await walk_with(tests=include_tests)
     if "error" in walk or "neighbors" not in walk:
         return walk
     out = {k: v for k, v in walk.items() if k not in ("neighbors", "chain", "note", "next", "hidden_tests")}
@@ -556,7 +559,7 @@ async def impact_impl(
     if not include_tests and walk.get("hidden_tests"):
         # The tests a change reaches are the ones to run: listed apart, not just counted,
         # so "what breaks" needs no second call.
-        everything = await walk_with(True)
+        everything = await walk_with(tests=True)
         shown = {(n.get("file_path"), n.get("qualified_name")) for n in walk["neighbors"]}
         tests = [n for n in everything.get("neighbors", ())
                  if (n.get("file_path"), n.get("qualified_name")) not in shown]

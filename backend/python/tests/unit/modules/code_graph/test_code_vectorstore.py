@@ -4,6 +4,8 @@ Sentence-splitting is meaningless for code, and the classifier in
 index_documents silently drops any block type it does not recognise -- so a
 missing branch here would leave code in the graph but absent from search.
 """
+from langchain_core.documents import Document
+
 from app.modules.parsers.code_parser import CodeFileParser
 from app.modules.transformers.vectorstore import _build_code_documents
 
@@ -17,16 +19,16 @@ class Client:
 '''
 
 
-def _code_blocks(container):
+def _code_blocks(container) -> list:
     return [b for b in container.blocks if str(b.type.value) == "code"]
 
 
-def _docs():
+def _docs() -> list[Document]:
     container = CodeFileParser().parse_to_blocks(SRC, "client.py", "src/client.py", "python")
     return _build_code_documents(_code_blocks(container), "vrid1", "org1")
 
 
-def _doc_for(kind_prefix: str):
+def _doc_for(kind_prefix: str) -> Document:
     return next(d for d in _docs() if kind_prefix in d.page_content)
 
 
