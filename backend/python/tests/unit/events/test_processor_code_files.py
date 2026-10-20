@@ -92,6 +92,10 @@ class Harness:
         self.graph.get_document.return_value = dict(RECORD)
         self.graph.update_node.return_value = True
         self.logger = MagicMock()
+        self.pipeline = MagicMock()
+        self.pipeline.rewrite_or_delete_vector_membership = AsyncMock()
+        self.sink = MagicMock()
+        self.sink.blob_storage.delete_storage_docs_for_vrid = AsyncMock()
 
         parsers = {
             ExtensionTypes.MD.value: self.md,
@@ -106,11 +110,11 @@ class Harness:
             self.processor = Processor(
                 logger=self.logger,
                 config_service=MagicMock(),
-                indexing_pipeline=MagicMock(),
+                indexing_pipeline=self.pipeline,
                 graph_provider=self.graph,
                 parsers=parsers,
                 document_extractor=MagicMock(),
-                sink_orchestrator=MagicMock(),
+                sink_orchestrator=self.sink,
             )
         self.processor._get_llm_for_role = AsyncMock(return_value=(MagicMock(), None))
 
@@ -131,7 +135,10 @@ class Harness:
             ]
 
     def status_writes(self) -> list[dict]:
-        return [call.args[2] for call in self.graph.update_node.call_args_list]
+        return [
+            call.args[2] for call in self.graph.update_node.call_args_list
+            if "indexingStatus" in call.args[2]
+        ]
 
     def parsed_as_markdown(self) -> bool:
         return self.md.parse_to_blocks.await_count > 0
@@ -239,6 +246,30 @@ async def test_a_generated_file_is_marked_not_supported_and_never_parsed(
     assert not harness.parsed_as_code()
     harness.json.parse.assert_not_awaited()
     harness.yaml.parse.assert_not_awaited()
+
+
+async def test_a_skipped_file_loses_the_content_it_had_indexed(harness: Harness) -> None:
+    calls: list[str] = []
+    harness.graph.update_node.side_effect = lambda *a: calls.append(
+        "status" if "indexingStatus" in a[2] else f"detach={a[2]['virtualRecordId']}"
+    ) or True
+    harness.pipeline.rewrite_or_delete_vector_membership.side_effect = lambda v: calls.append(f"vectors={v}")
+    harness.sink.blob_storage.delete_storage_docs_for_vrid.side_effect = (
+        lambda o, v: calls.append(f"blob={o}/{v}")
+    )
+
+    assert await harness.run("package-lock.json", b"{}") == DONE
+
+    # Detached before the purges, which keep anything a record still references.
+    assert calls == ["detach=None", "vectors=vr-1", "blob=org-1/vr-1", "status"]
+
+
+async def test_a_failed_purge_of_a_skipped_file_propagates(harness: Harness) -> None:
+    harness.pipeline.rewrite_or_delete_vector_membership.side_effect = RuntimeError("qdrant down")
+
+    with pytest.raises(Exception, match="qdrant down"):
+        await harness.run("package-lock.json", b"{}")
+    assert harness.status_writes() == []
 
 
 async def test_line_delimited_json_is_marked_not_supported(harness: Harness) -> None:

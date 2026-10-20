@@ -1805,16 +1805,40 @@ class Processor:
             return None
 
     async def _skip_code_file(
-        self, record_name: str, record_id: str, size_bytes: int, cause: str, reason: str | None
+        self, record_name: str, record_id: str, size_bytes: int, cause: str, reason: str | None,
+        *, org_id: str, virtual_record_id: str | None,
     ) -> AsyncGenerator[PipelineEvent, None]:
         """Mark a repository file as not indexed, with the reason people see."""
         self.logger.info(
             f"Not indexing {record_name} ({size_bytes} bytes): {cause}; marking as not supported"
         )
         await self._drop_code_blocks(record_id)
+        await self._release_skipped_content(org_id, record_id, virtual_record_id)
         await self._mark_record(record_id, ProgressStatus.FILE_TYPE_NOT_SUPPORTED, reason=reason)
         yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=record_id))
         yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=record_id))
+
+    async def _release_skipped_content(
+        self, org_id: str, record_id: str, virtual_record_id: str | None
+    ) -> None:
+        """Remove the vectors and stored content a now-skipped file had indexed.
+
+        Its last version (possibly unredacted) stayed searchable. Detached
+        first: both purges keep whatever a record still references, so a twin
+        sharing the VRID keeps its content. Raises, like the block drop.
+        """
+        if not virtual_record_id:
+            return
+        if not await self.graph_provider.update_node(
+            record_id, CollectionNames.RECORDS.value, {"virtualRecordId": None}
+        ):
+            raise DocumentProcessingError(
+                "Failed to detach the virtual record of a skipped file", doc_id=record_id
+            )
+        await self.indexing_pipeline.rewrite_or_delete_vector_membership(virtual_record_id)
+        await self.sink_orchestrator.blob_storage.delete_storage_docs_for_vrid(
+            org_id, virtual_record_id
+        )
 
     async def _drop_code_blocks(self, record_id: str) -> None:
         """Remove a code file's previous blocks when it no longer has any.
@@ -1938,7 +1962,8 @@ class Processor:
 
             if plan.route is CodeFileRoute.SKIP:
                 async for event in self._skip_code_file(
-                    recordName, recordId, len(code_binary), plan.skip_cause.value, plan.skip_reason
+                    recordName, recordId, len(code_binary), plan.skip_cause.value, plan.skip_reason,
+                    org_id=record.org_id, virtual_record_id=virtual_record_id,
                 ):
                     yield event
                 return
@@ -1991,6 +2016,7 @@ class Processor:
                         code_parser_engine.MAX_FILE_SIZE_BYTES,
                         repository_file=repository_file,
                     ),
+                    org_id=record.org_id, virtual_record_id=virtual_record_id,
                 ):
                     yield event
                 return
