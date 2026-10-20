@@ -96,7 +96,9 @@ function mcpToolCallProps(
  *  Anything else skips the repo check the code tools would cost. */
 function reachesCodeTools(body: unknown): boolean {
   if (Array.isArray(body)) return body.some(reachesCodeTools);
-  const message = body as { method?: unknown; params?: { name?: unknown } } | undefined;
+  const message = body as
+    | { method?: unknown; params?: { name?: unknown } }
+    | undefined;
   if (message?.method === 'tools/list') return true;
   return (
     message?.method === 'tools/call' &&
@@ -105,7 +107,7 @@ function reachesCodeTools(body: unknown): boolean {
 }
 
 /** Session users pass, as in requireScopes; an OAuth token or PAT needs code:read. */
-function mayReadCode(user: Record<string, any> | undefined): boolean {
+function mayReadCode(user: Record<string, unknown> | undefined): boolean {
   if (!user?.isOAuth) return true;
   const scopes: unknown = user.oauthScopes;
   return Array.isArray(scopes) && scopes.includes(OAuthScopeNames.CODE_READ);
@@ -170,7 +172,10 @@ export const handleMCPRequest =
       if (
         reachesCodeTools(req.body) &&
         mayReadCode(req.user) &&
-        (await callerHasCodeRepos(codeDeps, `${req.user?.orgId}:${req.user?.userId}`))
+        (await callerHasCodeRepos(
+          codeDeps,
+          `${req.user?.orgId}:${req.user?.userId}`,
+        ))
       ) {
         // The package's McpServer is typed against its own zod 4; comparing that
         // generic signature to ToolRegistrar's exceeds tsc's instantiation depth.
@@ -185,7 +190,11 @@ export const handleMCPRequest =
       // "initialized" notification never reaches this one. Count an accepted
       // initialize: a refused one can still answer HTTP 200 with a JSON-RPC
       // error, and the server keeps the client's info only once it accepts.
-      if (connectedProps && res.statusCode < 400 && mcpServer.server.getClientVersion()) {
+      if (
+        connectedProps &&
+        res.statusCode < 400 &&
+        mcpServer.server.getClientVersion()
+      ) {
         recordEvent('mcp_connected', connectedProps);
         recordActivityFromProps('mcp_connected', connectedProps);
       }

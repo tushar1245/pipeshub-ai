@@ -173,10 +173,12 @@ export async function callerHasCodeRepos(
       timeoutMs: REPOS_CHECK_TIMEOUT_MS,
       maxAttempts: 1,
     }).execute();
-    if (response.statusCode === 401 || response.statusCode === 403) return false;
+    if (response.statusCode === 401 || response.statusCode === 403)
+      return false;
     if (response.statusCode >= 400) return true;
     const has = (response.data?.repos?.length ?? 0) > 0;
-    if (reposCheckCache.size >= REPOS_CHECK_MAX_ENTRIES) reposCheckCache.clear();
+    if (reposCheckCache.size >= REPOS_CHECK_MAX_ENTRIES)
+      reposCheckCache.clear();
     reposCheckCache.set(cacheKey, { has, at: Date.now() });
     return has;
   } catch {
@@ -192,7 +194,8 @@ export function registerCodeGraphTools(
     'pipeshub_code_repos',
     {
       description:
-        EXPERIMENTAL + 'List the indexed code repositories you can read. Every other ' +
+        EXPERIMENTAL +
+        'List the indexed code repositories you can read. Every other ' +
         'pipeshub_code_* tool takes one of these names as `repo`.',
       annotations: READ_ONLY,
     },
@@ -203,7 +206,8 @@ export function registerCodeGraphTools(
     'pipeshub_code_symbols',
     {
       description:
-        EXPERIMENTAL + 'What a directory or file in an indexed repo holds. `select` a directory ' +
+        EXPERIMENTAL +
+        'What a directory or file in an indexed repo holds. `select` a directory ' +
         '(lists its children), a file (the symbols it defines, with line ranges) ' +
         'or a glob (`src/**`). Results are ranked by how connected each symbol is.',
       inputSchema: {
@@ -240,7 +244,8 @@ export function registerCodeGraphTools(
     'pipeshub_code_neighbours',
     {
       description:
-        EXPERIMENTAL + 'Callers, callees, imports and inheritance of a file or symbol: what ' +
+        EXPERIMENTAL +
+        'Callers, callees, imports and inheritance of a file or symbol: what ' +
         'reaches it (`direction: "inbound"`) and what it reaches (`"outbound"`). Each row ' +
         `has repo, file_path, line range and qualified name. ${COVERAGE}`,
       inputSchema: {
@@ -270,7 +275,8 @@ export function registerCodeGraphTools(
     'pipeshub_code_read',
     {
       description:
-        EXPERIMENTAL + 'Read indexed source: one symbol (`qualified_name`), a line range ' +
+        EXPERIMENTAL +
+        'Read indexed source: one symbol (`qualified_name`), a line range ' +
         '(`lines: "380-420"`), or a whole file (bounded by `max_lines`; the result ' +
         'says where it stopped). Reads the indexed copy, which can lag the repo.',
       inputSchema: {
@@ -295,7 +301,8 @@ export function registerCodeGraphTools(
     'pipeshub_code_path',
     {
       description:
-        EXPERIMENTAL + 'How symbol A reaches symbol B in one repo, hop by hop with a sentence ' +
+        EXPERIMENTAL +
+        'How symbol A reaches symbol B in one repo, hop by hop with a sentence ' +
         'per hop. If only B reaches A, that path comes back with `reversed: true`. ' +
         `Edges across languages or over HTTP are not in the graph. ${COVERAGE}`,
       inputSchema: {
@@ -333,19 +340,32 @@ export function registerCodeGraphTools(
     'pipeshub_code_search',
     {
       description:
-        EXPERIMENTAL + 'Find code without knowing its file. `mode: "identifier"` (default) lists every ' +
+        EXPERIMENTAL +
+        'Find code without knowing its file. `mode: "identifier"` (default) lists every ' +
         'definition with that name. `mode: "text"` or `"regex"` finds lines in file bodies ' +
         '(a string, a call site, a config key); these need `path` and read at most 100 files.',
       inputSchema: {
         repo: repoRequired,
-        pattern: z.string().min(1).max(200).describe('A symbol name, text, or a regex.'),
+        pattern: z
+          .string()
+          .min(1)
+          .max(200)
+          .describe('A symbol name, text, or a regex.'),
         mode: z.enum(['identifier', 'text', 'regex']).default('identifier'),
         path: z
           .string()
           .min(1)
           .optional()
-          .describe('Directory, file or glob to search. Required for text and regex.'),
-        limit: z.number().int().min(1).max(200).optional().describe('Maximum matches.'),
+          .describe(
+            'Directory, file or glob to search. Required for text and regex.',
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe('Maximum matches.'),
         include_tests: includeTests,
       },
       annotations: READ_ONLY,
@@ -357,7 +377,8 @@ export function registerCodeGraphTools(
     'pipeshub_code_outline',
     {
       description:
-        EXPERIMENTAL + "A file's classes, functions and methods with signatures, decorators, first doc " +
+        EXPERIMENTAL +
+        "A file's classes, functions and methods with signatures, decorators, first doc " +
         'line and line ranges — no bodies. Read before pipeshub_code_read to pick what to read.',
       inputSchema: {
         repo,
@@ -374,14 +395,21 @@ export function registerCodeGraphTools(
     'pipeshub_code_impact',
     {
       description:
-        EXPERIMENTAL + 'What changing a symbol can break: everything that calls, imports or builds on it, ' +
+        EXPERIMENTAL +
+        'What changing a symbol can break: everything that calls, imports or builds on it, ' +
         `followed backwards up to \`depth\` hops, grouped by file. ${COVERAGE}`,
       inputSchema: {
         repo,
         file_path: filePath,
         record_id: recordId,
         qualified_name: qualifiedName,
-        depth: z.number().int().min(1).max(3).optional().describe('Hops back, default 2.'),
+        depth: z
+          .number()
+          .int()
+          .min(1)
+          .max(3)
+          .optional()
+          .describe('Hops back, default 2.'),
         include_tests: includeTests,
       },
       annotations: READ_ONLY,
@@ -393,11 +421,18 @@ export function registerCodeGraphTools(
     'pipeshub_code_entry_points',
     {
       description:
-        EXPERIMENTAL + 'Where control enters a repo: functions nothing in it calls (routes, CLIs, jobs, ' +
+        EXPERIMENTAL +
+        'Where control enters a repo: functions nothing in it calls (routes, CLIs, jobs, ' +
         `hooks), conventional names and files first. ${COVERAGE}`,
       inputSchema: {
         repo: repoRequired,
-        limit: z.number().int().min(1).max(200).optional().describe('Maximum entry points.'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe('Maximum entry points.'),
         include_tests: includeTests,
       },
       annotations: READ_ONLY,

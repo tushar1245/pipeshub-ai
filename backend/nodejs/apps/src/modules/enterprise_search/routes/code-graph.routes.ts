@@ -23,9 +23,13 @@ export function createCodeGraphRouter(container: Container): Router {
 
   router.get(
     '/repos',
-    authMiddleware.authenticate,
+    authMiddleware.authenticate.bind(authMiddleware),
     requireScopes(OAuthScopeNames.CODE_READ),
-    async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    async (
+      req: AuthenticatedUserRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
       try {
         const response = await new AIServiceCommand<Record<string, unknown>>({
           uri: `${appConfig.aiBackend}/api/v1/code-graph/repos`,
