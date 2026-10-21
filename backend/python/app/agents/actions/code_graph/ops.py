@@ -376,10 +376,13 @@ async def _resolve_case_insensitive(
     """Fall back to a casefolded match among that file's blocks.
 
     Scoped to the one file, so this reads a handful of rows rather than scanning.
-    Ambiguous when the file holds several spellings that differ only by case --
-    there is no right answer then, so it resolves nothing rather than guess.
+    The kind prefix is optional (`Response.close` names `method:Response.close`),
+    and so is a leading `path::` the caller may have copied: an agent naming a
+    symbol in a file it knows got an empty result, read as "nothing calls this".
+    Ambiguous when the file holds several matching spellings -- there is no right
+    answer then, so it resolves nothing rather than guess.
     """
-    wanted = qualified_name.casefold()
+    wanted = qualified_name.rpartition("::")[2].casefold()
     rows: list[dict[str, Any]] = []
     for record_id in record_ids:
         rows.extend(await graph_provider.get_nodes_by_filters(
@@ -387,7 +390,12 @@ async def _resolve_case_insensitive(
             filters={"orgId": org_id, "recordId": record_id, "connectorId": connector_id},
             raise_on_error=True,
         ) or [])
-    matches = [r for r in rows if (r.get("qualifiedName") or "").casefold() == wanted]
+
+    def names(row: dict[str, Any]) -> set[str]:
+        stored = (row.get("qualifiedName") or "").casefold()
+        return {stored, stored.partition(":")[2]} if ":" in stored else {stored}
+
+    matches = [r for r in rows if wanted in names(r)]
     if len(matches) == 1:
         return _with_file_path(matches[0], file_path)
     if matches:

@@ -78,3 +78,11 @@ class TestSymbolRead:
         assert "error" not in result
         assert result["code"] == TARGET_SRC
         assert result["qualified_name"] == "function:target", "the stored spelling is returned"
+
+    async def test_a_name_without_its_kind_prefix_still_reaches_the_blob(self) -> None:
+        """An agent naming `target` in a file it knows got "no such symbol" (B6)."""
+        for name in ("target", "src/b.py::target"):
+            result = await _read(FakeGraphProvider(), qualified_name=name)
+            assert "error" not in result, name
+            assert result["code"] == TARGET_SRC
+            assert result["qualified_name"] == "function:target"
