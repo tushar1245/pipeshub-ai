@@ -274,6 +274,16 @@ async def _with_retry[T](coro_factory: Callable[[], Awaitable[T]], *, what: str,
     raise last  # type: ignore[misc]
 
 
+async def _both[A, B](first: Awaitable[A], second: Awaitable[B]) -> tuple[A, B]:
+    """Await two independent calls together. Both run to the end, then the first
+    failure is raised as it is, as two sequential awaits would raise it."""
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results[0], results[1]  # type: ignore[return-value]
+
+
 def _chunks(items: list, size: int = _WRITE_CHUNK) -> Iterator[list]:
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -353,14 +363,24 @@ async def write_code_file_blocks_to_graph(
 
     fresh_ids = {doc["id"] for doc in docs}
 
-    existing = await _with_retry(
-        lambda: graph_provider.get_nodes_by_filters(
-            collection=CollectionNames.BLOCKS.value,
-            filters={"recordId": context.record_id},
-            return_fields=["_key", "name", "kind"],
+    # The two reads are independent: one round trip of latency, not two.
+    existing, code_file = await _both(
+        _with_retry(
+            lambda: graph_provider.get_nodes_by_filters(
+                collection=CollectionNames.BLOCKS.value,
+                filters={"recordId": context.record_id},
+                return_fields=["_key", "name", "kind"],
+            ),
+            what="load existing blocks", log=log,
         ),
-        what="load existing blocks", log=log,
-    ) or []
+        _with_retry(
+            lambda: graph_provider.get_document(
+                context.record_id, CollectionNames.CODE_FILES.value, raise_on_error=True
+            ),
+            what="load codeFiles node", log=log,
+        ),
+    )
+    existing = existing or []
     existing_ids = {row.get("_key") or row.get("id") for row in existing}
     stale_ids = [bid for bid in existing_ids - fresh_ids if bid]
     # By identity (qualified name, and kind), not bare name: a definition that
@@ -374,13 +394,8 @@ async def write_code_file_blocks_to_graph(
 
     # referencedNames is written to the codeFiles node, not a block. The edge
     # builder queries it alongside filePath, avoiding a block-scan join.
-    code_file = await _with_retry(
-        lambda: graph_provider.get_document(
-            context.record_id, CollectionNames.CODE_FILES.value, raise_on_error=True
-        ),
-        what="load codeFiles node", log=log,
-    )
     referenced = _referenced_names(block_containers, (code_file or {}).get("filePath"))
+    code_file_update: Callable[[], Awaitable[Any]] | None = None
     if referenced is not None or changed:
         if code_file:
             updates: dict[str, Any] = {}
@@ -388,12 +403,14 @@ async def write_code_file_blocks_to_graph(
                 updates["referencedNames"] = referenced
             if changed:
                 updates.update(_merge_changed_names(code_file, changed))
-            await _with_retry(
-                lambda: graph_provider.update_node(
-                    context.record_id, CollectionNames.CODE_FILES.value, updates,
-                ),
-                what="update codeFiles names", log=log,
-            )
+            # Written alongside the first block chunk below: neither reads the other.
+            def code_file_update() -> Awaitable[Any]:
+                return _with_retry(
+                    lambda: graph_provider.update_node(
+                        context.record_id, CollectionNames.CODE_FILES.value, updates,
+                    ),
+                    what="update codeFiles names", log=log,
+                )
         elif docs and referenced is not None:
             # No codeFiles node (an uploaded .py): updating one would 404 and
             # fail the record. The symbol index falls back to the names on the
@@ -413,10 +430,17 @@ async def write_code_file_blocks_to_graph(
         )
 
     for chunk in _chunks(docs):
-        await _with_retry(
+        upsert = _with_retry(
             lambda c=chunk: graph_provider.batch_upsert_nodes(c, CollectionNames.BLOCKS.value),
             what="upsert blocks", log=log,
         )
+        if code_file_update is not None:
+            await _both(upsert, code_file_update())
+            code_file_update = None
+        else:
+            await upsert
+    if code_file_update is not None:
+        await code_file_update()
     for chunk in _chunks(edges):
         await _with_retry(
             lambda c=chunk: graph_provider.batch_upsert_node_relations(c),

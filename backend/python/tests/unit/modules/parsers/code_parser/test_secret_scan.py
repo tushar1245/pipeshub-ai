@@ -109,3 +109,26 @@ def test_sensitive_paths(path: str, sensitive: bool) -> None:
     assert is_sensitive_path(path) is sensitive
     if sensitive:
         assert should_index_code_file(path)[0] is False
+
+
+def test_every_token_rule_has_the_literals_that_gate_it() -> None:
+    """A rule whose regex runs only when one of its literals is in the text needs a hint
+    entry; one added without it would raise a KeyError on every file."""
+    from app.modules.parsers.code_parser.secret_scan import _TOKEN_HINTS, _TOKEN_RULES
+
+    assert {kind for kind, _ in _TOKEN_RULES} == set(_TOKEN_HINTS)
+
+
+@pytest.mark.parametrize("text", [
+    "x = 1\ny = compute(x)\n",
+    "passwd_hash = h\n",
+    "the ſecret is here\n",  # the long s matches `s` under IGNORECASE but is not lowered to it
+])
+def test_the_secret_name_shortcut_never_hides_a_match(text: str) -> None:
+    from app.modules.parsers.code_parser.secret_scan import (
+        _SECRET_NAME,
+        _may_name_a_secret,
+    )
+
+    if _SECRET_NAME.search(text):
+        assert _may_name_a_secret(text)

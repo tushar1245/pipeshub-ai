@@ -519,11 +519,9 @@ _REFERENCE_CALLEE_HANDLERS = frozenset({"python", "js"})
 # Type tables
 # --------------------------------------------------------------------------
 
-def _collect_type_table_ts(root: Node, src: bytes, table: dict[str, str]) -> None:
+def _collect_type_table_ts(root: Node, src: bytes, table: dict[str, str], cfg: LanguageConfig) -> None:
     """Harvest `name: Type` bindings from declarations and constructor params."""
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    for node in _nodes_of_types(root, cfg, ("variable_declarator", "required_parameter", "optional_parameter")):
         if node.type in ("variable_declarator", "required_parameter", "optional_parameter"):
             name_node = _field(node, "name") or next(
                 (c for c in node.named_children if c.type == "identifier"), None
@@ -537,14 +535,11 @@ def _collect_type_table_ts(root: Node, src: bytes, table: dict[str, str]) -> Non
                     table.setdefault(
                         _text(name_node, src), _text(type_node, src).split("<")[0]
                     )
-        stack.extend(node.named_children)
 
 
-def _collect_type_table_js(root: Node, src: bytes, table: dict[str, str]) -> None:
+def _collect_type_table_js(root: Node, src: bytes, table: dict[str, str], cfg: LanguageConfig) -> None:
     """JS has no annotations; `const x = new Foo()` is the only reliable binding."""
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    for node in _nodes_of_types(root, cfg, ("variable_declarator",)):
         if node.type == "variable_declarator":
             name_node = _field(node, "name")
             value = _field(node, "value")
@@ -552,7 +547,6 @@ def _collect_type_table_js(root: Node, src: bytes, table: dict[str, str]) -> Non
                 ctor = _field(value, "constructor")
                 if ctor is not None:
                     table.setdefault(_text(name_node, src), _text(ctor, src).rsplit(".", 1)[-1])
-        stack.extend(node.named_children)
 
 
 def _annotated_type(annotation: str) -> str:
@@ -564,11 +558,35 @@ def _annotated_type(annotation: str) -> str:
     return text.split("[")[0].rsplit(".", 1)[-1]
 
 
-def _collect_type_table_python(root: Node, src: bytes, table: dict[str, str]) -> None:
+_QUERY_CACHE: dict[tuple[str, tuple[str, ...]], object] = {}
+
+
+def _nodes_of_types(root: Node, cfg: LanguageConfig, types: tuple[str, ...]) -> list[Node]:
+    """The nodes of *types* under *root* (itself included), in the order a stack walk
+    pushing ``named_children`` pops them: preorder with children reversed.
+
+    Found by a tree-sitter query, natively, instead of visiting every node in Python.
+    Popped first is the node ending last, a node before its descendants (which end
+    no later and start no earlier); a node and its child spanning the same bytes stay
+    in the query's preorder, parent first, as the sort is stable.
+    """
+    from tree_sitter import Query, QueryCursor
+
+    key = (cfg.name, types)
+    query = _QUERY_CACHE.get(key)
+    if query is None:
+        # Not under _PARSER_LOCK: _get_parser takes it, and it is not reentrant. Two
+        # threads may both compile; setdefault keeps one.
+        pattern = "[" + " ".join(f"({t})" for t in types) + "] @node"
+        query = _QUERY_CACHE.setdefault(key, Query(_get_parser(cfg).language, pattern))
+    nodes = QueryCursor(query).captures(root).get("node", [])
+    nodes.sort(key=lambda n: (-n.end_byte, n.start_byte))
+    return nodes
+
+
+def _collect_type_table_python(root: Node, src: bytes, table: dict[str, str], cfg: LanguageConfig) -> None:
     """`self.x = Foo()`, `x: Foo = …` and a parameter's `x: Foo` are the usable bindings."""
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    for node in _nodes_of_types(root, cfg, ("typed_parameter", "typed_default_parameter", "assignment")):
         if node.type in ("typed_parameter", "typed_default_parameter"):
             # A parameter's annotation types every call on it in the body (P-5).
             name = next((c for c in node.named_children if c.type == "identifier"), None)
@@ -587,14 +605,11 @@ def _collect_type_table_python(root: Node, src: bytes, table: dict[str, str]) ->
                     called = _text(fn, src).rsplit(".", 1)[-1]
                     if called[:1].isupper():
                         table.setdefault(_text(left, src).split(".")[-1], called)
-        stack.extend(node.named_children)
 
 
-def _collect_type_table_java(root: Node, src: bytes, table: dict[str, str]) -> None:
+def _collect_type_table_java(root: Node, src: bytes, table: dict[str, str], cfg: LanguageConfig) -> None:
     """`Owner owner`, as a field, a parameter or a local: calls on `owner` are on Owner."""
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    for node in _nodes_of_types(root, cfg, ("field_declaration", "local_variable_declaration", "formal_parameter", "spread_parameter")):
         if node.type in ("field_declaration", "local_variable_declaration", "formal_parameter",
                          "spread_parameter"):
             type_node = _field(node, "type")
@@ -607,7 +622,6 @@ def _collect_type_table_java(root: Node, src: bytes, table: dict[str, str]) -> N
                 for name in names:
                     if name is not None and type_name[:1].isupper():
                         table.setdefault(_text(name, src), type_name)
-        stack.extend(node.named_children)
 
 
 _GO_BUILTIN_TYPES = frozenset({
@@ -626,14 +640,12 @@ def _go_type_name(node: Node, src: bytes) -> str:
     return _text(node, src).lstrip("*&[]").split("[")[0]
 
 
-def _collect_type_table_go(root: Node, src: bytes, table: dict[str, str]) -> None:
+def _collect_type_table_go(root: Node, src: bytes, table: dict[str, str], cfg: LanguageConfig) -> None:
     """A method's receiver, parameters and typed `var`s: `c.Render()` in
     `func (c *Context) JSON()` is Context.Render. A name bound to two types in
     one file is dropped rather than guessed."""
     seen: dict[str, set[str]] = {}
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    for node in _nodes_of_types(root, cfg, ("parameter_declaration", "var_spec")):
         if node.type in ("parameter_declaration", "var_spec"):
             type_node = _field(node, "type")
             if type_node is not None:
@@ -643,7 +655,6 @@ def _collect_type_table_go(root: Node, src: bytes, table: dict[str, str]) -> Non
                     if (child.type == "identifier" and type_name not in _GO_BUILTIN_TYPES
                             and all(part.isidentifier() for part in type_name.split("."))):
                         seen.setdefault(_text(child, src), set()).add(type_name)
-        stack.extend(node.named_children)
     for name, types in seen.items():
         if len(types) == 1:
             table.setdefault(name, next(iter(types)))
@@ -837,7 +848,7 @@ class _Walker:
         # is emitted: a variable is often declared below its first use.
         handler = _TYPE_TABLE_HANDLERS.get(self.cfg.type_table_handler_name)
         if handler:
-            handler(root, self.src, self.out.type_table)
+            handler(root, self.src, self.out.type_table, self.cfg)
         self._scope(root, 0, len(self.src), (), None, container_kind=None)
         return self.out
 
@@ -1340,7 +1351,7 @@ class _Walker:
                 table = self._scope_tables.get(scope.start_byte)
                 if table is None:
                     table = self._scope_tables[scope.start_byte] = {}
-                    _collect_type_table_go(scope, self.src, table)
+                    _collect_type_table_go(scope, self.src, table, self.cfg)
                 if receiver in table:
                     return table[receiver]
         return self.out.type_table.get(receiver)

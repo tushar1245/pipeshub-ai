@@ -38,6 +38,23 @@ _TOKEN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
 )
 
+# A literal every match of the rule contains: a file holding none of them is not run
+# through that rule's regex. Scanning is per file and on the indexing path, and most
+# files hold no secret at all.
+_TOKEN_HINTS: dict[str, tuple[str, ...]] = {
+    "private-key": ("PRIVATE KEY",),
+    "aws-access-key": ("A3T", "AKIA", "ASIA", "ABIA", "ACCA"),
+    "github-token": ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"),
+    "gitlab-token": ("glpat-",),
+    "slack-token": ("xox",),
+    "slack-webhook": ("hooks.slack.com",),
+    "stripe-key": ("_live_", "_test_"),
+    "google-api-key": ("AIza",),
+    "anthropic-key": ("sk-ant-",),
+    "openai-key": ("T3BlbkFJ",),
+    "jwt": ("eyJ",),
+}
+
 # scheme://user:PASSWORD@host -- only the password is replaced.
 _URL_PASSWORD = re.compile(r"\b([a-z][a-z0-9+.\-]{1,20}://[^\s:/@'\"]+:)([^\s@'\"/]{3,})(@)", re.IGNORECASE)
 
@@ -46,6 +63,9 @@ _SECRET_NAME = re.compile(
     r"|signing[_\-]?key|client[_\-]?secret|credential|auth[_\-]?key|encryption[_\-]?key)"
 )
 # `name = ...`, `name: ...`, `"name": ...`, `name := ...`, `export NAME=...`
+# Lowercase literals one of which every _SECRET_NAME match contains, for ASCII text.
+_SECRET_NAME_HINTS = ("passw", "pwd", "secret", "token", "api", "access", "private", "signing",
+                      "credential", "auth", "encryption")
 _ASSIGNMENT = re.compile(r"""^[\s{\[,]*(?:export\s+|(?:const|let|var|final|val)\s+)?["']?([\w.\-]+)["']?\s*(?::=|=|:)(?!=)(.*)$""")
 # `=` only as base64 padding: inside a token it is a `key=value` pair.
 _VALUE_TOKEN = re.compile(r"[A-Za-z0-9+/_\-.~]{10,}={0,2}")
@@ -102,10 +122,22 @@ def _redact_assignment(line: str, kinds: list[str]) -> str:
     return head + _VALUE_TOKEN.sub(sub, rhs) + ending
 
 
+def _may_name_a_secret(text: str) -> bool:
+    """False only when _SECRET_NAME cannot match. Its IGNORECASE also folds a few
+    non-ASCII letters (the long s, the Kelvin sign) that str.lower() keeps, so the
+    shortcut is taken for ASCII text only."""
+    if not text.isascii():
+        return True
+    lowered = text.lower()
+    return any(hint in lowered for hint in _SECRET_NAME_HINTS)
+
+
 def redact_secrets(text: str) -> RedactionResult:
     kinds: list[str] = []
 
     for kind, rule in _TOKEN_RULES:
+        if not any(hint in text for hint in _TOKEN_HINTS[kind]):
+            continue
         def sub(_m: re.Match[str], kind: str = kind) -> str:
             kinds.append(kind)
             return f"«REDACTED:{kind}»"
@@ -116,9 +148,10 @@ def redact_secrets(text: str) -> RedactionResult:
             return m.group(0)
         kinds.append("url-password")
         return f"{m.group(1)}«REDACTED:url-password»{m.group(3)}"
-    text = _URL_PASSWORD.sub(url_sub, text)
+    if "://" in text:
+        text = _URL_PASSWORD.sub(url_sub, text)
 
-    if _SECRET_NAME.search(text):
+    if _may_name_a_secret(text) and _SECRET_NAME.search(text):
         text = "".join(_redact_assignment(line, kinds) for line in text.splitlines(keepends=True))
 
     return RedactionResult(text, len(kinds), tuple(sorted(set(kinds))))

@@ -382,6 +382,16 @@ def cypher_kh_stamp_all(batch_size: int) -> str:
             """
 
 
+# The node labels a link endpoint can carry, by the collection its document id names.
+_LINK_ENDPOINT_LABELS = {CollectionNames.RECORDS.value: "Record", CollectionNames.BLOCKS.value: "Block"}
+
+
+def _link_endpoint_label(edge: dict, end: str) -> str | None:
+    """`Record` or `Block` when *edge* names the collection of its *end* ("from" or "to"), else None."""
+    collection = edge.get(f"{end}_collection") or (edge.get(f"_{end}") or "").partition("/")[0]
+    return _LINK_ENDPOINT_LABELS.get(collection)
+
+
 def _cypher_kh_tree_refresh(rel_types: str, *node_vars: str) -> str:
     """Tree-label rewrites for the endpoints of edges just written or deleted, when
     `rel_types` (a type or an `A|B` pattern) includes NODE_RELATION or
@@ -8492,6 +8502,8 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
                 edge_data.append({
                     "from_key": from_key,
                     "to_key": to_key,
+                    "from_label": _link_endpoint_label(edge, "from"),
+                    "to_label": _link_endpoint_label(edge, "to"),
                     "relationshipType": relationship_type,
                     "constraintName": constraint_name,
                     "props": props,
@@ -8511,36 +8523,51 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
                 if rel_type == Neo4jRelationshipType.RECORD_LINK.value:
                     # A link endpoint is a Record or a code Block, and the id indexes
                     # are per-label, so an unlabelled MATCH degrades to an
-                    # AllNodesScan per UNWIND row. Seek each label separately instead.
-                    endpoints = """
-                    OPTIONAL MATCH (fromRecord:Record {id: edge.from_key})
-                    OPTIONAL MATCH (fromBlock:Block {id: edge.from_key})
-                    WITH edge, coalesce(fromRecord, fromBlock) AS from
-                    OPTIONAL MATCH (toRecord:Record {id: edge.to_key})
-                    OPTIONAL MATCH (toBlock:Block {id: edge.to_key})
-                    WITH edge, from, coalesce(toRecord, toBlock) AS to
-                    WHERE from IS NOT NULL AND to IS NOT NULL
-                    """
+                    # AllNodesScan per UNWIND row. An edge whose ends name their
+                    # collections seeks one index per end; any other seeks both labels.
+                    by_labels: dict[tuple[str, str] | None, list[dict]] = {}
+                    for e in group:
+                        labels = (e["from_label"], e["to_label"]) if e["from_label"] and e["to_label"] else None
+                        by_labels.setdefault(labels, []).append(e)
+                    batches = []
+                    for labels, rows in by_labels.items():
+                        if labels is None:
+                            endpoints = """
+                            OPTIONAL MATCH (fromRecord:Record {id: edge.from_key})
+                            OPTIONAL MATCH (fromBlock:Block {id: edge.from_key})
+                            WITH edge, coalesce(fromRecord, fromBlock) AS from
+                            OPTIONAL MATCH (toRecord:Record {id: edge.to_key})
+                            OPTIONAL MATCH (toBlock:Block {id: edge.to_key})
+                            WITH edge, from, coalesce(toRecord, toBlock) AS to
+                            WHERE from IS NOT NULL AND to IS NOT NULL
+                            """
+                        else:
+                            endpoints = f"""
+                            MATCH (from:{labels[0]} {{id: edge.from_key}})
+                            MATCH (to:{labels[1]} {{id: edge.to_key}})
+                            """
+                        batches.append((endpoints, rows))
                 else:
-                    endpoints = """
+                    batches = [("""
                     MATCH (from:Record {id: edge.from_key})
                     MATCH (to:Record {id: edge.to_key})
+                    """, group)]
+                for endpoints, rows in batches:
+                    query = f"""
+                    UNWIND $edges AS edge
+                    {endpoints}
+                    MERGE (from)-[r:{rel_type} {{relationshipType: edge.relationshipType, constraintName: edge.constraintName}}]->(to)
+                    ON CREATE SET r += edge.props
+                    ON MATCH SET r += edge.updateProps
+                    {"WITH from, to, r" if refresh else ""}
+                    {refresh}
+                    RETURN count(r) AS upserted
                     """
-                query = f"""
-                UNWIND $edges AS edge
-                {endpoints}
-                MERGE (from)-[r:{rel_type} {{relationshipType: edge.relationshipType, constraintName: edge.constraintName}}]->(to)
-                ON CREATE SET r += edge.props
-                ON MATCH SET r += edge.updateProps
-                {"WITH from, to, r" if refresh else ""}
-                {refresh}
-                RETURN count(r) AS upserted
-                """
-                await self.client.execute_query(
-                    query,
-                    parameters={"edges": group},
-                    txn_id=transaction
-                )
+                    await self.client.execute_query(
+                        query,
+                        parameters={"edges": rows},
+                        txn_id=transaction
+                    )
 
             self.logger.debug(f"Successfully upserted {len(edge_data)} record relation edges.")
             return True
