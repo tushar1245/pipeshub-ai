@@ -263,6 +263,17 @@ class TestLiveApiApps:
         assert s.has_service_tools is False
 
 
+class TestMcpSurface:
+
+    def test_an_mcp_tool_is_flagged_but_is_not_a_live_app(self) -> None:
+        s = _resolve(["mcp_atlassian_rovo_search", "mcp_atlassian_rovo_getJiraIssue"])
+        assert s.has_mcp_tools is True
+        assert s.live_api_apps == ()
+
+    def test_no_flag_without_an_mcp_tool(self) -> None:
+        assert _resolve(["jira__search_issues", "api_jira_get_issue"]).has_mcp_tools is False
+
+
 class TestInternalToolsetKeys:
 
     def test_fallback_matches_the_registry(self) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from app.agents.mcp.naming import MCP_TOOL_PREFIX
 from app.modules.agents.context.tool_names import granted, granted_any
 
 # Module-level import so tests can patch `tool_surface.sandbox_network_enabled`.
@@ -96,6 +97,12 @@ class ToolSurfaces:
     calculator_tools: tuple[str, ...] = ()
     """Granted exact-calculation tools (expression, date difference, text
     count, in that order); `()` when none is granted."""
+
+    has_mcp_tools: bool = False
+    """True iff a tool from an attached MCP server (`mcp_<server>_<tool>`) is
+    granted. Kept out of `live_api_apps` on purpose: the assistant attaches
+    every server a person has, and a numbered source is one the prompt says
+    to check in parallel."""
 
     @property
     def search_tool(self) -> str | None:
@@ -213,6 +220,7 @@ class ToolSurfaces:
             has_web_search=has_web_search,
             has_service_tools=has_service_tools,
             calculator_tools=calculator_tools,
+            has_mcp_tools=any(name.startswith(MCP_TOOL_PREFIX) for name in names_set),
         )
 
     # ── Convenience formatters ────────────────────────────────────────────────

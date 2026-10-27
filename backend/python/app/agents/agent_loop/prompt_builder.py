@@ -414,6 +414,19 @@ _NO_KNOWLEDGE_SOURCES = (
     "reporting an empty result as though a search had been run."
 )
 
+# Attached MCP servers were in no source list, so the model took internal
+# knowledge and the web to be the only places to look and loaded a server only
+# when the user named it: Atlassian Rovo held the Confluence answer to "how to
+# deploy dropbox connector?" and was never called. Not a numbered source on
+# purpose — the assistant attaches every server a person has, and numbered
+# sources are the ones checked in parallel.
+_MCP_SERVERS_FALLBACK = (
+    "Connected MCP servers (`mcp_…` tools) can also hold this organization's "
+    "own pages, tickets and docs. When internal knowledge does not fully answer "
+    "a question about the organization's own work, check the server whose "
+    "description fits it — never every server — before searching the web."
+)
+
 
 def _build_finding_information(
     surfaces: "ToolSurfaces",
@@ -478,6 +491,8 @@ def _build_finding_information(
             "**Sources you can check this turn (use only what's actually granted):**\n"
             + numbered
         )
+    if surfaces.has_mcp_tools and (surfaces.retrieval is not None or surfaces.has_web_search):
+        parts.append(_MCP_SERVERS_FALLBACK)
 
     if surfaces.retrieval is not None and surfaces.has_service_tools:
         live_only = catalog.live_only_apps(frozenset(surfaces.live_api_apps))

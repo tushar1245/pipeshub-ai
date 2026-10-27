@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from textwrap import shorten
 from typing import TYPE_CHECKING
 
 from app.agent_loop_lib.tools.errors import DuplicateToolNameError, DuplicateToolPathError
@@ -40,6 +41,7 @@ from app.agents.agent_loop.tool_approvals import TOOLS_BY_PATH
 from app.agents.mcp.failure import classify_mcp_failure
 from app.agents.mcp.naming import namespace_key, unique_keys
 from app.agents.mcp.models import MCPToolInfo
+from app.agents.mcp.service import catalog_template
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -56,6 +58,8 @@ __all__ = ["MCPToolProvider"]
 # `lazy_tools_wiring.PipesHubGlobalCatalogFallback` so it reports the same names.
 MCP_NAMES_STATE_KEY = "mcp_names"
 
+_GROUP_DESCRIPTION_CHARS = 200
+
 
 def _unique_per_request(
     servers: list["ResolvedMCPServer"], key_of: "Callable[[ResolvedMCPServer], str]",
@@ -68,6 +72,17 @@ def _unique_per_request(
 def _current_name(server: "ResolvedMCPServer") -> str:
     # The listings name tools after the instance as it is now, not the attachment snapshot.
     return server.instance.get("name") or server.name
+
+
+def _group_description(server: "ResolvedMCPServer") -> str:
+    """`<server name> — <what it holds>`, the line the model picks a toolset to load by. The
+    name part is what `ToolsetAwareToolIndex` matches app names against. A line without what the
+    server holds left the model unable to tell Atlassian Rovo held the org's Confluence pages."""
+    template = catalog_template(server.instance.get("typeId"))
+    about = server.instance.get("description") or (template.description if template else "")
+    # One line, bounded: it is repeated for every attached server in every prompt.
+    about = shorten(about, width=_GROUP_DESCRIPTION_CHARS, placeholder="…") or "attached MCP server tools."
+    return f"{server.display_name} — {about}"
 
 
 def _assign_names(servers: list["ResolvedMCPServer"], context: "AgentContext") -> dict[str, dict[str, str]]:
@@ -173,7 +188,7 @@ class MCPToolProvider:
 
         registry.register_toolset(
             names["group"],
-            f"{server.display_name} — attached MCP server tools.",
+            _group_description(server),
             registered_names,
             parent=MCP_PARENT,
         )

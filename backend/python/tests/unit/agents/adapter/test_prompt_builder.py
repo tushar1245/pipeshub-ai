@@ -503,6 +503,29 @@ class TestFindingInformation:
         assert "Jira" in section
         assert "no indexed knowledge base" in section
 
+    def test_mcp_servers_are_a_fallback_not_a_numbered_source(self) -> None:
+        """Unlisted, the model took knowledge and web to be the only places to look and never
+        loaded a server the user didn't name. Unnumbered, because the assistant attaches every
+        server a person has and the numbered sources are the ones checked in parallel."""
+        context = make_context(has_knowledge=True)
+        result = _build(
+            context, tool_names=["retrieval__search_internal_knowledge", "mcp_atlassian_rovo_search"],
+        )
+        section = result.split("## Finding Information", 1)[1].split("\n## ", 1)[0]
+        assert "Connected MCP servers" in section
+        assert "never every server" in section
+        assert "\n2. " not in section
+        assert "IN PARALLEL" not in section
+
+    @pytest.mark.parametrize("tool_names", [
+        ["retrieval__search_internal_knowledge"],
+        # With neither knowledge nor web there is nothing to fall back from.
+        ["mcp_atlassian_rovo_search"],
+    ])
+    def test_no_mcp_fallback_without_both_sides(self, tool_names: list[str]) -> None:
+        result = _build(make_context(has_knowledge=True), tool_names=tool_names)
+        assert "Connected MCP servers" not in result
+
     def test_no_live_only_note_when_no_service_tools(self) -> None:
         context = make_context(has_knowledge=True)
         result = _build(context, tool_names=["retrieval__search_internal_knowledge"])

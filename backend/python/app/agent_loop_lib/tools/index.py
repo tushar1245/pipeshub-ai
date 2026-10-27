@@ -142,7 +142,7 @@ def _terms(text: str) -> set[str]:
 
 def _toolset_words(group: "ToolsetGroup") -> set[str]:
     """The app a toolset is for: its name (`mcp_linear` → linear), and an MCP group's server name
-    ("<server name> — attached MCP server tools"). Other descriptions ("Jira issue tracking.") say
+    ("<server name> — <what it holds>"). Other descriptions ("Jira issue tracking.") say
     what the tools do, which isn't an app's name."""
     named = group.name.replace("_", " ")
     if " — " in group.description:

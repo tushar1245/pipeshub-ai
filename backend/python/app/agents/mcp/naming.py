@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MAX_TOOL_NAME_LENGTH",
+    "MCP_TOOL_PREFIX",
     "assign_namespaces",
     "build_namespaced_tool_name",
     "instance_tag",
@@ -28,7 +29,7 @@ __all__ = [
 _T = TypeVar("_T")
 
 MAX_TOOL_NAME_LENGTH = 64
-_PREFIX = "mcp_"
+MCP_TOOL_PREFIX = "mcp_"
 _MAX_KEY_LENGTH = 24
 _HASH_LENGTH = 6
 _INVALID_KEY_CHARS = re.compile(r"[^a-z0-9_]")
@@ -82,7 +83,7 @@ def assign_namespaces(instances: Iterable[dict[str, Any]]) -> dict[str, str]:
     )
 
 
-def build_namespaced_tool_name(namespace: str, tool_name: str, *, prefix: str = _PREFIX) -> str:
+def build_namespaced_tool_name(namespace: str, tool_name: str, *, prefix: str = MCP_TOOL_PREFIX) -> str:
     """`{prefix}{namespace}_{tool}`, valid for every provider. API Toolsets pass `api_`."""
     key = _INVALID_KEY_CHARS.sub("_", _legacy_key(namespace)) or "server"
     tool = _INVALID_TOOL_CHARS.sub("_", tool_name) or "tool"

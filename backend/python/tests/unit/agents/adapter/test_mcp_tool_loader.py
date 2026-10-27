@@ -16,11 +16,13 @@ import pytest
 from app.agent_loop_lib.tools.registry import ToolRegistry
 from app.agents.agent_loop import mcp_session as mcp_session_module
 from app.agents.agent_loop.lazy_tools_wiring import MCP_PARENT
+from app.agents.agent_loop.mcp_access import ResolvedMCPServer
 from app.agents.agent_loop.mcp_session import MCPSessionManager
-from app.agents.agent_loop.mcp_tool_loader import MCPToolProvider
+from app.agents.agent_loop.mcp_tool_loader import MCPToolProvider, _group_description
 from app.agents.mcp.client import ToolListing
 from app.agents.mcp.models import MCPToolInfo
 from app.agents.mcp.service import (
+    catalog_template,
     credentials_to_discovery_dict,
     instance_config_from_dict,
 )
@@ -297,6 +299,39 @@ class TestLoadInto:
         assert registry.has("mcp_jira_mcp_search")
         assert not registry.has("mcp_jira_mcp_create")
         assert context.mcp_tool_load_failures == []
+
+
+def _resolved(instance: dict[str, Any]) -> ResolvedMCPServer:
+    return ResolvedMCPServer(
+        instance_id="inst-1", name="JiraMCP", display_name="JiraMCP",
+        instance=instance, auth={}, owner_id="user-1", attached_tools=None,
+    )
+
+
+class TestGroupDescription:
+    """The one line the model picks a server to load by when its tools are behind `fetch_tools`."""
+
+    async def test_a_catalog_server_says_what_it_holds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(MCPSessionManager, "tools", _session_discovery(_discover_ok))
+        registry = ToolRegistry()
+
+        await MCPToolProvider().load_into(registry, _context_with_server(type_id="atlassian_rovo"))
+
+        group = next(g for g in registry.toolsets() if g.name == "mcp_jiramcp")
+        assert group.description == f"JiraMCP — {catalog_template('atlassian_rovo').description}"
+        assert "Confluence" in group.description
+
+    def test_the_instance_description_wins_on_one_short_line(self) -> None:
+        instance = {**_instance(type_id="atlassian_rovo"), "description": "Our wiki\n\nand tickets. " * 40}
+
+        line = _group_description(_resolved(instance))
+
+        assert line.startswith("JiraMCP — Our wiki and tickets. Our wiki")
+        assert "\n" not in line
+        assert len(line) <= len("JiraMCP — ") + 200
+
+    def test_a_custom_server_without_one_keeps_the_plain_line(self) -> None:
+        assert _group_description(_resolved(_instance(type_id="jira_mcp"))) == "JiraMCP — attached MCP server tools."
 
 
 class TestFilterByAttached:
