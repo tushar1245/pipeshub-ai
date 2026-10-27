@@ -1,0 +1,1291 @@
+"""
+AI Model Providers API – Integration Tests
+=============================================
+
+GET    /api/v1/configurationManager/ai-models  — getAIModelsProviders (admin list;
+       not GET .../available/{modelType})
+GET    /api/v1/configurationManager/ai-models/{modelType}  — getModelsByType
+POST   /api/v1/configurationManager/ai-models/providers  — addAIModelProvider
+PUT    /api/v1/configurationManager/ai-models/providers/{modelType}/{modelKey}
+       — updateAIModelProvider
+DELETE /api/v1/configurationManager/ai-models/providers/{modelType}/{modelKey}
+
+Validates Zod ``addProviderRequestSchema`` / ``updateProviderRequestSchema``,
+admin OAuth auth, OpenAPI response schemas in ``pipeshub-openapi.yaml``, and
+(when API keys are set) live Python health-check + persist paths for openAI,
+gemini, azureOpenAI, and groq.
+
+Provider IDs and required configuration fields mirror the Python registry under
+``backend/python/app/config/ai_models/providers/``.
+
+Requires:
+  - PIPESHUB_BASE_URL and OAuth credentials (see integration-tests/README.md)
+  - Running Node.js API + Python query service (health-check)
+  - Per-provider API keys (optional — positive tests skip when unset):
+      TEST_OPENAI_API_KEY, TEST_GEMINI_API_KEY, TEST_GROQ_API_KEY,
+      TEST_AZURE_OPENAI_API_KEY + TEST_AZURE_OPENAI_ENDPOINT +
+      TEST_AZURE_OPENAI_DEPLOYMENT_NAME
+  - PIPESHUB_TEST_NON_ADMIN_EMAIL / PIPESHUB_TEST_NON_ADMIN_PASSWORD (optional)
+  - PIPESHUB_TEST_DELETE_CONFLICT_MODEL_KEY (optional — 409 when agent uses model)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[2]
+_RV_HELPER = _ROOT / "response-validation" / "helper"
+_AUTH_UTILS = _ROOT / "response-validation" / "auth" / "utils"
+for _p in (_ROOT, _RV_HELPER, _AUTH_UTILS):
+    s = str(_p)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+from helper.clients.ai_models_client import AIModelsClient  # noqa: E402
+from helper.second_user import SecondUser  # noqa: E402
+from helper.source_credentials import (  # noqa: E402
+    secrets_required,
+    source_unavailable,
+)
+from openapi_schema_validator import (  # noqa: E402
+    assert_response_matches_openapi_operation,
+    assert_response_matches_openapi_ref,
+)
+
+logger = logging.getLogger("ai-model-providers-integration-test")
+
+_ADMIN_ACCESS_REQUIRED = "You need admin access to do this. Ask an admin in your organisation."
+_MODEL_TYPE_LLM = "llm"
+_AI_MODEL_BUCKET_KEYS = (
+    "ocr",
+    "embedding",
+    "slm",
+    "llm",
+    "reasoning",
+    "multiModal",
+    "imageGeneration",
+    "tts",
+    "stt",
+)
+
+# Registry provider IDs (camelCase) — must match Python AIModelProviderBuilder ids.
+_PROVIDER_OPENAI = "openAI"
+_PROVIDER_GEMINI = "gemini"
+_PROVIDER_AZURE_OPENAI = "azureOpenAI"
+_PROVIDER_GROQ = "groq"
+
+
+@dataclass(frozen=True)
+class LiveProviderSpec:
+    """Describes a provider for live (health-check) positive tests."""
+
+    provider_id: str
+    api_key_env: str
+    api_key_fallback: Optional[str]
+    model_env: str
+    default_model: str
+    build_configuration: Callable[[str, str], Dict[str, Any]]
+    required_env: tuple[str, ...] = ()
+    skip_reason_extra: str = ""
+
+
+@dataclass
+class CreatedProvider:
+    model_type: str
+    model_key: str
+    provider: str
+
+
+# ------------------------------------------------------------------ #
+# Base test class
+# ------------------------------------------------------------------ #
+class AIModelsTestBase:
+    """Base class with shared ai_models_client fixture for AI models tests."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, ai_models_client: AIModelsClient) -> None:
+        self.ai = ai_models_client
+
+
+# ------------------------------------------------------------------ #
+# Helpers
+# ------------------------------------------------------------------ #
+def _env(name: str, fallback: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    if fallback:
+        fb = os.getenv(fallback, "").strip()
+        if fb:
+            return fb
+    return None
+
+
+def _assert_validation_error(body: dict, *, label: str) -> None:
+    error = body.get("error")
+    assert isinstance(error, dict), f"[{label}] Expected error envelope, got: {body!r}"
+    assert error.get("code") == "VALIDATION_ERROR", (
+        f"[{label}] Expected VALIDATION_ERROR, got {error.get('code')!r}"
+    )
+    assert_response_matches_openapi_ref(body, "#/components/schemas/ErrorResponse")
+
+
+def _assert_error_envelope_matches_spec(body: dict) -> None:
+    """Error paths without per-operation response schemas use ErrorResponse."""
+    assert_response_matches_openapi_ref(body, "#/components/schemas/ErrorResponse")
+
+
+def _live_provider_specs() -> List[LiveProviderSpec]:
+    def _openai_config(api_key: str, model: str) -> Dict[str, Any]:
+        return {"model": model, "apiKey": api_key}
+
+    def _gemini_config(api_key: str, model: str) -> Dict[str, Any]:
+        return {"model": model, "apiKey": api_key}
+
+    def _groq_config(api_key: str, model: str) -> Dict[str, Any]:
+        return {"model": model, "apiKey": api_key}
+
+    def _azure_config(api_key: str, model: str) -> Dict[str, Any]:
+        endpoint = _env("TEST_AZURE_OPENAI_ENDPOINT") or ""
+        deployment = _env("TEST_AZURE_OPENAI_DEPLOYMENT_NAME") or ""
+        return {
+            "endpoint": endpoint,
+            "apiKey": api_key,
+            "deploymentName": deployment,
+            "model": model,
+        }
+
+    return [
+        LiveProviderSpec(
+            provider_id=_PROVIDER_OPENAI,
+            api_key_env="TEST_OPENAI_API_KEY",
+            api_key_fallback="OPENAI_API_KEY",
+            model_env="TEST_OPENAI_LLM_MODEL",
+            default_model="gpt-4o-mini",
+            build_configuration=_openai_config,
+        ),
+        LiveProviderSpec(
+            provider_id=_PROVIDER_GEMINI,
+            api_key_env="TEST_GEMINI_API_KEY",
+            api_key_fallback=None,
+            model_env="TEST_GEMINI_LLM_MODEL",
+            default_model="gemini-2.5-flash",
+            build_configuration=_gemini_config,
+        ),
+        LiveProviderSpec(
+            provider_id=_PROVIDER_AZURE_OPENAI,
+            api_key_env="TEST_AZURE_OPENAI_API_KEY",
+            api_key_fallback=None,
+            model_env="TEST_AZURE_OPENAI_MODEL",
+            default_model="gpt-4o",
+            build_configuration=_azure_config,
+            required_env=(
+                "TEST_AZURE_OPENAI_ENDPOINT",
+                "TEST_AZURE_OPENAI_DEPLOYMENT_NAME",
+            ),
+            skip_reason_extra=" (endpoint + deployment required)",
+        ),
+        LiveProviderSpec(
+            provider_id=_PROVIDER_GROQ,
+            api_key_env="TEST_GROQ_API_KEY",
+            api_key_fallback=None,
+            model_env="TEST_GROQ_LLM_MODEL",
+            default_model="llama-3.3-70b-versatile",
+            build_configuration=_groq_config,
+        ),
+    ]
+
+
+def _resolve_live_spec(spec: LiveProviderSpec) -> Optional[tuple[str, str, Dict[str, Any]]]:
+    """Return (api_key, model_name, configuration) or None if env is incomplete."""
+    api_key = _env(spec.api_key_env, spec.api_key_fallback)
+    if not api_key:
+        return None
+    for name in spec.required_env:
+        if not _env(name):
+            return None
+    model = _env(spec.model_env) or spec.default_model
+    configuration = spec.build_configuration(api_key, model)
+    if spec.provider_id == _PROVIDER_AZURE_OPENAI:
+        if not configuration.get("endpoint") or not configuration.get("deploymentName"):
+            return None
+    return api_key, model, configuration
+
+
+# The providers whose credentials the integration workflow passes, and so the
+# only ones a red nightly would say anything true about. Add one here when its
+# key is in the repository's integration-test environment - and take one out
+# when the workflow stops passing it, or the nightly starts demanding a key
+# nobody is paying for.
+_PROVIDERS_CI_MUST_COVER = frozenset({_PROVIDER_AZURE_OPENAI})
+
+
+def _spec_for_a_live_provider() -> LiveProviderSpec:
+    """Whichever provider this run actually has credentials for.
+
+    Some tests need *a* live provider to reach a backend path - an unknown model
+    key, a model type that does not match the route. Which provider is
+    incidental, so pinning them to OpenAI tied them to a key the run may no
+    longer carry. The run's own provider is preferred; failing that, the first
+    one that resolves; failing that, the provider the run was meant to cover, so
+    the usual skip-or-fail decision is what reports it.
+    """
+    specs = _live_provider_specs()
+    preferred = [s for s in specs if s.provider_id in _PROVIDERS_CI_MUST_COVER]
+    for spec in [*preferred, *specs]:
+        if _resolve_live_spec(spec) is not None:
+            return spec
+    return preferred[0] if preferred else specs[0]
+
+
+def _skip_if_no_live_credentials(spec: LiveProviderSpec) -> tuple[str, str, Dict[str, Any]]:
+    resolved = _resolve_live_spec(spec)
+    if resolved is None:
+        missing = [spec.api_key_env, *spec.required_env]
+        source_unavailable(
+            f"{spec.provider_id}: no live credentials{spec.skip_reason_extra}",
+            secrets=missing,
+            required=secrets_required() and spec.provider_id in _PROVIDERS_CI_MUST_COVER,
+        )
+    _, model, configuration = resolved
+    return spec.provider_id, model, configuration
+
+
+def _minimal_llm_payload(
+    provider: str,
+    configuration: Dict[str, Any],
+    *,
+    is_default: bool = False,
+    is_multimodal: bool = False,
+    is_reasoning: bool = False,
+    context_length: Optional[int] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "modelType": _MODEL_TYPE_LLM,
+        "provider": provider,
+        "configuration": configuration,
+        "isMultimodal": is_multimodal,
+        "isReasoning": is_reasoning,
+        "isDefault": is_default,
+    }
+    if context_length is not None:
+        payload["contextLength"] = context_length
+    return payload
+
+
+def _assert_all_models_bucket_structure(body: dict, *, label: str) -> None:
+    assert body.get("status") == "success", f"[{label}] Unexpected status: {body}"
+    models = body.get("models")
+    assert isinstance(models, dict), f"[{label}] models must be an object: {body}"
+    for key in _AI_MODEL_BUCKET_KEYS:
+        assert key in models, f"[{label}] Missing models.{key}"
+        assert isinstance(models[key], list), (
+            f"[{label}] models.{key} must be a list, got {type(models[key])!r}"
+        )
+    assert isinstance(body.get("message"), str) and body["message"], (
+        f"[{label}] Expected non-empty message: {body}"
+    )
+
+
+def _find_configured_model(
+    models: List[Dict[str, Any]], model_key: str
+) -> Optional[Dict[str, Any]]:
+    return next((m for m in models if m.get("modelKey") == model_key), None)
+
+
+def _minimal_update_body(
+    provider: str,
+    configuration: Dict[str, Any],
+    *,
+    is_default: bool = False,
+    is_multimodal: bool = False,
+    is_reasoning: bool = False,
+    context_length: Optional[int] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "provider": provider,
+        "configuration": configuration,
+        "isMultimodal": is_multimodal,
+        "isReasoning": is_reasoning,
+        "isDefault": is_default,
+    }
+    if context_length is not None:
+        body["contextLength"] = context_length
+    return body
+
+
+def _teardown_provider(ai: AIModelsClient, created: CreatedProvider) -> None:
+    try:
+        resp = ai.delete_provider(created.model_type, created.model_key)
+    except Exception as exc:
+        logger.warning(
+            "Teardown delete failed for modelKey=%s: %s",
+            created.model_key,
+            exc,
+        )
+        return
+    if resp.status_code >= 300:
+        logger.warning(
+            "Teardown delete modelKey=%s: HTTP %s %s",
+            created.model_key,
+            resp.status_code,
+            resp.text[:300],
+        )
+
+
+def _create_live_provider(
+    ai: AIModelsClient,
+    spec: LiveProviderSpec,
+) -> CreatedProvider:
+    """POST a provider using live credentials; caller must teardown."""
+    provider_id, _model, configuration = _skip_if_no_live_credentials(spec)
+    payload = _minimal_llm_payload(provider_id, configuration)
+    resp = ai.add_provider(**payload)
+    assert resp.status_code == 200, (
+        f"[{provider_id}] create failed: {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    details = body.get("details") or {}
+    model_key = details.get("modelKey")
+    assert model_key, f"[{provider_id}] Missing details.modelKey: {body}"
+    return CreatedProvider(
+        model_type=_MODEL_TYPE_LLM,
+        model_key=model_key,
+        provider=provider_id,
+    )
+
+
+# ==================================================================== #
+# Negative — validation & auth (no live API keys)
+# ==================================================================== #
+
+
+@pytest.mark.integration
+class TestAddAIModelProviderValidation(AIModelsTestBase):
+    """Invalid bodies rejected by ValidationMiddleware (Zod) before health-check."""
+
+    @pytest.mark.parametrize(
+        "label,payload",
+        [
+            (
+                "missing modelType",
+                {
+                    "provider": _PROVIDER_OPENAI,
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                },
+            ),
+            (
+                "missing provider",
+                {
+                    "modelType": _MODEL_TYPE_LLM,
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                },
+            ),
+            (
+                "missing configuration",
+                {
+                    "modelType": _MODEL_TYPE_LLM,
+                    "provider": _PROVIDER_OPENAI,
+                },
+            ),
+            (
+                "invalid modelType enum",
+                {
+                    "modelType": "not-a-real-type",
+                    "provider": _PROVIDER_OPENAI,
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                },
+            ),
+            (
+                "empty provider string",
+                {
+                    "modelType": _MODEL_TYPE_LLM,
+                    "provider": "",
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                },
+            ),
+            (
+                "modelFriendlyName with comma-separated models",
+                {
+                    "modelType": _MODEL_TYPE_LLM,
+                    "provider": _PROVIDER_OPENAI,
+                    "configuration": {
+                        "model": "gpt-4o-mini, gpt-4o",
+                        "apiKey": "sk-test",
+                        "modelFriendlyName": "Should not be allowed",
+                    },
+                },
+            ),
+            (
+                "contextLength wrong type",
+                {
+                    "modelType": _MODEL_TYPE_LLM,
+                    "provider": _PROVIDER_OPENAI,
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                    "contextLength": "not-a-number",
+                },
+            ),
+        ],
+    )
+    def test_validation_rejects_invalid_body(
+        self, label: str, payload: Dict[str, Any]
+    ) -> None:
+        resp = self.ai.add_provider(**payload)
+        assert resp.status_code == 400, (
+            f"[{label}] Expected 400, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        _assert_validation_error(body, label=label)
+        _assert_error_envelope_matches_spec(body)
+
+    def test_malformed_json_body(self) -> None:
+        resp = self.ai.post(
+            "/providers",
+            data='{"modelType": "llm", "provider": "openAI", broken}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code >= 400, (
+            f"Expected client error for malformed JSON, got {resp.status_code}: {resp.text}"
+        )
+
+    def test_missing_authorization(self) -> None:
+        payload = _minimal_llm_payload(
+            _PROVIDER_OPENAI,
+            {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+        )
+        resp = self.ai.post("/providers", json=payload, auth=False)
+        assert resp.status_code in (400, 401), (
+            f"Expected 400/401 without Authorization, got {resp.status_code}: {resp.text}"
+        )
+        if resp.status_code == 401:
+            _assert_error_envelope_matches_spec(resp.json())
+
+
+@pytest.mark.integration
+class TestAddAIModelProviderHealthCheckFailure(AIModelsTestBase):
+    """Health-check failures for invalid credentials (no valid API key required)."""
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        "provider,configuration",
+        [
+            (
+                _PROVIDER_OPENAI,
+                {"model": "gpt-4o-mini", "apiKey": "sk-invalid-integration-test"},
+            ),
+            (
+                _PROVIDER_GEMINI,
+                {"model": "gemini-2.5-flash", "apiKey": "invalid-gemini-key"},
+            ),
+            (
+                _PROVIDER_GROQ,
+                {
+                    "model": "llama-3.3-70b-versatile",
+                    "apiKey": "gsk_invalid_integration_test",
+                },
+            ),
+        ],
+    )
+    def test_invalid_api_key_fails_health_check(
+        self, provider: str, configuration: Dict[str, Any]
+    ) -> None:
+        payload = _minimal_llm_payload(provider, configuration)
+        resp = self.ai.add_provider(**payload)
+        assert resp.status_code in (400, 401, 422, 500), (
+            f"[{provider}] Expected health-check failure status, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        if resp.status_code == 200:
+            pytest.fail(f"[{provider}] Unexpected success with invalid API key: {body}")
+        # Controller wraps health-check errors under `error`
+        err = body.get("error") or body
+        assert err.get("status") == "error" or err.get("message") or body.get("message"), (
+            f"[{provider}] Expected error payload, got {body}"
+        )
+
+
+# ==================================================================== #
+# Positive — live providers (skip when env keys missing)
+# ==================================================================== #
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestAddAIModelProviderLive(AIModelsTestBase):
+    """Successful add + modelKey assignment; tears down via DELETE."""
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_add_minimal_llm_provider(
+        self, spec: LiveProviderSpec
+    ) -> None:
+        provider_id, _model, configuration = _skip_if_no_live_credentials(spec)
+        payload = _minimal_llm_payload(provider_id, configuration)
+        created: Optional[CreatedProvider] = None
+        try:
+            resp = self.ai.add_provider(**payload)
+            assert resp.status_code == 200, (
+                f"[{provider_id}] Expected 200, got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert body.get("status") == "success", body
+            details = body.get("details") or {}
+            model_key = details.get("modelKey")
+            assert model_key, f"[{provider_id}] Missing details.modelKey: {body}"
+            assert details.get("modelType") == _MODEL_TYPE_LLM
+            assert details.get("provider") == provider_id
+            assert_response_matches_openapi_operation(
+                body, "addAIModelProvider", status_code="200"
+            )
+            created = CreatedProvider(
+                model_type=_MODEL_TYPE_LLM,
+                model_key=model_key,
+                provider=provider_id,
+            )
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_add_llm_with_optional_flags(
+        self, spec: LiveProviderSpec
+    ) -> None:
+        provider_id, _model, configuration = _skip_if_no_live_credentials(spec)
+        configuration = {
+            **configuration,
+            "modelFriendlyName": f"IT {provider_id} {uuid.uuid4().hex[:8]}",
+        }
+        payload = _minimal_llm_payload(
+            provider_id,
+            configuration,
+            is_default=False,
+            is_multimodal=provider_id in (_PROVIDER_GEMINI, _PROVIDER_OPENAI),
+            is_reasoning=False,
+            context_length=128000,
+        )
+        created: Optional[CreatedProvider] = None
+        try:
+            resp = self.ai.add_provider(**payload)
+            assert resp.status_code == 200, (
+                f"[{provider_id} optional flags] "
+                f"Expected 200, got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert_response_matches_openapi_operation(
+                body, "addAIModelProvider", status_code="200"
+            )
+            details = body.get("details") or {}
+            model_key = details.get("modelKey")
+            assert model_key
+            created = CreatedProvider(
+                model_type=_MODEL_TYPE_LLM,
+                model_key=model_key,
+                provider=provider_id,
+            )
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+
+@pytest.mark.integration
+class TestAddAIModelProviderAzureFields(AIModelsTestBase):
+    """Azure OpenAI requires endpoint, apiKey, deploymentName per registry."""
+
+    def test_azure_missing_deployment_rejected_at_health_check(self) -> None:
+        api_key = _env("TEST_AZURE_OPENAI_API_KEY")
+        endpoint = _env("TEST_AZURE_OPENAI_ENDPOINT")
+        if not api_key or not endpoint:
+            pytest.skip(
+                "TEST_AZURE_OPENAI_API_KEY and TEST_AZURE_OPENAI_ENDPOINT required"
+            )
+        payload = _minimal_llm_payload(
+            _PROVIDER_AZURE_OPENAI,
+            {
+                "endpoint": endpoint,
+                "apiKey": api_key,
+                "model": _env("TEST_AZURE_OPENAI_MODEL") or "gpt-4o",
+                # deploymentName intentionally omitted
+            },
+        )
+        resp = self.ai.add_provider(**payload)
+        assert resp.status_code in (400, 422, 500), (
+            f"Expected failure without deploymentName, got {resp.status_code}: {resp.text}"
+        )
+
+
+@pytest.mark.integration
+class TestAddAIModelProviderNonAdmin(AIModelsTestBase):
+    """Admin gate via userAdminCheck — skipped when no non-admin fixture exists."""
+
+    def test_non_admin_rejected(self, second_user: SecondUser) -> None:
+        payload = _minimal_llm_payload(
+            _PROVIDER_OPENAI,
+            {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+        )
+        resp = self.ai.post(
+            "/providers",
+            json=payload,
+            headers=second_user.headers,
+            auth=False,
+        )
+        assert resp.status_code == 403, (
+            f"Expected 403 for a non-admin, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("error", {}).get("message") == _ADMIN_ACCESS_REQUIRED, body
+        _assert_error_envelope_matches_spec(body)
+
+
+# ==================================================================== #
+# PUT — validation & auth (no live API keys)
+# ==================================================================== #
+
+
+@pytest.mark.integration
+class TestUpdateAIModelProviderValidation(AIModelsTestBase):
+    """Invalid params/bodies rejected by Zod before health-check."""
+
+    # Explicit ids are required, not cosmetic: parametrize arguments are evaluated at
+    # import time and every xdist worker imports this module separately, so a uuid4()
+    # folded into an auto-generated id makes each worker collect a different test id
+    # and aborts the whole run with a collection mismatch.
+    @pytest.mark.parametrize(
+        "label,model_type,model_key,payload",
+        [
+            pytest.param(
+                "invalid modelType path",
+                "not-a-real-type",
+                str(uuid.uuid4()),
+                _minimal_update_body(
+                    _PROVIDER_OPENAI,
+                    {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                ),
+                id="invalid-model-type-path",
+            ),
+            pytest.param(
+                "missing provider",
+                _MODEL_TYPE_LLM,
+                str(uuid.uuid4()),
+                {
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                    "isMultimodal": False,
+                    "isReasoning": False,
+                    "isDefault": False,
+                },
+                id="missing-provider",
+            ),
+            pytest.param(
+                "missing configuration",
+                _MODEL_TYPE_LLM,
+                str(uuid.uuid4()),
+                {
+                    "provider": _PROVIDER_OPENAI,
+                    "isMultimodal": False,
+                    "isReasoning": False,
+                    "isDefault": False,
+                },
+                id="missing-configuration",
+            ),
+            pytest.param(
+                "empty provider",
+                _MODEL_TYPE_LLM,
+                str(uuid.uuid4()),
+                _minimal_update_body(
+                    "",
+                    {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                ),
+                id="empty-provider",
+            ),
+            pytest.param(
+                "modelFriendlyName with comma-separated models",
+                _MODEL_TYPE_LLM,
+                str(uuid.uuid4()),
+                _minimal_update_body(
+                    _PROVIDER_OPENAI,
+                    {
+                        "model": "gpt-4o-mini, gpt-4o",
+                        "apiKey": "sk-test",
+                        "modelFriendlyName": "Not allowed",
+                    },
+                ),
+                id="friendly-name-with-comma-separated-models",
+            ),
+            pytest.param(
+                "contextLength wrong type",
+                _MODEL_TYPE_LLM,
+                str(uuid.uuid4()),
+                {
+                    "provider": _PROVIDER_OPENAI,
+                    "configuration": {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+                    "isMultimodal": False,
+                    "isReasoning": False,
+                    "isDefault": False,
+                    "contextLength": "not-a-number",
+                },
+                id="context-length-wrong-type",
+            ),
+        ],
+    )
+    def test_validation_rejects_invalid_put(
+        self,
+        label: str,
+        model_type: str,
+        model_key: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        resp = self.ai.update_provider(model_type, model_key, **payload)
+        assert resp.status_code == 400, (
+            f"[{label}] Expected 400, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        _assert_validation_error(body, label=label)
+        _assert_error_envelope_matches_spec(body)
+
+    def test_empty_model_key_put_returns_404(self) -> None:
+        # PUT .../providers/:modelType/:modelKey with modelKey="" becomes
+        # .../llm/ (trailing slash). Express does not match that path, so Zod
+        # (updateProviderRequestSchema modelKey min 1) never runs — 404, not 400.
+        payload = _minimal_update_body(
+            _PROVIDER_OPENAI,
+            {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+        )
+        resp = self.ai.update_provider(_MODEL_TYPE_LLM, "", **payload)
+        assert resp.status_code == 404, (
+            f"Expected 404 for empty modelKey (no route match), "
+            f"got {resp.status_code}: {resp.text}"
+        )
+
+    def test_unknown_model_key_put_returns_404(self) -> None:
+        # The key lookup runs before the provider health check, so this needs
+        # no live credentials.
+        payload = _minimal_update_body(
+            _PROVIDER_OPENAI,
+            {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+        )
+        resp = self.ai.update_provider(_MODEL_TYPE_LLM, str(uuid.uuid4()), **payload)
+        assert resp.status_code == 404, (
+            f"Expected 404 for unknown modelKey on PUT, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("status") == "error", body
+        assert_response_matches_openapi_operation(
+            body, "updateAIModelProvider", status_code="404"
+        )
+
+    def test_missing_authorization(self) -> None:
+        payload = _minimal_update_body(
+            _PROVIDER_OPENAI,
+            {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+        )
+        resp = self.ai.put(
+            f"/providers/{_MODEL_TYPE_LLM}/{uuid.uuid4()}",
+            json=payload,
+            auth=False,
+        )
+        assert resp.status_code in (400, 401), (
+            f"Expected 400/401 without Authorization, got {resp.status_code}: {resp.text}"
+        )
+        if resp.status_code == 401:
+            _assert_error_envelope_matches_spec(resp.json())
+
+    def test_malformed_json_body(self) -> None:
+        resp = self.ai.put(
+            f"/providers/{_MODEL_TYPE_LLM}/{uuid.uuid4()}",
+            data='{"provider": "openAI", broken}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code >= 400, (
+            f"Expected client error for malformed JSON, got {resp.status_code}: {resp.text}"
+        )
+
+
+@pytest.mark.integration
+class TestUpdateAIModelProviderNonAdmin(AIModelsTestBase):
+    """PUT rejected for non-admin session JWT."""
+
+    def test_non_admin_put_rejected(self, second_user: SecondUser) -> None:
+        payload = _minimal_update_body(
+            _PROVIDER_OPENAI,
+            {"model": "gpt-4o-mini", "apiKey": "sk-test"},
+        )
+        resp = self.ai.put(
+            f"/providers/{_MODEL_TYPE_LLM}/{uuid.uuid4()}",
+            json=payload,
+            headers=second_user.headers,
+            auth=False,
+        )
+        assert resp.status_code == 403, (
+            f"Expected 403 for a non-admin, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("error", {}).get("message") == _ADMIN_ACCESS_REQUIRED, body
+        _assert_error_envelope_matches_spec(body)
+
+
+# ==================================================================== #
+# PUT — live create → update → delete
+# ==================================================================== #
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestUpdateAIModelProviderLive(AIModelsTestBase):
+    """Successful update after POST; OpenAPI + teardown via DELETE."""
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_create_update_delete_llm_provider(self, spec: LiveProviderSpec) -> None:
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(
+                self.ai, spec
+            )
+            provider_id, _model, configuration = _skip_if_no_live_credentials(spec)
+            updated_config = {
+                **configuration,
+                "modelFriendlyName": f"Updated {provider_id} {uuid.uuid4().hex[:8]}",
+            }
+            update_body = _minimal_update_body(
+                provider_id,
+                updated_config,
+                is_multimodal=provider_id == _PROVIDER_GEMINI,
+                context_length=64000,
+            )
+            resp = self.ai.update_provider(
+                created.model_type,
+                created.model_key,
+                **update_body,
+            )
+            assert resp.status_code == 200, (
+                f"[{provider_id}] PUT expected 200, got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert body.get("status") == "success", body
+            details = body.get("details") or {}
+            assert details.get("modelKey") == created.model_key
+            assert details.get("modelType") == _MODEL_TYPE_LLM
+            assert_response_matches_openapi_operation(
+                body, "updateAIModelProvider", status_code="200"
+            )
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+    def test_model_type_mismatch_returns_400(self) -> None:
+        """Model exists under llm but path uses embedding → 400 before health-check."""
+        live_spec = _spec_for_a_live_provider()
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(self.ai, live_spec)
+            _, _, configuration = _skip_if_no_live_credentials(live_spec)
+            update_body = _minimal_update_body(live_spec.provider_id, configuration)
+            resp = self.ai.update_provider(
+                "embedding",
+                created.model_key,
+                **update_body,
+            )
+            assert resp.status_code == 400, (
+                f"Expected 400 model type mismatch, got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert "belongs to type" in (body.get("message") or ""), body
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_update_invalid_api_key_fails_health_check(
+        self, spec: LiveProviderSpec
+    ) -> None:
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(
+                self.ai, spec
+            )
+            bad_config = {"model": "gpt-4o-mini", "apiKey": "sk-invalid-update-test"}
+            if spec.provider_id == _PROVIDER_GEMINI:
+                bad_config = {
+                    "model": "gemini-2.5-flash",
+                    "apiKey": "invalid-gemini-key",
+                }
+            elif spec.provider_id == _PROVIDER_GROQ:
+                bad_config = {
+                    "model": "llama-3.3-70b-versatile",
+                    "apiKey": "gsk_invalid_update_test",
+                }
+            update_body = _minimal_update_body(spec.provider_id, bad_config)
+            resp = self.ai.update_provider(
+                created.model_type,
+                created.model_key,
+                **update_body,
+            )
+            assert resp.status_code in (400, 401, 422, 500), (
+                f"[{spec.provider_id}] Expected health-check failure on PUT, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+
+# ==================================================================== #
+# DELETE — validation & auth (no live API keys)
+# ==================================================================== #
+
+
+@pytest.mark.integration
+class TestDeleteAIModelProviderValidation(AIModelsTestBase):
+    """Invalid path params rejected by Zod (deleteProviderSchema)."""
+
+    @pytest.mark.parametrize(
+        "label,model_type,model_key",
+        [
+            pytest.param(
+                "invalid modelType path",
+                "not-a-real-type",
+                str(uuid.uuid4()),
+                id="invalid-model-type-path",
+            ),
+        ],
+    )
+    def test_validation_rejects_invalid_delete(
+        self, label: str, model_type: str, model_key: str
+    ) -> None:
+        resp = self.ai.delete_provider(model_type, model_key)
+        assert resp.status_code == 400, (
+            f"[{label}] Expected 400, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        _assert_validation_error(body, label=label)
+        _assert_error_envelope_matches_spec(body)
+
+    def test_empty_modelKey_delete_returns_404(self) -> None:
+        # Express does not match DELETE .../providers/:modelType/:modelKey when
+        # modelKey is empty (URL ends with .../llm/); deleteProviderSchema min(1)
+        # is never reached — same routing limitation as PUT empty modelKey.
+        resp = self.ai.delete_provider(_MODEL_TYPE_LLM, "")
+        assert resp.status_code == 404, (
+            f"Expected 404 (no route match for empty modelKey), "
+            f"got {resp.status_code}: {resp.text}"
+        )
+
+    def test_unknown_model_key_delete_returns_404(self) -> None:
+        unknown_key = str(uuid.uuid4())
+        resp = self.ai.delete_provider(_MODEL_TYPE_LLM, unknown_key)
+        assert resp.status_code == 404, (
+            f"Expected 404 for unknown modelKey, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("status") == "error" or body.get("error"), body
+        message = body.get("message") or (body.get("error") or {}).get("message") or ""
+        assert "not found" in message.lower(), body
+        assert_response_matches_openapi_ref(
+            body, "#/components/schemas/AIModelProviderSimpleError"
+        )
+
+    def test_missing_authorization(self) -> None:
+        resp = self.ai.delete(
+            f"/providers/{_MODEL_TYPE_LLM}/{uuid.uuid4()}",
+            auth=False,
+        )
+        assert resp.status_code in (400, 401), (
+            f"Expected 400/401 without Authorization, got {resp.status_code}: {resp.text}"
+        )
+        if resp.status_code == 401:
+            _assert_error_envelope_matches_spec(resp.json())
+
+
+@pytest.mark.integration
+class TestDeleteAIModelProviderNonAdmin(AIModelsTestBase):
+    """DELETE rejected for non-admin session JWT."""
+
+    def test_non_admin_delete_rejected(self, second_user: SecondUser) -> None:
+        resp = self.ai.delete(
+            f"/providers/{_MODEL_TYPE_LLM}/{uuid.uuid4()}",
+            headers=second_user.headers,
+            auth=False,
+        )
+        assert resp.status_code == 403, (
+            f"Expected 403 for a non-admin, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("error", {}).get("message") == _ADMIN_ACCESS_REQUIRED, body
+        _assert_error_envelope_matches_spec(body)
+
+
+# ==================================================================== #
+# DELETE — live create → delete
+# ==================================================================== #
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestDeleteAIModelProviderLive(AIModelsTestBase):
+    """Successful DELETE after POST; OpenAPI status + teardown safety."""
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_create_then_delete_llm_provider(self, spec: LiveProviderSpec) -> None:
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(
+                self.ai, spec
+            )
+            resp = self.ai.delete_provider(
+                created.model_type,
+                created.model_key,
+            )
+            assert resp.status_code == 200, (
+                f"[{spec.provider_id}] DELETE expected 200, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert body.get("status") == "success", body
+            details = body.get("details") or {}
+            assert details.get("modelKey") == created.model_key
+            assert details.get("modelType") == _MODEL_TYPE_LLM
+            assert details.get("provider") == created.provider
+            deleted_key = created.model_key
+            created = None
+            second = self.ai.delete_provider(_MODEL_TYPE_LLM, deleted_key)
+            assert second.status_code == 404, (
+                f"Expected 404 on second DELETE, got {second.status_code}: {second.text}"
+            )
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+    def test_model_type_mismatch_returns_400(self) -> None:
+        """Model exists under llm but path uses embedding → 400."""
+        live_spec = _spec_for_a_live_provider()
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(self.ai, live_spec)
+            resp = self.ai.delete_provider("embedding", created.model_key)
+            assert resp.status_code == 400, (
+                f"Expected 400 model type mismatch, got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert "belongs to type" in (body.get("message") or ""), body
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+
+@pytest.mark.integration
+class TestDeleteAIModelProviderConflict(AIModelsTestBase):
+    """409 when an agent references the model (optional — requires env fixture)."""
+
+    def test_delete_blocked_when_agent_uses_model(self) -> None:
+        model_key = os.getenv("PIPESHUB_TEST_DELETE_CONFLICT_MODEL_KEY", "").strip()
+        if not model_key:
+            pytest.skip(
+                "Set PIPESHUB_TEST_DELETE_CONFLICT_MODEL_KEY to an LLM modelKey "
+                "that is referenced by at least one agent to test 409 conflict"
+            )
+        resp = self.ai.delete_provider(_MODEL_TYPE_LLM, model_key)
+        assert resp.status_code == 409, (
+            f"Expected 409 when model is in use, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        message = body.get("error", {}).get("message") or body.get("message") or ""
+        assert "currently in use" in message, body
+        assert body.get("error", {}).get("code") == "HTTP_CONFLICT", body
+        _assert_error_envelope_matches_spec(body)
+
+
+# ==================================================================== #
+# GET — list all providers (admin /ai-models, not /available/llm)
+# ==================================================================== #
+
+
+@pytest.mark.integration
+class TestGetAIModelsProviders(AIModelsTestBase):
+    """GET /configurationManager/ai-models — getAIModelsProviders."""
+
+    def test_list_all_returns_200_with_bucket_structure(self) -> None:
+        resp = self.ai.get_providers()
+        assert resp.status_code == 200, (
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        _assert_all_models_bucket_structure(body, label="list-all")
+        if body.get("message") == "No AI models found":
+            for key in _AI_MODEL_BUCKET_KEYS:
+                assert body["models"][key] == [], (
+                    f"Empty org should have empty models.{key}"
+                )
+
+    def test_list_all_openapi_contract(self) -> None:
+        """May fail if spec stays loose `type: object` — intentional drift signal."""
+        resp = self.ai.get_providers()
+        assert resp.status_code == 200, resp.text
+        assert_response_matches_openapi_operation(
+            resp.json(), "getAIModelsProviders", status_code="200"
+        )
+
+    def test_missing_authorization(self) -> None:
+        resp = self.ai.get("/", auth=False)
+        assert resp.status_code in (400, 401), (
+            f"Expected 400/401 without Authorization, got {resp.status_code}: {resp.text}"
+        )
+        if resp.status_code == 401:
+            _assert_error_envelope_matches_spec(resp.json())
+
+
+@pytest.mark.integration
+class TestGetAIModelsProvidersNonAdmin(AIModelsTestBase):
+    """GET /ai-models rejected for non-admin session JWT."""
+
+    def test_non_admin_list_rejected(self, second_user: SecondUser) -> None:
+        resp = self.ai.get("/", headers=second_user.headers, auth=False)
+        assert resp.status_code == 403, (
+            f"Expected 403 for a non-admin, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("error", {}).get("message") == _ADMIN_ACCESS_REQUIRED, body
+        _assert_error_envelope_matches_spec(body)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestGetAIModelsProvidersLive(AIModelsTestBase):
+    """POST provider then GET list-all includes entry under models.llm."""
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_list_all_includes_created_llm_provider(
+        self, spec: LiveProviderSpec
+    ) -> None:
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(self.ai, spec)
+            resp = self.ai.get_providers()
+            assert resp.status_code == 200, (
+                f"[{spec.provider_id}] list-all expected 200, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            _assert_all_models_bucket_structure(body, label=spec.provider_id)
+            assert "retrieved successfully" in body.get("message", "").lower(), body
+            entry = _find_configured_model(
+                body["models"][_MODEL_TYPE_LLM], created.model_key
+            )
+            assert entry is not None, (
+                f"[{spec.provider_id}] modelKey {created.model_key!r} "
+                f"not in models.llm: {body['models'][_MODEL_TYPE_LLM]}"
+            )
+            assert entry.get("provider") == created.provider
+            # Stored KV entries omit modelType; bucket path implies llm.
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)
+
+
+# ==================================================================== #
+# GET — models by type (/ai-models/{modelType})
+# ==================================================================== #
+
+
+@pytest.mark.integration
+class TestGetModelsByType(AIModelsTestBase):
+    """GET /configurationManager/ai-models/{modelType} — getModelsByType."""
+
+    def test_get_llm_empty_or_list_returns_200(self) -> None:
+        resp = self.ai.get_models_by_type(_MODEL_TYPE_LLM)
+        assert resp.status_code == 200, (
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("status") == "success", body
+        assert isinstance(body.get("models"), list), body
+        assert isinstance(body.get("message"), str) and body["message"], body
+
+    @pytest.mark.parametrize(
+        "label,model_type",
+        [
+            ("invalid modelType path", "not-a-real-type"),
+        ],
+    )
+    def test_validation_rejects_invalid_model_type(
+        self, label: str, model_type: str
+    ) -> None:
+        resp = self.ai.get_models_by_type(model_type)
+        assert resp.status_code == 400, (
+            f"[{label}] Expected 400, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        _assert_validation_error(body, label=label)
+        _assert_error_envelope_matches_spec(body)
+
+    def test_get_by_type_openapi_contract(self) -> None:
+        resp = self.ai.get_models_by_type(_MODEL_TYPE_LLM)
+        assert resp.status_code == 200, resp.text
+        assert_response_matches_openapi_operation(
+            resp.json(), "getModelsByType", status_code="200"
+        )
+
+    def test_missing_authorization(self) -> None:
+        resp = self.ai.get(f"/{_MODEL_TYPE_LLM}", auth=False)
+        assert resp.status_code in (400, 401), (
+            f"Expected 400/401 without Authorization, got {resp.status_code}: {resp.text}"
+        )
+        if resp.status_code == 401:
+            _assert_error_envelope_matches_spec(resp.json())
+
+
+@pytest.mark.integration
+class TestGetModelsByTypeNonAdmin(AIModelsTestBase):
+    """GET /ai-models/{modelType} rejected for non-admin session JWT."""
+
+    def test_non_admin_get_by_type_rejected(self, second_user: SecondUser) -> None:
+        resp = self.ai.get(
+            f"/{_MODEL_TYPE_LLM}", headers=second_user.headers, auth=False
+        )
+        assert resp.status_code == 403, (
+            f"Expected 403 for a non-admin, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("error", {}).get("message") == _ADMIN_ACCESS_REQUIRED, body
+        _assert_error_envelope_matches_spec(body)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestGetModelsByTypeLive(AIModelsTestBase):
+    """POST provider then GET by type returns the created entry."""
+
+    @pytest.mark.parametrize("spec", _live_provider_specs(), ids=lambda s: s.provider_id)
+    def test_get_llm_includes_created_provider(
+        self, spec: LiveProviderSpec
+    ) -> None:
+        created: Optional[CreatedProvider] = None
+        try:
+            created = _create_live_provider(self.ai, spec)
+            resp = self.ai.get_models_by_type(_MODEL_TYPE_LLM)
+            assert resp.status_code == 200, (
+                f"[{spec.provider_id}] get-by-type expected 200, "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            body = resp.json()
+            assert body.get("status") == "success", body
+            assert f"{_MODEL_TYPE_LLM} models" in body.get("message", "").lower(), (
+                body
+            )
+            entry = _find_configured_model(body["models"], created.model_key)
+            assert entry is not None, (
+                f"[{spec.provider_id}] modelKey {created.model_key!r} "
+                f"not in models list: {body['models']}"
+            )
+            assert entry.get("provider") == created.provider
+            assert_response_matches_openapi_operation(
+                body, "getModelsByType", status_code="200"
+            )
+        finally:
+            if created:
+                _teardown_provider(self.ai, created)

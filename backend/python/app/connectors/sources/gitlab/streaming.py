@@ -1,0 +1,174 @@
+"""
+Content streaming and reindex orchestration for the GitLab connector.
+
+Responsibilities:
+- ``stream_record``: build and return a ``StreamingResponse`` for any supported record type.
+- ``reindex_records``: refresh source-changed TICKET / PULL_REQUEST records, then re-queue the rest.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+
+from app.config.constants.arangodb import MimeTypes
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.error.stream_errors import connector_not_ready
+from app.models.entities import CodeFileRecord, Record, RecordType
+from app.utils.filename_utils import sanitize_filename_for_content_disposition
+from app.utils.streaming import create_stream_record_response
+
+if TYPE_CHECKING:
+    from app.connectors.sources.gitlab.connector import GitLabConnector
+
+
+def _blocks_download_headers(record: Record) -> dict[str, str]:
+    # Titles are free text; a header value outside latin-1 fails the response.
+    filename = sanitize_filename_for_content_disposition(
+        record.record_name or "", fallback="record"
+    )
+    # Inside a quoted header parameter, a quote or backslash has to be escaped.
+    filename = filename.replace("\\", "\\\\").replace('"', '\\"')
+    return {"Content-Disposition": f'attachment; filename="{filename}"'}
+
+
+class StreamingHelper:
+    """Content streaming and reindex orchestration for ``GitLabConnector``."""
+
+    def __init__(self, connector: "GitLabConnector") -> None:
+        self.c = connector
+        self.logger = connector.logger
+
+    # ------------------------------------------------------------------
+    # Streaming dispatch
+    # ------------------------------------------------------------------
+
+    async def stream_record(self, record: Record) -> StreamingResponse:
+        """Build and return an HTTP streaming response for a GitLab record.
+
+        - TICKET / PULL_REQUEST: serialises the full blocks container in a
+          single-chunk ``StreamingResponse`` with the blocks MIME type.
+        - FILE / CODE_FILE: returns a chunked download response via
+          ``create_stream_record_response``. The router's
+          ``start_streaming_response`` primes the first chunk, so source
+          errors still surface before the status is committed.
+        """
+        c = self.c
+        # init() reports failure by returning False and cleanup() nulls this
+        # out, so without the guard a dead connector is an AttributeError.
+        if not c.data_source:
+            raise connector_not_ready(c.display_name)
+        await c.runtime.refresh_token_if_needed()
+
+        if record.record_type == RecordType.TICKET.value:
+            blocks = await c.issues.build_ticket_blocks(record)
+            return StreamingResponse(
+                content=iter([blocks]),
+                media_type=MimeTypes.BLOCKS.value,
+                headers=_blocks_download_headers(record),
+            )
+
+        if record.record_type == RecordType.PULL_REQUEST.value:
+            blocks = await c.merge_requests.build_pull_request_blocks(record)
+            return StreamingResponse(
+                content=iter([blocks]),
+                media_type=MimeTypes.BLOCKS.value,
+                headers=_blocks_download_headers(record),
+            )
+
+        if record.record_type == RecordType.FILE.value:
+            filename = record.record_name or str(record.external_record_id)
+            return create_stream_record_response(
+                c.attachments.fetch_attachment_content(record),
+                filename=filename,
+                mime_type=record.mime_type,
+                fallback_filename=f"record_{record.id}",
+            )
+
+        if record.record_type == RecordType.CODE_FILE.value:
+            if not isinstance(record, CodeFileRecord):
+                raise HTTPException(
+                    HttpStatusCode.BAD_REQUEST.value,
+                    f"Expected CodeFileRecord for CODE_FILE stream, got {type(record).__name__}",
+                )
+            filename = record.record_name or str(record.external_record_id)
+            return create_stream_record_response(
+                c.repos._fetch_code_file_content(record),
+                filename=filename,
+                mime_type=record.mime_type,
+                fallback_filename=f"record_{record.id}",
+            )
+
+        raise HTTPException(
+            HttpStatusCode.BAD_REQUEST.value,
+            f"Unsupported record type for streaming: {record.record_type}",
+        )
+
+    # ------------------------------------------------------------------
+    # Reindex
+    # ------------------------------------------------------------------
+
+    async def reindex_records(self, records: list[Record]) -> None:
+        """Reindex GitLab records: upsert changed work items, re-queue others."""
+        c = self.c
+        if not records:
+            return
+        try:
+            await c.runtime.refresh_token_if_needed()
+            if not c.data_source:
+                raise Exception("DataSource not initialized. Call init() first.")
+
+            self.logger.info("Starting reindex for %s GitLab records", len(records))
+
+            from app.models.permission import Permission
+
+            updated_pairs: list[tuple[Record, list[Permission]]] = []
+            non_updated: list[Record] = []
+
+            for record in records:
+                try:
+                    fresh = await c.merge_requests.check_and_fetch_updated_record_for_reindex(record)
+                    if fresh:
+                        updated_pairs.append(fresh)
+                    else:
+                        non_updated.append(record)
+                except Exception as e:
+                    self.logger.error("Error checking GitLab record %s at source: %s", record.id, e)
+                    continue
+
+            if updated_pairs:
+                await c.data_entities_processor.on_new_records(updated_pairs)
+                self.logger.info("Updated %s GitLab records in DB that changed at source", len(updated_pairs))
+
+            if non_updated:
+                reindexable: list[Record] = []
+                skipped_untyped = 0
+                skipped_folders = 0
+                for r in non_updated:
+                    if type(r).__name__ == "Record":
+                        self.logger.warning("Record %s (%s) is base Record class, skipping reindex", r.id, r.record_type)
+                        skipped_untyped += 1
+                        continue
+                    if r.record_type == RecordType.FILE.value:
+                        extension = getattr(r, "extension", None)
+                        if not extension or not str(extension).strip():
+                            skipped_folders += 1
+                            continue
+                    reindexable.append(r)
+
+                if reindexable:
+                    try:
+                        await c.data_entities_processor.reindex_existing_records(reindexable)
+                        self.logger.info("Published reindex events for %s GitLab records", len(reindexable))
+                    except NotImplementedError as e:
+                        self.logger.warning("Cannot reindex records — to_kafka_record not implemented: %s", e)
+                if skipped_untyped:
+                    self.logger.warning("Skipped reindex for %s records that are not properly typed", skipped_untyped)
+                if skipped_folders:
+                    self.logger.info("Skipped reindex for %s folder records (no streamable content)", skipped_folders)
+
+        except Exception as e:
+            self.logger.error("Error during GitLab reindex: %s", e, exc_info=True)
+            raise

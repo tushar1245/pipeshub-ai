@@ -1,0 +1,1376 @@
+"""Tests for app.agents.actions.image_generator.image_generator."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+def _make_state(**overrides):
+    """Return a minimal ChatState-like dict for toolset tests."""
+    state = {
+        "conversation_id": "conv-123",
+        "org_id": "org-456",
+        "user_id": "user-789",
+        "blob_store": MagicMock(),
+        "config_service": MagicMock(),
+        "graph_provider": MagicMock(),
+    }
+    state.update(overrides)
+    return state
+
+
+class TestImageGeneratorImport:
+    def test_imports(self):
+        from app.agents.actions.image_generator.image_generator import (
+            ImageGenerator,
+        )
+        assert ImageGenerator is not None
+
+
+class TestGenerateImage:
+    @pytest.mark.asyncio
+    async def test_no_prompt(self):
+        from app.agents.actions.image_generator.image_generator import (
+            ImageGenerator,
+        )
+        tool = ImageGenerator(_make_state())
+        success, payload = await tool.generate_image(prompt="   ")
+        assert success is False
+        data = json.loads(payload)
+        assert data["success"] is False
+        assert "Prompt is required" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_config_returns_error(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        with patch.object(
+            mod, "get_image_generation_config", AsyncMock(return_value=None),
+        ):
+            success, payload = await tool.generate_image(prompt="a cat")
+
+        assert success is False
+        data = json.loads(payload)
+        assert "No image-generation model" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_generated_images_belong_to_the_artifact_owner(self) -> None:
+        """A service-account agent's run: the images are the chatting user's."""
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state(user_id="u-alice", artifact_owner_user_id="u-bob"))
+        adapter = SimpleNamespace(provider="openAI", model="gpt-image-1", generate=AsyncMock(return_value=[b"\x89PNG"]))
+        upload = AsyncMock(return_value={"fileName": "img.png", "mimeType": "image/png", "sizeBytes": 4, "recordId": "rec-1"})
+        tasks: list[asyncio.Task] = []
+
+        with patch.object(mod, "get_image_generation_config", AsyncMock(return_value={
+            "provider": "openAI", "configuration": {"apiKey": "sk", "model": "gpt-image-1"}, "isDefault": True,
+        })), patch("app.utils.aimodels.get_image_generation_model", return_value=adapter), patch.object(
+            mod, "upload_bytes_artifact", upload,
+        ), patch.object(mod, "register_task", lambda conv_id, task: tasks.append(task)):
+            ok, _ = await tool.generate_image(prompt="a fox", size="1024x1024", n=1)
+            await tasks[0]
+
+        assert ok is True
+        assert upload.await_args.kwargs["user_id"] == "u-bob"
+
+    @pytest.mark.asyncio
+    async def test_happy_path_schedules_upload(self):
+        from app.agents.actions.image_generator import image_generator as mod
+        from app.config.constants.arangodb import Connectors
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        image_bytes = b"\x89PNG-fake"
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(return_value=[image_bytes, image_bytes]),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+
+        mock_upload = AsyncMock(return_value={
+            "fileName": "img.png",
+            "signedUrl": "https://blob/1",
+            "mimeType": "image/png",
+            "sizeBytes": len(image_bytes),
+            "recordId": "rec-1",
+        })
+
+        captured_tasks: list[asyncio.Task] = []
+
+        def _fake_register(conv_id: str, task: asyncio.Task) -> None:
+            captured_tasks.append(task)
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch.object(
+            mod, "upload_bytes_artifact", mock_upload,
+        ), patch.object(
+            mod, "register_task", _fake_register,
+        ):
+            success, payload = await tool.generate_image(
+                prompt="a watercolor fox",
+                size="1024x1792",
+                n=2,
+            )
+
+            assert success is True
+            data = json.loads(payload)
+            assert data["success"] is True
+            assert data["count"] == 2
+            assert data["provider"] == "openAI"
+            assert data["model"] == "gpt-image-1"
+            assert data["size"] == "1024x1792"
+
+            # A background upload task should have been scheduled.
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+            assert result is not None
+            assert result["type"] == "artifacts"
+            assert len(result["artifacts"]) == 2
+
+        mock_adapter.generate.assert_awaited_once_with(
+            "a watercolor fox", size="1024x1792", n=2,
+        )
+        assert mock_upload.await_count == 2
+        # Connector is tagged so these rows are distinguishable from
+        # coding-sandbox artifacts.
+        kwargs = mock_upload.await_args_list[0].kwargs
+        assert kwargs["connector_name"] == Connectors.IMAGE_GENERATION
+        assert kwargs["mime_type"] == "image/png"
+        assert kwargs["source_tool"] == "image_generator.generate_image"
+
+    @pytest.mark.asyncio
+    async def test_unsupported_size_falls_back(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        mock_adapter = SimpleNamespace(
+            provider="gemini",
+            model="gemini-2.5-flash-image",
+            generate=AsyncMock(return_value=[b"ok"]),
+        )
+        fake_config = {
+            "provider": "gemini",
+            "configuration": {"apiKey": "x", "model": "gemini-2.5-flash-image"},
+            "isDefault": True,
+        }
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch.object(
+            mod, "upload_bytes_artifact", AsyncMock(return_value=None),
+        ), patch.object(
+            mod, "register_task", lambda *a, **kw: None,
+        ):
+            success, payload = await tool.generate_image(
+                prompt="x", size="9999x9999", n=1,
+            )
+
+        assert success is True
+        data = json.loads(payload)
+        assert data["size"] == "1024x1024"
+
+
+class TestGenerateImageEdit:
+    """Cover the ``record_id`` (edit) branch of ``generate_image``."""
+
+    @pytest.mark.asyncio
+    async def test_record_id_calls_adapter_edit_not_generate(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        source_bytes = b"\x89PNG-source"
+        edited_bytes = b"\x89PNG-edited"
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(),
+            edit=AsyncMock(return_value=[edited_bytes]),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+
+        mock_registry = MagicMock()
+        mock_registry.get_content = AsyncMock(return_value=source_bytes)
+        mock_registry_cls = MagicMock(return_value=mock_registry)
+
+        captured_tasks: list[asyncio.Task] = []
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            mock_registry_cls,
+        ), patch.object(
+            mod, "upload_bytes_artifact", AsyncMock(),
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="add a hat",
+                file_name="cat_with_hat",
+                record_id="artifact-abc",
+            )
+
+        assert success is True
+        data = json.loads(payload)
+        assert data["action"] == "edit"
+        assert data["source_record_id"] == "artifact-abc"
+
+        mock_adapter.edit.assert_awaited_once_with(
+            "add a hat", input_image=source_bytes, size="1024x1024", n=1,
+        )
+        mock_adapter.generate.assert_not_awaited()
+        mock_registry.get_content.assert_awaited_once()
+        assert (
+            mock_registry.get_content.await_args.kwargs["artifact_id"]
+            == "artifact-abc"
+        )
+
+    @pytest.mark.asyncio
+    async def test_record_id_absent_uses_generate(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(return_value=[b"img"]),
+            edit=AsyncMock(),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch.object(
+            mod, "upload_bytes_artifact", AsyncMock(),
+        ), patch.object(
+            mod, "register_task", lambda *a, **kw: None,
+        ):
+            success, payload = await tool.generate_image(prompt="a cat")
+
+        assert success is True
+        data = json.loads(payload)
+        assert data["action"] == "generate"
+        assert data["source_record_id"] is None
+        mock_adapter.generate.assert_awaited_once()
+        mock_adapter.edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_record_id_not_found_returns_error(self):
+        from app.agents.actions.image_generator import image_generator as mod
+        from app.services.artifact_registry.access import ArtifactNotFoundError
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI", model="gpt-image-1",
+            generate=AsyncMock(), edit=AsyncMock(),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_registry = MagicMock()
+        mock_registry.get_content = AsyncMock(
+            side_effect=ArtifactNotFoundError("nope"),
+        )
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="x", record_id="missing-id",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert "No artifact found" in data["error"]
+        mock_adapter.edit.assert_not_awaited()
+        mock_adapter.generate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_record_id_access_denied_returns_error(self):
+        from app.agents.actions.image_generator import image_generator as mod
+        from app.services.artifact_registry.access import AccessDeniedError
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI", model="gpt-image-1",
+            generate=AsyncMock(), edit=AsyncMock(),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_registry = MagicMock()
+        mock_registry.get_content = AsyncMock(
+            side_effect=AccessDeniedError("denied"),
+        )
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="x", record_id="not-mine",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert "do not have permission" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_record_id_missing_storage_context_returns_error(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state(graph_provider=None)
+        tool = mod.ImageGenerator(state)
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI", model="gpt-image-1",
+            generate=AsyncMock(), edit=AsyncMock(),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ):
+            success, payload = await tool.generate_image(
+                prompt="x", record_id="some-id",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert "unavailable" in data["error"]
+        mock_adapter.edit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_without_edit_support_returns_clear_error(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openRouter",
+            model="flux/dev",
+            generate=AsyncMock(),
+            edit=AsyncMock(
+                side_effect=NotImplementedError(
+                    "The 'openRouter' image provider does not support editing existing images.",
+                ),
+            ),
+        )
+        fake_config = {
+            "provider": "openRouter",
+            "configuration": {"apiKey": "sk", "model": "flux/dev"},
+            "isDefault": True,
+        }
+        mock_registry = MagicMock()
+        mock_registry.get_content = AsyncMock(return_value=b"source-bytes")
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="x", record_id="artifact-1",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert data["provider"] == "openRouter"
+        assert "does not support editing" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_record_id_with_no_content_returns_error(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI", model="gpt-image-1",
+            generate=AsyncMock(), edit=AsyncMock(),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_registry = MagicMock()
+        mock_registry.get_content = AsyncMock(return_value=b"")
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="x", record_id="empty-artifact",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert "no content to edit" in data["error"]
+
+
+class TestEditFailureRetryGuidance:
+    """A failed edit (typically a provider safety rejection) must tell the
+    model to reuse the ORIGINAL file name if it retries as a fresh
+    generation — otherwise it invents a new descriptive name, which
+    registers a second artifact and abandons the one being updated."""
+
+    @staticmethod
+    def _safety_rejection_setup(source_name):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(),
+            edit=AsyncMock(
+                side_effect=Exception(
+                    "Error code: 400 - Your request was rejected by the safety system",
+                ),
+            ),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_registry = MagicMock()
+        mock_registry.get_content = AsyncMock(return_value=b"source-bytes")
+        if source_name is None:
+            mock_registry.resolve = AsyncMock(side_effect=Exception("boom"))
+        else:
+            mock_registry.resolve = AsyncMock(
+                return_value=SimpleNamespace(name=source_name),
+            )
+        return mod, mock_adapter, fake_config, mock_registry
+
+    @pytest.mark.asyncio
+    async def test_failed_edit_names_the_original_artifact_to_reuse(self):
+        mod, mock_adapter, fake_config, mock_registry = self._safety_rejection_setup(
+            "fictional_football_faceoff.png",
+        )
+        tool = mod.ImageGenerator(_make_state())
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="turn them around", record_id="artifact-abc",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert "safety system" in data["error"]
+        assert data["source_record_id"] == "artifact-abc"
+        assert data["source_file_name"] == "fictional_football_faceoff.png"
+        # The stem (no extension) is what register_output matches on.
+        assert "fictional_football_faceoff" in data["retry_guidance"]
+        assert ".png" not in data["retry_guidance"]
+
+    @pytest.mark.asyncio
+    async def test_guidance_is_generic_when_source_name_unresolvable(self):
+        mod, mock_adapter, fake_config, mock_registry = self._safety_rejection_setup(None)
+        tool = mod.ImageGenerator(_make_state())
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="turn them around", record_id="artifact-abc",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert data["source_file_name"] is None
+        assert "reuse the SAME file_name" in data["retry_guidance"]
+
+    @pytest.mark.asyncio
+    async def test_failed_plain_generation_has_no_retry_guidance(self):
+        """Only the edit path carries the name-stability warning — a plain
+        generation failure has no original artifact to preserve."""
+        from app.agents.actions.image_generator import image_generator as mod
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(side_effect=Exception("rate limited")),
+            edit=AsyncMock(),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        tool = mod.ImageGenerator(_make_state())
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ):
+            success, payload = await tool.generate_image(
+                prompt="a cat", file_name="cat",
+            )
+
+        assert success is False
+        data = json.loads(payload)
+        assert "retry_guidance" not in data
+        assert "source_record_id" not in data
+
+
+class TestStemOf:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("fictional_football_faceoff.png", "fictional_football_faceoff"),
+            ("Some Image.PNG", "some_image"),
+            ("no_extension", "no_extension"),
+            ("", ""),
+            (None, ""),
+        ],
+    )
+    def test_stem_of(self, raw, expected):
+        from app.agents.actions.image_generator.image_generator import _stem_of
+
+        assert _stem_of(raw) == expected
+
+
+class TestScheduleArtifactUploadEdit:
+    """``_schedule_artifact_upload`` with ``edit_record_id`` set."""
+
+    @pytest.mark.asyncio
+    async def test_first_image_bumps_existing_artifact_version(self):
+        from app.agents.actions.image_generator import image_generator as mod
+        from app.services.artifact_registry.models import ArtifactMetadata, ArtifactVersion
+        from app.models.entities import ArtifactType
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        metadata = ArtifactMetadata(
+            artifact_id="artifact-abc",
+            org_id="org-456",
+            conversation_id="conv-123",
+            name="cat_with_hat.png",
+            logical_name="cat_with_hat.png",
+            artifact_type=ArtifactType.IMAGE,
+            mime_type="image/png",
+            version=2,
+            size_bytes=100,
+            document_id="doc-abc",
+        )
+        version = ArtifactVersion(
+            version=2, size_bytes=100, content_hash="hash", mime_type="image/png",
+            created_at=1,
+        )
+        mock_registry = MagicMock()
+        mock_registry.add_version = AsyncMock(return_value=(version, metadata))
+        mock_registry.get_download_url = AsyncMock(return_value="https://blob/edited")
+
+        captured_tasks: list[asyncio.Task] = []
+        with patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ), patch.object(
+            mod, "upload_bytes_artifact", AsyncMock(),
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            tool._schedule_artifact_upload(
+                images=[b"edited-bytes"],
+                blob_store=state["blob_store"],
+                graph_provider=state["graph_provider"],
+                org_id="org-456",
+                conversation_id="conv-123",
+                user_id="user-789",
+                model_name="gpt-image-1",
+                file_name_hint="cat_with_hat",
+                edit_record_id="artifact-abc",
+            )
+            result = await captured_tasks[0]
+
+        assert result is not None
+        entries = result["artifacts"]
+        assert len(entries) == 1
+        assert entries[0]["recordId"] == "artifact-abc"
+        assert entries[0]["version"] == 2
+        assert entries[0]["downloadUrl"] == "https://blob/edited"
+        mock_registry.add_version.assert_awaited_once()
+        assert (
+            mock_registry.add_version.await_args.kwargs["artifact_id"]
+            == "artifact-abc"
+        )
+        assert (
+            mock_registry.add_version.await_args.kwargs["content"]
+            == b"edited-bytes"
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_version_failure_skips_entry(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        mock_registry = MagicMock()
+        mock_registry.add_version = AsyncMock(side_effect=RuntimeError("boom"))
+
+        captured_tasks: list[asyncio.Task] = []
+        with patch(
+            "app.services.artifact_registry.ArtifactRegistryService",
+            MagicMock(return_value=mock_registry),
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            tool._schedule_artifact_upload(
+                images=[b"edited-bytes"],
+                blob_store=state["blob_store"],
+                graph_provider=state["graph_provider"],
+                org_id="org-456",
+                conversation_id="conv-123",
+                user_id="user-789",
+                model_name="gpt-image-1",
+                edit_record_id="artifact-abc",
+            )
+            result = await captured_tasks[0]
+
+        assert result is None
+
+
+class TestGenerateImageErrorPaths:
+    """Cover the early-exit / failure branches in ``generate_image``."""
+
+    @pytest.mark.asyncio
+    async def test_missing_config_service(self):
+        from app.agents.actions.image_generator.image_generator import (
+            ImageGenerator,
+        )
+
+        state = _make_state(config_service=None)
+        tool = ImageGenerator(state)
+
+        success, payload = await tool.generate_image(prompt="hello")
+        assert success is False
+        data = json.loads(payload)
+        assert "config_service unavailable" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_get_config_raises(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            success, payload = await tool.generate_image(prompt="hello")
+
+        assert success is False
+        data = json.loads(payload)
+        assert "Failed to load image generation config" in data["error"]
+        assert "boom" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_adapter_build_failure(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value={"provider": "openAI", "configuration": {}}),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            side_effect=RuntimeError("sdk missing"),
+        ):
+            success, payload = await tool.generate_image(prompt="hello")
+
+        assert success is False
+        data = json.loads(payload)
+        assert "Failed to initialise" in data["error"]
+        assert "sdk missing" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_adapter_generate_raises(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(side_effect=RuntimeError("rate limit")),
+        )
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value={"provider": "openAI", "configuration": {}}),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ):
+            success, payload = await tool.generate_image(prompt="hello")
+
+        assert success is False
+        data = json.loads(payload)
+        assert data["provider"] == "openAI"
+        assert data["model"] == "gpt-image-1"
+        assert "Image generation failed" in data["error"]
+        assert "rate limit" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_adapter_returns_no_images(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="gemini",
+            model="imagen-3",
+            generate=AsyncMock(return_value=[]),
+        )
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value={"provider": "gemini", "configuration": {}}),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ):
+            success, payload = await tool.generate_image(prompt="hello")
+
+        assert success is False
+        data = json.loads(payload)
+        assert data["provider"] == "gemini"
+        assert data["error"] == "Provider returned no images"
+
+
+class TestScheduleArtifactUpload:
+    """Directly exercise ``_schedule_artifact_upload`` branches."""
+
+    @pytest.mark.asyncio
+    async def test_skip_when_no_conversation_id(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state(conversation_id=None))
+
+        captured: list = []
+        with patch.object(mod, "register_task", lambda *a, **kw: captured.append(a)):
+            tool._schedule_artifact_upload(
+                images=[b"abc"],
+                blob_store=MagicMock(),
+                graph_provider=MagicMock(),
+                org_id="org-456",
+                conversation_id=None,
+                user_id="u",
+                model_name="m",
+            )
+
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_blob_store_fallback_created_when_missing(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state(blob_store=None)
+        tool = mod.ImageGenerator(state)
+
+        fake_store = MagicMock()
+        fake_blob_cls = MagicMock(return_value=fake_store)
+
+        captured_tasks: list[asyncio.Task] = []
+
+        mock_upload = AsyncMock(return_value={
+            "fileName": "img.png",
+            "signedUrl": "https://blob/1",
+            "documentId": "doc-1",
+        })
+
+        with patch(
+            "app.modules.transformers.blob_storage.BlobStorage", fake_blob_cls,
+        ), patch.object(
+            mod, "upload_bytes_artifact", mock_upload,
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            tool._schedule_artifact_upload(
+                images=[b"img-bytes"],
+                blob_store=None,
+                graph_provider=state["graph_provider"],
+                org_id="org-456",
+                conversation_id="conv-123",
+                user_id="user-789",
+                model_name="gpt-image-1",
+            )
+
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+
+        assert result is not None
+        assert result["type"] == "artifacts"
+        assert len(result["artifacts"]) == 1
+        fake_blob_cls.assert_called_once()
+        mock_upload.assert_awaited_once()
+        # upload called with the fallback-built store
+        assert mock_upload.await_args.kwargs["blob_store"] is fake_store
+
+    @pytest.mark.asyncio
+    async def test_blob_store_fallback_construction_fails(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state(blob_store=None)
+        tool = mod.ImageGenerator(state)
+
+        captured_tasks: list[asyncio.Task] = []
+        mock_upload = AsyncMock()
+
+        with patch(
+            "app.modules.transformers.blob_storage.BlobStorage",
+            side_effect=RuntimeError("no storage config"),
+        ), patch.object(
+            mod, "upload_bytes_artifact", mock_upload,
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            tool._schedule_artifact_upload(
+                images=[b"img-bytes"],
+                blob_store=None,
+                graph_provider=state["graph_provider"],
+                org_id="org-456",
+                conversation_id="conv-123",
+                user_id="user-789",
+                model_name="gpt-image-1",
+            )
+
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+
+        assert result is None
+        mock_upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upload_exception_is_logged_and_skipped(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        captured_tasks: list[asyncio.Task] = []
+        call_count = {"n": 0}
+
+        async def _upload_side_effect(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("transient upload error")
+            return {
+                "fileName": kwargs["file_name"],
+                "signedUrl": "https://blob/ok",
+                "documentId": "doc-ok",
+            }
+
+        with patch.object(
+            mod, "upload_bytes_artifact", AsyncMock(side_effect=_upload_side_effect),
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            tool._schedule_artifact_upload(
+                images=[b"first", b"second"],
+                blob_store=state["blob_store"],
+                graph_provider=state["graph_provider"],
+                org_id="org-456",
+                conversation_id="conv-123",
+                user_id="user-789",
+                model_name="gpt-image-1",
+            )
+
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+
+        assert result is not None
+        assert len(result["artifacts"]) == 1
+        assert result["artifacts"][0]["fileName"].startswith("gpt-image-1")
+
+    @pytest.mark.asyncio
+    async def test_all_uploads_return_none_yields_no_artifacts(self):
+        """When every upload returns a falsy entry, the task should resolve to None."""
+        from app.agents.actions.image_generator import image_generator as mod
+
+        state = _make_state()
+        tool = mod.ImageGenerator(state)
+
+        captured_tasks: list[asyncio.Task] = []
+
+        with patch.object(
+            mod, "upload_bytes_artifact", AsyncMock(return_value=None),
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            tool._schedule_artifact_upload(
+                images=[b"a", b"b"],
+                blob_store=state["blob_store"],
+                graph_provider=state["graph_provider"],
+                org_id="org-456",
+                conversation_id="conv-123",
+                user_id="user-789",
+                model_name="gpt-image-1",
+            )
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+
+        assert result is None
+
+
+class TestBuildFileName:
+    def test_sanitises_model_name(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        name = _build_file_name("gpt-image-1", 0)
+        assert name.startswith("gpt-image-1_1_")
+        assert name.endswith(".png")
+
+    def test_strips_unsafe_chars(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        name = _build_file_name("my model/v2!", 2)
+        # slashes / spaces / ! become "_"; leading/trailing "_" stripped
+        assert name.startswith("my_model_v2_3_")
+
+    def test_empty_model_name_falls_back(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        name = _build_file_name("", 0)
+        assert name.startswith("image_1_")
+
+    def test_uses_hint_single_image(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        assert (
+            _build_file_name("gpt-image-1", 0, total=1, hint="Mona Lisa")
+            == "mona_lisa.png"
+        )
+
+    def test_uses_hint_multiple_images(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        assert (
+            _build_file_name("gpt-image-1", 0, total=3, hint="coffee_logo")
+            == "coffee_logo_1.png"
+        )
+        assert (
+            _build_file_name("gpt-image-1", 2, total=3, hint="coffee_logo")
+            == "coffee_logo_3.png"
+        )
+
+    def test_blank_hint_falls_back_to_model(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        name = _build_file_name("gpt-image-1", 0, total=1, hint="   ")
+        assert name.startswith("gpt-image-1_1_")
+        assert name.endswith(".png")
+
+    def test_junk_hint_falls_back_to_model(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        name = _build_file_name("gpt-image-1", 0, total=1, hint="***///")
+        assert name.startswith("gpt-image-1_1_")
+        assert name.endswith(".png")
+
+    def test_none_hint_falls_back_to_model(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        name = _build_file_name("gpt-image-1", 0, total=1, hint=None)
+        assert name.startswith("gpt-image-1_1_")
+        assert name.endswith(".png")
+
+    def test_hint_sanitisation_preserved(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _build_file_name,
+        )
+
+        # Spaces / slashes / punctuation become underscores which are then
+        # collapsed and trimmed; alphanumerics (including non-ASCII letters)
+        # are preserved and lowercased.
+        assert (
+            _build_file_name("m", 0, total=1, hint="Über /cat!")
+            == "über_cat.png"
+        )
+
+
+class TestSanitizeFileStem:
+    def test_spaces_become_underscores_and_lowercased(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        assert _sanitize_file_stem("Mona Lisa") == "mona_lisa"
+
+    def test_trims_whitespace_and_punctuation(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        assert (
+            _sanitize_file_stem("  Coffee Shop Logo!!") == "coffee_shop_logo"
+        )
+
+    def test_slashes_and_dots_become_underscores(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        assert _sanitize_file_stem("my/model\\v2.png") == "my_model_v2_png"
+
+    def test_empty_inputs_return_empty(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        assert _sanitize_file_stem(None) == ""
+        assert _sanitize_file_stem("") == ""
+        assert _sanitize_file_stem("   ") == ""
+        assert _sanitize_file_stem("***") == ""
+        assert _sanitize_file_stem("___") == ""
+
+    def test_long_inputs_truncated_to_60_chars(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        result = _sanitize_file_stem("a" * 200)
+        assert len(result) == 60
+        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+        assert set(result).issubset(allowed)
+
+    def test_collapses_repeated_separators(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        assert _sanitize_file_stem("a___b---c") == "a_b-c"
+
+    def test_preserves_hyphens(self):
+        from app.agents.actions.image_generator.image_generator import (
+            _sanitize_file_stem,
+        )
+
+        assert _sanitize_file_stem("gpt-image-1") == "gpt-image-1"
+
+
+class TestGenerateImagePassesFileName:
+    """End-to-end: LLM-supplied ``file_name`` reaches ``upload_bytes_artifact``."""
+
+    @pytest.mark.asyncio
+    async def test_hint_threaded_to_upload_single_image(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(return_value=[b"img-bytes"]),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_upload = AsyncMock(return_value={
+            "fileName": "mona_lisa.png",
+            "signedUrl": "https://blob/1",
+            "documentId": "doc-1",
+        })
+        captured_tasks: list[asyncio.Task] = []
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch.object(
+            mod, "upload_bytes_artifact", mock_upload,
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="A Renaissance portrait of a noblewoman",
+                file_name="Mona Lisa",
+                size="1024x1024",
+                n=1,
+            )
+
+            assert success is True
+            data = json.loads(payload)
+            assert data["file_name"] == "mona_lisa"
+
+            await captured_tasks[0]
+
+        mock_upload.assert_awaited_once()
+        assert mock_upload.await_args.kwargs["file_name"] == "mona_lisa.png"
+
+    @pytest.mark.asyncio
+    async def test_hint_threaded_to_upload_multi_image(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(return_value=[b"a", b"b", b"c"]),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_upload = AsyncMock(return_value={
+            "fileName": "x",
+            "signedUrl": "https://blob/x",
+            "documentId": "doc",
+        })
+        captured_tasks: list[asyncio.Task] = []
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch.object(
+            mod, "upload_bytes_artifact", mock_upload,
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            success, _ = await tool.generate_image(
+                prompt="logo",
+                file_name="Coffee Shop Logo",
+                n=3,
+            )
+            assert success is True
+            await captured_tasks[0]
+
+        actual_names = [
+            call.kwargs["file_name"] for call in mock_upload.await_args_list
+        ]
+        assert actual_names == [
+            "coffee_shop_logo_1.png",
+            "coffee_shop_logo_2.png",
+            "coffee_shop_logo_3.png",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_file_name_falls_back_to_model(self):
+        from app.agents.actions.image_generator import image_generator as mod
+
+        tool = mod.ImageGenerator(_make_state())
+
+        mock_adapter = SimpleNamespace(
+            provider="openAI",
+            model="gpt-image-1",
+            generate=AsyncMock(return_value=[b"img"]),
+        )
+        fake_config = {
+            "provider": "openAI",
+            "configuration": {"apiKey": "sk", "model": "gpt-image-1"},
+            "isDefault": True,
+        }
+        mock_upload = AsyncMock(return_value={
+            "fileName": "x",
+            "signedUrl": "https://blob/x",
+            "documentId": "doc",
+        })
+        captured_tasks: list[asyncio.Task] = []
+
+        with patch.object(
+            mod, "get_image_generation_config",
+            AsyncMock(return_value=fake_config),
+        ), patch(
+            "app.utils.aimodels.get_image_generation_model",
+            return_value=mock_adapter,
+        ), patch.object(
+            mod, "upload_bytes_artifact", mock_upload,
+        ), patch.object(
+            mod, "register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            success, payload = await tool.generate_image(
+                prompt="anything",
+                file_name="",
+                n=1,
+            )
+            assert success is True
+            data = json.loads(payload)
+            assert data["file_name"] == ""
+            await captured_tasks[0]
+
+        uploaded_name = mock_upload.await_args.kwargs["file_name"]
+        assert uploaded_name.startswith("gpt-image-1_1_")
+        assert uploaded_name.endswith(".png")
+
+
+class TestGenerateImageInputSchema:
+    """Lock in the LLM-facing contract for the ``file_name`` argument."""
+
+    def test_file_name_is_required(self):
+        from app.agents.actions.image_generator.image_generator import (
+            GenerateImageInput,
+        )
+
+        schema = GenerateImageInput.model_json_schema()
+        assert "file_name" in schema["properties"]
+        assert "file_name" in schema["required"]
+
+    def test_file_name_description_guides_llm(self):
+        from app.agents.actions.image_generator.image_generator import (
+            GenerateImageInput,
+        )
+
+        desc = (
+            GenerateImageInput.model_json_schema()
+            ["properties"]["file_name"]["description"]
+            .lower()
+        )
+        # The description should push the LLM toward descriptive snake_case
+        # names derived from the prompt, and away from model names / random IDs.
+        assert "snake_case" in desc
+        assert "descriptive" in desc
+        assert "model name" in desc
+
+    def test_file_name_description_includes_example(self):
+        from app.agents.actions.image_generator.image_generator import (
+            GenerateImageInput,
+        )
+
+        desc = (
+            GenerateImageInput.model_json_schema()
+            ["properties"]["file_name"]["description"]
+        )
+        # At least one canonical example so the LLM has something to copy.
+        assert "mona_lisa" in desc
+
+

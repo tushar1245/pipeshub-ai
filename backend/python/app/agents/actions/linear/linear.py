@@ -1,0 +1,505 @@
+import json
+import logging
+from typing import List, Optional, Tuple
+
+from app.agent_loop_lib.tools.base import ParameterType, Tag, ToolParameter
+from app.agent_loop_lib.tools.decorators import tool
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolDefinition,
+    ToolsetBuilder,
+    ToolsetCategory,
+)
+from app.sources.client.linear.linear import LinearClient
+from app.sources.external.linear.linear import LinearDataSource
+
+logger = logging.getLogger(__name__)
+
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="get_viewer",
+        description="Get current user information",
+        parameters=[],
+        tags=["users", "info"]
+    ),
+    ToolDefinition(
+        name="get_user",
+        description="Get user information",
+        parameters=[
+            {"name": "user_id", "type": "string", "description": "User ID", "required": True}
+        ],
+        tags=["users", "read"]
+    ),
+    ToolDefinition(
+        name="get_teams",
+        description="Get all teams",
+        parameters=[],
+        tags=["teams", "list"]
+    ),
+    ToolDefinition(
+        name="get_team",
+        description="Get team details",
+        parameters=[
+            {"name": "team_id", "type": "string", "description": "Team ID", "required": True}
+        ],
+        tags=["teams", "read"]
+    ),
+    ToolDefinition(
+        name="get_issues",
+        description="Get issues",
+        parameters=[
+            {"name": "team_id", "type": "string", "description": "Team ID", "required": False}
+        ],
+        tags=["issues", "list"]
+    ),
+    ToolDefinition(
+        name="get_issue",
+        description="Get issue details",
+        parameters=[
+            {"name": "issue_id", "type": "string", "description": "Issue ID", "required": True}
+        ],
+        tags=["issues", "read"]
+    ),
+    ToolDefinition(
+        name="create_issue",
+        description="Create a new issue",
+        parameters=[
+            {"name": "team_id", "type": "string", "description": "Team ID", "required": True},
+            {"name": "title", "type": "string", "description": "Issue title", "required": True}
+        ],
+        tags=["issues", "create"]
+    ),
+    ToolDefinition(
+        name="update_issue",
+        description="Update an issue",
+        parameters=[
+            {"name": "issue_id", "type": "string", "description": "Issue ID", "required": True}
+        ],
+        tags=["issues", "update"]
+    ),
+    ToolDefinition(
+        name="delete_issue",
+        description="Delete an issue",
+        parameters=[
+            {"name": "issue_id", "type": "string", "description": "Issue ID", "required": True}
+        ],
+        tags=["issues", "delete"]
+    ),
+]
+
+
+# Register Linear toolset
+@ToolsetBuilder("Linear")\
+    .in_group("Project Management")\
+    .with_description("Linear integration for issue tracking and project management")\
+    .with_category(ToolsetCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Linear",
+            authorize_url="https://linear.app/oauth/authorize",
+            token_url="https://api.linear.app/oauth/token",
+            redirect_uri="toolsets/oauth/callback/linear",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "read",
+                    "write"
+                ]
+            ),
+            fields=[
+                CommonFields.client_id("Linear OAuth App"),
+                CommonFields.client_secret("Linear OAuth App")
+            ],
+            icon_path="/assets/icons/connectors/linear.svg",
+            app_group="Project Management",
+            app_description="Linear OAuth application for agent integration"
+        ),
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("Linear API Key", "lin_api_your-key-here")
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon("/assets/icons/connectors/linear.svg"))\
+    .build_decorator()
+class Linear:
+    """Linear tool exposed to the agents"""
+    def __init__(self, client: LinearClient) -> None:
+        """Initialize the Linear tool"""
+        """
+        Args:
+            client: Linear client object
+        Returns:
+            None
+        """
+        self.client = LinearDataSource(client)
+
+    @tool(
+        path="/tools/linear/get_viewer",
+        short_description="Get current authenticated Linear user",
+        description="Get current user information from Linear, including display name, email, and account details.",
+        parameters=[],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="read")],
+    )
+    async def get_viewer(self) -> Tuple[bool, str]:
+        """Get current user information"""
+        try:
+            response = await self.client.viewer()
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error getting viewer: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/get_user",
+        short_description="Get a Linear user by ID",
+        description="Get user information from Linear by their user ID, including display name, email, and role.",
+        parameters=[
+            ToolParameter(
+                name="user_id",
+                type=ParameterType.STRING,
+                description="The ID of the user to get",
+                required=True,
+            )
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="read")],
+    )
+    async def get_user(self, user_id: str) -> Tuple[bool, str]:
+        """Get user by ID"""
+        try:
+            response = await self.client.user(id=user_id)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error getting user: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/get_teams",
+        short_description="List Linear teams",
+        description="Get all teams in the Linear workspace with optional pagination.",
+        parameters=[
+            ToolParameter(
+                name="first",
+                type=ParameterType.INTEGER,
+                description="Number of teams to return",
+                required=False,
+            ),
+            ToolParameter(
+                name="after",
+                type=ParameterType.STRING,
+                description="Cursor for pagination",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="read")],
+    )
+    async def get_teams(
+        self,
+        first: Optional[int] = None,
+        after: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Get teams"""
+        try:
+            response = await self.client.teams(first=first, after=after)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error getting teams: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/get_team",
+        short_description="Get a Linear team by ID",
+        description="Get detailed information about a specific Linear team by its ID.",
+        parameters=[
+            ToolParameter(
+                name="team_id",
+                type=ParameterType.STRING,
+                description="The ID of the team to get",
+                required=True,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="read")],
+    )
+    async def get_team(self, team_id: str) -> Tuple[bool, str]:
+        """Get team by ID"""
+        try:
+            response = await self.client.team(id=team_id)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error getting team: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/get_issues",
+        short_description="List Linear issues",
+        description="Get issues from Linear with optional pagination and filtering. Filter accepts a JSON string of Linear issue filter fields.",
+        parameters=[
+            ToolParameter(
+                name="first",
+                type=ParameterType.INTEGER,
+                description="Number of issues to return",
+                required=False,
+            ),
+            ToolParameter(
+                name="after",
+                type=ParameterType.STRING,
+                description="Cursor for pagination",
+                required=False,
+            ),
+            ToolParameter(
+                name="filter",
+                type=ParameterType.STRING,
+                description="Filter for issues as a JSON string",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="read")],
+    )
+    async def get_issues(
+        self,
+        first: Optional[int] = None,
+        after: Optional[str] = None,
+        filter: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Get issues"""
+        try:
+            # Convert string filter (if provided) to dict expected by data source
+            filter_dict = None
+            if filter is not None:
+                try:
+                    filter_dict = json.loads(filter)
+                except (ValueError, TypeError, RecursionError):
+                    return False, json.dumps({"error": "Invalid filter: not valid JSON. Pass a JSON object of Linear issue filter fields."})
+                if not isinstance(filter_dict, dict):
+                    return False, json.dumps({"error": "Invalid filter: must be a JSON object of Linear issue filter fields."})
+
+            response = await self.client.issues(first=first, after=after, filter=filter_dict)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error getting issues: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/get_issue",
+        short_description="Get a Linear issue by ID",
+        description="Get detailed information about a specific Linear issue by its ID, including title, description, state, assignee, and priority.",
+        parameters=[
+            ToolParameter(
+                name="issue_id",
+                type=ParameterType.STRING,
+                description="The ID of the issue to get",
+                required=True,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="read")],
+    )
+    async def get_issue(self, issue_id: str) -> Tuple[bool, str]:
+        """Get issue by ID"""
+        try:
+            response = await self.client.issue(id=issue_id)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error getting issue: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/create_issue",
+        short_description="Create a new Linear issue",
+        description="Create a new issue in Linear with a title, team, and optional description, state, assignee, and priority.",
+        parameters=[
+            ToolParameter(
+                name="team_id",
+                type=ParameterType.STRING,
+                description="The ID of the team",
+                required=True,
+            ),
+            ToolParameter(
+                name="title",
+                type=ParameterType.STRING,
+                description="Title of the issue",
+                required=True,
+            ),
+            ToolParameter(
+                name="description",
+                type=ParameterType.STRING,
+                description="Description of the issue",
+                required=False,
+            ),
+            ToolParameter(
+                name="state_id",
+                type=ParameterType.STRING,
+                description="ID of the state",
+                required=False,
+            ),
+            ToolParameter(
+                name="assignee_id",
+                type=ParameterType.STRING,
+                description="ID of the assignee",
+                required=False,
+            ),
+            ToolParameter(
+                name="priority",
+                type=ParameterType.INTEGER,
+                description="Priority of the issue (0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low)",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="write")],
+    )
+    async def create_issue(
+        self,
+        team_id: str,
+        title: str,
+        description: Optional[str] = None,
+        state_id: Optional[str] = None,
+        assignee_id: Optional[str] = None,
+        priority: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """Create a new issue"""
+        try:
+            # Build GraphQL input for issueCreate
+            issue_input = {"title": title, "teamId": team_id}
+            if description is not None:
+                issue_input["description"] = description
+            if state_id is not None:
+                issue_input["stateId"] = state_id
+            if assignee_id is not None:
+                issue_input["assigneeId"] = assignee_id
+            if priority is not None:
+                issue_input["priority"] = priority
+
+            response = await self.client.issueCreate(input=issue_input)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error creating issue: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/update_issue",
+        short_description="Update a Linear issue",
+        description="Update an existing Linear issue's title, description, state, or assignee.",
+        parameters=[
+            ToolParameter(
+                name="issue_id",
+                type=ParameterType.STRING,
+                description="The ID of the issue to update",
+                required=True,
+            ),
+            ToolParameter(
+                name="title",
+                type=ParameterType.STRING,
+                description="New title of the issue",
+                required=False,
+            ),
+            ToolParameter(
+                name="description",
+                type=ParameterType.STRING,
+                description="New description of the issue",
+                required=False,
+            ),
+            ToolParameter(
+                name="state_id",
+                type=ParameterType.STRING,
+                description="New state ID",
+                required=False,
+            ),
+            ToolParameter(
+                name="assignee_id",
+                type=ParameterType.STRING,
+                description="New assignee ID",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="write")],
+    )
+    async def update_issue(
+        self,
+        issue_id: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        state_id: Optional[str] = None,
+        assignee_id: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Update an issue"""
+        try:
+            # Build GraphQL input for issueUpdate
+            update_input = {}
+            if title is not None:
+                update_input["title"] = title
+            if description is not None:
+                update_input["description"] = description
+            if state_id is not None:
+                update_input["stateId"] = state_id
+            if assignee_id is not None:
+                update_input["assigneeId"] = assignee_id
+
+            response = await self.client.issueUpdate(id=issue_id, input=update_input)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error updating issue: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/linear/delete_issue",
+        short_description="Delete a Linear issue",
+        description="Permanently delete an issue from Linear by its ID.",
+        parameters=[
+            ToolParameter(
+                name="issue_id",
+                type=ParameterType.STRING,
+                description="The ID of the issue to delete",
+                required=True,
+            ),
+        ],
+        tags=[Tag(key="category", value="project_management"), Tag(key="type", value="write")],
+    )
+    async def delete_issue(self, issue_id: str) -> Tuple[bool, str]:
+        """Delete an issue"""
+        try:
+            response = await self.client.issueDelete(id=issue_id)
+
+            if response.success:
+                return True, json.dumps({"data": response.data})
+            else:
+                return False, json.dumps({"error": response.message})
+        except Exception as e:
+            logger.error(f"Error deleting issue: {e}")
+            return False, json.dumps({"error": str(e)})

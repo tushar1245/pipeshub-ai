@@ -1,0 +1,345 @@
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Union
+
+from app.services.vector_db.models import (
+    CollectionConfig,
+    FilterExpression,
+    FilterMode,
+    FilterValue,
+    HybridSearchRequest,
+    ScrollResult,
+    SearchFailureKind,
+    SearchResult,
+    VectorCollectionInfo,
+    VectorDBCapabilities,
+    VectorDBHealth,
+    VectorDBMemoryReport,
+    VectorPoint,
+)
+
+
+class IVectorDBService(ABC):
+    """Abstract interface for vector database providers.
+
+    All data-path methods are **async** so they can be safely awaited in
+    async request handlers and background tasks without blocking the event loop.
+
+    Providers
+    ---------
+    Qdrant   – sparse + dense vectors, native RRF prefetch/fusion
+    OpenSearch – dense KNN + server-side BM25, RRF via score-ranker pipeline
+    Redis    – dense KNN + server-side BM25, RRF via FT.HYBRID (Redis >= 8.4)
+
+    Capability negotiation
+    ----------------------
+    Call ``get_capabilities()`` at startup to learn whether a provider accepts
+    client-computed sparse vectors or relies on server-side text search for the
+    lexical leg.  Indexing and retrieval paths branch on these flags so the
+    *call-site code never hard-codes provider names*.
+    """
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def connect(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def disconnect(self) -> None:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_service_name(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_service(self) -> "IVectorDBService":
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_service_client(self) -> object:
+        """Return the underlying raw client (for langchain adapters if needed)."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Capabilities and health (new)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_capabilities(self) -> VectorDBCapabilities:
+        """Return static capability descriptor for this provider."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def health_check(self) -> VectorDBHealth:
+        """Perform a live health check and return a structured result."""
+        raise NotImplementedError
+
+    async def memory_report(self) -> VectorDBMemoryReport | None:
+        """Estimate the memory search needs to stay fast, against what the store has.
+
+        None when the provider cannot estimate it. Concrete so providers that
+        manage their own memory (OpenSearch, Redis) need not implement it.
+        """
+        return None
+
+    def transient_search_error(self, error: BaseException) -> SearchFailureKind | None:
+        """Whether ``error``, raised by this provider's client during a search,
+        is one a second attempt may get past: a timeout or the store being
+        briefly unreachable. None for everything else (a bad request, auth),
+        which a retry would only repeat.
+
+        Concrete so a provider with nothing client-specific to classify keeps
+        the builtin ``TimeoutError``/``ConnectionError`` handling of
+        ``search_retry`` and nothing more.
+        """
+        return None
+
+    # ------------------------------------------------------------------
+    # Collection management
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def create_collection(
+        self,
+        collection_name: str = "records",
+        config: Optional[CollectionConfig] = None,
+    ) -> None:
+        raise NotImplementedError
+
+    async def reconcile_storage_layout(
+        self,
+        collection_name: str = "records",
+        config: Optional[CollectionConfig] = None,
+    ) -> Optional[str]:
+        """Advance an existing collection one step toward ``config``'s storage layout.
+
+        Returns the field that was changed, or None when nothing was applied.
+        Intentionally concrete: providers that cannot retune a live collection
+        inherit the no-op rather than being forced to stub it out.
+        """
+        return None
+
+    async def reconcile_lexical_scoring(
+        self,
+        collection_name: str = "records",
+        config: Optional[CollectionConfig] = None,
+    ) -> Optional[str]:
+        """Bring an existing collection's keyword scoring in line with ``config``.
+
+        Unlike ``reconcile_storage_layout`` this must be cheap enough to run on
+        every startup: it may change how stored data is scored, never rewrite
+        it. Returns the setting that was changed, or None when nothing was.
+        Concrete for the same reason as ``reconcile_storage_layout``.
+        """
+        return None
+
+    @abstractmethod
+    async def get_collections(self) -> object:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_collection(self, collection_name: str) -> object:
+        """Return raw provider-specific collection info (for legacy callers)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_collection_info(self, collection_name: str) -> VectorCollectionInfo:
+        """Return normalised, provider-neutral collection metadata."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def collection_exists(self, collection_name: str) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_collection(self, collection_name: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def create_index(
+        self,
+        collection_name: str,
+        field_name: str,
+        field_schema: dict,
+    ) -> None:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Filter construction
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def filter_collection(
+        self,
+        filter_mode: Union[str, FilterMode] = FilterMode.MUST,
+        must: Optional[Dict[str, FilterValue]] = None,
+        should: Optional[Dict[str, FilterValue]] = None,
+        must_not: Optional[Dict[str, FilterValue]] = None,
+        min_should_match: Optional[int] = None,
+        max_values: Optional[Dict[str, int]] = None,
+        **filters: FilterValue,
+    ) -> FilterExpression:
+        """Build a provider-native filter.
+
+        ``max_values`` bounds an array field's length (``{"connectorIds": 1}``
+        matches a point whose only owner is the one named in ``must``). It is
+        always ANDed, never an alternative to a value match.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Data operations — all async
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def scroll(
+        self,
+        collection_name: str,
+        scroll_filter: FilterExpression,
+        limit: int,
+        offset: Optional[str] = None,
+        with_payload: Optional[List[str]] = None,
+    ) -> ScrollResult:
+        """Page through matching points.
+
+        ``with_payload`` restricts which payload fields come back (dotted paths
+        such as ``metadata.virtualRecordId``). Callers that need a couple of
+        fields should pass it: the default pulls the whole payload including
+        ``page_content``, which on a large scan is megabytes of chunk text
+        transferred and discarded.
+        """
+        raise NotImplementedError
+
+    def scroll_offset_after_delete(
+        self, next_offset: Optional[str], deleted: int,
+    ) -> Optional[str]:
+        """``next_offset`` from ``scroll``, adjusted after the caller deleted
+        ``deleted`` of the points that page returned.
+
+        A key-based cursor (the next id, a ``search_after`` value) is
+        unaffected. A positional one must step back, or the next page skips
+        as many points as were deleted.
+        """
+        return next_offset
+
+    @abstractmethod
+    async def retrieve_points(
+        self,
+        collection_name: str,
+        ids: List[str],
+    ) -> List[VectorPoint]:
+        """Points by id, without vectors; ids with no point are omitted.
+
+        Unlike ``scroll``, this reads writes that are not yet searchable (an
+        OpenSearch index only refreshes every 30s), so a read-modify-write can
+        use it without losing an update made moments earlier.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def update_payload_by_ids(
+        self,
+        collection_name: str,
+        point_ids: List[str],
+        payload: dict,
+    ) -> None:
+        """Merge ``payload`` into the points with these ids, by id.
+
+        Unlike ``set_payload``, which finds its points with a search (an
+        OpenSearch ``update_by_query`` cannot see a document until the index
+        refreshes), this reaches a point the moment it was written. Ids with
+        no point are ignored.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def query_nearest_points(
+        self,
+        collection_name: str,
+        requests: List[HybridSearchRequest],
+    ) -> List[List[SearchResult]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def upsert_points(
+        self,
+        collection_name: str,
+        points: List[VectorPoint],
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_points(
+        self,
+        collection_name: str,
+        filter: FilterExpression,
+        refresh: bool = False,
+    ) -> None:
+        """Delete matching points.
+
+        ``refresh=True`` asks the provider to make the write immediately
+        visible to a subsequent read. Only pass it when the caller re-reads the
+        matched set to decide whether it is done — on OpenSearch it forces a
+        shard refresh, creating a Lucene segment per call, which is exactly the
+        segment proliferation the 30s ``refresh_interval`` exists to avoid.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def overwrite_payload(
+        self,
+        collection_name: str,
+        payload: dict,
+        points: FilterExpression,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def set_payload(
+        self,
+        collection_name: str,
+        payload: dict,
+        filter: FilterExpression,
+        refresh: bool = False,
+    ) -> None:
+        """Merge ``payload`` into matching points without replacing the rest.
+
+        See ``delete_points`` for ``refresh``.
+
+        Must not use Qdrant ``overwrite_payload`` (that drops ``page_content``).
+        Rejects an empty filter — the same safety rule as ``delete_points``.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Performance utilities (optional — providers that don't support these
+    # inherit the no-op default; override in OpenSearch / others as needed)
+    # ------------------------------------------------------------------
+
+    async def force_merge(
+        self,
+        collection_name: str,
+        max_segments: int = 1,
+    ) -> None:
+        """Merge index segments for optimal search performance.
+
+        No-op for providers that manage segment lifecycle internally (e.g.
+        Qdrant).  Override in providers that expose a merge API (e.g.
+        OpenSearch / Elasticsearch).
+        """
+
+    async def warmup(self, collection_name: str) -> None:
+        """Pre-load indexes into memory to eliminate cold-start latency.
+
+        No-op for providers whose indexes are always in memory (e.g. Qdrant
+        with ``always_ram=True``).  Override in providers that use memory-
+        mapped files and expose an explicit warmup API (e.g. OpenSearch).
+        """
+

@@ -1,0 +1,37 @@
+'use client';
+
+import i18n from 'i18next';
+import { initReactI18next } from 'react-i18next';
+import LanguageDetector from 'i18next-browser-languagedetector';
+import { SUPPORTED_LNG_KEYS, SUPPORTED_LANGUAGES } from './supported-languages';
+import { locales } from './locales';
+import localePolicy from './locale-policy.json';
+import { addFormatters } from './formatters';
+import { DEFAULT_BRAND, i18nBrandVariables } from '@/lib/branding/defaults';
+
+const resources = Object.fromEntries(
+  (Object.keys(SUPPORTED_LANGUAGES) as (keyof typeof SUPPORTED_LANGUAGES)[]).map(
+    (lang) => [lang, { translation: locales[lang] }]
+  )
+);
+
+i18n
+  .use(LanguageDetector) // Detect user language
+  .use(initReactI18next) // Pass i18n to react-i18next
+  .init({
+    resources,
+    fallbackLng: localePolicy.source,
+    supportedLngs: SUPPORTED_LNG_KEYS,
+    interpolation: {
+      escapeValue: false, // React already escapes
+      defaultVariables: i18nBrandVariables(DEFAULT_BRAND),
+    },
+    detection: {
+      order: ['localStorage', 'navigator'],
+      caches: ['localStorage'],
+      lookupLocalStorage: 'i18nextLng',
+    },
+  });
+addFormatters(i18n);
+
+export default i18n;

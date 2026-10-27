@@ -1,0 +1,475 @@
+import { Response, NextFunction } from 'express';
+import { AuthenticatedUserRequest } from '../../../libs/middlewares/types';
+import { Logger } from '../../../libs/services/logger.service';
+import {
+  BadRequestError,
+  InternalServerError,
+  NotFoundError,
+} from '../../../libs/errors/http.errors';
+import {
+  AICommandOptions,
+  AIServiceCommand,
+} from '../../../libs/commands/ai_service/ai.service.command';
+import { HttpMethod } from '../../../libs/enums/http-methods.enum';
+import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
+import { AppConfig } from '../../tokens_manager/config/config';
+import { inject, injectable } from 'inversify';
+import { UserDisplayPicture } from '../schema/userDp.schema';
+import type {
+  TeamCreatedByUser,
+  TeamResponse,
+  TeamUsersResponse,
+  TeamsListResponse,
+} from '../types/user_management.types';
+
+
+import { handleBackendError } from '../../../libs/errors/backend-error';
+
+/**
+ * Handle AI service response
+ * Checks status code and extracts error messages if needed
+ */
+const handleAIServiceResponse = (
+  aiResponse: any,
+  res: Response,
+  operation: string,
+  failureMessage: string,
+  successStatus: number = HTTP_STATUS.OK,
+) => {
+  if (!aiResponse) {
+    throw new InternalServerError('No response from AI service');
+  }
+  if (aiResponse.statusCode !== HTTP_STATUS.OK && aiResponse.statusCode !== HTTP_STATUS.CREATED) {
+    throw handleBackendError(aiResponse, operation);
+  }
+  const responseData = aiResponse.data;
+  if (!responseData) {
+    throw new NotFoundError(`${operation} failed: ${failureMessage}`);
+  }
+  res.status(successStatus).json(responseData);
+};
+
+// The team service wraps the team it returns: `{ data: team }` from create,
+// `{ team }` from get, update and the member list.
+const teamIn = (body: unknown): TeamResponse | undefined => {
+  if (typeof body !== 'object' || body === null) return undefined;
+  const { team, data } = body as { team?: unknown; data?: unknown };
+  const inner: unknown = team ?? data ?? body;
+  return typeof inner === 'object' && inner !== null
+    ? (inner as TeamResponse)
+    : undefined;
+};
+
+// Pictures are decoration: a failed lookup must not turn a create the team
+// service already committed into an error the client would retry.
+async function enrichTeamsProfilePictures(
+  orgId: string,
+  teams: TeamResponse[],
+  logger: Logger,
+): Promise<void> {
+  const userIds: string[] = [];
+  for (const team of teams) {
+    if (team.members) {
+      for (const member of team.members) {
+        if (member?.userId) userIds.push(member.userId);
+      }
+    }
+    const createdByUser = team.createdByUser as TeamCreatedByUser | null | undefined;
+    if (createdByUser?.userId) {
+      userIds.push(createdByUser.userId);
+    }
+  }
+  if (userIds.length === 0) return;
+
+  const uniqueIds = [...new Set(userIds)];
+  let dpDocs;
+  try {
+    dpDocs = await UserDisplayPicture.find({
+      orgId,
+      userId: { $in: uniqueIds },
+      pic: { $ne: null },
+    })
+      .lean()
+      .exec();
+  } catch (error) {
+    logger.warn('Could not look up team profile pictures', {
+      orgId,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    return;
+  }
+
+  const dpMap = new Map<string, string>();
+  for (const dp of dpDocs) {
+    if (dp.userId && dp.pic) {
+      const mime = dp.mimeType || 'image/jpeg';
+      dpMap.set(dp.userId.toString(), `data:${mime};base64,${dp.pic}`);
+    }
+  }
+
+  for (const team of teams) {
+    if (team.members) {
+      for (const member of team.members) {
+        if (member?.userId && dpMap.has(member.userId)) {
+          member.profilePicture = dpMap.get(member.userId);
+        }
+      }
+    }
+    const createdByUser = team.createdByUser as TeamCreatedByUser | null | undefined;
+    if (createdByUser?.userId && dpMap.has(createdByUser.userId)) {
+      createdByUser.profilePicture = dpMap.get(createdByUser.userId);
+    }
+  }
+}
+
+@injectable()
+export class TeamsController {
+  constructor(
+    @inject('AppConfig') private config: AppConfig,
+    @inject('Logger') private logger: Logger,
+  ) {}
+
+  async createTeam(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    this.logger.info('Creating team', {
+      requestId: req.context?.requestId,
+      userId: req.user?.userId,
+      orgId: req.user?.orgId,
+    });
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/team`,
+        method: HttpMethod.POST,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+        body: req.body,
+      };
+      const aiCommand = new AIServiceCommand(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (!aiResponse) {
+        throw new InternalServerError('No response from AI service');
+      }
+      if (
+        aiResponse.statusCode !== HTTP_STATUS.CREATED &&
+        aiResponse.statusCode !== HTTP_STATUS.OK
+      ) {
+        throw handleBackendError(aiResponse, 'Creating team');
+      }
+      const teamData = aiResponse.data as TeamResponse | undefined;
+      if (!teamData) {
+        throw new NotFoundError('Creating team failed: Team not found');
+      }
+      const created = teamIn(teamData);
+      if (created !== undefined) {
+        await enrichTeamsProfilePictures(orgId, [created], this.logger);
+      }
+      res.status(HTTP_STATUS.CREATED).json(teamData);
+    } catch (error: any) {
+      this.logger.error('Error creating team', {
+        requestId,
+        message: 'Error creating team',
+        error: error.message,
+      });
+      const handledError = handleBackendError(error, 'create team');
+      next(handledError);
+    }
+  }
+
+  async getTeam(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    const { teamId } = req.params as { teamId: string };
+    const orgId = req.user?.orgId;
+    const userId = req.user?.userId;
+    if (!orgId) {
+      throw new BadRequestError('Organization ID is required');
+    }
+    if (!userId) {
+      throw new BadRequestError('User ID is required');
+    }
+    try {
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/team/${encodeURIComponent(teamId)}`,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+        method: HttpMethod.GET,
+      };
+      const aiCommand = new AIServiceCommand(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (!aiResponse) {
+        throw new InternalServerError('No response from AI service');
+      }
+      if (aiResponse.statusCode !== HTTP_STATUS.OK) {
+        throw handleBackendError(aiResponse, 'get team');
+      }
+      const teamData = aiResponse.data as TeamResponse | undefined;
+      if (!teamData) {
+        throw new NotFoundError('Getting team failed: Team not found');
+      }
+      const found = teamIn(teamData);
+      // Defence in depth: the service scopes by org, but never relay a team
+      // from another org even if that scoping regresses. A team the caller
+      // may not see is reported as missing, not forbidden.
+      if (found === undefined || found.orgId !== orgId) {
+        throw new NotFoundError('Team not found');
+      }
+      await enrichTeamsProfilePictures(orgId, [found], this.logger);
+      res.status(HTTP_STATUS.OK).json(teamData);
+    } catch (error: any) {
+      this.logger.error('Error getting team', {
+        requestId,
+        message: 'Error getting team',
+        error: error.message,
+      });
+      const handledError = handleBackendError(error, 'get team');
+      next(handledError);
+    }
+  }
+
+  async updateTeam(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      const teamId = req.params.teamId as string;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/team/${encodeURIComponent(teamId)}`,
+        method: HttpMethod.PUT,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+        body: req.body,
+      };
+      const aiCommand = new AIServiceCommand(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (!aiResponse) {
+        throw new InternalServerError('No response from AI service');
+      }
+      if (aiResponse.statusCode !== HTTP_STATUS.OK) {
+        throw handleBackendError(aiResponse, 'Updating team');
+      }
+      const teamData = aiResponse.data as TeamResponse | undefined;
+      if (!teamData) {
+        throw new NotFoundError('Updating team failed: Team not found');
+      }
+      const updated = teamIn(teamData);
+      if (updated !== undefined) {
+        await enrichTeamsProfilePictures(orgId, [updated], this.logger);
+      }
+      res.status(HTTP_STATUS.OK).json(teamData);
+    } catch (error: any) {
+      this.logger.error('Error updating team', {
+        requestId,
+        message: 'Error updating team',
+        error: error.message,
+      });
+      const handledError = handleBackendError(error, 'update team');
+      next(handledError);
+    }
+  }
+
+  async deleteTeam(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      const teamId = req.params.teamId as string;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/team/${encodeURIComponent(teamId)}`,
+        method: HttpMethod.DELETE,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+      };
+      const aiCommand = new AIServiceCommand(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      handleAIServiceResponse(
+        aiResponse,
+        res,
+        'Deleting team',
+        'Failed to delete team',
+      );
+    } catch (error: any) {
+      this.logger.error('Error deleting team', {
+        requestId,
+        message: 'Error deleting team',
+        error: error.message,
+      });
+      const handledError = handleBackendError(error, 'delete team');
+      next(handledError);
+    }
+  }
+
+  async getTeamUsers(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      const teamId = req.params.teamId as string;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+      const { page, limit, search } = req.query;
+      const queryParams = new URLSearchParams();
+      if (page) queryParams.append('page', String(page));
+      if (limit) queryParams.append('limit', String(limit));
+      if (search) queryParams.append('search', String(search));
+      const qs = queryParams.toString();
+
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/team/${encodeURIComponent(teamId)}/users${qs ? `?${qs}` : ''}`,
+        method: HttpMethod.GET,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+      };
+      const aiCommand = new AIServiceCommand<TeamUsersResponse>(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (!aiResponse) {
+        throw new InternalServerError('No response from AI service');
+      }
+      if (aiResponse.statusCode !== HTTP_STATUS.OK) {
+        throw handleBackendError(aiResponse, 'get team users');
+      }
+
+      const data = aiResponse.data;
+      const teamData = teamIn(data);
+
+      if (teamData !== undefined) {
+        await enrichTeamsProfilePictures(orgId, [teamData], this.logger);
+      }
+
+      res.status(HTTP_STATUS.OK).json(data);
+    } catch (error: any) {
+      this.logger.error('Error getting team users', {
+        requestId,
+        message: 'Error getting team users',
+        error: error.message,
+      });
+      const handledError = handleBackendError(error, 'get team users');
+      next(handledError);
+    }
+  }
+
+  async getUserTeams(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+
+      const { page, limit, search, created_by, created_after, created_before } = req.query;
+
+      const queryParams = new URLSearchParams();
+      if (page) queryParams.append('page', String(page));
+      if (limit) queryParams.append('limit', String(limit));
+      if (search) queryParams.append('search', String(search));
+      if (created_by) queryParams.append('created_by', String(created_by));
+      if (created_after) queryParams.append('created_after', String(created_after));
+      if (created_before) queryParams.append('created_before', String(created_before));
+      const queryString = queryParams.toString();
+
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/user/teams${queryString ? `?${queryString}` : ''}`,
+        method: HttpMethod.GET,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+      };
+      const aiCommand = new AIServiceCommand<TeamsListResponse>(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (!aiResponse) {
+        throw new InternalServerError('No response from AI service');
+      }
+      // An unreadable database must not look like a person with no teams.
+      if (aiResponse.statusCode === HTTP_STATUS.SERVICE_UNAVAILABLE) {
+        throw handleBackendError(aiResponse, 'get user teams');
+      }
+      if (aiResponse.statusCode !== HTTP_STATUS.OK) {
+        res.status(HTTP_STATUS.OK).json({
+          teams: [],
+          pagination: { page: 1, limit: 10, total: 0, pages: 0 },
+        });
+        return;
+      }
+      const teamsData = aiResponse.data as TeamsListResponse | undefined;
+      if (!teamsData) {
+        throw new NotFoundError('Getting user created teams failed: Teams not found');
+      }
+
+      const teams = teamsData.teams ?? [];
+      if (teams.length > 0) {
+        await enrichTeamsProfilePictures(orgId, teams, this.logger);
+      }
+
+      res.status(HTTP_STATUS.OK).json(teamsData);
+    } catch (error: any) {
+      this.logger.error('Error getting user teams', {
+        requestId,
+        message: 'Error getting user teams',
+        error: error.message,
+      });
+      next(error);
+    }
+  }
+
+}

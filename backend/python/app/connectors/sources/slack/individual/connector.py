@@ -1,0 +1,4702 @@
+"""
+Slack Individual Connector — Personal-scope, production-ready implementation.
+
+Syncs the authenticated user's visible Slack data (public/private channels,
+DMs, MPIMs) and produces a graph of AppUser, RecordGroup, and Record nodes.
+Only the authenticated user is synced as an AppUser node; other workspace
+members are cached in-memory for mention text replacement and display names,
+but no DB nodes or edges are created for them.
+
+Sync pipeline (personal-scope, in order):
+  1. Users         → Single AppUser node for the authenticated user +
+                     in-memory caches for all workspace members
+                     (for @mention text replacement / display names).
+  2. Channels      → RecordGroup nodes (public/private/DM/MPIM) + HAS_PERMISSION
+                     (authenticated user only — single direct USER edge per channel).
+  3. Messages      → MessageRecord / FileRecord / LinkRecord per channel (incremental,
+                     per-channel checkpoint via messages_sync_point).
+  4. Thread-growth → Detects threads with new replies since last run.
+                     Uses per-channel checkpoints (audit_log_sync_point keyed by
+                     channel_id) so each channel's window is exactly "since we last
+                     checked it".  First run falls back to the sync-window filter
+                     (same range as messages).  Full cursor-based pagination prevents
+                     silent truncation on busy channels.
+
+Graph edges produced:
+  HAS_PERMISSION   AppUser        → RecordGroup  (authenticated user only)
+  BELONGS_TO       Any Record     → RecordGroup  (via record_group_id on every record)
+  MENTIONED_IN     RecordGroup    → MessageRecord  (from <#C…> in text)
+  ATTACHMENT       FileRecord     → MessageRecord  (via RecordRelations.ATTACHMENT)
+  parent_node_id   child record   → parent record (files, links, thread replies, burst children)
+
+Change-detection limitations (inherent to polling conversations.history):
+  - conversations.history orders messages by creation time, not modification time.
+    Edits on messages whose ts predates the current window cannot be detected.
+  - For complete real-time coverage use Slack's Events API (push webhooks).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import mimetypes
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import IntEnum
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+
+from app.config.constants.arangodb import (
+    Connectors,
+    MimeTypes,
+    OriginTypes,
+    PermissionModel,
+)
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.connector.connector_service import BaseConnector
+from app.connectors.core.base.data_processor.data_source_entities_processor import (
+    DataSourceEntitiesProcessor,
+)
+from app.connectors.core.base.data_processor.record_links import (
+    canonical_address,
+    related_for_urls,
+)
+from app.connectors.core.base.error.stream_errors import (
+    map_source_status,
+    not_downloadable,
+    to_stream_error,
+)
+from app.connectors.core.base.sync_point.sync_point import (
+    SyncDataPointType,
+    SyncPoint,
+    generate_record_sync_point_key,
+)
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import (
+    CommonFields,
+    ConnectorBuilder,
+    ConnectorScope,
+    DocumentationLink,
+    SyncStrategy,
+)
+from app.connectors.core.registry.filters import (
+    FilterCategory,
+    FilterCollection,
+    FilterField,
+    FilterOperator,
+    FilterOption,
+    FilterOptionsResponse,
+    FilterType,
+    IndexingFilterKey,
+    OptionSourceType,
+    SyncFilterKey,
+    load_connector_filters,
+)
+from app.connectors.core.sync.full_sync_coverage import FullSyncCoverage
+from app.connectors.sources.slack.common.apps import SlackApp
+from app.connectors.sources.slack.common.stream_errors import (
+    sanitize_retry_after,
+    slack_stream_error,
+)
+from app.connectors.sources.slack.common.token_renewal import (
+    RenewingSlackDataSource,
+    SlackTokenRenewal,
+)
+from app.models.blocks import (
+    Block,
+    BlockGroup,
+    BlockGroupChildren,
+    BlocksContainer,
+    BlockSubType,
+    BlockType,
+    ChildRecord,
+    ChildType,
+    DataFormat,
+    GroupSubType,
+    GroupType,
+    IndexRange,
+)
+from app.models.entities import (
+    AppUser,
+    FileRecord,
+    LinkPublicStatus,
+    LinkRecord,
+    MessageRecord,
+    ProgressStatus,
+    Record,
+    RecordGroup,
+    RecordGroupType,
+    RecordType,
+    RelatedExternalRecord,
+)
+from app.sources.client.slack.slack import SlackClient
+from app.sources.external.slack.slack import SlackDataSource
+from app.utils.streaming import create_stream_record_response
+from app.utils.time_conversion import get_epoch_timestamp_in_ms
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from logging import Logger
+
+    from app.config.configuration_service import ConfigurationService
+    from app.connectors.core.base.data_store.data_store import DataStoreProvider
+    from app.models.permission import Permission
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+BURST_WINDOW_SECONDS        = 300           # 5-minute conversational burst window
+PAGE_SIZE_MESSAGES          = 200
+PAGE_SIZE_THREADS           = 200
+PAGE_SIZE_USERS             = 500
+PAGE_SIZE_CHANNELS          = 500
+PAGE_SIZE_MEMBERS           = 200
+
+CHANNEL_TYPE_LABEL_TO_API = {
+    "public channel": "public_channel",
+    "private channel": "private_channel",
+    "Direct Messages": "im",
+    "Group Direct Messages": "mpim",
+}
+ALL_CHANNEL_API_TYPES = set(CHANNEL_TYPE_LABEL_TO_API.values())
+# conversations.list fails the whole call with missing_scope if any requested type lacks its scope.
+CHANNEL_API_TYPE_READ_SCOPE = {
+    "public_channel": "channels:read",
+    "private_channel": "groups:read",
+    "im": "im:read",
+    "mpim": "mpim:read",
+}
+
+SLACK_TIER_LIMITS_PER_MINUTE: dict[int, int] = {
+    2: 20,
+    3: 50,
+    4: 100,
+}
+RATE_LIMIT_HEADROOM = 0.9
+
+_SLACK_MAX_TIMESTAMP_LENGTH = 13
+MAX_CONCURRENT_USER_INFO = 10
+_USER_MENTION_RE = re.compile(r"<@([UW]\w+)(?:\|[^>]+)?>")
+
+
+def _slack_failure(method: str, resp: object) -> str:
+    """An admin-readable account of a failed Slack call: the raw code plus Slack's explanation."""
+    if not resp:
+        return f"Slack {method} failed: no response"
+    error = getattr(resp, "error", None)
+    message = getattr(resp, "message", None)
+    code = error if isinstance(error, str) and error else "unknown_error"
+    if isinstance(message, str) and message and message != code:
+        return f"Slack {method} failed ({code}): {message}"
+    return f"Slack {method} failed ({code})"
+
+
+def _numeric_epoch_to_ms(value: int | float | str | None) -> int | None:
+    """Normalize a numeric Unix timestamp to epoch milliseconds.
+
+    Slack channel ``created`` is in seconds; ``updated`` is already in ms.
+    Values with at least 13 digits are returned as-is.
+    """
+    if value is None:
+        return None
+    ts = int(float(value))
+    if len(str(abs(ts))) >= _SLACK_MAX_TIMESTAMP_LENGTH:
+        return ts
+    return ts * 1000
+
+
+# ── Internal dataclasses ───────────────────────────────────────────────────────
+
+@dataclass
+class ConversationalBurst:
+    """All messages within BURST_WINDOW_SECONDS regardless of author."""
+    messages:  list[dict[str, Any]]
+    start_ts:  float
+    end_ts:    float
+
+    @property
+    def message_count(self) -> int:
+        return len(self.messages)
+
+    @property
+    def aggregated_text(self) -> str:
+        return "\n\n".join(
+            m.get("text", "") for m in self.messages if m.get("text")
+        )
+
+
+@dataclass
+class ProcessingContext:
+    """Immutable snapshot of workspace state passed through the message pipeline."""
+    channel_id:         str
+    channel_groups_map: dict[str, str]   # external channel_id → internal RecordGroup.id
+    user_id_to_email:   dict[str, str]   # Slack user_id → email  (snapshot)
+    user_id_to_name:    dict[str, str]   # Slack user_id → name  (snapshot)
+    channel_id_to_name: dict[str, str]   # Slack channel_id → name  (snapshot)
+    rate_limiter:       "RateLimiter"
+    # Set when channel_groups_map is keyed on a thread instead of a channel.
+    root_rg_id:         Optional[str] = None
+    # True when root_rg_id was resolved explicitly, so None means "no root",
+    # not "not looked up". The reindex paths key channel_groups_map on the
+    # record's own group, which for a threaded record is the thread — falling
+    # back to it would store the thread as its own root, and _derive_group_root
+    # only fills a root in when one is absent, so nothing would repair it.
+    root_resolved:      bool = False
+
+
+@dataclass
+class DeferredThread:
+    """Thread parent message whose processing is deferred until after channel records are published."""
+    msg: dict[str, Any]
+    ctx: ProcessingContext
+    rg_id: Optional[str]
+
+
+class Tier(IntEnum):
+    """Slack Web API rate-limit tier."""
+
+    T2 = 2
+    T3 = 3
+    T4 = 4
+
+
+class RateLimiter:
+    """Per-tier sliding-window limiter for Slack's Web API."""
+
+    def __init__(
+        self,
+        limits: Optional[dict[int, int]] = None,
+        headroom: float = RATE_LIMIT_HEADROOM,
+        logger: Optional[Logger] = None,
+    ) -> None:
+        src = limits if limits is not None else SLACK_TIER_LIMITS_PER_MINUTE
+        self._limits = {
+            tier: max(1, int(limit * headroom))
+            for tier, limit in src.items()
+        }
+        self._calls: dict[int, list[datetime]] = {
+            tier: [] for tier in self._limits
+        }
+        self._locks: dict[int, asyncio.Lock] = {
+            tier: asyncio.Lock() for tier in self._limits
+        }
+        self._logger = logger
+
+    async def acquire(self, tier: Tier) -> None:
+        key = int(tier)
+        async with self._locks[key]:
+            window = self._calls[key]
+            now = datetime.now()
+            window[:] = [
+                call_time
+                for call_time in window
+                if now - call_time < timedelta(minutes=1)
+            ]
+
+            if len(window) >= self._limits[key]:
+                wait = (
+                    window[0] + timedelta(minutes=1) - now
+                ).total_seconds()
+                if wait > 0:
+                    if self._logger:
+                        self._logger.debug(
+                            f"⏱️  Tier {key} rate limit — waiting {wait:.2f}s"
+                        )
+                    await asyncio.sleep(wait)
+                    now = datetime.now()
+                    window[:] = [
+                        call_time
+                        for call_time in window
+                        if now - call_time < timedelta(minutes=1)
+                    ]
+
+            window.append(datetime.now())
+
+
+# ── Connector declaration ──────────────────────────────────────────────────────
+
+@ConnectorBuilder("Slack")\
+    .in_group("Slack")\
+    .with_description("Sync messages and channels from Slack")\
+    .with_categories(["Messaging"])\
+    .with_scopes([ConnectorScope.PERSONAL.value])\
+    .with_permission_model(PermissionModel.APP_LEVEL)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Slack",
+            authorize_url="https://slack.com/oauth/v2/authorize",
+            token_url="https://slack.com/api/oauth.v2.access",
+            redirect_uri="connectors/oauth/callback/Slack",
+            scopes=OAuthScopeConfig(
+                personal_sync=[
+                    "channels:read",      "channels:history",
+                    "groups:read",        "groups:history",
+                    "mpim:read",          "mpim:history",
+                    "im:read",            "im:history",
+                    "users:read",         "users:read.email",
+                    "users.profile:read",
+                    "files:read",
+                ],
+                team_sync=[],
+                agent=[]
+            ),
+            fields=[
+                CommonFields.client_id("Slack App Console"),
+                CommonFields.client_secret("Slack App Console"),
+            ],
+            icon_path="/icons/connectors/slack.svg",
+            app_group="Communication",
+            app_description="OAuth application for accessing Slack workspace data",
+            app_categories=["Messaging"],
+            scope_parameter_name="user_scope",
+            token_response_path="authed_user",
+        ),
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("User OAuth Access Token")
+        ]),
+    ])\
+    .configure(lambda b: b
+        .with_icon("/icons/connectors/slack.svg")
+        .with_realtime_support(False)
+        .add_documentation_link(DocumentationLink(
+            "Slack API Setup", "https://api.slack.com/authentication/basics", "setup"))
+        .add_documentation_link(DocumentationLink(
+            "Pipeshub Docs", "https://docs.pipeshub.com/connectors/slack/slack", "pipeshub"))
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
+        .with_scheduled_config(True, 60)
+        .with_sync_support(True)
+        .with_agent_support(True)
+        # Sync filters
+        .add_filter_field(FilterField(
+            name="channel_ids", display_name="Channel",
+            description="Include or exclude specific channels",
+            filter_type=FilterType.LIST, category=FilterCategory.SYNC,
+            option_source_type=OptionSourceType.DYNAMIC))
+        .add_filter_field(FilterField(
+            name="channel_types", display_name="Channel Types",
+            description="Filter by channel type (public, private, DM, group DM)",
+            filter_type=FilterType.MULTISELECT, category=FilterCategory.SYNC,
+            options=list(CHANNEL_TYPE_LABEL_TO_API),
+            option_source_type=OptionSourceType.STATIC,
+            default_value=list(CHANNEL_TYPE_LABEL_TO_API)))
+        .add_filter_field(FilterField(
+            name="sync_window",
+            display_name="Sync Messages From",
+            description=(
+                "How far back to sync messages on the first sync. If this filter "
+                "is not set, only the last 30 days are synced; choose an earlier "
+                "date to include older history."
+            ),
+            filter_type=FilterType.DATETIME,
+            category=FilterCategory.SYNC,
+            default_operator=FilterOperator.LAST_30_DAYS,
+            # What _compute_sync_window_oldest uses when no filter is saved; the
+            # panel shows it while the filter is cleared.
+            fallback_operator=FilterOperator.LAST_30_DAYS))
+        .add_filter_field(CommonFields.enable_manual_sync_filter())
+        # Indexing filters
+        .add_filter_field(FilterField(
+            name="messages", display_name="Index Messages",
+            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING,
+            description="Enable indexing of messages", default_value=True))
+        .add_filter_field(FilterField(
+            name="threads", display_name="Index Threads",
+            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING,
+            description="Enable indexing of thread replies", default_value=True))
+        .add_filter_field(FilterField(
+            name=IndexingFilterKey.DIRECT_MESSAGES.value,
+            display_name="Index Direct Messages",
+            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING,
+            description="Enable indexing of 1:1 direct messages",
+            default_value=True))
+        .add_filter_field(FilterField(
+            name=IndexingFilterKey.GROUP_DIRECT_MESSAGES.value,
+            display_name="Index Group Direct Messages",
+            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING,
+            description="Enable indexing of group direct messages",
+            default_value=True))
+        .add_filter_field(FilterField(
+            name="files", display_name="Index Files",
+            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING,
+            description="Enable indexing of files shared in messages", default_value=True))
+        .add_filter_field(FilterField(
+            name="links", display_name="Index Links",
+            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING,
+            description="Enable indexing of links shared in messages", default_value=True))
+    )\
+    .build_decorator()
+class SlackIndividualConnector(BaseConnector):
+    """
+    Slack Individual Connector — personal-scope graph-aware implementation.
+
+    Syncs the authenticated user's visible channels (public, private, DM, MPIM)
+    and their messages.  All workspace users are synced as AppUser nodes for
+    mention resolution and entity edges, but HAS_PERMISSION is scoped to the
+    authenticated user only.
+
+    Caches live on the instance:
+      user_id_to_email_cache       Slack user_id  → email  (all workspace members, in-memory only)
+      user_id_to_internal_id_cache Slack user_id  → internal AppUser._key  (auth user only)
+      user_id_to_name_cache        Slack user_id  → display name  (all workspace members, in-memory only)
+      channel_groups_cache         Slack channel_id → internal RecordGroup._key
+      channel_id_to_name_cache     Slack channel_id → channel display name
+
+    All caches are re-populated on every run_sync() so stale data never persists
+    across runs.  Every downstream method receives a snapshot of the warm caches
+    via ProcessingContext — mid-batch updates to the instance caches cannot affect
+    in-flight processing.
+    """
+
+    # ── Constructor ────────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        logger: Logger,
+        data_entities_processor: DataSourceEntitiesProcessor,
+        data_store_provider: DataStoreProvider,
+        config_service: ConfigurationService,
+        connector_id: str,
+        scope: str,
+        created_by: str,
+    ) -> None:
+        super().__init__(
+            SlackApp(connector_id), logger,
+            data_entities_processor, data_store_provider,
+            config_service, connector_id,
+            scope, created_by,
+        )
+
+        self.connector_id = connector_id
+        self.external_client: Optional[SlackClient] = None
+        self.data_source:     Optional[SlackDataSource] = None
+
+        # Workspace identity (set in init())
+        self.workspace_domain: Optional[str] = None
+        self.team_id:          Optional[str] = None
+
+        # Authenticated user identity (set in init() via auth.test)
+        self.authenticated_user_id:    Optional[str] = None
+        self.authenticated_user_email: Optional[str] = None
+        self.authenticated_user_name:  Optional[str] = None
+
+        # ── Sync points ──────────────────────────────────────────────────────
+        def _sp(t: SyncDataPointType) -> SyncPoint:
+            return SyncPoint(
+                connector_id=self.connector_id,
+                org_id=self.data_entities_processor.org_id,
+                sync_data_point_type=t,
+                data_store_provider=self.data_store_provider,
+            )
+
+        # messages_sync_point  → RECORDS   : per-channel incremental cursor
+        # audit_log_sync_point → RECORDS   : global change-detection watermark
+        self.messages_sync_point  = _sp(SyncDataPointType.RECORDS)
+        self.audit_log_sync_point = _sp(SyncDataPointType.RECORDS)
+
+        # ── Rate limiter ─────────────────────────────────────────────────────
+        self.rate_limiter = RateLimiter(logger=logger)
+
+        # ── In-memory caches ─────────────────────────────────────────────
+        # Populated during _sync_users(); re-populated on every run_sync().
+        # All workspace members cached for @mention text replacement.
+        self.user_id_to_email_cache:       dict[str, str] = {}
+        # Populated in _build_user_id_caches() after _sync_users().
+        # Key: Slack user_id  Value: internal DB AppUser._key
+        # Only the authenticated user will have an entry here.
+        self.user_id_to_internal_id_cache: dict[str, str] = {}
+        # Populated during _sync_users() for ALL workspace members.
+        # Key: Slack user_id  Value: user full_name
+        # Used to replace @mentions in message content with display names.
+        self.user_id_to_name_cache:        dict[str, str] = {}
+        # Slack user IDs marked deleted/deactivated in users.list.
+        self.deactivated_user_ids:         set[str] = set()
+        # Populated during _sync_channels(); extended lazily.
+        self.channel_groups_cache:         dict[str, str] = {}
+        # Populated during _sync_channels().
+        # Key: Slack channel_id  Value: channel name
+        # Used to replace channel mentions in message content.
+        self.channel_id_to_name_cache:     dict[str, str] = {}
+        # Key: Slack channel_id  Value: im, mpim, or channel.
+        self.channel_type_cache:           dict[str, str] = {}
+
+        # ── Channel-filter cache ──────────────────────────────────────────
+        self.channel_filter_cache: dict[str, dict[str, str]] = {}
+        self._cache_rebuild_event: Optional[asyncio.Event] = None
+
+        # ── Filter state ─────────────────────────────────────────────────────
+        self.sync_filters:     FilterCollection = FilterCollection()
+        self.indexing_filters: FilterCollection = FilterCollection()
+
+    # =========================================================================
+    # 0.  Helpers
+    # =========================================================================
+
+    _OPERATOR_SECONDS: dict[str, int] = {
+        FilterOperator.LAST_7_DAYS:   7   * 86400,
+        FilterOperator.LAST_14_DAYS:  14  * 86400,
+        FilterOperator.LAST_30_DAYS:  30  * 86400,
+        FilterOperator.LAST_90_DAYS:  90  * 86400,
+        FilterOperator.LAST_180_DAYS: 180 * 86400,
+        FilterOperator.LAST_365_DAYS: 365 * 86400,
+    }
+
+    def full_sync_coverage(self) -> FullSyncCoverage:
+        """A full sync reads messages from the sync window on, and a thread only
+        when its first message is inside the window. So a message or thread
+        older than the window that it did not see was not read, not deleted.
+
+        Asked after the sync: the window start is computed now, a little later
+        than the one the sync used, so nothing the sync could have read is
+        counted as outside it.
+        """
+        oldest = self._compute_sync_window_oldest()
+        return FullSyncCoverage(
+            complete=not getattr(self, "_full_sync_read_failed", False),
+            window_start_ms=int(float(oldest) * 1000) if oldest else None,
+            windowed_group_types=frozenset({RecordGroupType.SLACK_THREAD.value}),
+        )
+
+    def _compute_sync_window_oldest(self) -> Optional[str]:
+        """
+        Compute the Slack ``oldest`` ts from the sync_window DATETIME filter.
+
+        The filter operator determines the time range:
+          - LAST_7_DAYS … LAST_365_DAYS  → relative window
+          - IS_AFTER                     → absolute custom start date
+
+        Falls back to 30 days when no filter is configured.
+        """
+        sw = self.sync_filters.get("sync_window")
+        if not sw:
+            return f"{time.time() - 30 * 86400:.6f}"
+
+        op = sw.operator_value
+        secs = self._OPERATOR_SECONDS.get(op)
+        # Guard against a 0 / negative entry slipping into _OPERATOR_SECONDS:
+        # `time.time() - 0` would send "now" as Slack's `oldest` and silently
+        # return zero messages.
+        if secs and secs > 0:
+            return f"{time.time() - secs:.6f}"
+
+        if op == FilterOperator.IS_AFTER:
+            start_epoch = sw.get_datetime_start()
+            if start_epoch:
+                return f"{start_epoch / 1000.0:.6f}"
+
+        return f"{time.time() - 30 * 86400:.6f}"
+
+    # =========================================================================
+    # 0b. Initialisation
+    # =========================================================================
+
+    async def init(self) -> bool:
+        """Build the Slack client, fetch workspace identity, and identify the authenticated user."""
+        try:
+            self.logger.info("🔧 Initialising Slack Individual connector…")
+            self.external_client = await SlackClient.build_from_services(
+                logger=self.logger,
+                config_service=self.config_service,
+                connector_instance_id=self.connector_id,
+            )
+            self.data_source = SlackDataSource(self.external_client)
+
+            ds = await self._fresh_datasource()
+            auth_resp = await ds.auth_test()
+            if auth_resp and auth_resp.success:
+                auth_data = auth_resp.data or {}
+                self.authenticated_user_id = auth_data.get("user_id")
+                self.team_id = auth_data.get("team_id")
+                auth_url = auth_data.get("url", "")
+                if auth_url:
+                    try:
+                        host = urlparse(auth_url).hostname or ""
+                        if host.endswith(".slack.com"):
+                            self.workspace_domain = host.replace(".slack.com", "")
+                    except Exception:
+                        pass
+                self.logger.info(
+                    f"Workspace: {self.workspace_domain} ({self.team_id})"
+                )
+                self.logger.info(
+                    f"Authenticated user: {self.authenticated_user_id}"
+                )
+                if self.authenticated_user_id:
+                    try:
+                        user_resp = await ds.users_info(
+                            user=self.authenticated_user_id
+                        )
+                        if user_resp and user_resp.success:
+                            profile = (
+                                (user_resp.data or {})
+                                .get("user", {})
+                                .get("profile", {})
+                            )
+                            self.authenticated_user_email = (
+                                profile.get("email") or ""
+                            ).strip() or None
+                            self.authenticated_user_name = (
+                                profile.get("real_name")
+                                or profile.get("display_name")
+                                or self.authenticated_user_id
+                            )
+                        else:
+                            self.logger.warning(
+                                "users.info failed for authenticated user %s: %s",
+                                self.authenticated_user_id,
+                                getattr(user_resp, "error", "no response"),
+                            )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Could not fetch Slack profile for authenticated user %s: %s",
+                            self.authenticated_user_id,
+                            exc,
+                        )
+            else:
+                self.logger.warning(
+                    f"⚠️  auth.test failed: {getattr(auth_resp, 'error', 'no response')}"
+                )
+
+            self.logger.info("✅ Slack Individual connector initialised")
+            return True
+
+        except Exception as exc:
+            self.logger.error(f"❌ Init failed: {exc}", exc_info=True)
+            return False
+
+    @cached_property
+    def _token_renewal(self) -> SlackTokenRenewal:
+        return SlackTokenRenewal(
+            self.connector_id, type(self)._connector_metadata["name"], self.config_service, self.logger,
+        )
+
+    async def _fresh_datasource(self) -> RenewingSlackDataSource:
+        """Return a SlackDataSource backed by the always-current token, renewed when it expires."""
+        if not self.external_client:
+            raise RuntimeError("Call init() first.")
+        return await self._token_renewal.datasource(self.external_client, self._current_token)
+
+    async def _current_token(self) -> tuple[dict[str, Any], str]:
+        cfg = await self.config_service.get_config(
+            f"/services/connectors/{self.connector_id}/config",
+            use_cache=True,
+        )
+        if not cfg:
+            raise RuntimeError("Connector config not found.")
+
+        auth = cfg.get("auth", {}) or {}
+        credentials = cfg.get("credentials", {}) or {}
+
+        # Collect all candidate tokens from every known config location.
+        candidates: list[str] = [
+            (credentials.get("access_token") or "").strip(),
+            (auth.get("apiToken") or "").strip(),
+            (auth.get("accessToken") or "").strip(),
+        ]
+
+        # Prefer user tokens, rotating or not; this is a personal-scope connector.
+        token = ""
+        for t in candidates:
+            if t.startswith(("xoxp-", "xoxe.xoxp-")):
+                token = t
+                break
+        # Fallback: first non-empty token (may be xoxb if no xoxp found).
+        if not token:
+            for t in candidates:
+                if t:
+                    token = t
+                    break
+
+        if not token:
+            raise RuntimeError("No access token in config.")
+
+        if token.startswith(("xoxb-", "xoxe.xoxb-")):
+            self.logger.warning(
+                "⚠️  Only a bot token (xoxb) was found — personal-scope connector "
+            )
+        return cfg, token
+
+    # =========================================================================
+    # 1.  Main orchestration
+    # =========================================================================
+
+    async def run_sync(self) -> None:
+        """
+        Personal Slack synchronisation for the authenticated user.
+
+        Phase 1 — Users       (_sync_users)              → AppUser node for the authenticated
+                                                           user only + in-memory caches for
+                                                           all workspace members (names/emails)
+        Phase 2 — Channels    (_sync_channels)            → RecordGroups + HAS_PERMISSION
+                                                           (authenticated user only)
+        Phase 3 — Messages    (sync_channel_messages)     → per-RecordGroup checkpoint
+        Phase 4 — Thread-growth (_sync_thread_growth)      → incremental thread detection
+        """
+        try:
+            self.logger.info(
+                f"🚀 Slack Individual sync — org {self.data_entities_processor.org_id}, "
+                f"user {self.authenticated_user_id}"
+            )
+
+            if not self.external_client:
+                raise RuntimeError("Call init() first.")
+
+            # Set when a read fails and the sync carries on without it; see
+            # full_sync_coverage.
+            self._full_sync_read_failed = False
+
+            self.sync_filters, self.indexing_filters = await load_connector_filters(
+                self.config_service, "slack", self.connector_id, self.logger
+            )
+            self.logger.info(
+                "sync_filters: %s", self.sync_filters
+            )
+
+            # Phase 1 — Users (warms all user caches as a side-effect)
+            # Only the authenticated user gets an AppUser node + User-App edge.
+            # All other workspace members are cached in-memory only (for @mention
+            # text replacement and display names).
+            await self._sync_users()
+            if not self.authenticated_user_email:
+                raise RuntimeError(
+                    "Cannot proceed: authenticated user email could not be resolved. "
+                    "Aborting sync to prevent creating inaccessible records."
+                )
+            # Phase 2 — Channels → RecordGroups + HAS_PERMISSION (auth user only)
+            channels = await self._sync_channels()
+
+            # Phase 3 — Messages per channel (per-RecordGroup sync point)
+            for rg in channels:
+                if rg.external_group_id:
+                    try:
+                        await self.sync_channel_messages(rg.external_group_id)
+                    except Exception as exc:
+                        self._full_sync_read_failed = True
+                        self.logger.error(
+                            f"Channel message sync failed for "
+                            f"{rg.external_group_id}: {exc}",
+                            exc_info=True,
+                        )
+
+            # Phase 4 — Thread-growth detection (edit detection bypassed for now)
+            await self._sync_thread_growth()
+
+            self.logger.info("✅ Slack Individual sync complete")
+
+        except Exception as exc:
+            self.logger.error(f"❌ Sync failed: {exc}", exc_info=True)
+            raise
+
+    # =========================================================================
+    # 2.  Phase 1 — User sync
+    # =========================================================================
+
+    async def _sync_users(self) -> None:
+        """Sync the authenticated Slack user as the connector's AppUser."""
+        self.logger.info("👥 Syncing user…")
+        self.user_id_to_email_cache.clear()
+        self.user_id_to_internal_id_cache.clear()
+        self.user_id_to_name_cache.clear()
+
+        email = self.authenticated_user_email
+        if not email:
+            try:
+                creator = await self.data_entities_processor.get_app_creator_user(
+                    self.connector_id
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not resolve connector creator email: %s", exc
+                )
+                creator = None
+            if creator and getattr(creator, "email", None):
+                email = creator.email
+                self.authenticated_user_email = email
+
+        slack_uid = self.authenticated_user_id
+        if not slack_uid or not email:
+            self.logger.error(
+                "Cannot sync user: missing Slack user ID or email"
+            )
+            return
+
+        now = get_epoch_timestamp_in_ms()
+        app_user = AppUser(
+            app_name=Connectors.SLACK,
+            connector_id=self.connector_id,
+            source_user_id=slack_uid,
+            org_id=self.data_entities_processor.org_id,
+            email=email,
+            full_name=self.authenticated_user_name or email,
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        await self.data_entities_processor.on_new_app_users([app_user])
+        self.user_id_to_email_cache[slack_uid] = email
+        if app_user.full_name:
+            self.user_id_to_name_cache[slack_uid] = app_user.full_name
+
+        await self._build_user_id_caches()
+        await self._warm_all_user_caches()
+        self.logger.info("✅ User sync done")
+
+    def _to_app_user(self, m: dict[str, Any], fallback_email: Optional[str] = None) -> Optional[AppUser]:
+        uid    = m.get("id")
+        profile = m.get("profile", {})
+        email  = (profile.get("email") or "").strip()
+        if not email and fallback_email:
+            email = fallback_email.strip()
+        updated_at = m.get("updated", get_epoch_timestamp_in_ms())
+        if not uid or not email:
+            self.logger.warning(
+                f"_to_app_user: skipping user {uid} — "
+                f"uid={'set' if uid else 'missing'}, email={'set' if email else 'missing'}"
+            )
+            return None
+
+        name = (
+            profile.get("real_name_normalized")
+            or profile.get("real_name")
+            or profile.get("display_name_normalized")
+            or profile.get("display_name")
+            or email
+        )
+        try:
+            return AppUser(
+                app_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                source_user_id=uid,
+                org_id=self.data_entities_processor.org_id,
+                email=email,
+                full_name=name,
+                is_active=not m.get("deleted", False),
+                created_at=updated_at,
+                updated_at=updated_at,
+            )
+        except Exception as exc:
+            self.logger.error(f"_to_app_user failed for {uid}: {exc}")
+            return None
+
+    async def _build_user_id_caches(self) -> None:
+        """
+        Query the DB for the authenticated user's AppUser node and populate
+        user_id_to_internal_id_cache.
+
+        In a personal-scope connector only one AppUser node exists (the
+        authenticated user).  This cache is used for any downstream logic that
+        needs the internal DB ID for that user.
+        """
+        try:
+            all_users = await self.data_entities_processor.get_all_app_users(
+                connector_id=self.connector_id
+            )
+            self.user_id_to_internal_id_cache.clear()
+            for u in all_users:
+                if u.source_user_id and u.id:
+                    self.user_id_to_internal_id_cache[u.source_user_id] = u.id
+                    if u.source_user_id not in self.user_id_to_email_cache and u.email:
+                        self.user_id_to_email_cache[u.source_user_id] = u.email
+                    # Populate name cache if not already set
+                    if u.source_user_id not in self.user_id_to_name_cache and u.full_name:
+                        self.user_id_to_name_cache[u.source_user_id] = u.full_name
+            self.logger.debug(
+                f"user_id_to_internal_id_cache warmed: {len(self.user_id_to_internal_id_cache)} entries"
+            )
+        except Exception as exc:
+            self.logger.error(f"_build_user_id_caches failed: {exc}", exc_info=True)
+
+    async def _warm_all_user_caches(self) -> None:
+        """
+        Fetch ALL workspace users via Slack users.list API and populate
+        user_id_to_name_cache and user_id_to_email_cache for the entire
+        workspace.
+
+        This is essential for resolving user IDs to display names in:
+          - DM channel labels  ("DM: Alice" instead of "DM: U07303G2C2X")
+          - MPIM group names   ("Group DM: Alice, Bob" instead of mpdm-… IDs)
+          - Message author attribution in blocks
+          - @mention text replacement
+
+        Only populates in-memory caches — no DB nodes are created for
+        non-authenticated users.  Uses ``setdefault`` so it never overwrites
+        entries already populated by ``_sync_users`` / ``_build_user_id_caches``.
+        """
+        self.logger.info("🔄 Warming user caches from Slack API…")
+        count = 0
+        cursor: Optional[str] = None
+        self.deactivated_user_ids.clear()
+
+        try:
+            while True:
+                await self.rate_limiter.acquire(Tier.T2)
+                ds = await self._fresh_datasource()
+                resp = await ds.users_list(limit=PAGE_SIZE_USERS, cursor=cursor)
+                if not resp or not resp.success:
+                    self.logger.warning(
+                        f"users.list failed: {getattr(resp, 'error', 'no response')}"
+                    )
+                    break
+
+                for m in resp.data.get("members", []):
+                    uid = m.get("id")
+                    if not uid:
+                        continue
+                    if m.get("deleted"):
+                        self.deactivated_user_ids.add(uid)
+                    # Include bots and deactivated users so their DM labels
+                    # and @mentions resolve to names rather than raw IDs.
+                    profile = m.get("profile", {})
+                    name = (
+                        profile.get("real_name_normalized")
+                        or profile.get("real_name")
+                        or profile.get("display_name_normalized")
+                        or profile.get("display_name")
+                    )
+                    email = (profile.get("email") or "").strip()
+
+                    if name:
+                        self.user_id_to_name_cache.setdefault(uid, name)
+                    if email:
+                        self.user_id_to_email_cache.setdefault(uid, email)
+                    count += 1
+
+                cursor = resp.data.get("response_metadata", {}).get("next_cursor", "")
+                if not cursor:
+                    break
+
+            self.logger.info(
+                f"✅ User caches warmed: {count} users, "
+                f"{len(self.user_id_to_name_cache)} names, "
+                f"{len(self.user_id_to_email_cache)} emails"
+            )
+        except Exception as exc:
+            self.logger.error(f"❌ Failed to warm user caches: {exc}", exc_info=True)
+
+    async def _sync_deactivated_user_ids(self) -> None:
+        """Refresh deactivated Slack user IDs used to hide stale DM filter options."""
+        self.deactivated_user_ids.clear()
+        cursor: Optional[str] = None
+
+        try:
+            while True:
+                await self.rate_limiter.acquire(Tier.T2)
+                ds = await self._fresh_datasource()
+                resp = await ds.users_list(limit=PAGE_SIZE_USERS, cursor=cursor)
+                if not resp or not resp.success:
+                    self.logger.warning(
+                        "users.list failed while loading deactivated users: %s",
+                        getattr(resp, "error", "no response"),
+                    )
+                    break
+
+                for member in (resp.data or {}).get("members", []):
+                    uid = member.get("id")
+                    if uid and member.get("deleted"):
+                        self.deactivated_user_ids.add(uid)
+
+                cursor = (resp.data or {}).get(
+                    "response_metadata", {}
+                ).get("next_cursor", "")
+                if not cursor:
+                    break
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to refresh deactivated user IDs for channel filter: %s",
+                exc,
+            )
+
+    def _should_include_channel_in_filter(self, ch: dict[str, Any]) -> bool:
+        if not ch.get("is_im"):
+            return True
+        peer_id = ch.get("user", "")
+        return not peer_id or peer_id not in self.deactivated_user_ids
+
+    async def _listable_channel_types_param(self, requested: set[str]) -> str:
+        """The ``types`` for conversations.list: ``requested`` minus kinds the token has no read scope for.
+
+        Raises when none of ``requested`` can be listed, naming the scopes to add.
+        """
+        granted: set[str] | None = None
+        try:
+            resp = await (await self._fresh_datasource()).check_token_scopes()
+            scopes = (resp.data or {}).get("scopes") if resp and resp.success else None
+            if isinstance(scopes, list):
+                granted = {s for s in scopes if isinstance(s, str)}
+        except Exception as exc:
+            self.logger.warning("Could not read the Slack token's scopes: %s", exc)
+
+        known = requested & CHANNEL_API_TYPE_READ_SCOPE.keys()
+        # No granular read scope at all means a token whose scopes we cannot map
+        # (or no header); ask for everything and let a real failure surface.
+        if granted is None or not granted & set(CHANNEL_API_TYPE_READ_SCOPE.values()):
+            listable = known
+        else:
+            listable = {t for t in known if CHANNEL_API_TYPE_READ_SCOPE[t] in granted}
+        missing = sorted(CHANNEL_API_TYPE_READ_SCOPE[t] for t in known - listable)
+        if not listable:
+            raise RuntimeError(
+                "The Slack token cannot list any of the selected conversation types"
+                + (f": it lacks {', '.join(missing)}. Add these user token scopes to the Slack app and reinstall it,"
+                   if missing else ";")
+                + " or change the Channel Types sync filter."
+            )
+        if missing:
+            self.logger.warning(
+                "⚠️  Skipping %s: the Slack token lacks %s. Add these user token scopes "
+                "to the Slack app and reinstall it to sync these conversations.",
+                ", ".join(label for label, api in CHANNEL_TYPE_LABEL_TO_API.items() if api in known - listable),
+                ", ".join(missing),
+            )
+        return ",".join(t for t in CHANNEL_API_TYPE_READ_SCOPE if t in listable)
+
+    # =========================================================================
+    # 3.  Channel sync → RecordGroups + HAS_PERMISSION edges
+    # =========================================================================
+
+    async def _sync_channels(self) -> list[RecordGroup]:
+        """
+        Sync every channel type → RecordGroup.
+        Builds HAS_PERMISSION edges for the authenticated user only:
+
+        All channel types (public, private, IM, MPIM) → authenticated user
+        gets a direct USER-level READ permission edge.
+        """
+        self.logger.info("📢 Syncing channels…")
+
+        # Apply channel_ids filter
+        ch_filter = self.sync_filters.get(SyncFilterKey.CHANNEL_IDS)
+        include_ids: Optional[set[str]] = None
+        exclude_ids: Optional[set[str]] = None
+        if ch_filter is not None:
+            op = ch_filter.get_operator()
+            if op == FilterOperator.IN:
+                include_ids = set(ch_filter.get_value() or [])
+            elif op == FilterOperator.NOT_IN:
+                exclude_ids = set(ch_filter.get_value() or [])
+
+        # Apply channel_types filter (public, private, im, mpim).
+        # NOT_IN is inverted to IN against the fixed 4-type universe.
+        # Empty value = no explicit selection → default to all types.
+        ch_types_filter = self.sync_filters.get(SyncFilterKey.CHANNEL_TYPES)
+        allowed_types: set[str] | None = None
+        if ch_types_filter is not None:
+            raw = {
+                CHANNEL_TYPE_LABEL_TO_API.get(value, value)
+                for value in ch_types_filter.get_value() or []
+            }
+            # Checked before NOT_IN is inverted: the subtraction would drop an
+            # unknown value, and the sync would then include what was excluded.
+            unknown = sorted(raw - ALL_CHANNEL_API_TYPES)
+            if unknown:
+                raise RuntimeError(
+                    f"The Channel Types sync filter holds unrecognised values: {', '.join(unknown)}. "
+                    "Choose from: " + ", ".join(CHANNEL_TYPE_LABEL_TO_API) + "."
+                )
+            if raw:
+                if ch_types_filter.get_operator() == FilterOperator.NOT_IN:
+                    allowed_types = ALL_CHANNEL_API_TYPES - raw
+                else:
+                    allowed_types = raw
+                if not allowed_types:
+                    self.logger.info("channel_types filter excludes all types — nothing to sync")
+                    return []
+        types_param = await self._listable_channel_types_param(allowed_types or ALL_CHANNEL_API_TYPES)
+
+        self.channel_groups_cache.clear()
+        self.channel_id_to_name_cache.clear()
+        self.channel_type_cache.clear()
+
+        cursor: Optional[str] = None
+        record_groups: list[RecordGroup] = []
+        total = 0
+
+        while True:
+            await self.rate_limiter.acquire(Tier.T2)
+            ds   = await self._fresh_datasource()
+            resp = await ds.conversations_list(
+                exclude_archived=True,
+                types=types_param,
+                limit=PAGE_SIZE_CHANNELS,
+                cursor=cursor,
+            )
+
+            if not resp or not resp.success:
+                # Returning what we have would end the run as a successful sync
+                # of nothing (or of a truncated channel list).
+                raise RuntimeError(_slack_failure("conversations.list", resp))
+
+            data = resp.data
+            channels: list[dict[str, Any]] = data.get("channels", [])
+            if not channels:
+                break
+
+            # Apply channel_ids filter
+            if exclude_ids:
+                channels = [c for c in channels if c.get("id") not in exclude_ids]
+
+            batch: list[tuple[RecordGroup, list[Permission]]] = []
+
+            for cd in channels:
+                cid = cd.get("id")
+                if not cid:
+                    continue
+                if not self._should_include_channel_in_filter(cd):
+                    continue
+                if (
+                    not cd.get("is_im")
+                    and not cd.get("is_mpim")
+                    and not cd.get("is_member")
+                ):
+                    continue
+                if include_ids and cid not in include_ids:
+                    continue
+
+                try:
+                    if cd.get("is_im"):
+                        self.channel_type_cache[cid] = "im"
+                    elif cd.get("is_mpim"):
+                        self.channel_type_cache[cid] = "mpim"
+                    else:
+                        self.channel_type_cache[cid] = "channel"
+
+                    rg = self._to_channel_record_group(cd)
+                    if not rg:
+                        # It logs and answers None when it cannot build the group:
+                        # the channel goes unwritten, so it must not be unlinked.
+                        self._full_sync_read_failed = True
+                        continue
+
+                    if rg.name:
+                        self.channel_id_to_name_cache[cid] = rg.name
+
+                    permissions = await self._channel_permissions(cd)
+
+                    batch.append((rg, permissions))
+                    record_groups.append(rg)
+                    total += 1
+
+                except Exception as exc:
+                    # Not written, so not seen: without this the unlink after the
+                    # sync would take the channel's links away.
+                    self._full_sync_read_failed = True
+                    self.logger.error(
+                        f"❌ Failed to process channel {cd.get('name')}: {exc}"
+                    )
+
+            if batch:
+                await self.data_entities_processor.on_new_record_groups(batch)
+                for rg_item, _ in batch:
+                    ext_id = rg_item.external_group_id
+                    if ext_id and rg_item.id:
+                        self.channel_groups_cache[ext_id] = rg_item.id
+                self.logger.info(f"Synced batch of {len(batch)} channels")
+
+            cursor = data.get("response_metadata", {}).get("next_cursor", "")
+            if not cursor:
+                break
+
+        self.logger.info(f"✅ Channels — {total} synced")
+        return record_groups
+
+    # ── Permission helpers ─────────────────────────────────────────────────────
+
+    async def _channel_permissions(
+        self,
+        channel_data: dict[str, Any],
+    ) -> list[Permission]:
+        """
+        Return no grant: every visible channel inherits the app, and only the
+        authenticated user is linked to the app.
+        """
+        if not self.authenticated_user_email:
+            self.logger.warning(
+                "authenticated_user_email not set — channel will inherit the app with no grant"
+            )
+        return []
+
+    async def _fetch_channel_members(self, channel_id: str) -> list[str]:
+        """
+        Return all member Slack user IDs for a channel via conversations.members
+        with full cursor-based pagination.
+        """
+        members: list[str] = []
+        cursor: Optional[str] = None
+
+        while True:
+            try:
+                await self.rate_limiter.acquire(Tier.T4)
+                ds   = await self._fresh_datasource()
+                resp = await ds.conversations_members(
+                    channel=channel_id,
+                    limit=PAGE_SIZE_MEMBERS,
+                    cursor=cursor,
+                )
+
+                if not resp or not resp.success:
+                    # Connector may lack membership scope — log and bail
+                    error = getattr(resp, "error", "no response")
+                    if error in ("channel_not_found", "not_in_channel", "missing_scope"):
+                        self.logger.debug(
+                            f"Cannot fetch members for {channel_id}: {error}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"conversations.members({channel_id}) failed: {error}"
+                        )
+                    break
+
+                members.extend(resp.data.get("members", []))
+                cursor = resp.data.get("response_metadata", {}).get("next_cursor", "")
+                if not cursor:
+                    break
+
+            except Exception as exc:
+                self.logger.error(
+                    f"_fetch_channel_members({channel_id}): {exc}", exc_info=True
+                )
+                break
+
+        return members
+
+    def _resolve_mpim_name(self, cd: dict[str, Any]) -> str:
+        """
+        Build a human-friendly display name for MPIM (multi-party DM) channels.
+
+        Slack names MPIMs like ``mpdm-alice--bob--charlie-1``.  This helper
+        parses the participant user IDs from ``cd['name']``, resolves display
+        names via the user_id_to_name_cache, excludes the authenticated user
+        so the label reads like a regular chat ("DM: Alice, Bob"), and falls
+        back gracefully when parsing or resolution fails.
+        """
+        cid = cd.get("id", "")
+        raw_name = cd.get("name", "")
+
+        # Attempt to parse user names from the mpdm-user1--user2--user3-N format
+        display_parts: list[str] = []
+        if raw_name.startswith("mpdm-"):
+            # Strip "mpdm-" prefix and the trailing "-<digit>" group number
+            inner = raw_name[5:]
+            # Remove trailing -<digits>
+            parts = inner.rsplit("-", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                inner = parts[0]
+            user_handles = [h for h in inner.split("--") if h]
+
+            for handle in user_handles:
+                # Try to find user by matching handle against cached names
+                resolved = False
+                for uid, name in self.user_id_to_name_cache.items():
+                    # Skip authenticated user in the display label
+                    if uid == self.authenticated_user_id:
+                        continue
+                    # Slack handles in mpdm are lowercase display names
+                    if handle.lower() in name.lower().replace(" ", "").lower():
+                        display_parts.append(name)
+                        resolved = True
+                        break
+                if not resolved and handle:
+                    display_parts.append(handle)
+
+        if display_parts:
+            return f"Group DM: {', '.join(display_parts)}"
+
+        # Fallback: try member list from purpose/members metadata
+        members_field = cd.get("members", [])
+        if members_field:
+            names = []
+            for uid in members_field:
+                if uid == self.authenticated_user_id:
+                    continue
+                name = (
+                    self.user_id_to_name_cache.get(uid)
+                    or self.user_id_to_email_cache.get(uid)
+                    or uid
+                )
+                names.append(name)
+            if names:
+                return f"Group DM: {', '.join(names)}"
+
+        return raw_name or f"Group DM: {cid}"
+
+    def _to_channel_record_group(
+        self, cd: dict[str, Any]
+    ) -> Optional[RecordGroup]:
+        cid = cd.get("id")
+        if not cid:
+            return None
+
+        name = cd.get("name", "")
+
+        if cd.get("is_im"):
+            uid   = cd.get("user", "")
+            if uid == "USLACKBOT":
+                display = "Slackbot"
+            else:
+                display = (
+                    self.user_id_to_name_cache.get(uid)
+                    or self.user_id_to_email_cache.get(uid)
+                    or uid
+                    or cid
+                )
+            name  = f"DM: {display}"
+        elif cd.get("is_mpim"):
+            name = self._resolve_mpim_name(cd)
+
+        web_url = (
+            f"https://{self.workspace_domain}.slack.com/archives/{cid}"
+            if self.workspace_domain else None
+        )
+        src_ts = _numeric_epoch_to_ms(cd.get("created"))
+        upd_ts = _numeric_epoch_to_ms(cd.get("updated"))
+        current_ts = get_epoch_timestamp_in_ms()
+
+        try:
+            return RecordGroup(
+                org_id=self.data_entities_processor.org_id,
+                name=name or f"Channel {cid}",
+                short_name=name or cid,
+                description=(
+                    cd.get("topic", {}).get("value", "")
+                    if not cd.get("is_im") else ""
+                ),
+                external_group_id=cid,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                group_type=RecordGroupType.SLACK_CHANNEL,
+                # Slack has no per-message ACL, so channel membership is the
+                # whole permission story and search can trust the group.
+                permission_model=PermissionModel.RECORD_GROUP_LEVEL,
+                web_url=web_url,
+                created_at=current_ts,
+                updated_at=current_ts,
+                source_created_at=src_ts,
+                source_updated_at=upd_ts,
+                inherit_permissions=True,
+                hide_children=True,
+            )
+        except Exception as exc:
+            self.logger.error(f"_to_channel_record_group({cid}): {exc}")
+            return None
+
+    # =========================================================================
+    # 4.  Messages (per-RecordGroup / per-channel sync point)
+    # =========================================================================
+
+    def _is_channel_indexing_enabled(self, channel_id: str) -> bool:
+        channel_type = self.channel_type_cache.get(channel_id)
+        if channel_type == "im":
+            return self.indexing_filters.is_enabled(
+                IndexingFilterKey.DIRECT_MESSAGES
+            )
+        if channel_type == "mpim":
+            return self.indexing_filters.is_enabled(
+                IndexingFilterKey.GROUP_DIRECT_MESSAGES
+            )
+        return True
+
+    def _apply_record_indexing_filters(
+        self,
+        records: list[tuple[Record, list[Permission]]],
+        channel_id: str,
+        *,
+        message_key: IndexingFilterKey,
+    ) -> None:
+        channel_enabled = self._is_channel_indexing_enabled(channel_id)
+        message_enabled = self.indexing_filters.is_enabled(message_key)
+        file_enabled = self.indexing_filters.is_enabled(IndexingFilterKey.FILES)
+        link_enabled = self.indexing_filters.is_enabled(IndexingFilterKey.LINKS)
+
+        for record, _ in records:
+            if not channel_enabled:
+                record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            elif record.record_type == RecordType.MESSAGE and not message_enabled:
+                record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            elif record.record_type == RecordType.FILE and not file_enabled:
+                record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            elif record.record_type == RecordType.LINK and not link_enabled:
+                record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+
+    async def sync_channel_messages(self, channel_id: str) -> None:
+        """
+        Incremental message sync for one channel.
+
+        Checkpoint key:  generate_record_sync_point_key(MESSAGE, "slack_messages", channel_id)
+        Checkpoint value: {"last_sync_time": "<slack ts of newest message>"}
+
+        The checkpoint is written ONLY after ALL pages succeed, guaranteeing
+        at-least-once delivery even if the process crashes mid-channel.
+        """
+        self.logger.info(f"📨 Syncing messages — channel: {channel_id}")
+
+        # Per-channel (per-RecordGroup) sync point
+        sync_key      = generate_record_sync_point_key(
+            RecordType.MESSAGE.value, "slack_messages", channel_id
+        )
+        last_data     = await self.messages_sync_point.read_sync_point(sync_key)
+        last_ts: Optional[str] = last_data.get("last_sync_time") if last_data else None
+
+        # On first sync (no checkpoint), apply the sync_window filter
+        if not last_ts:
+            last_ts = self._compute_sync_window_oldest()
+
+        self.logger.info(
+            f"  {'Incremental from ts=' + last_ts if last_ts else 'Full sync (no window limit)'}"
+        )
+
+        ctx = ProcessingContext(
+            channel_id=channel_id,
+            channel_groups_map=await self._channel_group_map([channel_id]),
+            user_id_to_email=dict(self.user_id_to_email_cache),   # snapshot
+            user_id_to_name=dict(self.user_id_to_name_cache),     # snapshot
+            channel_id_to_name=dict(self.channel_id_to_name_cache), # snapshot
+            rate_limiter=self.rate_limiter,
+        )
+
+        cursor:     Optional[str] = None
+        newest_ts:  Optional[str] = None   # newest across ALL pages (Slack newest-first)
+        total_msgs = 0
+        all_deferred_threads: list[DeferredThread] = []
+        # Set when a page fails for a reason that is not a permanent skip
+        # (rate limit, server error, no response). Older pages were never
+        # fetched, so the checkpoint must not move past them.
+        history_error: Optional[str] = None
+        # Threads whose replies were not all read (a failed replies page, or
+        # an exception while processing the thread). Their parents must stay
+        # inside the next sync's window, so the channel checkpoint waits too.
+        incomplete_threads = 0
+
+        while True:
+            await self.rate_limiter.acquire(Tier.T3)
+            ds   = await self._fresh_datasource()
+            resp = await ds.conversations_history(
+                channel=channel_id,
+                oldest=last_ts,          # exclusive lower bound → only new messages
+                limit=PAGE_SIZE_MESSAGES,
+                cursor=cursor,
+            )
+
+            if not resp or not resp.success:
+                error = getattr(resp, "error", "no response")
+                # channel_not_found / not_in_channel are permanent errors for this channel
+                if error in ("channel_not_found", "not_in_channel"):
+                    self.logger.warning(
+                        f"Skipping channel {channel_id}: {error}"
+                    )
+                else:
+                    self.logger.error(
+                        f"❌ conversations.history({channel_id}) failed: {error}"
+                    )
+                    history_error = error
+                break
+
+            msgs: list[dict[str, Any]] = resp.data.get("messages", [])
+            if not msgs:
+                break
+
+            # Slack returns newest-first; first message of the first page is the global newest
+            if newest_ts is None:
+                newest_ts = msgs[0].get("ts")
+
+            records, deferred_threads = await self._process_message_batch(msgs, ctx)
+
+            self._apply_record_indexing_filters(
+                records,
+                channel_id,
+                message_key=IndexingFilterKey.MESSAGES,
+            )
+
+            await self._enrich_link_records_linked_id(records)
+            if records:
+                await self.data_entities_processor.on_new_records(records)
+
+                total_msgs += sum(
+                    1 for r, _ in records if r.record_type == RecordType.MESSAGE
+                )
+
+            all_deferred_threads.extend(deferred_threads)
+
+            cursor = resp.data.get("response_metadata", {}).get("next_cursor", "")
+            if not cursor:
+                break
+
+        # Process deferred threads after all channel records have been published.
+        # Full vs. incremental is gated on the per-thread sync_point, not on RG-node
+        # existence: a full sync deletes sync_points and sync edges but keeps RG
+        # nodes, so gating on RG existence would silently take the incremental
+        # path on full sync and leave the thread RG's BELONGS_TO /
+        # INHERIT_PERMISSIONS / PERMISSION edges unrecreated.
+        # Sync_point absent ⇒ _process_thread (re-emits the RG and refetches all
+        # replies, recreating every edge through on_new_record_groups /
+        # on_new_records).
+        if all_deferred_threads:
+            self.logger.info(
+                f"📨 Processing {len(all_deferred_threads)} deferred threads for channel {channel_id}"
+            )
+            for dt in all_deferred_threads:
+                ts = dt.msg.get("ts", "")
+                thread_sp_key = generate_record_sync_point_key(
+                    RecordType.MESSAGE.value, "slack_thread",
+                    f"{dt.ctx.channel_id}_{ts}",
+                )
+                try:
+                    sp_data = await self.audit_log_sync_point.read_sync_point(
+                        thread_sp_key
+                    )
+                    last_reply_ts = (sp_data or {}).get("last_reply_ts")
+
+                    existing_rg_id = ""
+                    if last_reply_ts:
+                        try:
+                            existing_rg = await self.data_entities_processor.get_record_group_by_external_id(
+                                connector_id=self.connector_id,
+                                external_id=f"thread_{dt.ctx.channel_id}_{ts}",
+                            )
+                            if existing_rg:
+                                existing_rg_id = existing_rg.id or ""
+                        except Exception as exc:
+                            self.logger.debug(
+                                f"[DeferredThread] RG lookup for thread {ts}: {exc}"
+                            )
+
+                    # No checkpoint, or checkpoint exists but the RG node was
+                    # removed (orphan sync_point) ⇒ full path so the RG is
+                    # rebuilt and edges reasserted.
+                    if not last_reply_ts or not existing_rg_id:
+                        self.logger.info(
+                            f"[DeferredThread] Processing thread parent ts={ts}, "
+                            f"reply_count={dt.msg.get('reply_count')}, channel={dt.ctx.channel_id} (full)"
+                        )
+                        replies_complete = await self._process_thread(
+                            dt.msg, dt.ctx, dt.rg_id
+                        )
+                    else:
+                        self.logger.info(
+                            f"[DeferredThread] Processing thread parent ts={ts}, "
+                            f"reply_count={dt.msg.get('reply_count')}, channel={dt.ctx.channel_id} (incremental)"
+                        )
+                        replies_complete = await self._process_thread_incremental(
+                            dt.msg, dt.ctx, existing_rg_id, last_reply_ts
+                        )
+
+                    if not replies_complete:
+                        incomplete_threads += 1
+                        self.logger.warning(
+                            f"[DeferredThread] Thread checkpoint NOT updated for ts={ts}, "
+                            f"channel={dt.ctx.channel_id}: replies were only partly fetched"
+                        )
+                        continue
+
+                    latest_reply = dt.msg.get("latest_reply") or ts
+                    await self.audit_log_sync_point.update_sync_point(
+                        thread_sp_key, {"last_reply_ts": latest_reply}
+                    )
+                except Exception as exc:
+                    incomplete_threads += 1
+                    self.logger.error(
+                        f"[DeferredThread] Thread processing FAILED for ts={ts}, "
+                        f"channel={dt.ctx.channel_id}: {exc}",
+                        exc_info=True,
+                    )
+
+        if history_error or incomplete_threads:
+            self._full_sync_read_failed = True
+
+        # Persist checkpoint ONLY after all pages succeed
+        if history_error:
+            self.logger.warning(
+                f"⚠️ Checkpoint NOT updated for {channel_id}: conversations.history "
+                f"failed part-way ({history_error}) after {total_msgs} messages; "
+                f"the next sync starts again from the previous checkpoint"
+            )
+        elif incomplete_threads:
+            self.logger.warning(
+                f"⚠️ Checkpoint NOT updated for {channel_id}: replies of "
+                f"{incomplete_threads} thread(s) could not all be read; the next "
+                f"sync starts again from the previous checkpoint"
+            )
+        elif newest_ts:
+            await self.messages_sync_point.update_sync_point(
+                sync_key, {"last_sync_time": newest_ts}
+            )
+            self.logger.info(f"📍 Checkpoint updated for {channel_id}: ts={newest_ts}")
+
+        self.logger.info(f"✅ {total_msgs} messages synced for {channel_id}")
+
+    # ── Message batch processing ───────────────────────────────────────────────
+
+    async def _process_message_batch(
+        self,
+        msgs: list[dict[str, Any]],
+        ctx: ProcessingContext,
+    ) -> tuple[list[tuple[Record, list[Permission]]], list[DeferredThread]]:
+        out: list[tuple[Record, list[Permission]]] = []
+        deferred_threads: list[DeferredThread] = []
+        await self._warm_user_cache_for_messages(msgs, ctx)
+        for burst in self._detect_bursts(msgs):
+            if burst.message_count > 1:
+                recs, threads = await self._process_burst(burst, ctx)
+                out.extend(recs)
+                deferred_threads.extend(threads)
+            else:
+                recs, threads = await self._process_single(burst.messages[0], ctx)
+                out.extend(recs)
+                deferred_threads.extend(threads)
+        return out, deferred_threads
+
+    # =========================================================================
+    # 5b.  Block-building helpers
+    # =========================================================================
+
+    @staticmethod
+    def _format_reactions_line(reactions: list[dict[str, Any]]) -> str | None:
+        """Format Slack message reactions for inclusion in block text."""
+        if not reactions:
+            return None
+        parts = [
+            f":{r.get('name', '?')}: ({r.get('count', 1)})"
+            for r in reactions[:20]
+        ]
+        return f"Reactions: {', '.join(parts)}"
+
+    def _format_mentioned_users_line(
+        self,
+        raw_text: str,
+        ctx: ProcessingContext,
+    ) -> str | None:
+        """Format <@U…> mentions with resolved id/email for block text (indexing/retrieval)."""
+        mentioned_ids = list(dict.fromkeys(self._extract_user_mentions(raw_text or "")))
+        if not mentioned_ids:
+            return None
+        parts: list[str] = []
+        for uid in mentioned_ids:
+            name = (
+                ctx.user_id_to_name.get(uid)
+                or ctx.user_id_to_email.get(uid)
+                or uid
+            )
+            segment = f"{name} (ID: {uid}"
+            email = (ctx.user_id_to_email.get(uid) or "").strip()
+            if email:
+                segment += f", Email: {email}"
+            segment += ")"
+            parts.append(segment)
+        return f"Mentioned Users: {'; '.join(parts)}"
+
+    def _build_message_block(
+        self,
+        msg: dict[str, Any],
+        block_index: int,
+        parent_bg_index: int,
+        ctx: ProcessingContext,
+        children_records: Optional[list[ChildRecord]] = None,
+    ) -> Block:
+        """Build a single TEXT Block from a Slack message dict.
+
+        The block ``data`` field is prefixed with the author's display name
+        so that each message within a multi-user burst is attributable.
+        """
+        ts   = msg.get("ts", "")
+        text = self._replace_mentions_in_text(
+            msg.get("text", ""),
+            ctx.user_id_to_name,
+            ctx.channel_id_to_name,
+        )
+
+        # Prefix the message content with the author name
+        user_id = msg.get("user", "")
+        author_name = (
+            ctx.user_id_to_name.get(user_id)
+            or ctx.user_id_to_email.get(user_id)
+            or self._bot_display_name(msg)
+            or user_id
+        )
+        author_email = (ctx.user_id_to_email.get(user_id) or "").strip() or None
+        if author_name and text:
+            block_data = f"**{author_name}**: {text}"
+        elif author_name:
+            block_data = f"**{author_name}**:"
+        else:
+            block_data = text or ""
+
+        author_meta: list[str] = []
+        if user_id:
+            author_meta.append(f"Author ID: {user_id}")
+        if author_email:
+            author_meta.append(f"Author Email: {author_email}")
+        if author_meta:
+            block_data = f"{block_data}\n\n{', '.join(author_meta)}"
+
+        mentioned_line = self._format_mentioned_users_line(msg.get("text", ""), ctx)
+        if mentioned_line:
+            block_data = f"{block_data}\n\n{mentioned_line}"
+
+        src_ts_ms = int(float(ts) * 1000) if ts else None
+        is_edited = "edited" in msg
+        upd_ts_ms = src_ts_ms
+        if is_edited:
+            raw_ets = msg.get("edited", {}).get("ts")
+            if raw_ets:
+                upd_ts_ms = int(float(raw_ets) * 1000)
+
+        from datetime import timezone as _tz
+        src_dt = (
+            datetime.fromtimestamp(src_ts_ms / 1000, tz=_tz.utc)
+            if src_ts_ms else None
+        )
+        upd_dt = (
+            datetime.fromtimestamp(upd_ts_ms / 1000, tz=_tz.utc)
+            if upd_ts_ms else None
+        )
+
+        try:
+            weburl_str = self._message_url(ctx.channel_id, ts)
+        except Exception:
+            weburl_str = None
+
+        # Append attachment and link metadata to block data so they are stored in blob
+        # and included in indexing/retrieval (vectorstore uses block.data only).
+        if children_records:
+            att_parts = [
+                f"{cr.child_name or 'attachment'} (record_id: {cr.child_id})"
+                for cr in children_records
+            ]
+            block_data = f"{block_data}\n\nAttachments: {', '.join(att_parts)}"
+        urls = self._extract_urls(msg.get("text", ""))
+        if urls:
+            block_data = f"{block_data}\n\nLinks: {', '.join(urls)}"
+        reaction_line = self._format_reactions_line(msg.get("reactions") or [])
+        if reaction_line:
+            block_data = f"{block_data}\n\n{reaction_line}"
+        reply_count = msg.get("reply_count")
+        if isinstance(reply_count, int) and reply_count > 0:
+            block_data = f"{block_data}\n\nReply Count: {reply_count}"
+
+        return Block(
+            index=block_index,
+            parent_index=parent_bg_index,
+            type=BlockType.TEXT,
+            sub_type=BlockSubType.MESSAGE,
+            format=DataFormat.MARKDOWN,
+            data=block_data,
+            source_id=ts,
+            source_name=author_name or None,
+            source_creation_date=src_dt,
+            source_update_date=upd_dt,
+            weburl=weburl_str,
+            children_records=children_records,
+        )
+
+    def _build_burst_block_containers(
+        self,
+        messages: list[dict[str, Any]],
+        burst_id: str,
+        ctx: ProcessingContext,
+        file_child_records: Optional[dict[str, list[ChildRecord]]] = None,
+        thread_ts: Optional[str] = None,
+    ) -> BlocksContainer:
+        """
+        Build a BlocksContainer for a burst record.
+
+        Structure:
+          block_groups[0]: CONVERSATION / BURST  (covers all blocks via IndexRange)
+          blocks[i]:       one TEXT block per message
+
+        ``thread_ts`` should be set when the burst lives inside a thread, so the
+        BlockGroup ``weburl`` opens the thread side-panel on the first reply.
+        """
+        first_ts = messages[0].get("ts", "") if messages else ""
+        try:
+            first_url = self._message_url(ctx.channel_id, first_ts, thread_ts=thread_ts)
+        except Exception:
+            first_url = None
+
+        blocks: list[Block] = []
+        for i, msg in enumerate(messages):
+            ts = msg.get("ts", "")
+            cr = (file_child_records or {}).get(ts)
+            block = self._build_message_block(msg, i, 0, ctx, children_records=cr)
+            blocks.append(block)
+
+        n = len(blocks)
+        bg = BlockGroup(
+            index=0,
+            type=GroupType.TEXT_SECTION,
+            sub_type=GroupSubType.BURST,
+            source_group_id=burst_id,
+            weburl=first_url,
+            children=BlockGroupChildren(
+                block_ranges=[IndexRange(start=0, end=n - 1)] if n > 0 else []
+            ),
+        )
+
+        return BlocksContainer(block_groups=[bg], blocks=blocks)
+
+    def _build_single_block_containers(
+        self,
+        msg: dict[str, Any],
+        ctx: ProcessingContext,
+        children_records: Optional[list[ChildRecord]] = None,
+    ) -> BlocksContainer:
+        """
+        Build a BlocksContainer for a single message record.
+
+        Structure:
+          block_groups[0]: CONVERSATION / SINGLE_MESSAGE
+          blocks[0]:       one TEXT block
+        """
+        ts = msg.get("ts", "")
+        try:
+            url = self._message_url(ctx.channel_id, ts)
+        except Exception:
+            url = None
+
+        block = self._build_message_block(msg, 0, 0, ctx, children_records=children_records)
+
+        bg = BlockGroup(
+            index=0,
+            type=GroupType.CONVERSATION,
+            sub_type=GroupSubType.SINGLE_MESSAGE,
+            source_group_id=ts,
+            weburl=url,
+            children=BlockGroupChildren(
+                block_ranges=[IndexRange(start=0, end=0)]
+            ),
+        )
+        return BlocksContainer(block_groups=[bg], blocks=[block])
+
+
+    # =========================================================================
+    # 5c.  Thread record-group / record builder
+    # =========================================================================
+
+    def _create_thread_record_group(
+        self,
+        parent_msg: dict[str, Any],
+        ctx: ProcessingContext,
+        parent_rg_id: Optional[str],
+    ) -> Optional[RecordGroup]:
+        """Create a SLACK_THREAD RecordGroup for a thread-parent message."""
+        thread_ts = parent_msg.get("ts", "")
+        if not thread_ts:
+            self.logger.warning(
+                f"[ThreadRG] Skipping — parent_msg has no ts, channel={ctx.channel_id}"
+            )
+            return None
+
+        channel_name = ctx.channel_id_to_name.get(ctx.channel_id, ctx.channel_id)
+        name = f"{channel_name}_{self._slack_ts_to_utc_label(thread_ts)}"
+
+        try:
+            url = self._message_url(ctx.channel_id, thread_ts)
+        except Exception:
+            url = None
+
+        src_ts_ms = int(float(thread_ts) * 1000)
+        now = get_epoch_timestamp_in_ms()
+        ext_group_id = f"thread_{ctx.channel_id}_{thread_ts}"
+
+        try:
+            rg = RecordGroup(
+                org_id=self.data_entities_processor.org_id,
+                name=name,
+                external_group_id=ext_group_id,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                group_type=RecordGroupType.SLACK_THREAD,
+                permission_model=PermissionModel.RECORD_GROUP_LEVEL,
+                web_url=url,
+                created_at=now,
+                updated_at=now,
+                source_created_at=src_ts_ms,
+                source_updated_at=src_ts_ms,
+                parent_external_group_id=ctx.channel_id,
+                inherit_permissions=True,
+            )
+            self.logger.info(
+                f"[ThreadRG] Built SLACK_THREAD RecordGroup: "
+                f"ext_id={ext_group_id}, parent_ext_id={ctx.channel_id}, "
+                f"name={name[:60]}, auto_id={rg.id}"
+            )
+            return rg
+        except Exception as exc:
+            self.logger.error(
+                f"[ThreadRG] Failed to build RecordGroup for thread_ts={thread_ts}, "
+                f"channel={ctx.channel_id}: {exc}",
+                exc_info=True,
+            )
+            return None
+
+    async def _fetch_thread_replies_raw(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        ctx: ProcessingContext,
+        oldest: Optional[str] = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Fetch raw thread replies (excluding the parent) via conversations.replies.
+
+        Args:
+            oldest: If set, only replies with ts > oldest are returned
+                    (Slack ``oldest`` is exclusive lower bound).
+
+        Returns:
+            ``(replies, complete)``. ``complete`` is False when a page failed
+            before the cursor ran out; ``replies`` then holds only the pages
+            fetched so far, and the caller must not record the thread as synced.
+        """
+        replies: list[dict[str, Any]] = []
+        cursor:  Optional[str] = None
+        seen:    set[str] = set()
+
+        while True:
+            await ctx.rate_limiter.acquire(Tier.T3)
+            ds   = await self._fresh_datasource()
+            kwargs: dict[str, Any] = dict(
+                channel=channel_id, ts=thread_ts,
+                limit=PAGE_SIZE_THREADS, cursor=cursor,
+            )
+            if oldest:
+                kwargs["oldest"] = oldest
+            resp = await ds.conversations_replies(**kwargs)
+            if not resp or not resp.success:
+                error = getattr(resp, "error", "no response")
+                # The thread or channel is gone: nothing more can be read, so
+                # a retry would fail the same way. Treat it as finished.
+                if error in ("thread_not_found", "channel_not_found", "not_in_channel"):
+                    self.logger.warning(
+                        f"Skipping replies of thread ts={thread_ts} in {channel_id}: {error}"
+                    )
+                    return replies, True
+                self.logger.warning(
+                    f"conversations.replies({channel_id}, ts={thread_ts}) failed: "
+                    f"{error}; returning {len(replies)} replies fetched so far as incomplete"
+                )
+                return replies, False
+
+            for md in resp.data.get("messages", []):
+                ts = md.get("ts")
+                if not ts or ts == thread_ts or ts in seen:
+                    continue
+                seen.add(ts)
+                replies.append(md)
+
+            cursor = resp.data.get("response_metadata", {}).get("next_cursor", "")
+            if not cursor:
+                break
+
+        return replies, True
+
+    async def _build_thread_burst_record(
+        self,
+        burst: ConversationalBurst,
+        thread_ts: str,
+        thread_rg_id: str,
+        ctx: ProcessingContext,
+        file_child_records: Optional[dict[str, list[ChildRecord]]] = None,
+    ) -> Optional[MessageRecord]:
+        """
+        Build a thread-burst MessageRecord from a 5-min burst window of thread
+        messages.  These records are indexed (blob storage + vectorization).
+        """
+        if not burst.messages:
+            return None
+
+        first_ts = burst.messages[0].get("ts", "")
+        last_ts  = burst.messages[-1].get("ts", "")
+        if not first_ts:
+            return None
+
+        mentioned_user_ids:  set[str] = set()
+        mentioned_group_ids: set[str] = set()
+        for msg in burst.messages:
+            t = msg.get("text", "")
+            mentioned_user_ids.update(self._extract_user_mentions(t))
+            mentioned_group_ids.update(self._extract_channel_mentions(t))
+
+        src_ts_ms  = int(float(first_ts) * 1000)
+        last_ts_ms = int(float(last_ts) * 1000) if last_ts else src_ts_ms
+
+        all_ts_str = "|".join(sorted(m.get("ts", "") for m in burst.messages))
+        burst_hash = hashlib.md5(all_ts_str.encode()).hexdigest()[:8]
+        burst_id   = f"thread_burst_{ctx.channel_id}_{thread_ts}_{burst_hash}"
+
+        bc = self._build_burst_block_containers(
+            burst.messages, burst_id, ctx,
+            file_child_records=file_child_records,
+            thread_ts=thread_ts,
+        )
+
+        aggregated_text = self._replace_mentions_in_text(
+            burst.aggregated_text, ctx.user_id_to_name, ctx.channel_id_to_name
+        )
+
+        try:
+            url = self._message_url(ctx.channel_id, first_ts, thread_ts=thread_ts)
+        except Exception:
+            url = None
+
+        burst_authors = list(dict.fromkeys(
+            m.get("user", "") for m in burst.messages if m.get("user")
+        ))
+
+        channel_name = ctx.channel_id_to_name.get(ctx.channel_id, ctx.channel_id)
+        try:
+            return MessageRecord(
+                org_id=self.data_entities_processor.org_id,
+                record_name=f"{channel_name}_{self._slack_ts_to_utc_label(first_ts)}",
+                record_type=RecordType.MESSAGE,
+                external_record_id=burst_id,
+                external_record_group_id=f"thread_{ctx.channel_id}_{thread_ts}",
+                record_group_id=thread_rg_id,
+                root_record_group_id=self._root_rg_id(ctx),
+                version=1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=MimeTypes.BLOCKS.value,
+                weburl=url,
+                source_created_at=src_ts_ms,
+                source_updated_at=last_ts_ms,
+                content=aggregated_text,
+                thread_id=thread_ts,
+                # The thread's first burst holds its parent message.
+                has_replies=any(
+                    m.get("ts") == thread_ts and m.get("reply_count", 0) > 0
+                    for m in burst.messages
+                ),
+                is_reply=True,
+                mentioned_user_ids=list(mentioned_user_ids),
+                mentioned_group_ids=list(mentioned_group_ids),
+                start_ts=first_ts,
+                end_ts=last_ts,
+                inherit_permissions=True,
+                preview_renderable=False,
+                block_containers=bc,
+                involved_user_source_ids=burst_authors,
+                related_external_records=self._related_for_messages(burst.messages),
+            )
+        except Exception as exc:
+            self.logger.error(f"_build_thread_burst_record({burst_id}): {exc}")
+            return None
+
+    # =========================================================================
+    # 5d.  Shared thread processing
+    # =========================================================================
+
+    async def _process_thread(
+        self,
+        parent_msg: dict[str, Any],
+        ctx: ProcessingContext,
+        rg_id: Optional[str],
+    ) -> bool:
+        """
+        Full thread processing for a thread-parent message.
+
+        Returns False when the replies could only be partly fetched, so the
+        caller must not write the thread's sync point.
+
+        Creates:
+          1. SLACK_THREAD RecordGroup
+          2. Thread-burst/single MessageRecords (5-min windows, indexed)
+          3. FileRecords attached to burst records
+          4. MENTIONED_IN / INVOLVED_IN edges for burst records
+        """
+        ts = parent_msg.get("ts", "")
+        reply_count = parent_msg.get("reply_count", 0)
+        self.logger.info(
+            f"[ThreadProcess] Starting full thread processing: "
+            f"ts={ts}, channel={ctx.channel_id}, reply_count={reply_count}, "
+            f"channel_rg_id={rg_id}"
+        )
+
+        thread_rg = self._create_thread_record_group(parent_msg, ctx, rg_id)
+        if not thread_rg:
+            self.logger.warning(
+                f"[ThreadProcess] Could not build thread RecordGroup for ts={ts} "
+                f"in {ctx.channel_id} — skipping thread"
+            )
+            return True
+
+        try:
+            await self.data_entities_processor.on_new_record_groups([(thread_rg, [])])
+        except Exception as exc:
+            self.logger.error(
+                f"[ThreadProcess] on_new_record_groups FAILED for thread ts={ts}, "
+                f"channel={ctx.channel_id}, ext_id={thread_rg.external_group_id}: {exc}",
+                exc_info=True,
+            )
+            raise
+
+        thread_rg_id = thread_rg.id or ""
+        self.logger.info(
+            f"[ThreadProcess] Thread RecordGroup persisted: "
+            f"id={thread_rg_id}, ext_id={thread_rg.external_group_id}, "
+            f"group_type={thread_rg.group_type}"
+        )
+
+        replies, replies_complete = await self._fetch_thread_replies_raw(
+            ctx.channel_id, ts, ctx
+        )
+        all_msgs = [parent_msg] + replies
+        await self._warm_user_cache_for_messages(all_msgs, ctx)
+        self.logger.info(
+            f"[ThreadProcess] Fetched {len(replies)} replies for thread ts={ts}"
+        )
+
+        # -- Collect file records keyed by message ts --------------------------
+        thread_ext_group_id = f"thread_{ctx.channel_id}_{ts}"
+        file_children_by_ts: dict[str, list[ChildRecord]] = {}
+        file_recs_by_ts: dict[str, list[FileRecord]] = {}
+        for msg in all_msgs:
+            mts = msg.get("ts", "")
+            for fd in msg.get("files", []):
+                fr = await self._process_file_raw(fd, ctx)
+                if fr:
+                    fr.record_group_id = thread_rg_id
+                    fr.root_record_group_id       = self._root_rg_id(ctx)
+                    fr.external_record_group_id = thread_ext_group_id
+                    fr.record_group_type = RecordGroupType.SLACK_THREAD
+                    file_recs_by_ts.setdefault(mts, []).append(fr)
+                    cr = ChildRecord(
+                        child_type=ChildType.RECORD,
+                        child_id=fr.id,
+                        child_name=fr.record_name,
+                    )
+                    file_children_by_ts.setdefault(mts, []).append(cr)
+
+        # -- Thread-burst MessageRecords (5-min windows, indexed) ---------------
+        bursts = self._detect_bursts(all_msgs)
+        burst_recs_batch: list[tuple[Record, list[Permission]]] = []
+
+        for burst in bursts:
+            burst_file_children: dict[str, list[ChildRecord]] = {}
+            burst_file_recs: list[FileRecord] = []
+            for msg in burst.messages:
+                mts = msg.get("ts", "")
+                if mts in file_children_by_ts:
+                    burst_file_children[mts] = file_children_by_ts[mts]
+                if mts in file_recs_by_ts:
+                    burst_file_recs.extend(file_recs_by_ts[mts])
+
+            burst_rec = await self._build_thread_burst_record(
+                burst, ts, thread_rg_id, ctx,
+                file_child_records=burst_file_children,
+            )
+            if not burst_rec:
+                continue
+
+            burst_recs_batch.append((burst_rec, []))
+
+            for fr in burst_file_recs:
+                fr.parent_node_id            = burst_rec.id
+                fr.is_dependent_node         = True
+                fr.inherit_permissions       = True
+                fr.parent_external_record_id = burst_rec.external_record_id
+                fr.parent_record_type        = RecordType.MESSAGE
+                self.logger.debug(
+                    f"[ThreadFile] File '{fr.record_name}' linked to thread burst "
+                    f"parent_node_id={burst_rec.id}, rg={fr.external_record_group_id}"
+                )
+                burst_recs_batch.append((fr, []))
+
+            for msg in burst.messages:
+                for url_str in self._extract_urls(msg.get("text", "")):
+                    lr = await self._process_link(url_str, burst_rec, ctx, msg)
+                    if lr:
+                        burst_recs_batch.append((lr, []))
+
+            burst_authors = list(dict.fromkeys(
+                m.get("user", "") for m in burst.messages if m.get("user")
+            ))
+            burst_rec.involved_user_source_ids = burst_authors
+
+        if burst_recs_batch:
+            self._apply_record_indexing_filters(
+                burst_recs_batch,
+                ctx.channel_id,
+                message_key=IndexingFilterKey.THREADS,
+            )
+
+            await self._enrich_link_records_linked_id(burst_recs_batch)
+            burst_msg_count = sum(
+                1 for r, _ in burst_recs_batch if getattr(r, 'record_type', None) == RecordType.MESSAGE
+            )
+            burst_file_count = sum(
+                1 for r, _ in burst_recs_batch if getattr(r, 'record_type', None) == RecordType.FILE
+            )
+            self.logger.info(
+                f"[ThreadProcess] Creating {burst_msg_count} burst records and "
+                f"{burst_file_count} file records for thread ts={ts}"
+            )
+            await self.data_entities_processor.on_new_records(burst_recs_batch)
+
+        self.logger.info(
+            f"[ThreadProcess] Completed thread processing for ts={ts}, "
+            f"channel={ctx.channel_id}: thread_rg_id={thread_rg_id}, "
+            f"{len(burst_recs_batch)} burst/file records"
+        )
+        return replies_complete
+
+    async def _process_thread_incremental(
+        self,
+        parent_msg: dict[str, Any],
+        ctx: ProcessingContext,
+        thread_rg_id: str,
+        last_reply_ts: str,
+    ) -> bool:
+        """
+        Incremental thread processing: only fetch and process replies newer
+        than ``last_reply_ts``.
+
+        Creates thread-burst/single records for the new replies only.
+        Returns False when the new replies could only be partly fetched.
+        """
+        thread_ts = parent_msg.get("ts", "")
+        new_replies, replies_complete = await self._fetch_thread_replies_raw(
+            ctx.channel_id, thread_ts, ctx, oldest=last_reply_ts,
+        )
+        if not new_replies:
+            return replies_complete
+        await self._warm_user_cache_for_messages(new_replies, ctx)
+
+        self.logger.info(
+            f"  Thread {thread_ts}: {len(new_replies)} new replies "
+            f"(after ts={last_reply_ts})"
+        )
+
+        # -- Collect file records for new replies -----------------------------
+        thread_ext_group_id = f"thread_{ctx.channel_id}_{thread_ts}"
+        file_children_by_ts: dict[str, list[ChildRecord]] = {}
+        file_recs_by_ts: dict[str, list[FileRecord]] = {}
+        for msg in new_replies:
+            mts = msg.get("ts", "")
+            for fd in msg.get("files", []):
+                fr = await self._process_file_raw(fd, ctx)
+                if fr:
+                    fr.record_group_id = thread_rg_id
+                    fr.root_record_group_id       = self._root_rg_id(ctx)
+                    fr.external_record_group_id = thread_ext_group_id
+                    fr.record_group_type = RecordGroupType.SLACK_THREAD
+                    file_recs_by_ts.setdefault(mts, []).append(fr)
+                    cr = ChildRecord(
+                        child_type=ChildType.RECORD,
+                        child_id=fr.id,
+                        child_name=fr.record_name,
+                    )
+                    file_children_by_ts.setdefault(mts, []).append(cr)
+
+        # -- Thread-burst MessageRecords for new replies -----------------------
+        bursts = self._detect_bursts(new_replies)
+        burst_recs_batch: list[tuple[Record, list[Permission]]] = []
+
+        for burst in bursts:
+            burst_file_children: dict[str, list[ChildRecord]] = {}
+            burst_file_recs: list[FileRecord] = []
+            for msg in burst.messages:
+                mts = msg.get("ts", "")
+                if mts in file_children_by_ts:
+                    burst_file_children[mts] = file_children_by_ts[mts]
+                if mts in file_recs_by_ts:
+                    burst_file_recs.extend(file_recs_by_ts[mts])
+
+            burst_rec = await self._build_thread_burst_record(
+                burst, thread_ts, thread_rg_id, ctx,
+                file_child_records=burst_file_children,
+            )
+            if not burst_rec:
+                continue
+
+            burst_recs_batch.append((burst_rec, []))
+
+            for fr in burst_file_recs:
+                fr.parent_node_id            = burst_rec.id
+                fr.is_dependent_node         = True
+                fr.inherit_permissions       = True
+                fr.parent_external_record_id = burst_rec.external_record_id
+                fr.parent_record_type        = RecordType.MESSAGE
+                burst_recs_batch.append((fr, []))
+
+            for msg in burst.messages:
+                for url_str in self._extract_urls(msg.get("text", "")):
+                    lr = await self._process_link(url_str, burst_rec, ctx, msg)
+                    if lr:
+                        burst_recs_batch.append((lr, []))
+
+            burst_authors = list(dict.fromkeys(
+                m.get("user", "") for m in burst.messages if m.get("user")
+            ))
+            burst_rec.involved_user_source_ids = burst_authors
+
+        if burst_recs_batch:
+            self._apply_record_indexing_filters(
+                burst_recs_batch,
+                ctx.channel_id,
+                message_key=IndexingFilterKey.THREADS,
+            )
+
+            await self._enrich_link_records_linked_id(burst_recs_batch)
+            await self.data_entities_processor.on_new_records(burst_recs_batch)
+
+        return replies_complete
+
+    # =========================================================================
+    # 5e.  Burst / single processing
+    # =========================================================================
+
+    async def _process_burst(
+        self,
+        burst: ConversationalBurst,
+        ctx: ProcessingContext,
+    ) -> tuple[list[tuple[Record, list[Permission]]], list[DeferredThread]]:
+        """
+        Multi-message burst → ONE burst MessageRecord with block_containers.
+        Thread-parent messages are collected for deferred processing.
+        """
+        recs: list[tuple[Record, list[Permission]]] = []
+        deferred_threads: list[DeferredThread] = []
+
+        first_ts = burst.messages[0].get("ts", "")
+        last_ts  = burst.messages[-1].get("ts", "")
+        if not first_ts:
+            return recs, deferred_threads
+
+        # ── Aggregate burst-level metadata ────────────────────────────────────
+        mentioned_user_ids:  set[str] = set()
+        mentioned_group_ids: set[str] = set()
+        reply_count = 0
+
+        for msg in burst.messages:
+            t = msg.get("text", "")
+            mentioned_user_ids.update(self._extract_user_mentions(t))
+            mentioned_group_ids.update(self._extract_channel_mentions(t))
+            rc = msg.get("reply_count", 0)
+            if rc > reply_count:
+                reply_count = rc
+
+        # ── Build file FileRecords first so we can attach ChildRecords ────────
+        file_children_by_ts: dict[str, list[ChildRecord]] = {}
+        file_recs: list[FileRecord] = []
+
+        for msg in burst.messages:
+            ts = msg.get("ts", "")
+            for fd in msg.get("files", []):
+                fr = await self._process_file_raw(fd, ctx)
+                if fr:
+                    # fr.record_group_type = RecordGroupType.SLACK_CHANNEL
+                    file_recs.append(fr)
+                    cr = ChildRecord(
+                        child_type=ChildType.RECORD,
+                        child_id=fr.id,
+                        child_name=fr.record_name,
+                    )
+                    file_children_by_ts.setdefault(ts, []).append(cr)
+
+        # ── Generate burst id ─────────────────────────────────────────────────
+        all_ts_str = "|".join(sorted([m.get("ts", "") for m in burst.messages]))
+        ts_hash = hashlib.md5(all_ts_str.encode()).hexdigest()[:8]
+        burst_id = f"burst_{ctx.channel_id}_{ts_hash}"
+
+        # ── Build block_containers ────────────────────────────────────────────
+        bc = self._build_burst_block_containers(
+            burst.messages, burst_id, ctx,
+            file_child_records=file_children_by_ts,
+        )
+
+        # ── Aggregated display name ───────────────────────────────────────────
+        aggregated_text = self._replace_mentions_in_text(
+            burst.aggregated_text, ctx.user_id_to_name, ctx.channel_id_to_name
+        )
+        rg_id     = ctx.channel_groups_map.get(ctx.channel_id)
+        src_ts_ms = int(float(first_ts) * 1000)
+        last_ts_ms = int(float(last_ts) * 1000) if last_ts else src_ts_ms
+
+        # Collect unique authors in this burst
+        burst_authors = list(dict.fromkeys(
+            m.get("user", "") for m in burst.messages if m.get("user")
+        ))
+
+        channel_name = ctx.channel_id_to_name.get(ctx.channel_id, ctx.channel_id)
+        try:
+            burst_rec = MessageRecord(
+                org_id=self.data_entities_processor.org_id,
+                record_name=f"{channel_name}_{self._slack_ts_to_utc_label(first_ts)}",
+                record_type=RecordType.MESSAGE,
+                external_record_id=burst_id,
+                external_record_group_id=ctx.channel_id,
+                record_group_id=rg_id,
+                root_record_group_id=self._root_rg_id(ctx),
+                version=1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=MimeTypes.BLOCKS.value,
+                weburl=self._message_url(ctx.channel_id, first_ts),
+                source_created_at=src_ts_ms,
+                source_updated_at=last_ts_ms,
+                content=aggregated_text,
+                mentioned_user_ids=list(mentioned_user_ids),
+                mentioned_group_ids=list(mentioned_group_ids),
+                # True when any message in the burst started a thread, as the
+                # deferred-thread loop below decides it.
+                has_replies=any(
+                    m.get("reply_count", 0) > 0 and m.get("thread_ts") == m.get("ts")
+                    for m in burst.messages
+                ),
+                start_ts=first_ts,
+                end_ts=last_ts,
+                inherit_permissions=True,
+                preview_renderable=False,
+                block_containers=bc,
+                involved_user_source_ids=burst_authors,
+                related_external_records=self._related_for_messages(burst.messages),
+            )
+        except Exception as exc:
+            self.logger.error(f"_process_burst create burst_rec ({burst_id}): {exc}")
+            return recs, deferred_threads
+
+        recs.append((burst_rec, []))
+
+        # ── File dependencies ─────────────────────────────────────────────────
+        for fr in file_recs:
+            fr.parent_node_id = burst_rec.id
+            fr.is_dependent_node = True
+            fr.inherit_permissions = True
+            fr.parent_external_record_id = burst_id
+            fr.parent_record_type = RecordType.MESSAGE
+            self.logger.debug(
+                f"[BurstFile] File '{fr.record_name}' linked to burst "
+                f"parent_node_id={burst_rec.id}, parent_ext_id={burst_id}"
+            )
+            recs.append((fr, []))
+
+        # ── Links at burst level ──────────────────────────────────────────────
+        for msg in burst.messages:
+            for url in self._extract_urls(msg.get("text", "")):
+                lr = await self._process_link(url, burst_rec, ctx, msg)
+                if lr:
+                    recs.append((lr, []))
+
+        # ── Collect thread parents for deferred processing ──────────────────
+        for msg in burst.messages:
+            ts = msg.get("ts", "")
+            if msg.get("reply_count", 0) > 0 and msg.get("thread_ts") == ts:
+                deferred_threads.append(DeferredThread(msg=msg, ctx=ctx, rg_id=rg_id))
+
+        if deferred_threads:
+            self.logger.info(
+                f"[BurstThread] Found {len(deferred_threads)} thread parent(s) "
+                f"in burst, channel={ctx.channel_id} (deferred)"
+            )
+
+        return recs, deferred_threads
+
+    async def _process_single(
+        self,
+        msg: dict[str, Any],
+        ctx: ProcessingContext,
+    ) -> tuple[list[tuple[Record, list[Permission]]], list[DeferredThread]]:
+        """
+        Single-message burst → ONE MessageRecord with block_containers.
+        Thread-parent messages are collected for deferred processing.
+        """
+        recs: list[tuple[Record, list[Permission]]] = []
+        deferred_threads: list[DeferredThread] = []
+        ts   = msg.get("ts", "")
+        if not ts:
+            return recs, deferred_threads
+
+        rg_id = ctx.channel_groups_map.get(ctx.channel_id)
+
+        # ── Build file ChildRecords ───────────────────────────────────────────
+        file_children: list[ChildRecord] = []
+        file_recs:     list[FileRecord]  = []
+        for fd in msg.get("files", []):
+            fr = await self._process_file_raw(fd, ctx)
+            if fr:
+                file_recs.append(fr)
+                # fr.record_group_type = RecordGroupType.SLACK_CHANNEL
+                file_children.append(ChildRecord(
+                    child_type=ChildType.RECORD,
+                    child_id=fr.id,
+                    child_name=fr.record_name,
+                ))
+
+        # ── Build block_containers ────────────────────────────────────────────
+        bc = self._build_single_block_containers(
+            msg, ctx, children_records=file_children or None
+        )
+
+        # ── Build message record ──────────────────────────────────────────────
+        text = self._replace_mentions_in_text(
+            msg.get("text", ""), ctx.user_id_to_name, ctx.channel_id_to_name
+        )
+        src_ts_ms = int(float(ts) * 1000)
+        is_edited = "edited" in msg
+        upd_ts_ms = src_ts_ms
+        if is_edited:
+            raw_ets = msg.get("edited", {}).get("ts")
+            if raw_ets:
+                upd_ts_ms = int(float(raw_ets) * 1000)
+
+        thread_ts = msg.get("thread_ts")
+        has_replies = (
+            (thread_ts == ts if thread_ts else False)
+            and msg.get("reply_count", 0) > 0
+        )
+
+        try:
+            url = self._message_url(ctx.channel_id, ts)
+        except Exception:
+            url = None
+
+        mentioned_user_ids  = self._extract_user_mentions(msg.get("text", ""))
+        mentioned_group_ids = self._extract_channel_mentions(msg.get("text", ""))
+
+        channel_name = ctx.channel_id_to_name.get(ctx.channel_id, ctx.channel_id)
+        try:
+            rec = MessageRecord(
+                org_id=self.data_entities_processor.org_id,
+                record_name=f"{channel_name}_{self._slack_ts_to_utc_label(ts)}",
+                record_type=RecordType.MESSAGE,
+                external_record_id=ts,
+                external_record_group_id=ctx.channel_id,
+                record_group_id=rg_id,
+                root_record_group_id=self._root_rg_id(ctx),
+                version=1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=MimeTypes.BLOCKS.value,
+                weburl=url,
+                source_created_at=src_ts_ms,
+                source_updated_at=upd_ts_ms,
+                content=text,
+                thread_id=thread_ts,
+                has_replies=has_replies,
+                mentioned_user_ids=mentioned_user_ids,
+                mentioned_group_ids=mentioned_group_ids,
+                is_edited=is_edited,
+                start_ts=ts,
+                end_ts=ts,
+                inherit_permissions=True,
+                preview_renderable=False,
+                block_containers=bc,
+                involved_user_source_ids=[msg.get("user", "")] if msg.get("user") else [],
+                related_external_records=self._related_for_messages([msg]),
+            )
+        except Exception as exc:
+            self.logger.error(f"_process_single({ts}): {exc}")
+            return recs, deferred_threads
+
+        recs.append((rec, []))
+
+        # ── File dependencies ─────────────────────────────────────────────────
+        for fr in file_recs:
+            fr.parent_node_id = rec.id
+            fr.is_dependent_node = True
+            fr.inherit_permissions = True
+            fr.parent_external_record_id = ts
+            fr.parent_record_type = RecordType.MESSAGE
+            self.logger.debug(
+                f"[ChannelFile] File '{fr.record_name}' linked to msg "
+                f"parent_node_id={rec.id}, parent_ext_id={ts}, rg={fr.external_record_group_id}"
+            )
+            recs.append((fr, []))
+
+        # ── Link dependencies ─────────────────────────────────────────────────
+        for url_str in self._extract_urls(msg.get("text", "")):
+            lr = await self._process_link(url_str, rec, ctx, msg)
+            if lr:
+                recs.append((lr, []))
+
+        # ── Collect thread parent for deferred processing ──────────────────
+        if has_replies:
+            deferred_threads.append(DeferredThread(msg=msg, ctx=ctx, rg_id=rg_id))
+
+        return recs, deferred_threads
+
+    # ── File record helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_file_extension(filename: str) -> Optional[str]:
+        """Extract the file extension from a filename, lowercased and without dot."""
+        if filename and "." in filename:
+            parts = filename.rsplit(".", 1)
+            if len(parts) > 1 and parts[1]:
+                return parts[1].lower()
+        return None
+
+    @staticmethod
+    def _resolve_file_mime_type(filename: str, slack_mimetype: Optional[str]) -> str:
+        """
+        Determine the best MIME type for a file.
+
+        Slack often returns 'application/octet-stream' (binary) for files it
+        doesn't recognise (e.g. .md, .yaml).  When that happens we fall back
+        to Python's mimetypes.guess_type which uses the filename extension.
+        """
+        UNRELIABLE_MIME_TYPES = {
+            None,
+            "",
+            "application/octet-stream",
+            "binary/octet-stream",
+        }
+        # If Slack gave a useful MIME type, validate it against our enum
+        if slack_mimetype and slack_mimetype not in UNRELIABLE_MIME_TYPES:
+            return slack_mimetype
+
+        # Fall back to guessing from filename
+        if filename:
+            guessed, _ = mimetypes.guess_type(filename, strict=False)
+            if guessed:
+                return guessed
+
+        return MimeTypes.UNKNOWN.value
+
+    @staticmethod
+    def _resolve_file_extension(
+        filename: str, slack_filetype: Optional[str]
+    ) -> Optional[str]:
+        """
+        Determine the best extension for a Slack file.
+
+        Slack's ``filetype`` field sometimes returns ``'binary'`` for files it
+        doesn't recognise (e.g. .md, .yaml).  When that happens we derive the
+        extension from the filename instead.
+        """
+        UNRELIABLE_FILETYPES = {None, "", "binary", "undefined"}
+
+        # Always prefer filename-derived extension when Slack's is unreliable
+        fname_ext = None
+        if filename and "." in filename:
+            parts = filename.rsplit(".", 1)
+            if len(parts) > 1 and parts[1]:
+                fname_ext = parts[1].lower()
+
+        if slack_filetype and slack_filetype not in UNRELIABLE_FILETYPES:
+            return slack_filetype.lower()
+
+        return fname_ext
+
+    async def _process_file_raw(
+        self,
+        fd: dict[str, Any],
+        ctx: ProcessingContext,
+    ) -> Optional[FileRecord]:
+        """
+        Create a FileRecord for a Slack file attachment.
+        parent_node_id is intentionally NOT set here; the caller sets it after
+        the parent record has been created.
+        """
+        fid = fd.get("id")
+        if not fid:
+            return None
+
+        file_hash: Optional[str] = None
+        url_dl = fd.get("url_private_download") or fd.get("url_private")
+        if url_dl:
+            try:
+                await ctx.rate_limiter.acquire(Tier.T4)
+                token = (await self._fresh_datasource()).access_token
+                async with httpx.AsyncClient(timeout=30.0) as http:
+                    headers = {"Authorization": f"Bearer {token}"} if token else {}
+                    r = await http.get(url_dl, headers=headers)
+                    # Slack answers a token it no longer accepts with 200 and its sign-in
+                    # page. Right after a scheduled rotation the connector can still hold
+                    # the old token, so try once more with the stored one if it is newer.
+                    if r.status_code == 200 and "text/html" in r.headers.get("content-type", ""):
+                        newer = await self._token_renewal.newer_stored_token(token)
+                        if newer:
+                            r = await http.get(url_dl, headers={"Authorization": f"Bearer {newer}"})
+                    if r.status_code == 200:
+                        file_hash = hashlib.sha256(r.content).hexdigest()
+            except Exception as exc:
+                self.logger.warning(f"File download failed {fid}: {exc}")
+
+        rg_id = ctx.channel_groups_map.get(ctx.channel_id)
+        filename = fd.get("name", f"file_{fid}")
+        extension = self._resolve_file_extension(filename, fd.get("filetype"))
+        mime_type = self._resolve_file_mime_type(filename, fd.get("mimetype"))
+
+        try:
+            return FileRecord(
+                org_id=self.data_entities_processor.org_id,
+                record_name=filename,
+                record_type=RecordType.FILE,
+                external_record_id=fid,
+                external_record_group_id=ctx.channel_id,
+                record_group_id=rg_id,
+                root_record_group_id=self._root_rg_id(ctx),
+                version=1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=mime_type,
+                weburl=fd.get("permalink"),
+                source_created_at=int(fd.get("created", 0)) * 1000,
+                source_updated_at=int(fd.get("created", 0)) * 1000,
+                is_file=True,
+                extension=extension,
+                size_in_bytes=fd.get("size"),
+                sha256_hash=file_hash,
+                is_dependent_node=True,
+                inherit_permissions=True,
+            )
+        except Exception as exc:
+            self.logger.error(f"_process_file_raw({fid}): {exc}")
+            return None
+
+    async def _process_file(
+        self,
+        fd: dict[str, Any],
+        parent: MessageRecord,
+        ctx: ProcessingContext,
+    ) -> Optional[FileRecord]:
+        """Compatibility wrapper — creates a file record linked to parent."""
+        fr = await self._process_file_raw(fd, ctx)
+        if fr:
+            fr.parent_node_id              = parent.id
+            fr.parent_external_record_id   = parent.external_record_id
+            fr.parent_record_type          = RecordType.MESSAGE
+        return fr
+
+
+    # ── Link record ────────────────────────────────────────────────────────────
+
+    async def _process_link(
+        self,
+        url: str,
+        parent: MessageRecord,
+        ctx: ProcessingContext,
+        msg: dict[str, Any],
+    ) -> Optional[LinkRecord]:
+        try:
+            unfurl       = self._unfurl_data(url, msg)
+
+            return LinkRecord(
+                org_id=self.data_entities_processor.org_id,
+                record_name=unfurl.get("title") or url[:100],
+                record_type=RecordType.LINK,
+                external_record_id=hashlib.md5(url.encode()).hexdigest(),
+                # A link in a thread reply sits in the thread group with its message.
+                external_record_group_id=parent.external_record_group_id or ctx.channel_id,
+                record_group_id=parent.record_group_id or ctx.channel_groups_map.get(ctx.channel_id),
+                root_record_group_id=self._root_rg_id(ctx),
+                parent_external_record_id=parent.external_record_id,
+                parent_record_type=RecordType.MESSAGE,
+                version=1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=MimeTypes.MARKDOWN.value,
+                # The canonical address, which a record indexed later looks for
+                # (record_links.addresses_linking_to); the paste stays on url.
+                weburl=canonical_address(url),
+                url=url,
+                title=unfurl.get("title"),
+                is_public=LinkPublicStatus.UNKNOWN,
+                linked_record_id=None,
+                is_dependent_node=True,
+                parent_node_id=parent.id,
+                inherit_permissions=True,
+            )
+        except Exception as exc:
+            self.logger.error(f"_process_link({url[:60]}): {exc}")
+            return None
+
+    async def _enrich_link_records_linked_id(
+        self,
+        batch: list[tuple[Record, list[Permission]]],
+    ) -> None:
+        """Look up related record by weburl for LinkRecords (same as Linear)."""
+        link_records = [
+            rec for rec, _ in batch
+            if rec.record_type == RecordType.LINK and getattr(rec, "weburl", None)
+        ]
+        if not link_records:
+            return
+        for rec in link_records:
+            try:
+                related_record = await self.data_entities_processor.get_record_by_weburl(
+                    rec.weburl
+                )
+                if related_record:
+                    rec.linked_record_id = related_record.id
+                    self.logger.debug(
+                        f"🔗 Found related record {related_record.id} for link URL: {rec.weburl}"
+                    )
+            except Exception as e:
+                self.logger.debug(
+                    f"⚠️ Could not fetch related record for URL {rec.weburl}: {e}"
+                )
+
+    # ── Message record transformation ──────────────────────────────────────────
+
+    async def _to_message_record(
+        self,
+        msg: dict[str, Any],
+        ctx: ProcessingContext,
+        parent_external_record_id: Optional[str] = None,
+    ) -> Optional[MessageRecord]:
+        ts = msg.get("ts")
+        if not ts:
+            return None
+
+        text       = msg.get("text", "")
+        user_id    = msg.get("user", "")
+        thread_ts  = msg.get("thread_ts")
+        src_ts     = int(float(ts) * 1000)
+        upd_ts     = src_ts
+        is_edited  = "edited" in msg
+
+        if is_edited:
+            raw_ets = msg.get("edited", {}).get("ts")
+            if raw_ets:
+                upd_ts = int(float(raw_ets) * 1000)
+
+        # Replace mentions in content
+        content_with_mentions = self._replace_mentions_in_text(
+            text, ctx.user_id_to_name, ctx.channel_id_to_name
+        )
+
+        rg_id           = ctx.channel_groups_map.get(ctx.channel_id)
+
+        channel_name = ctx.channel_id_to_name.get(ctx.channel_id, ctx.channel_id)
+        try:
+            return MessageRecord(
+                org_id=self.data_entities_processor.org_id,
+                record_name=f"{channel_name}_{self._slack_ts_to_utc_label(ts)}",
+                record_type=RecordType.MESSAGE,
+                external_record_id=ts,
+                external_record_group_id=ctx.channel_id,
+                record_group_id=rg_id,
+                root_record_group_id=self._root_rg_id(ctx),
+                parent_external_record_id=parent_external_record_id,
+                parent_record_type=(
+                    RecordType.MESSAGE if parent_external_record_id else None
+                ),
+                version=1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=MimeTypes.BLOCKS.value,
+                weburl=self._message_url(ctx.channel_id, ts),
+                source_created_at=src_ts,
+                source_updated_at=upd_ts,
+                # Content (with mentions replaced)
+                content=content_with_mentions,
+                thread_id=thread_ts,
+                has_replies=(
+                    (thread_ts == ts if thread_ts else False)
+                    and msg.get("reply_count", 0) > 0
+                ),
+                mentioned_user_ids=self._extract_user_mentions(text),  # Keep original IDs for edges
+                mentioned_group_ids=self._extract_channel_mentions(text),  # Keep original IDs for edges
+                is_edited=is_edited,
+                involved_user_source_ids=[user_id] if user_id else [],
+                # Rebuilt for a reindex, which leaves the link records alone: None keeps
+                # the message's link edges as they are, in step with those records.
+                related_external_records=None,
+                # Hierarchy
+                inherit_permissions=True,
+                preview_renderable=False,
+            )
+        except Exception as exc:
+            self.logger.error(f"_to_message_record({ts}): {exc}")
+            return None
+
+    @staticmethod
+    def _slack_ts_to_utc_label(ts: str) -> str:
+        """Format Slack ts as UTC human-readable label (e.g. 2025-02-28_14-30-45)."""
+        try:
+            t = float(ts)
+            dt = datetime.fromtimestamp(t, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d_%H-%M-%S")
+        except (ValueError, OSError):
+            return ts.replace(".", "-")
+
+    def _message_url(
+        self,
+        channel_id: str,
+        ts: str,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        clean = ts.replace(".", "")
+        if self.workspace_domain:
+            url = (
+                f"https://{self.workspace_domain}.slack.com"
+                f"/archives/{channel_id}/p{clean}"
+            )
+        else:
+            url = f"https://app.slack.com/client/{self.team_id or ''}/{channel_id}/p{clean}"
+        # Slack opens the thread side-panel and highlights the reply only when
+        # both ?thread_ts=<parent> and &cid=<channel> are present on the URL.
+        if thread_ts and thread_ts != ts:
+            url += f"?thread_ts={thread_ts}&cid={channel_id}"
+        return url
+
+    # ── Burst detection ────────────────────────────────────────────────────────
+
+    def _detect_bursts(self, msgs: list[dict[str, Any]]) -> list[ConversationalBurst]:
+        """
+        Group messages into conversational bursts (oldest-first processing).
+
+        A burst contains ALL messages from ALL users that fall within a
+        BURST_WINDOW_SECONDS gap between consecutive messages.  A gap larger
+        than the window, or a bot / system message, starts a new burst.
+        """
+        if not msgs:
+            return []
+
+        SYSTEM = {
+            "channel_join", "channel_leave", "channel_topic",
+            "channel_purpose", "channel_name", "channel_archive",
+        }
+
+        # Slack returns newest-first; reverse to process chronologically
+        sorted_msgs = sorted(msgs, key=lambda m: float(m.get("ts", "0")))
+        bursts: list[ConversationalBurst] = []
+        cur:    list[dict[str, Any]]      = [sorted_msgs[0]]
+
+        for i in range(1, len(sorted_msgs)):
+            curr = sorted_msgs[i]
+            prev = sorted_msgs[i - 1]
+
+            # Hard break: system message
+            if curr.get("subtype") in SYSTEM:
+                bursts.append(ConversationalBurst(
+                    messages=cur,
+                    start_ts=float(cur[0].get("ts", "0")),
+                    end_ts=float(cur[-1].get("ts", "0")),
+                ))
+                cur = [curr]
+                continue
+
+            within_time = (
+                float(curr.get("ts", "0")) - float(prev.get("ts", "0"))
+                <= BURST_WINDOW_SECONDS
+            )
+
+            if within_time:
+                cur.append(curr)
+            else:
+                bursts.append(ConversationalBurst(
+                    messages=cur,
+                    start_ts=float(cur[0].get("ts", "0")),
+                    end_ts=float(cur[-1].get("ts", "0")),
+                ))
+                cur = [curr]
+
+        # Flush final burst
+        bursts.append(ConversationalBurst(
+            messages=cur,
+            start_ts=float(cur[0].get("ts", "0")),
+            end_ts=float(cur[-1].get("ts", "0")),
+        ))
+        return bursts
+
+    # =========================================================================
+    # 5.  Thread-growth detection (lightweight incremental)
+    # =========================================================================
+
+    async def _sync_thread_growth(self) -> None:
+        """
+        Per-channel scan that detects threads with new replies and
+        incrementally creates records + burst records for those new replies.
+
+        Edit detection is bypassed — only thread growth (reply_count > 0 on a
+        parent message whose thread RecordGroup may already exist) is handled.
+
+        Checkpoint logic mirrors ``sync_channel_messages``:
+          - First run (no checkpoint) → use the sync-window filter so the scan
+            covers the same range as the initial message sync.
+          - Subsequent runs → use the stored ``last_check_time``.
+        """
+        self.logger.info("🔍 Thread-growth detection (per-channel)…")
+        try:
+            now_ms = int(time.time() * 1000)
+            await self._refresh_user_caches()
+
+            sync_window_ts = self._compute_sync_window_oldest()
+
+            channel_ids = list(self.channel_groups_cache.keys())
+            self.logger.info(f"  Scanning {len(channel_ids)} channels for thread growth…")
+
+            for cid in channel_ids:
+                if not cid:
+                    continue
+
+                chan_key = generate_record_sync_point_key(
+                    RecordType.MESSAGE.value, "thread_growth", cid
+                )
+                last = await self.audit_log_sync_point.read_sync_point(chan_key)
+
+                oldest_ts: Optional[str] = None
+                if last and last.get("last_check_time"):
+                    oldest_ts = f"{last['last_check_time'] / 1000.0:.6f}"
+                else:
+                    oldest_ts = sync_window_ts
+
+                try:
+                    scan_complete = await self._scan_channel_thread_growth(
+                        cid, oldest_ts
+                    )
+                    if not scan_complete:
+                        self.logger.warning(
+                            f"Thread-growth checkpoint NOT updated for {cid}: "
+                            f"channel history was only partly scanned"
+                        )
+                        continue
+                    await self.audit_log_sync_point.update_sync_point(
+                        chan_key, {"last_check_time": now_ms}
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        f"Thread-growth detection failed for {cid}: {exc}",
+                        exc_info=True,
+                    )
+
+            self.logger.info("✅ Thread-growth detection complete")
+
+        except Exception as exc:
+            self.logger.error(f"❌ Thread-growth detection failed: {exc}", exc_info=True)
+
+    async def _scan_channel_thread_growth(
+        self, channel_id: str, oldest_ts: Optional[str]
+    ) -> bool:
+        """
+        Paginate through channel history within [oldest_ts, now] and call
+        ``_handle_new_thread()`` for every thread-root message (reply_count > 0).
+
+        Returns True when the whole range was scanned (or the channel is gone
+        for good), False when a page failed part-way or a thread's replies
+        could not all be read, so the caller must not advance its checkpoint.
+        """
+        SKIP_SUBTYPES: frozenset = frozenset({
+            "channel_join",        "channel_leave",
+            "channel_archive",     "channel_unarchive",
+            "channel_name",        "channel_purpose",      "channel_topic",
+            "group_join",          "group_leave",
+            "group_archive",       "group_unarchive",
+            "group_name",          "group_purpose",        "group_topic",
+            "file_comment",        "pinned_item",          "unpinned_item",
+            "reminder_add",        "reminder_delete",
+            "slackbot_response",   "thread_broadcast",
+        })
+
+        cursor: Optional[str] = None
+        now_ts = f"{time.time():.6f}"
+        threads_complete = True
+
+        while True:
+            await self.rate_limiter.acquire(Tier.T3)
+            ds = await self._fresh_datasource()
+
+            try:
+                kwargs: dict[str, Any] = dict(
+                    channel=channel_id,
+                    latest=now_ts,
+                    limit=200,
+                    cursor=cursor,
+                )
+                if oldest_ts:
+                    kwargs["oldest"] = oldest_ts
+                resp = await ds.conversations_history(**kwargs)
+            except Exception as exc:
+                self.logger.error(
+                    f"conversations.history for thread-growth in {channel_id}: {exc}",
+                    exc_info=True,
+                )
+                return False
+
+            if not resp or not resp.success:
+                error = getattr(resp, "error", "no response")
+                if error in ("channel_not_found", "not_in_channel"):
+                    return True
+                self.logger.warning(
+                    f"conversations.history for thread-growth in {channel_id} "
+                    f"failed: {error}"
+                )
+                return False
+
+            msgs: list[dict[str, Any]] = resp.data.get("messages", [])
+            if not msgs:
+                break
+
+            for md in msgs:
+                ts = md.get("ts")
+                if not ts:
+                    continue
+
+                subtype: str = md.get("subtype", "")
+                if subtype == "message_changed":
+                    inner = md.get("message") or {}
+                    if inner:
+                        md      = inner
+                        ts      = md.get("ts", ts)
+                        subtype = md.get("subtype", "")
+
+                if subtype in SKIP_SUBTYPES:
+                    continue
+                if md.get("thread_ts") and md.get("thread_ts") != ts:
+                    continue
+
+                if md.get("reply_count", 0) > 0 and md.get("thread_ts") == ts:
+                    try:
+                        if not await self._handle_new_thread(md, channel_id, ts):
+                            threads_complete = False
+                    except Exception as exc:
+                        threads_complete = False
+                        self.logger.error(
+                            f"Thread-growth for ts={ts} in {channel_id}: {exc}",
+                            exc_info=True,
+                        )
+
+            cursor = (
+                resp.data.get("response_metadata", {}).get("next_cursor") or ""
+            )
+            if not cursor:
+                break
+
+        return threads_complete
+
+    # =========================================================================
+    # 7b. Phase 5 — Full change detection (bypassed for now)
+    # =========================================================================
+
+    async def _sync_message_changes(self) -> None:
+        """
+        Per-channel incremental change detection.
+
+        Each channel maintains its own change-detection checkpoint
+        (``audit_log_sync_point`` keyed per channel_id).  The change window for
+        a given channel is:
+
+          - First run (no checkpoint) → sync-window filter (same range as
+            the initial message sync).
+          - Subsequent runs → stored ``last_check_time``.
+
+        Benefits over a single global checkpoint:
+        - A channel checked 5 min ago only scans 5 min of history, not 24 h.
+        - A newly-added channel falls back to the sync-window filter.
+        - A failed channel does NOT update its checkpoint, so the next run
+          automatically retries from the last successful check time.
+
+        Limitation (inherent to polling conversations.history):
+        - ``conversations.history`` returns messages ordered by creation time,
+          not modification time.  Edits / new thread replies on messages whose
+          ``ts`` falls outside the current window cannot be detected here.
+          For complete real-time coverage, integrate with Slack's Events API.
+        """
+        self.logger.info("🔍 Change detection (per-channel)…")
+        try:
+            now_ms = int(time.time() * 1000)
+            total_updated = 0
+
+            sync_window_ts = self._compute_sync_window_oldest()
+
+            # Refresh user cache before the per-channel loop
+            await self._refresh_user_caches()
+
+            channel_ids = list(self.channel_groups_cache.keys())
+            self.logger.info(f"  Scanning {len(channel_ids)} channels for changes…")
+
+            for cid in channel_ids:
+                if not cid:
+                    continue
+
+                # ── Per-channel change window ────────────────────────────────
+                chan_key = generate_record_sync_point_key(
+                    RecordType.MESSAGE.value, "changes", cid
+                )
+                last = await self.audit_log_sync_point.read_sync_point(chan_key)
+
+                oldest_ts: Optional[str] = None
+                if last and last.get("last_check_time"):
+                    oldest_ts = f"{last['last_check_time'] / 1000.0:.6f}"
+                else:
+                    oldest_ts = sync_window_ts
+
+                self.logger.debug(
+                    f"  [{cid}] window: "
+                    f"{'ts=' + oldest_ts if oldest_ts else 'full (no window limit)'} → now"
+                )
+
+                try:
+                    count = await self._check_channel_changes(cid, oldest_ts)
+                    total_updated += count
+                    # Only persist checkpoint after a fully-successful scan so that
+                    # a partial failure retries from the old window on the next run.
+                    await self.audit_log_sync_point.update_sync_point(
+                        chan_key, {"last_check_time": now_ms}
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        f"Change detection failed for {cid}: {exc}", exc_info=True
+                    )
+                    # Do NOT update checkpoint — next run will retry from old window.
+
+            self.logger.info(f"✅ Change detection — {total_updated} records updated")
+
+        except Exception as exc:
+            self.logger.error(f"❌ Change detection failed: {exc}", exc_info=True)
+
+    async def _refresh_user_caches(self) -> None:
+        """
+        Re-sync user caches from the DB without hitting the Slack API.
+        Called at the start of change detection to capture any users
+        added after the initial _sync_users() phase.
+        Populates email, internal-id, and display-name caches.
+        """
+        try:
+            all_users = await self.data_entities_processor.get_all_app_users(
+                connector_id=self.connector_id
+            )
+            for u in all_users:
+                if u.source_user_id:
+                    if u.email:
+                        self.user_id_to_email_cache.setdefault(
+                            u.source_user_id, u.email
+                        )
+                    if u.id:
+                        self.user_id_to_internal_id_cache.setdefault(
+                            u.source_user_id, u.id
+                        )
+                    if u.full_name:
+                        self.user_id_to_name_cache.setdefault(
+                            u.source_user_id, u.full_name
+                        )
+        except Exception as exc:
+            self.logger.error(f"_refresh_user_caches: {exc}")
+
+    async def _find_burst_record_by_message_ts(
+        self, channel_id: str, ts: str
+    ) -> Optional[MessageRecord]:
+        """
+        Find the burst MessageRecord that contains the message with the given ts.
+
+        Delegates to the data-store abstraction layer so that the query is
+        properly encapsulated in the provider (ArangoDB / Neo4j) rather than
+        in the connector.
+
+        Returns None if no such record exists (e.g. the message is standalone).
+        """
+        try:
+            async with self.data_store_provider.transaction() as tx:
+                return await tx.find_slack_burst_record_by_ts(
+                    connector_id=self.connector_id,
+                    channel_id=channel_id,
+                    ts=ts,
+                )
+        except Exception as exc:
+            self.logger.error(f"_find_burst_record_by_message_ts({ts}): {exc}")
+            return None
+
+    async def _check_channel_changes(
+        self, channel_id: str, oldest_ts: Optional[str]
+    ) -> int:
+        """
+        Fully-paginated change scan for one channel within [oldest_ts, now].
+
+        Handles:
+          A) Single-message record edited  → rebuild block_containers, republish
+          B) Burst member edited           → find burst, update block, republish
+          C) Newly-threaded / grown thread → create or update thread RecordGroup
+          D) ``message_changed`` subtype   → unwrap inner message, treat as edit
+
+        Skips (non-actionable events in history):
+          - Bot-only messages (no human ``user`` field)
+          - System event messages (join, leave, archive, pin, reminder …)
+          - ``message_deleted`` events
+          - Thread replies (``thread_ts != ts``): replies are processed via
+            ``_handle_new_thread`` which fetches them from the thread directly.
+
+        Pagination:
+          Iterates through ALL pages returned by ``conversations.history`` using
+          the ``next_cursor`` from ``response_metadata``.  Each page acquires
+          the rate limiter independently so we never exceed Slack's tier limits.
+
+        Returns:
+          Count of records that were updated (Cases A + B).
+        """
+        SKIP_SUBTYPES: frozenset = frozenset({
+            "channel_join",        "channel_leave",
+            "channel_archive",     "channel_unarchive",
+            "channel_name",        "channel_purpose",      "channel_topic",
+            "group_join",          "group_leave",
+            "group_archive",       "group_unarchive",
+            "group_name",          "group_purpose",        "group_topic",
+            "file_comment",        "pinned_item",          "unpinned_item",
+            "reminder_add",        "reminder_delete",
+            "slackbot_response",   "thread_broadcast",
+        })
+
+        # Permanent errors that mean we should stop and not retry for this channel
+        TERMINAL_ERRORS: frozenset = frozenset({
+            "channel_not_found", "not_in_channel", "is_archived",
+            "missing_scope", "invalid_auth", "account_inactive",
+        })
+
+        updated = 0
+        cursor: Optional[str] = None
+        page   = 0
+
+        # Stable upper-bound for the window — avoids fetching messages posted
+        # mid-run that have not yet been processed by the messages sync phase.
+        now_ts = f"{time.time():.6f}"
+
+        while True:
+            page += 1
+            await self.rate_limiter.acquire(Tier.T3)
+            ds = await self._fresh_datasource()
+
+            try:
+                hist_kwargs: dict[str, Any] = dict(
+                    channel=channel_id,
+                    latest=now_ts,
+                    limit=200,
+                    cursor=cursor,
+                )
+                if oldest_ts:
+                    hist_kwargs["oldest"] = oldest_ts
+                resp = await ds.conversations_history(**hist_kwargs)
+            except Exception as exc:
+                self.logger.error(
+                    f"conversations.history page {page} for {channel_id}: {exc}",
+                    exc_info=True,
+                )
+                break
+
+            if not resp or not resp.success:
+                error = getattr(resp, "error", "unknown") if resp else "no_response"
+                if error in TERMINAL_ERRORS:
+                    self.logger.warning(
+                        f"Channel {channel_id} skipped in change detection: {error}"
+                    )
+                else:
+                    self.logger.warning(
+                        f"conversations.history({channel_id}) page {page} → {error}"
+                    )
+                break
+
+            msgs: list[dict[str, Any]] = resp.data.get("messages", [])
+            if not msgs:
+                break
+
+            self.logger.debug(
+                f"  [{channel_id}] page {page}: {len(msgs)} messages"
+            )
+
+            for md in msgs:
+                ts = md.get("ts")
+                if not ts:
+                    continue
+
+                subtype: str = md.get("subtype", "")
+
+                # ── D: unwrap message_changed events ──────────────────────
+                # Rarely appears in conversations.history but handle defensively.
+                if subtype == "message_changed":
+                    inner = md.get("message") or {}
+                    if inner:
+                        md      = inner
+                        ts      = md.get("ts", ts)
+                        subtype = md.get("subtype", "")
+
+                # ── Skip non-content messages ──────────────────────────────
+                if subtype in SKIP_SUBTYPES:
+                    continue
+
+                # Skip deleted messages
+                if subtype == "message_deleted":
+                    continue
+
+                # Skip thread replies — they live inside threads, not channel history.
+                # The parent message check (Case C) will pull all replies via
+                # conversations.replies when it detects reply_count > 0.
+                if md.get("thread_ts") and md.get("thread_ts") != ts:
+                    continue
+
+                try:
+                    # ── A / B: edits ───────────────────────────────────────
+                    if self._is_edited(md):
+                        updated += await self._handle_edited_message(
+                            md, channel_id, ts
+                        )
+
+                    # ── C: newly-threaded or grown thread ──────────────────
+                    # reply_count > 0 and thread_ts == ts → this is a thread root.
+                    if md.get("reply_count", 0) > 0 and md.get("thread_ts") == ts:
+                        await self._handle_new_thread(md, channel_id, ts)
+
+                except Exception as exc:
+                    self.logger.error(
+                        f"Change check ts={ts} in {channel_id}: {exc}",
+                        exc_info=True,
+                    )
+
+            # ── Advance pagination cursor ──────────────────────────────────
+            cursor = (
+                resp.data.get("response_metadata", {}).get("next_cursor") or ""
+            )
+            if not cursor:
+                break
+
+        return updated
+
+    def _is_edited(self, md: dict[str, Any]) -> bool:
+        return "edited" in md
+
+    async def _handle_edited_message(
+        self, md: dict[str, Any], channel_id: str, ts: str
+    ) -> int:
+        """
+        Handle an edited Slack message.  Returns 1 if a record was updated, else 0.
+
+        Case A: standalone single-message record (external_record_id == ts).
+        Case B: message is a member of a burst record (start_ts ≤ ts ≤ end_ts).
+
+        In both cases we build a fresh, properly-typed MessageRecord so that
+        ``to_kafka_record()`` works and the DB is force-updated via a synthetic
+        ``external_revision_id``.
+        """
+        # ── Case A: standalone single-message record ──────────────────────
+        existing_base: Optional[Record] = None
+        try:
+            existing_base = await self.data_entities_processor.get_record_by_external_id(
+                connector_id=self.connector_id, external_record_id=ts
+            )
+        except Exception as exc:
+            self.logger.error(f"DB lookup for ts={ts}: {exc}")
+            return 0
+
+        if existing_base:
+            if not self._record_changed(md, existing_base):
+                return 0
+
+            rg_id = getattr(existing_base, "record_group_id", None)
+            # Pass the root explicitly: for a threaded message rg_id is the
+            # *thread* group, and _root_rg_id's channel_groups_map fallback
+            # would then persist the thread as its own root. A stored wrong
+            # value is worse than none — _derive_group_root only fills a root
+            # in when one is absent, so the backfill could not repair it.
+            ctx   = self._make_ctx(
+                channel_id,
+                rg_id,
+                root_rg_id=await self._reindex_root_rg_id(existing_base, channel_id),
+                root_resolved=True,
+            )
+            text  = self._replace_mentions_in_text(
+                md.get("text", ""), ctx.user_id_to_name, ctx.channel_id_to_name
+            )
+            bc = self._build_single_block_containers(md, ctx)
+
+            src_ts_ms = int(float(ts) * 1000)
+            is_edited = "edited" in md
+            upd_ts_ms = src_ts_ms
+            if is_edited:
+                raw_ets = md.get("edited", {}).get("ts")
+                if raw_ets:
+                    upd_ts_ms = int(float(raw_ets) * 1000)
+
+            channel_name = ctx.channel_id_to_name.get(ctx.channel_id, ctx.channel_id)
+            updated_rec = MessageRecord(
+                id=existing_base.id,
+                org_id=self.data_entities_processor.org_id,
+                record_name=f"{channel_name}_{self._slack_ts_to_utc_label(ts)}",
+                record_type=RecordType.MESSAGE,
+                external_record_id=ts,
+                external_record_group_id=channel_id,
+                record_group_id=rg_id,
+                root_record_group_id=self._root_rg_id(ctx),
+                version=existing_base.version + 1,
+                external_revision_id=str(get_epoch_timestamp_in_ms()),
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.SLACK,
+                connector_id=self.connector_id,
+                mime_type=MimeTypes.BLOCKS.value,
+                weburl=existing_base.weburl,
+                source_created_at=existing_base.source_created_at or src_ts_ms,
+                source_updated_at=upd_ts_ms,
+                content=text,
+                is_edited=is_edited,
+                start_ts=ts,
+                end_ts=ts,
+                inherit_permissions=True,
+                preview_renderable=False,
+                block_containers=bc,
+                mentioned_user_ids=self._extract_user_mentions(md.get("text", "")),
+                mentioned_group_ids=self._extract_channel_mentions(md.get("text", "")),
+                involved_user_source_ids=[md.get("user", "")] if md.get("user") else [],
+                related_external_records=self._related_for_messages([md]),
+            )
+            await self.data_entities_processor.on_record_content_update(updated_rec)
+            return 1
+
+        # ── Case B: message is a member of a burst record ─────────────────
+        burst_rec = await self._find_burst_record_by_message_ts(channel_id, ts)
+        if not burst_rec:
+            return 0  # message not yet synced — nothing to update
+
+        ctx = self._make_ctx(channel_id, burst_rec.record_group_id)
+
+        # Fetch all messages in the burst window from Slack and rebuild block_containers
+        # (block_containers are NOT stored in the DB; we must reconstruct them).
+        try:
+            await self.rate_limiter.acquire(Tier.T3)
+            ds   = await self._fresh_datasource()
+            resp = await ds.conversations_history(
+                channel=channel_id,
+                oldest=burst_rec.start_ts,
+                latest=burst_rec.end_ts,
+                inclusive=True,
+                limit=200,
+            )
+            if not resp or not resp.success:
+                self.logger.warning(
+                    f"Could not fetch burst messages for channel={channel_id} "
+                    f"ts={ts}; skipping burst update"
+                )
+                return 0
+
+            burst_msgs = sorted(
+                [
+                    m for m in resp.data.get("messages", [])
+                    if (
+                        m.get("ts")
+                        and burst_rec.start_ts <= m["ts"] <= burst_rec.end_ts
+                    )
+                ],
+                key=lambda m: m["ts"],
+            )
+        except Exception as exc:
+            self.logger.error(f"Fetching burst messages for ts={ts}: {exc}")
+            return 0
+
+        if not burst_msgs:
+            return 0
+
+        # Rebuild the block_containers with the updated message content
+        bc = self._build_burst_block_containers(
+            burst_msgs, burst_rec.external_record_id, ctx
+        )
+        # Update aggregated content
+        new_content = "\n\n".join(
+            self._replace_mentions_in_text(
+                m.get("text", ""), ctx.user_id_to_name, ctx.channel_id_to_name
+            )
+            for m in burst_msgs if m.get("text")
+        )
+        burst_rec.content       = new_content
+        burst_rec.block_containers = bc
+        # Rebuilt from every message, as the links are: saving drops the ones left out.
+        burst_rec.related_external_records = self._related_for_messages(burst_msgs)
+        burst_rec.version      += 1
+        # Synthetic revision forces _handle_updated_record to DB-upsert
+        burst_rec.external_revision_id = str(get_epoch_timestamp_in_ms())
+
+        await self.data_entities_processor.on_record_content_update(burst_rec)
+        return 1
+
+
+    def _root_rg_id(self, ctx: ProcessingContext) -> Optional[str]:
+        """Channel record group id: the root of a Slack record's group chain."""
+        if ctx.root_resolved:
+            return ctx.root_rg_id
+        return ctx.root_rg_id or ctx.channel_groups_map.get(ctx.channel_id)
+
+    @staticmethod
+    def _channel_ext_id(external_group_id: str) -> str:
+        """The Slack channel id behind a record's external group id.
+
+        Threaded records carry the thread group's id, ``thread_{channel}_{ts}``.
+        """
+        if external_group_id.startswith("thread_"):
+            parts = external_group_id.split("_", 2)  # ["thread", channel_id, thread_ts]
+            if len(parts) >= 2:
+                return parts[1]
+        return external_group_id
+
+    async def _reindex_root_rg_id(
+        self, rec: Record, external_group_id: str
+    ) -> Optional[str]:
+        """Root (channel) group for a record being reindexed.
+
+        A threaded record's ``record_group_id`` is its thread group, so the
+        ``channel_groups_map`` fallback in :meth:`_root_rg_id` would publish the
+        thread as its own root; container filtering drops a root-scoped
+        connector's descendants, so the record would then vanish from search.
+        Records written before ``rootRecordGroupId`` existed have none stored.
+        """
+        stored = getattr(rec, "root_record_group_id", None)
+        if stored:
+            return stored
+        cid = self._channel_ext_id(external_group_id)
+        return (await self._channel_group_map([cid])).get(cid)
+
+    def _make_ctx(
+        self,
+        channel_id: str,
+        rg_id: Optional[str],
+        root_rg_id: Optional[str] = None,
+        root_resolved: bool = False,
+    ) -> ProcessingContext:
+        return ProcessingContext(
+            channel_id=channel_id,
+            channel_groups_map={channel_id: rg_id} if rg_id else {},
+            root_rg_id=root_rg_id,
+            root_resolved=root_resolved,
+            user_id_to_email=dict(self.user_id_to_email_cache),
+            user_id_to_name=dict(self.user_id_to_name_cache),
+            channel_id_to_name=dict(self.channel_id_to_name_cache),
+            rate_limiter=self.rate_limiter,
+        )
+
+    async def _handle_new_thread(
+        self, md: dict[str, Any], channel_id: str, ts: str
+    ) -> bool:
+        """
+        Handle a thread root discovered during change detection.
+
+        Returns False when the thread's replies could not all be read, so
+        the thread-growth scan must not advance its checkpoint.
+
+        Decision is gated on the per-thread sync_point, not on whether the
+        thread RecordGroup node already exists. A full sync deletes sync_points
+        (and sync edges) but keeps RG nodes; gating on RG existence would
+        silently take the incremental path on full sync and leave the RG's
+        edges (BELONGS_TO / INHERIT_PERMISSIONS / PERMISSION) unrecreated.
+
+        sync_point absent  → _process_thread: re-emits the RG and refetches
+                             every reply, rebuilding all edges.
+        sync_point present → incremental: only fetch replies newer than the
+                             stored ts.
+        """
+        rg_id: Optional[str] = None
+        try:
+            existing_rg_chan = await self.data_entities_processor.get_record_group_by_external_id(
+                connector_id=self.connector_id,
+                external_id=channel_id,
+            )
+            if existing_rg_chan:
+                rg_id = existing_rg_chan.id
+        except Exception:
+            pass
+
+        ctx = self._make_ctx(channel_id, rg_id)
+
+        thread_sp_key = generate_record_sync_point_key(
+            RecordType.MESSAGE.value, "slack_thread", f"{channel_id}_{ts}"
+        )
+
+        sp_data = await self.audit_log_sync_point.read_sync_point(thread_sp_key)
+        last_reply_ts = (sp_data or {}).get("last_reply_ts")
+
+        # If we have a checkpoint, look up the thread RG arango id for the
+        # incremental path. Failure here is fatal for the incremental branch
+        # (we'd publish bursts with an empty record_group_id), so we fall
+        # through to the full path on lookup error.
+        thread_rg_id = ""
+        if last_reply_ts:
+            try:
+                existing_rg = await self.data_entities_processor.get_record_group_by_external_id(
+                    connector_id=self.connector_id,
+                    external_id=f"thread_{channel_id}_{ts}",
+                )
+                if existing_rg:
+                    thread_rg_id = existing_rg.id or ""
+            except Exception as exc:
+                self.logger.error(f"[ThreadGrowth] RG lookup for thread {ts}: {exc}")
+
+        # No checkpoint, or checkpoint exists but RG node missing/lookup
+        # failed (orphan sync_point) ⇒ full path that rebuilds the RG.
+        if not last_reply_ts or not thread_rg_id:
+            self.logger.info(
+                f"[ThreadGrowth] Fresh sync for thread ts={ts}, channel={channel_id}, "
+                f"reply_count={md.get('reply_count')}, channel_rg_id={rg_id}"
+            )
+            replies_complete = await self._process_thread(md, ctx, rg_id)
+            if not replies_complete:
+                self.logger.warning(
+                    f"[ThreadGrowth] Thread checkpoint NOT updated for ts={ts}, "
+                    f"channel={channel_id}: replies were only partly fetched"
+                )
+                return False
+
+            latest_reply = md.get("latest_reply") or ts
+            await self.audit_log_sync_point.update_sync_point(
+                thread_sp_key, {"last_reply_ts": latest_reply}
+            )
+            return True
+
+        # ── Incremental ───────────────────────────────────────────────────
+        replies_complete = await self._process_thread_incremental(
+            md, ctx, thread_rg_id, last_reply_ts,
+        )
+        if not replies_complete:
+            self.logger.warning(
+                f"[ThreadGrowth] Thread checkpoint NOT updated for ts={ts}, "
+                f"channel={channel_id}: replies were only partly fetched"
+            )
+            return False
+
+        latest_reply = md.get("latest_reply") or last_reply_ts
+        await self.audit_log_sync_point.update_sync_point(
+            thread_sp_key, {"last_reply_ts": latest_reply}
+        )
+        return True
+
+    def _record_changed(
+        self, md: dict[str, Any], existing: Any
+    ) -> bool:
+        """Return True if any detectable field has changed since last sync."""
+        # Edit newly detected
+        if "edited" in md and not getattr(existing, "is_edited", False):
+            return True
+        # Re-edit detected via Slack edited timestamp vs stored source_updated_at
+        if "edited" in md:
+            raw_ets = md.get("edited", {}).get("ts")
+            if raw_ets:
+                edited_ms = int(float(raw_ets) * 1000)
+                existing_ts = (
+                    getattr(existing, "source_updated_at", None)
+                    or getattr(existing, "source_created_at", None)
+                )
+                if existing_ts is None or edited_ms > existing_ts:
+                    return True
+        return False
+
+    # =========================================================================
+    # 8.  DB / cache helpers
+    # =========================================================================
+
+    async def _channel_group_map(
+        self, channel_ids: list[str]
+    ) -> dict[str, str]:
+        """
+        Return channel_id → RecordGroup._key for the given channels.
+        Serves from cache first; falls back to a single DB transaction
+        for any cache misses.
+        """
+        result:   dict[str, str] = {}
+        uncached: list[str]      = []
+
+        for cid in channel_ids:
+            if cid in self.channel_groups_cache:
+                result[cid] = self.channel_groups_cache[cid]
+            else:
+                uncached.append(cid)
+
+        if uncached:
+            try:
+                for cid in uncached:
+                    rg = await self.data_entities_processor.get_record_group_by_external_id(
+                        connector_id=self.connector_id, external_id=cid
+                    )
+                    if rg:
+                        result[cid] = rg.id
+                        self.channel_groups_cache[cid] = rg.id
+            except Exception as exc:
+                self.logger.error(f"_channel_group_map DB fallback: {exc}")
+
+        return result
+
+    # =========================================================================
+    # 9.  Text extraction utilities
+    # =========================================================================
+
+    async def _warm_user_cache_for_messages(
+        self,
+        msgs: list[dict[str, Any]],
+        ctx: Optional[ProcessingContext] = None,
+    ) -> None:
+        """Resolve mention IDs missing from the name cache via ``users.info``."""
+        seen_names = self.user_id_to_name_cache
+        ctx_names = ctx.user_id_to_name if ctx is not None else None
+        ctx_emails = ctx.user_id_to_email if ctx is not None else None
+        unknown: set[str] = set()
+        for msg in msgs:
+            candidate_ids: set[str] = set()
+            author_uid = msg.get("user")
+            if author_uid:
+                candidate_ids.add(author_uid)
+            candidate_ids.update(self._extract_user_mentions(msg.get("text") or ""))
+            for user_id in candidate_ids:
+                has_name = user_id in seen_names or (ctx_names is not None and user_id in ctx_names)
+                has_email = bool(
+                    self.user_id_to_email_cache.get(user_id)
+                    or (ctx_emails is not None and ctx_emails.get(user_id))
+                )
+                if has_name and has_email:
+                    continue
+                unknown.add(user_id)
+
+        if not unknown:
+            return
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_USER_INFO)
+        resolved: dict[str, tuple[Optional[str], Optional[str]]] = {}
+
+        async def _fetch(user_id: str) -> None:
+            async with semaphore:
+                try:
+                    await self.rate_limiter.acquire(Tier.T4)
+                    ds = await self._fresh_datasource()
+                    resp = await ds.users_info(user=user_id)
+                except Exception as exc:
+                    self.logger.debug(f"users.info({user_id}) failed: {exc}")
+                    return
+                if not resp or not resp.success:
+                    return
+                user = (resp.data or {}).get("user", {}) or {}
+                profile = user.get("profile", {}) or {}
+                name = (
+                    profile.get("real_name")
+                    or profile.get("display_name")
+                    or user.get("name")
+                )
+                email = (profile.get("email") or "").strip() or None
+                if name or email:
+                    resolved[user_id] = (name, email)
+
+        await asyncio.gather(*(_fetch(user_id) for user_id in unknown))
+
+        for user_id, (name, email) in resolved.items():
+            if name:
+                self.user_id_to_name_cache[user_id] = name
+                if ctx is not None:
+                    ctx.user_id_to_name[user_id] = name
+            if email:
+                self.user_id_to_email_cache.setdefault(user_id, email)
+                if ctx is not None:
+                    ctx.user_id_to_email.setdefault(user_id, email)
+
+    @staticmethod
+    def _extract_user_mentions(text: str) -> list[str]:
+        """Extract Slack user IDs from <@U…> / <@W…> / <@U…|label> syntax."""
+        return re.findall(r"<@([UW]\w+)(?:\|[^>]+)?>", text)
+
+    @staticmethod
+    def _extract_channel_mentions(text: str) -> list[str]:
+        """Extract Slack channel IDs from <#C…> / <#G…> syntax."""
+        return re.findall(r"<#([CG]\w+)(?:\|[^>]+)?>", text)
+
+    def _replace_mentions_in_text(
+        self,
+        text: str,
+        user_id_to_name: dict[str, str],
+        channel_id_to_name: dict[str, str],
+    ) -> str:
+        """
+        Replace Slack mention syntax with actual names:
+        - <@U09AEBH69JS> → @John Doe (or @email if name not available)
+        - <#C123|general> → #general
+        - <#C123> → #Channel Name
+
+        Args:
+            text: Original message text with Slack mention syntax
+            user_id_to_name: Mapping of Slack user_id → user name
+            channel_id_to_name: Mapping of Slack channel_id → channel name
+
+        Returns:
+            Text with mentions replaced by names
+        """
+        if not text:
+            return text
+
+        # Replace user mentions: <@U09AEBH69JS> or <@U09AEBH69JS|display_name>
+        def replace_user_mention(match) -> str:
+            user_id = match.group(1)
+            display_name = match.group(2) if match.group(2) else None
+
+            # Use display name from mention if available, otherwise lookup in cache
+            if display_name:
+                return f"@{display_name}"
+
+            # Lookup user name in cache
+            name = user_id_to_name.get(user_id)
+            if name:
+                return f"@{name}"
+
+            # Fallback to email if available
+            email = self.user_id_to_email_cache.get(user_id)
+            if email:
+                return f"@{email}"
+
+            # Final fallback: keep the user ID (log warning for cache miss)
+            self.logger.debug(f"User mention cache miss for user_id: {user_id}")
+            return f"@{user_id}"
+
+        # Pattern: <@U09AEBH69JS> or <@U09AEBH69JS|display_name>
+        text = re.sub(r"<@([UW]\w+)(?:\|([^>]+))?>", replace_user_mention, text)
+
+        # Replace channel mentions: <#C123> or <#C123|channel-name>
+        def replace_channel_mention(match) -> str:
+            channel_id = match.group(1)
+            display_name = match.group(2) if match.group(2) else None
+
+            # Use display name from mention if available
+            if display_name:
+                return f"#{display_name}"
+
+            # Lookup channel name in cache
+            name = channel_id_to_name.get(channel_id)
+            if name:
+                return f"#{name}"
+
+            # Fallback: keep the channel ID (log warning for cache miss)
+            self.logger.debug(f"Channel mention cache miss for channel_id: {channel_id}")
+            return f"#{channel_id}"
+
+        # Pattern: <#C123> or <#C123|channel-name>
+        text = re.sub(r"<#([CG]\w+)(?:\|([^>]+))?>", replace_channel_mention, text)
+        
+        return text
+
+    @staticmethod
+    def _extract_urls(text: str) -> list[str]:
+        """Extract HTTP/HTTPS URLs from both Slack mrkdwn and plain text."""
+        return [
+            m[0] or m[1]
+            for m in re.findall(r"<(https?://[^>|]+)(?:\|[^>]+)?>|(https?://\S+)", text)
+            if m[0] or m[1]
+        ]
+
+    def _related_for_messages(self, msgs: list[dict[str, Any]]) -> list[RelatedExternalRecord]:
+        """The records these messages link to, named by address.
+
+        Saved on the message record, so the message is joined to the pull request,
+        ticket or page it pastes, in whichever connector holds it (see
+        ``record_links``). Built from every message the record holds: saving the
+        record drops the links left out.
+        """
+        return related_for_urls([
+            url for msg in msgs for url in self._extract_urls(msg.get("text", ""))
+        ])
+
+    # =========================================================================
+    # 10.  Link classification
+    # =========================================================================
+
+    @staticmethod
+    def _bot_display_name(msg: dict[str, Any]) -> Optional[str]:
+        bot_profile = msg.get("bot_profile") or {}
+        name = bot_profile.get("name") or msg.get("username")
+        return name.strip() if isinstance(name, str) and name.strip() else None
+
+    @staticmethod
+    def _classify_url(url: str) -> tuple[str, dict[str, Any]]:
+        from urllib.parse import urlparse
+        try:
+            p    = urlparse(url)
+            host = (p.hostname or "").lower()
+
+            def _host_matches(h: str, *domains: str) -> bool:
+                # Exact host or proper dot-prefixed subdomain only; prevents
+                # spoofs like "evil-atlassian.net" or "github.com.attacker.io".
+                return any(h == d or h.endswith("." + d) for d in domains)
+
+            if _host_matches(host, "atlassian.net") or "jira" in host.split("."):
+                m = re.search(r"/browse/([A-Z]+-\d+)", p.path)
+                return "jira", {"ticket_key": m.group(1), "url": url} if m else {"url": url}
+
+            if _host_matches(host, "github.com"):
+                m = re.search(r"/([^/]+)/([^/]+)/(issues|pull)/(\d+)", p.path)
+                if m:
+                    return "github", {
+                        "owner": m.group(1), "repo": m.group(2),
+                        "type":  m.group(3), "number": m.group(4), "url": url,
+                    }
+                return "github", {"url": url}
+
+            if _host_matches(host, "drive.google.com", "docs.google.com"):
+                m = re.search(r"/d/([a-zA-Z0-9-_]+)", p.path)
+                return "gdrive", {"file_id": m.group(1), "url": url} if m else {"url": url}
+
+            return "web", {"url": url}
+        except Exception:
+            return "web", {"url": url}
+
+    @staticmethod
+    def _unfurl_data(url: str, msg: dict[str, Any]) -> dict[str, Any]:
+        """Match a URL to its Slack attachment (unfurl) metadata."""
+        for att in msg.get("attachments", []):
+            from_url = att.get("from_url", "")
+            if from_url == url or url in from_url:
+                return {
+                    "service_name": att.get("service_name"),
+                    "title":        att.get("title"),
+                    "text":         att.get("text"),
+                    "image_url":    att.get("image_url"),
+                    "fields":       att.get("fields", []),
+                    "author_name":  att.get("author_name"),
+                }
+        return {}
+
+    # =========================================================================
+    # 11.  Streaming
+    # =========================================================================
+
+    async def stream_record(
+        self,
+        record:    Record,
+        user_id:   Optional[str] = None,
+        convertTo: Optional[str] = None,
+    ) -> StreamingResponse:
+        try:
+            if record.record_type == RecordType.MESSAGE:
+                content_bytes = await self._build_message_blocks_for_streaming(record)
+
+                return StreamingResponse(
+                    iter([content_bytes]),
+                    media_type=MimeTypes.BLOCKS.value,
+                    headers={"Content-Disposition":
+                             f'inline; filename="msg_{record.external_record_id}.json"'}
+                )
+
+            if record.record_type == RecordType.FILE:
+                return create_stream_record_response(
+                    self._stream_file_bytes(record),
+                    filename=record.record_name or record.external_record_id,
+                    mime_type=record.mime_type,
+                    fallback_filename=f"file_{record.id}",
+                )
+
+            if record.record_type == RecordType.LINK:
+                # Stream link as markdown (same as Linear connector)
+                if not record.weburl:
+                    raise not_downloadable(
+                        f"LinkRecord {record.external_record_id} has no URL to open.",
+                        connector=self.display_name,
+                    )
+                link_name = record.record_name or "Link"
+                markdown_content = f"# {link_name}\n\n[{record.weburl}]({record.weburl})"
+                return StreamingResponse(
+                    iter([markdown_content.encode("utf-8")]),
+                    media_type=MimeTypes.MARKDOWN.value,
+                    headers={
+                        "Content-Disposition": f'inline; filename="{record.external_record_id}.md"'
+                    },
+                )
+
+            raise HTTPException(400, f"Unsupported record type: {record.record_type}")
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            self.logger.error(f"stream_record failed: {exc}", exc_info=True)
+            raise to_stream_error(exc, connector=self.display_name) from exc
+
+    async def _build_message_blocks_for_streaming(
+        self, record: MessageRecord
+    ) -> bytes:
+        """
+        Rebuild a BlocksContainer on-demand for a message record and return
+        serialised JSON bytes.  Handles burst, thread, and single-message
+        record sub-types by fetching the relevant messages from the Slack API.
+        """
+        ext_id = record.external_record_id
+        ch     = record.external_record_group_id
+        if not ext_id or not ch:
+            raise HTTPException(400, f"Missing id/channel for record {record.id}")
+
+        ch = self._channel_ext_id(ch)
+
+        rg_id = getattr(record, "record_group_id", None)
+        ctx   = self._make_ctx(ch, rg_id)
+
+        # ── Burst record: fetch messages in the time window ───────────────
+        if ext_id.startswith("burst_"):
+            start_ts = getattr(record, "start_ts", None)
+            end_ts   = getattr(record, "end_ts", None)
+            if not start_ts or not end_ts:
+                raise HTTPException(400, f"Burst record {ext_id} missing start_ts/end_ts")
+
+            await self.rate_limiter.acquire(Tier.T3)
+            ds   = await self._fresh_datasource()
+            resp = await ds.conversations_history(
+                channel=ch, oldest=start_ts, latest=end_ts,
+                inclusive=True, limit=200,
+            )
+            if not resp or not resp.success:
+                raise slack_stream_error(resp, connector=self.display_name)
+
+            burst_msgs = sorted(
+                [m for m in resp.data.get("messages", [])
+                 if m.get("ts") and start_ts <= m["ts"] <= end_ts],
+                key=lambda m: m["ts"],
+            )
+            if not burst_msgs:
+                raise HTTPException(404, f"No messages found for burst: {ext_id}")
+
+            await self._warm_user_cache_for_messages(burst_msgs, ctx)
+
+            # Resolve file ChildRecords from DB, keyed by message ts
+            file_children_by_ts: dict[str, list[ChildRecord]] = {}
+            try:
+                child_records = await self.data_entities_processor.get_records_by_parent(
+                    connector_id=self.connector_id,
+                    parent_external_record_id=ext_id,
+                    record_type=RecordType.FILE.value,
+                )
+                ext_id_to_child: dict[str, ChildRecord] = {}
+                for cr in (child_records or []):
+                    ext_id_to_child[cr.external_record_id] = ChildRecord(
+                        child_type=ChildType.RECORD, child_id=cr.id, child_name=cr.record_name
+                    )
+                for msg in burst_msgs:
+                    mts = msg.get("ts", "")
+                    for fd in msg.get("files", []):
+                        fid = fd.get("id", "")
+                        if fid in ext_id_to_child:
+                            file_children_by_ts.setdefault(mts, []).append(ext_id_to_child[fid])
+            except Exception:
+                pass
+
+            bc = self._build_burst_block_containers(
+                burst_msgs, ext_id, ctx, file_child_records=file_children_by_ts
+            )
+
+        # ── Thread burst record: fetch thread replies in burst window ────
+        elif ext_id.startswith("thread_burst_"):
+            start_ts = getattr(record, "start_ts", None)
+            end_ts   = getattr(record, "end_ts", None)
+            thread_ts_val = getattr(record, "thread_id", None)
+            if not start_ts or not end_ts or not thread_ts_val:
+                raise HTTPException(
+                    400,
+                    f"Thread burst record {ext_id} missing start_ts/end_ts/thread_id",
+                )
+
+            await self.rate_limiter.acquire(Tier.T3)
+            ds   = await self._fresh_datasource()
+            resp = await ds.conversations_replies(
+                channel=ch, ts=thread_ts_val,
+                oldest=start_ts, latest=end_ts,
+                inclusive=True, limit=200,
+            )
+            if not resp or not resp.success:
+                raise slack_stream_error(resp, connector=self.display_name)
+
+            burst_msgs = sorted(
+                [m for m in resp.data.get("messages", [])
+                 if m.get("ts") and start_ts <= m["ts"] <= end_ts],
+                key=lambda m: m["ts"],
+            )
+            if not burst_msgs:
+                raise HTTPException(404, f"No messages found for thread burst: {ext_id}")
+
+            await self._warm_user_cache_for_messages(burst_msgs, ctx)
+
+            file_children_by_ts: dict[str, list[ChildRecord]] = {}
+            try:
+                child_records = await self.data_entities_processor.get_records_by_parent(
+                    connector_id=self.connector_id,
+                    parent_external_record_id=ext_id,
+                    record_type=RecordType.FILE.value,
+                )
+                ext_id_to_child: dict[str, ChildRecord] = {}
+                for cr in (child_records or []):
+                    ext_id_to_child[cr.external_record_id] = ChildRecord(
+                        child_type=ChildType.RECORD, child_id=cr.id, child_name=cr.record_name
+                    )
+                for msg in burst_msgs:
+                    mts = msg.get("ts", "")
+                    for fd in msg.get("files", []):
+                        fid = fd.get("id", "")
+                        if fid in ext_id_to_child:
+                            file_children_by_ts.setdefault(mts, []).append(ext_id_to_child[fid])
+            except Exception:
+                pass
+
+            bc = self._build_burst_block_containers(
+                burst_msgs, ext_id, ctx, file_child_records=file_children_by_ts
+            )
+
+        # ── Single message record ─────────────────────────────────────────
+        else:
+            await self.rate_limiter.acquire(Tier.T3)
+            ds   = await self._fresh_datasource()
+            resp = await ds.conversations_history(
+                channel=ch, oldest=ext_id, latest=ext_id,
+                inclusive=True, limit=1,
+            )
+            msg = None
+            if resp and resp.success:
+                msgs = resp.data.get("messages", [])
+                if msgs:
+                    msg = msgs[0]
+
+            if not msg:
+                tid = getattr(record, "thread_id", None)
+                if tid and tid != ext_id:
+                    await self.rate_limiter.acquire(Tier.T3)
+                    resp = await (await self._fresh_datasource()).conversations_replies(
+                        channel=ch, ts=tid, oldest=ext_id, latest=ext_id,
+                        inclusive=True, limit=1,
+                    )
+                    if resp and resp.success:
+                        msgs = resp.data.get("messages", [])
+                        if msgs:
+                            msg = msgs[0]
+
+            if not msg:
+                # Only an empty result from a *successful* fetch means the
+                # message is gone; a failed call says nothing about that.
+                if not resp or not resp.success:
+                    raise slack_stream_error(resp, connector=self.display_name)
+                raise HTTPException(404, f"Message not found: {ext_id}")
+
+            await self._warm_user_cache_for_messages([msg], ctx)
+
+            # Resolve file ChildRecords
+            file_children: list[ChildRecord] = []
+            try:
+                child_records = await self.data_entities_processor.get_records_by_parent(
+                    connector_id=self.connector_id,
+                    parent_external_record_id=ext_id,
+                    record_type=RecordType.FILE.value,
+                )
+                for cr in (child_records or []):
+                    file_children.append(
+                        ChildRecord(child_type=ChildType.RECORD, child_id=cr.id, child_name=cr.record_name)
+                    )
+            except Exception:
+                pass
+
+            bc = self._build_single_block_containers(
+                msg, ctx, children_records=file_children or None
+            )
+
+        blocks_json = bc.model_dump_json(indent=2, exclude_none=True)
+        return blocks_json.encode("utf-8")
+
+    async def _stream_file_bytes(
+        self, record: FileRecord
+    ) -> AsyncGenerator[bytes, None]:
+        fid = record.external_record_id
+        if not fid:
+            raise HTTPException(400, f"No file ID for {record.id}")
+
+        await self.rate_limiter.acquire(Tier.T4)
+        ds   = await self._fresh_datasource()
+        info = await ds.files_info(file=fid)
+        if not info or not info.success:
+            raise slack_stream_error(info, connector=self.display_name)
+
+        fd  = info.data.get("file", {})
+        url = fd.get("url_private_download") or fd.get("url_private")
+        if not url:
+            raise not_downloadable(
+                f"Slack does not expose a download URL for file {fid}.",
+                connector=self.display_name,
+            )
+
+        token = ds.access_token
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with http.stream("GET", url, headers=headers) as r:
+                if r.status_code != 200:
+                    self.logger.error(
+                        f"Slack file download for {fid} failed with status {r.status_code}"
+                    )
+                    raise map_source_status(
+                        r.status_code,
+                        connector=self.display_name,
+                        retry_after=sanitize_retry_after(r.headers.get("retry-after")),
+                    )
+                content_type = r.headers.get("content-type", "")
+                if "text/html" in content_type:
+                    # Slack serves its sign-in page (200 text/html) instead of the
+                    # file when the token no longer authorises the download.
+                    self.logger.error(
+                        f"Received HTML instead of file content for {fid} — likely an auth issue"
+                    )
+                    raise map_source_status(
+                        HttpStatusCode.UNAUTHORIZED.value, connector=self.display_name
+                    )
+                async for chunk in r.aiter_bytes(8192):
+                    yield chunk
+
+
+    # =========================================================================
+    # 12.  Reindexing
+    # =========================================================================
+
+    async def reindex_records(self, record_results: list[Record]) -> None:
+        """
+        Reindex a batch of records:
+          - Changed records → on_record_content_update (DB write + re-index event)
+          - Unchanged records → reindex_existing_records (re-index event only)
+        """
+        if not record_results:
+            return
+
+        self.logger.info(f"Re-indexing {len(record_results)} records…")
+        updated:     list[tuple[Record, list[Permission]]] = []
+        not_updated: list[Record]                          = []
+
+        for rec in record_results:
+            try:
+                result = await self._check_updated(rec)
+                if result:
+                    updated.append(result)
+                else:
+                    not_updated.append(rec)
+            except Exception as exc:
+                self.logger.error(f"reindex check failed for {rec.id}: {exc}")
+
+        for rec, perms in updated:
+            await self.data_entities_processor.on_record_content_update(rec)
+            if perms:
+                await self.data_entities_processor.on_updated_record_permissions(rec, perms)
+
+        if not_updated:
+            await self.data_entities_processor.reindex_existing_records(not_updated)
+
+        self.logger.info(
+            f"Reindex done — updated: {len(updated)}, unchanged: {len(not_updated)}"
+        )
+
+    async def _check_updated(
+        self, rec: Record
+    ) -> Optional[tuple[Record, list[Permission]]]:
+        if rec.record_type == RecordType.MESSAGE:
+            return await self._check_updated_message(rec)
+        if rec.record_type == RecordType.FILE:
+            return await self._check_updated_file(rec)
+        return None   # Links are derived; they don't change independently
+
+    async def _check_updated_message(
+        self, rec: MessageRecord
+    ) -> Optional[tuple[Record, list[Permission]]]:
+        ts = rec.external_record_id
+        ch = rec.external_record_group_id
+        if not ts or not ch:
+            return None
+
+        # Burst records and thread-burst records are synthetic aggregates.
+        # They are updated via _check_channel_changes, not here.
+        if rec.external_record_id and rec.external_record_id.startswith(("burst_", "thread_burst_")):
+            return None
+
+        await self.rate_limiter.acquire(Tier.T3)
+        ds   = await self._fresh_datasource()
+        resp = await ds.conversations_history(
+            channel=ch, oldest=ts, latest=ts, inclusive=True, limit=1
+        )
+
+        md: Optional[dict[str, Any]] = None
+        if resp and resp.success:
+            msgs = resp.data.get("messages", [])
+            if msgs:
+                md = msgs[0]
+
+        if not md:
+            tid = getattr(rec, "thread_id", None)
+            if tid and tid != ts:
+                await self.rate_limiter.acquire(Tier.T3)
+                r2 = await (await self._fresh_datasource()).conversations_replies(
+                    channel=ch, ts=tid, oldest=ts, latest=ts, inclusive=True, limit=1
+                )
+                if r2 and r2.success:
+                    msgs = r2.data.get("messages", [])
+                    if msgs:
+                        md = msgs[0]
+
+        if not md:
+            return None
+
+        if not self._record_changed(md, rec):
+            return None
+
+        rg_id = getattr(rec, "record_group_id", None)
+        ctx   = ProcessingContext(
+            channel_id=ch,
+            channel_groups_map={ch: rg_id} if rg_id else {},
+            root_rg_id=await self._reindex_root_rg_id(rec, ch),
+            root_resolved=True,
+            user_id_to_email=dict(self.user_id_to_email_cache),
+            user_id_to_name=dict(self.user_id_to_name_cache),
+            channel_id_to_name=dict(self.channel_id_to_name_cache),
+            rate_limiter=self.rate_limiter,
+        )
+        updated = await self._to_message_record(md, ctx)
+        if not updated:
+            return None
+
+        updated.id      = rec.id
+        updated.version = rec.version + 1
+        return (updated, [])
+
+    async def _check_updated_file(
+        self, rec: FileRecord
+    ) -> Optional[tuple[Record, list[Permission]]]:
+        fid = rec.external_record_id
+        if not fid:
+            return None
+
+        await self.rate_limiter.acquire(Tier.T4)
+        ds   = await self._fresh_datasource()
+        info = await ds.files_info(file=fid)
+        if not info or not info.success:
+            return None
+
+        fd = info.data.get("file", {})
+        if not fd:
+            return None
+
+        file_ts    = int(fd.get("created", 0)) * 1000
+        existing_ts = rec.source_updated_at or rec.source_created_at
+        if existing_ts and file_ts <= existing_ts:
+            return None
+
+        # Need the parent message to set parent_node_id correctly
+        parent_ext_id = rec.parent_external_record_id
+        ch            = rec.external_record_group_id
+        if not parent_ext_id or not ch:
+            return None
+
+        try:
+            parent = await self.data_entities_processor.get_record_by_external_id(
+                connector_id=self.connector_id, external_record_id=parent_ext_id
+            )
+        except Exception:
+            parent = None
+
+        if not parent or not isinstance(parent, MessageRecord):
+            return None
+
+        rg_id = getattr(rec, "record_group_id", None)
+        ctx   = ProcessingContext(
+            channel_id=ch,
+            channel_groups_map={ch: rg_id} if rg_id else {},
+            root_rg_id=await self._reindex_root_rg_id(rec, ch),
+            root_resolved=True,
+            user_id_to_email=dict(self.user_id_to_email_cache),
+            user_id_to_name=dict(self.user_id_to_name_cache),
+            channel_id_to_name=dict(self.channel_id_to_name_cache),
+            rate_limiter=self.rate_limiter,
+        )
+        updated = await self._process_file(fd, parent, ctx)
+        if not updated:
+            return None
+
+        updated.id      = rec.id
+        updated.version = rec.version + 1
+        return (updated, [])
+
+    # =========================================================================
+    # 13.  Dynamic filter options
+    # =========================================================================
+
+    async def _ensure_user_caches_for_filters(self) -> None:
+        """
+        Guarantee that user_id_to_name_cache and user_id_to_email_cache are
+        populated before building filter labels.
+
+        Tries the cheap DB path first (_refresh_user_caches).  If the name
+        cache is still empty afterwards, falls back to the full API warm-up.
+        """
+        await self._refresh_user_caches()
+
+        if self.user_id_to_name_cache:
+            await self._sync_deactivated_user_ids()
+            return
+
+        # Fallback: warm from the Slack API
+        self.logger.debug("User name cache empty after DB refresh — warming via API")
+        await self._warm_all_user_caches()
+
+    def _channel_display_name(self, c: dict[str, Any]) -> str:
+        """Return a user-friendly label for any channel type."""
+        cid = c.get("id", "")
+
+        if c.get("is_im"):
+            uid = c.get("user", "")
+            if uid == "USLACKBOT":
+                return "DM: Slackbot"
+            display = (
+                self.user_id_to_name_cache.get(uid)
+                or self.user_id_to_email_cache.get(uid)
+                or uid or cid
+            )
+            return f"DM: {display}"
+
+        if c.get("is_mpim"):
+            return self._resolve_mpim_name(c)
+
+        return c.get("name") or f"Channel: {cid}"
+
+    async def _populate_channel_filter_cache(self) -> None:
+        """Fetch all channels from Slack and rebuild the in-memory filter cache."""
+        if self._cache_rebuild_event is not None:
+            await self._cache_rebuild_event.wait()
+            return
+
+        self._cache_rebuild_event = asyncio.Event()
+        try:
+            await self._ensure_user_caches_for_filters()
+
+            tmp: dict[str, dict[str, str]] = {}
+            api_cursor: Optional[str] = None
+            types_param = await self._listable_channel_types_param(ALL_CHANNEL_API_TYPES)
+
+            while True:
+                await self.rate_limiter.acquire(Tier.T2)
+                ds = await self._fresh_datasource()
+                resp = await ds.conversations_list(
+                    exclude_archived=True,
+                    types=types_param,
+                    limit=PAGE_SIZE_CHANNELS,
+                    cursor=api_cursor,
+                )
+
+                if not resp or not resp.success:
+                    error = getattr(resp, "error", "no response") if resp else "no response"
+                    raise RuntimeError(f"conversations.list cache rebuild failed: {error}")
+
+                data = resp.data or {}
+                for ch in data.get("channels", []):
+                    cid = ch.get("id")
+                    if not cid:
+                        continue
+                    if (
+                        not ch.get("is_im")
+                        and not ch.get("is_mpim")
+                        and not ch.get("is_member")
+                    ):
+                        continue
+                    if not self._should_include_channel_in_filter(ch):
+                        continue
+                    tmp[cid] = {
+                        "id": cid,
+                        "label": self._channel_display_name(ch),
+                    }
+
+                api_cursor = data.get("response_metadata", {}).get("next_cursor") or None
+                if not api_cursor:
+                    break
+
+            self.channel_filter_cache = tmp
+            self.logger.info(
+                "Channel filter cache rebuilt: %d channels", len(self.channel_filter_cache)
+            )
+        finally:
+            ev = self._cache_rebuild_event
+            self._cache_rebuild_event = None
+            ev.set()
+
+    async def get_filter_options(
+        self,
+        filter_key: str,
+        page:   int = 1,
+        limit:  int = 20,
+        search: Optional[str] = None,
+        cursor: Optional[str] = None,
+    ) -> FilterOptionsResponse:
+        if filter_key != "channel_ids":
+            raise ValueError(f"Unknown filter key: {filter_key}")
+
+        try:
+            page  = max(1, page)
+            limit = max(1, min(limit, 100))
+
+            if not self.channel_filter_cache or not search or not search.strip():
+                await self._populate_channel_filter_cache()
+
+            channels = list(self.channel_filter_cache.values())
+            channels.sort(key=lambda c: (c.get("label", "").lower(), c.get("id", "")))
+
+            if search and search.strip():
+                sl = search.strip().lower()
+                channels = [
+                    c for c in channels
+                    if sl in c.get("label", "").lower() or sl in c.get("id", "").lower()
+                ]
+
+            if cursor:
+                try:
+                    offset = max(0, int(cursor))
+                except ValueError:
+                    offset = 0
+            else:
+                offset = (page - 1) * limit
+
+            page_items = channels[offset : offset + limit]
+            options = [
+                FilterOption(id=item["id"], label=item["label"])
+                for item in page_items
+            ]
+
+            next_offset = offset + len(page_items)
+            has_more    = next_offset < len(channels)
+            next_cursor = str(next_offset) if has_more else None
+
+            return FilterOptionsResponse(
+                success=True, options=options, page=page, limit=limit,
+                has_more=has_more,
+                cursor=next_cursor,
+            )
+
+        except Exception as exc:
+            self.logger.error(f"get_filter_options: {exc}", exc_info=True)
+            return FilterOptionsResponse(
+                success=False, options=[], page=page, limit=limit,
+                has_more=False, message=str(exc),
+            )
+
+    # =========================================================================
+    # 14.  BaseConnector interface
+    # =========================================================================
+
+    async def test_connection_and_access(self) -> bool:
+        try:
+            ds   = await self._fresh_datasource()
+            resp = await ds.check_token_scopes()
+            return bool(resp and resp.success)
+        except Exception as exc:
+            self.logger.error(f"Connection test failed: {exc}")
+            return False
+
+    async def run_incremental_sync(self) -> None:
+        await self.run_sync()
+
+    async def cleanup(self) -> None:
+        self.logger.info("Slack connector cleanup complete")
+
+    async def get_signed_url(self, record: Record) -> str:
+        return ""   # Slack uses OAuth bearer tokens, not signed URLs
+
+    async def handle_webhook_notification(self, notification: dict) -> None:
+        self.logger.warning("Webhook notifications not yet implemented for Slack")
+
+    # =========================================================================
+    # 15.  Factory
+    # =========================================================================
+
+    @classmethod
+    async def create_connector(
+        cls,
+        logger:               Logger,
+        data_store_provider:  DataStoreProvider,
+        config_service:       ConfigurationService,
+        connector_id:         str,
+        scope:                str,
+        created_by:           str,
+        data_entities_processor,
+        **kwargs,
+    ) -> "SlackIndividualConnector":
+        return cls(
+            logger, data_entities_processor, data_store_provider, config_service,
+            connector_id, scope, created_by,
+        )

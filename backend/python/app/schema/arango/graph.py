@@ -1,0 +1,230 @@
+from app.config.constants.arangodb import CollectionNames
+
+# Define all edge definitions
+EDGE_DEFINITIONS = [
+    {
+        "edge_collection": CollectionNames.BELONGS_TO.value,
+        # A record group belongs to its org, its App and its parent group; the
+        # processor writes all three on every sync.
+        "from_vertex_collections": [
+            CollectionNames.USERS.value,
+            CollectionNames.RECORDS.value,
+            CollectionNames.FILES.value,
+            CollectionNames.RECORD_GROUPS.value,
+        ],
+        "to_vertex_collections": [
+            CollectionNames.GROUPS.value,
+            CollectionNames.ORGS.value,
+            CollectionNames.RECORD_GROUPS.value,
+            CollectionNames.APPS.value,
+        ],
+    },
+    {
+        "edge_collection": CollectionNames.INHERIT_PERMISSIONS.value,
+        # From child to parent, the direction every write uses: a record
+        # inherits from its parent record or its record group, and a top-level
+        # group from its App.
+        "from_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.RECORD_GROUPS.value,
+        ],
+        "to_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.RECORD_GROUPS.value,
+            CollectionNames.APPS.value,
+        ],
+    },
+    {
+        "edge_collection": CollectionNames.ORG_DEPARTMENT_RELATION.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.DEPARTMENTS.value],
+    },
+    {
+        "edge_collection": CollectionNames.BELONGS_TO_DEPARTMENT.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [CollectionNames.DEPARTMENTS.value],
+    },
+    {
+        "edge_collection": CollectionNames.BELONGS_TO_CATEGORY.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [
+            CollectionNames.CATEGORIES.value,
+            CollectionNames.SUBCATEGORIES1.value,
+            CollectionNames.SUBCATEGORIES2.value,
+            CollectionNames.SUBCATEGORIES3.value,
+        ],
+    },
+    {
+        "edge_collection": CollectionNames.BELONGS_TO_TOPIC.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [CollectionNames.TOPICS.value],
+    },
+    {
+        "edge_collection": CollectionNames.MENTIONS_ENTITY.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [CollectionNames.NAMED_ENTITIES.value],
+    },
+    {
+        "edge_collection": CollectionNames.BELONGS_TO_LANGUAGE.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [CollectionNames.LANGUAGES.value],
+    },
+    {
+        "edge_collection": CollectionNames.INTER_CATEGORY_RELATIONS.value,
+        "from_vertex_collections": [CollectionNames.CATEGORIES.value, CollectionNames.SUBCATEGORIES1.value, CollectionNames.SUBCATEGORIES2.value, CollectionNames.SUBCATEGORIES3.value],
+        "to_vertex_collections": [CollectionNames.CATEGORIES.value, CollectionNames.SUBCATEGORIES1.value, CollectionNames.SUBCATEGORIES2.value, CollectionNames.SUBCATEGORIES3.value],
+    },
+    {
+        "edge_collection": CollectionNames.IS_OF_TYPE.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [
+            CollectionNames.FILES.value,
+            CollectionNames.MAILS.value,
+            CollectionNames.WEBPAGES.value,
+            CollectionNames.COMMENTS.value,
+            CollectionNames.TICKETS.value,
+            CollectionNames.MEETINGS.value,
+            CollectionNames.ARTIFACTS.value,
+            CollectionNames.SQL_TABLES.value,
+            CollectionNames.SQL_VIEWS.value,
+        ],
+    },
+    {
+        "edge_collection": CollectionNames.NODE_RELATIONS.value,
+        # The hierarchy runs from the App through record groups to records.
+        "from_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.FILES.value,
+            CollectionNames.RECORD_GROUPS.value,
+            CollectionNames.APPS.value,
+        ],
+        "to_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.FILES.value,
+            CollectionNames.RECORD_GROUPS.value,
+        ],
+    },
+    {
+        # Links between records, apart from the hierarchy.
+        "edge_collection": CollectionNames.RECORD_LINKS.value,
+        # Code-graph edges are links too (record->block CONTAINS, block->block CALLS).
+        "from_vertex_collections": [CollectionNames.RECORDS.value, CollectionNames.BLOCKS.value],
+        "to_vertex_collections": [CollectionNames.RECORDS.value, CollectionNames.BLOCKS.value],
+    },
+    {
+        "edge_collection": CollectionNames.USER_DRIVE_RELATION.value,
+        "from_vertex_collections": [CollectionNames.USERS.value],
+        "to_vertex_collections": [CollectionNames.DRIVES.value],
+    },
+    {
+        "edge_collection": CollectionNames.USER_APP_RELATION.value,
+        # people: an external collaborator who is not yet a platform user still needs
+        # app membership so their shared records are reachable in browse.
+        "from_vertex_collections": [
+            CollectionNames.USERS.value,
+            CollectionNames.TEAMS.value,
+            CollectionNames.PEOPLE.value,
+        ],
+        "to_vertex_collections": [CollectionNames.APPS.value],
+    },
+    {
+        "edge_collection": CollectionNames.AUTHENTICATED_AS.value,
+        "from_vertex_collections": [CollectionNames.USERS.value],
+        "to_vertex_collections": [CollectionNames.USERS.value],
+    },
+    {
+        "edge_collection": CollectionNames.ORG_APP_RELATION.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.APPS.value],
+    },
+    {
+        "edge_collection": CollectionNames.PERMISSION.value,
+        # people: external collaborators hold grants on individual records before
+        # (or without ever) becoming platform users.
+        "from_vertex_collections": [CollectionNames.USERS.value, CollectionNames.TEAMS.value, CollectionNames.ROLES.value, CollectionNames.GROUPS.value, CollectionNames.ORGS.value, CollectionNames.PEOPLE.value],
+        # APPS: a collection grant is a permission edge from the user to the App.
+        "to_vertex_collections": [CollectionNames.AGENT_INSTANCES.value, CollectionNames.AGENT_TEMPLATES.value, CollectionNames.TEAMS.value, CollectionNames.ROLES.value, CollectionNames.RECORDS.value, CollectionNames.RECORD_GROUPS.value, CollectionNames.AGENT_SKILLS.value, CollectionNames.APPS.value],
+    },
+    {
+        "edge_collection": CollectionNames.ENTITY_RELATIONS.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [CollectionNames.USERS.value],
+    },
+    # Agent Builder Graph Edges
+    {
+        "edge_collection": CollectionNames.AGENT_HAS_TOOLSET.value,
+        "from_vertex_collections": [CollectionNames.AGENT_INSTANCES.value],
+        "to_vertex_collections": [CollectionNames.AGENT_TOOLSETS.value],
+    },
+    {
+        "edge_collection": CollectionNames.TOOLSET_HAS_TOOL.value,
+        "from_vertex_collections": [CollectionNames.AGENT_TOOLSETS.value],
+        "to_vertex_collections": [CollectionNames.AGENT_TOOLS.value],
+    },
+    {
+        "edge_collection": CollectionNames.AGENT_HAS_KNOWLEDGE.value,
+        "from_vertex_collections": [CollectionNames.AGENT_INSTANCES.value],
+        "to_vertex_collections": [CollectionNames.AGENT_KNOWLEDGE.value],
+    },
+    {
+        "edge_collection": CollectionNames.AGENT_HAS_MCP_SERVER.value,
+        "from_vertex_collections": [CollectionNames.AGENT_INSTANCES.value],
+        "to_vertex_collections": [CollectionNames.AGENT_MCP_SERVERS.value],
+    },
+    {
+        "edge_collection": CollectionNames.MCP_SERVER_HAS_TOOL.value,
+        "from_vertex_collections": [CollectionNames.AGENT_MCP_SERVERS.value],
+        "to_vertex_collections": [CollectionNames.AGENT_TOOLS.value],
+    },
+    # Agent Skills Graph Edges
+    {
+        "edge_collection": CollectionNames.AGENT_SKILL_RELATION.value,
+        "from_vertex_collections": [CollectionNames.AGENT_SKILLS.value],
+        "to_vertex_collections": [CollectionNames.AGENT_SKILLS.value],
+    },
+    {
+        "edge_collection": CollectionNames.AGENT_HAS_SKILL.value,
+        "from_vertex_collections": [CollectionNames.AGENT_INSTANCES.value],
+        "to_vertex_collections": [CollectionNames.AGENT_SKILLS.value],
+    },
+    {
+        "edge_collection": CollectionNames.PROSPECT.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.ORGS.value],
+    },
+    {
+        "edge_collection": CollectionNames.CUSTOMER.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.ORGS.value],
+    },
+    {
+        "edge_collection": CollectionNames.LEAD.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.PEOPLE.value],
+    },
+    {
+        "edge_collection": CollectionNames.CONTACT.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.PEOPLE.value],
+    },
+    {
+        "edge_collection": CollectionNames.DEAL_INFO.value,
+        "from_vertex_collections": [CollectionNames.ORGS.value],
+        "to_vertex_collections": [CollectionNames.RECORDS.value],
+    },
+    {
+        "edge_collection": CollectionNames.DEAL_OF.value,
+        "from_vertex_collections": [CollectionNames.RECORD_GROUPS.value],
+        "to_vertex_collections": [CollectionNames.ORGS.value],
+    },
+    {
+        "edge_collection": CollectionNames.SOLD_IN.value,
+        "from_vertex_collections": [CollectionNames.RECORDS.value],
+        "to_vertex_collections": [CollectionNames.RECORDS.value],
+    },
+    {
+        "edge_collection": CollectionNames.MEMBER_OF.value,
+        "from_vertex_collections": [CollectionNames.PEOPLE.value],
+        "to_vertex_collections": [CollectionNames.ORGS.value],
+    },
+]

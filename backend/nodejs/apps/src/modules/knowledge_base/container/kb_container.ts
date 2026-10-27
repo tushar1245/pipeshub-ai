@@ -1,0 +1,140 @@
+import { Container } from 'inversify';
+import { Logger } from '../../../libs/services/logger.service';
+import { ConfigurationManagerConfig } from '../../configuration_manager/config/config';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import { AuthTokenService } from '../../../libs/services/authtoken.service';
+import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
+import { AppConfig } from '../../tokens_manager/config/config';
+import { SyncEventProducer } from '../services/sync_events.service';
+import { IMessageProducer } from '../../../libs/types/messaging.types';
+import {
+  resolveMessageBrokerConfig,
+  createMessageProducer,
+} from '../../../libs/services/message-broker.factory';
+
+const loggerConfig = {
+  service: 'Knowledge Base Service',
+};
+
+export class KnowledgeBaseContainer {
+  protected static instance: Container;
+  protected static logger: Logger = Logger.getInstance(loggerConfig);
+
+  static async initialize(
+    configurationManagerConfig: ConfigurationManagerConfig,
+    appConfig: AppConfig,
+  ): Promise<Container> {
+    const container = new Container();
+
+    // Bind configuration
+    // Bind logger
+    container.bind<Logger>('Logger').toConstantValue(this.logger);
+    container
+      .bind<ConfigurationManagerConfig>('ConfigurationManagerConfig')
+      .toConstantValue(configurationManagerConfig);
+    container.bind<AppConfig>('AppConfig').toConstantValue(appConfig);
+
+    // Initialize and bind services
+    await this.initializeServices(container, appConfig);
+
+    this.instance = container;
+    return container;
+  }
+
+  protected static async initializeServices(
+    container: Container,
+    appConfig: AppConfig,
+  ): Promise<void> {
+    try {
+      const configurationManagerConfig =
+        container.get<ConfigurationManagerConfig>('ConfigurationManagerConfig');
+      const keyValueStoreService = KeyValueStoreService.getInstance(
+        configurationManagerConfig,
+      );
+      await keyValueStoreService.connect();
+      container
+        .bind<KeyValueStoreService>('KeyValueStoreService')
+        .toConstantValue(keyValueStoreService);
+
+      // Create broker-agnostic message producer
+      const brokerConfig = resolveMessageBrokerConfig(appConfig);
+      const messageProducer = createMessageProducer(brokerConfig, this.logger);
+      await messageProducer.connect();
+
+      container
+        .bind<IMessageProducer>('MessageProducer')
+        .toConstantValue(messageProducer);
+
+      const syncEventProducer = new SyncEventProducer(
+        messageProducer,
+        this.logger,
+      );
+      await syncEventProducer.start();
+
+      container
+        .bind<SyncEventProducer>('SyncEventProducer')
+        .toConstantValue(syncEventProducer);
+        
+      this.logger.info('After sync producer binding');
+
+      const authTokenService = new AuthTokenService(
+        appConfig.jwtSecret,
+        appConfig.scopedJwtSecret,
+      );
+      const authMiddleware = new AuthMiddleware(
+        container.get('Logger'),
+        authTokenService,
+      );
+      container
+        .bind<AuthMiddleware>('AuthMiddleware')
+        .toConstantValue(authMiddleware);
+      this.logger.info('Knowledge Base services initialized successfully');
+    } catch (error) {
+      this.logger.error('Failed to initialize Knowledge Base services', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      throw error;
+    }
+  }
+
+  static getInstance(): Container {
+    if (!this.instance) {
+      throw new Error('Service container not initialized');
+    }
+    return this.instance;
+  }
+
+  static async dispose(): Promise<void> {
+    if (this.instance) {
+      try {
+        const messageProducer = this.instance.isBound('MessageProducer')
+          ? this.instance.get<IMessageProducer>('MessageProducer')
+          : null;
+
+        if (messageProducer && messageProducer.isConnected()) {
+          await messageProducer.disconnect();
+        }
+
+        const keyValueStoreService = this.instance.isBound(
+          'KeyValueStoreService',
+        )
+          ? this.instance.get<KeyValueStoreService>('KeyValueStoreService')
+          : null;
+
+        if (keyValueStoreService && keyValueStoreService.isConnected()) {
+          await keyValueStoreService.disconnect();
+          this.logger.info('KeyValueStoreService disconnected successfully');
+        }
+
+        this.instance = null!;
+        this.logger.info(
+          'All services in Knowledge base successfully disposed',
+        );
+      } catch (error) {
+        this.logger.error('Error during service disposal', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+  }
+}

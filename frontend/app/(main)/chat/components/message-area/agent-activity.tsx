@@ -1,0 +1,1266 @@
+'use client';
+
+/**
+ * Renders the agent-activity transcript (`MessagePart[]` — see "Parts-Based
+ * Agent Message Transcript" / "Cursor-Style Agent Transparency" plans) as a
+ * vertical timeline of narration text, collapsible thinking blocks,
+ * tool-call cards (individually or grouped), and nested sub-agent groups.
+ * Used both while streaming (`ChatSlot.streamingParts`) and after reload
+ * (`ConversationMessage.parts`) — same components, same shape, so a message
+ * never visually changes when the live stream hands off to the persisted
+ * transcript.
+ */
+import React, { useState, useRef, useMemo, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import type { PluggableList } from 'unified';
+import { Badge, Box, Flex, Table, Text } from '@radix-ui/themes';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { ICON_SIZES } from '@/lib/constants/icon-sizes';
+import { useCopyText } from '@/lib/hooks/use-copy-text';
+import { LottieLoader } from '@/app/components/ui/lottie-loader';
+import { markdownUrlTransform } from '@/lib/utils/image-url-policy';
+import type { MessagePart, StatusMessage } from '../../types';
+import { looksLikeJson, safeLink, toolResultView, type ToolResultView } from '../../tool-result-view';
+import { stripAnswerMarkers } from '../../utils/parse-download-markers';
+import type { CitationMaps, CitationCallbacks } from './response-tabs/citations';
+import { CodeBlock, createMarkdownComponents } from './answer-content';
+import { processMarkdownContent } from '../../utils/process-markdown-content';
+import {
+  extractSqlQuery,
+  extractToolsetLabel,
+  isMcpTool,
+  isWebTool,
+  isSkillTool,
+  toolActivityLabel as toolActivityLabelUtil,
+} from '../../utils/tool-display';
+
+interface AgentActivityTimelineProps {
+  parts: MessagePart[];
+  /** Nested rendering (inside a SubAgentGroup) shows every `text` part,
+   * including the delegate's own `isFinal` answer — there's no separate
+   * "answer" slot for a sub-agent's turn like there is for the root. */
+  isNested?: boolean;
+  /** While the root message is still streaming, the trailing (last) `text`
+   * part is an in-progress preamble, not settled narration yet — hide it
+   * until either it's superseded (a later part arrives) or the run ends
+   * (at which point it's either replaced by `isFinal` or just narration). */
+  isStreaming?: boolean;
+  /** Current SSE status ("Thinking...", "Using Jira Search...") — rendered
+   * as the last entry in the timeline (instead of a disconnected element
+   * below the answer) so the "thinking -> tool -> thinking" flow reads as
+   * one continuous progressive disclosure, Claude-style. Root-level only —
+   * nested (sub-agent) timelines never receive this. */
+  currentStatus?: StatusMessage | null;
+  citationMaps?: CitationMaps;
+  citationCallbacks?: CitationCallbacks;
+}
+
+/** True when the transcript contains any tool call, reasoning block, or
+ * sub-agent delegation — i.e. this is a multi-step ReAct response, not a
+ * simple single-shot answer. Drives whether the completed activity gets a
+ * collapsible summary wrapper (`CollapsibleActivitySection`) and whether the
+ * live status entry renders inside the timeline vs. below the answer (see
+ * `ChatResponse`). */
+export function hasMultiStepActivity(parts: MessagePart[] | undefined): boolean {
+  if (!parts) return false;
+  return parts.some((part) => part.type === 'tool_call' || part.type === 'reasoning' || part.type === 'sub_agent');
+}
+
+/**
+ * Root-level text filtering:
+ * - The one part marked `isFinal` (the actual answer, mirrors Python's
+ *   `TranscriptCollector.replace_final_text`) is never shown here —
+ *   `AnswerContent` renders it.
+ * - Every other root `text` part is narration and shown once `settled`
+ *   (`agui-event-handler.ts`'s `LivePartsBuilder.settleLastRootText()`,
+ *   called the moment a tool call, reasoning block, or new text turn
+ *   proves the text wasn't the final answer).
+ * - The still-unsettled trailing text — whether or not the response has
+ *   had multi-step activity — stays hidden here and streams live into
+ *   `AnswerContent` instead (`ChatResponse` no longer suppresses the
+ *   answer for multi-step runs). This is what makes the common case (the
+ *   trailing text IS the final answer) render seamlessly in the answer
+ *   area as it streams, with no jump when `RUN_FINISHED` lands. If it
+ *   later turns out to be narration (a tool call/reasoning block follows),
+ *   `settleLastRootText()` moves it here and clears the answer buffer in
+ *   the same update.
+ */
+function filterRootParts(parts: MessagePart[], isStreaming: boolean): MessagePart[] {
+  return parts.filter((part) => {
+    // The reply's sign-in card, drawn under the answer (`McpSignInCard`).
+    if (part.type === 'mcp_sign_in') return false;
+    if (part.type !== 'text') return true;
+    if (part.isFinal) return false;
+    if (isStreaming && !part.settled) return false;
+    return true;
+  });
+}
+
+/** Root-level visible timeline entries for `parts` — the exact same
+ * filtering `AgentActivityTimeline` applies internally for a root (non-
+ * nested) render. Exposed so callers (`ChatResponse`) can decide whether to
+ * render a separator / collapsible wrapper around the timeline without
+ * duplicating (and risking drift from) the filtering rules above. */
+export function getVisibleRootParts(parts: MessagePart[], isStreaming: boolean): MessagePart[] {
+  return filterRootParts(parts, isStreaming);
+}
+
+type RenderItem =
+  | { kind: 'part'; part: MessagePart; key: string }
+  | { kind: 'toolGroup'; parts: MessagePart[]; key: string };
+
+/** Groups consecutive `tool_call` parts so a burst of activity (e.g. several
+ * searches in a row) collapses into one summary row instead of a wall of
+ * individual cards. A lone tool call (not adjacent to another) renders
+ * directly, without a group wrapper. */
+function groupConsecutiveToolCalls(parts: MessagePart[]): RenderItem[] {
+  const items: RenderItem[] = [];
+  let i = 0;
+  while (i < parts.length) {
+    const part = parts[i];
+    if (part.type === 'tool_call') {
+      let j = i;
+      while (j < parts.length && parts[j].type === 'tool_call') j += 1;
+      const group = parts.slice(i, j);
+      if (group.length === 1) {
+        items.push({ kind: 'part', part: group[0], key: `part-${group[0].toolCallId ?? i}` });
+      } else {
+        items.push({ kind: 'toolGroup', parts: group, key: `group-${group[0].toolCallId ?? i}` });
+      }
+      i = j;
+    } else {
+      items.push({ kind: 'part', part, key: `part-${part.type}-${part.runId ?? i}` });
+      i += 1;
+    }
+  }
+  return items;
+}
+
+/** True when `item` will actually paint something — filters out narration/
+ * thinking entries whose `content` is blank before they ever reach a rail
+ * row, so the connected line never threads through an empty placeholder
+ * (`ThinkingBlock`/`NarrationText`/`LiveNarrationText` would otherwise
+ * return `null` from inside an already-committed row). */
+/** Enter/Space activates a `role="button"` element the same way a native
+ * `<button>` would — every expand/collapse header in this file is a
+ * clickable `Flex` (not a real `<button>`, for layout/style reasons), so
+ * none of them get free keyboard activation from the browser. */
+function handleToggleKeyDown(e: React.KeyboardEvent, toggle: () => void): void {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    toggle();
+  }
+}
+
+function hasRenderableContent(item: RenderItem): boolean {
+  if (item.kind === 'toolGroup') return true;
+  const { part } = item;
+  if (part.type === 'reasoning' || part.type === 'text') return !!part.content?.trim();
+  return true;
+}
+
+type TimelineIconSpec =
+  | { kind: 'icon'; node: React.ReactNode; bg: string; border: string }
+  | { kind: 'dot'; color: string }
+  | { kind: 'lottie'; node: React.ReactNode };
+
+function timelineIconForStatus(status: NonNullable<MessagePart['status']>, iconName: string): TimelineIconSpec {
+  return {
+    kind: 'icon',
+    node: (
+      <MaterialIcon
+        name={iconName}
+        size={13}
+        color={TOOL_STATUS_COLOR[status]}
+        style={status === 'running' ? { animation: 'spin 1s linear infinite' } : undefined}
+      />
+    ),
+    bg: 'var(--slate-a3)',
+    border: 'var(--slate-6)',
+  };
+}
+
+/** One consistent glyph per activity type for the rail node — Claude-style,
+ * so the "thinking -> search -> thinking -> ..." order reads at a glance
+ * from the icons alone, without opening any card. Skill tool calls
+ * (`load_skill`/`skill_search`/...) get the skill icon FIRST — checked
+ * ahead of the search heuristic below so `skill_search` reads as a skill
+ * lookup, not a web/knowledge search. Search-flavored tool calls
+ * (individual or grouped) get the magnifying-glass icon instead of the
+ * generic status icon, mirroring how search steps read visually distinct
+ * from other tool use. */
+function getTimelineIcon(item: RenderItem): TimelineIconSpec {
+  if (item.kind === 'toolGroup') {
+    const allSkills = item.parts.every((p) => isSkillTool(p.toolName));
+    const allSearches = !allSkills && item.parts.every((p) => isSearchLike(p.toolName));
+    // The most pressing state in the group shows: a call waiting for the person, then one still
+    // running, one that failed, one that was stopped.
+    const statuses = item.parts.map((p) => p.status ?? 'running');
+    const status: NonNullable<MessagePart['status']> =
+      (['awaiting_approval', 'running', 'failed', 'blocked'] as const).find((s) => statuses.includes(s)) ?? 'completed';
+    const iconName = allSkills ? 'auto_stories' : allSearches ? 'travel_explore' : TOOL_STATUS_ICON[status];
+    return timelineIconForStatus(status, iconName);
+  }
+  const { part } = item;
+  switch (part.type) {
+    case 'reasoning':
+      return {
+        kind: 'icon',
+        node: <MaterialIcon name="psychology" size={13} color="var(--slate-10)" />,
+        bg: 'var(--slate-a3)',
+        border: 'var(--slate-6)',
+      };
+    case 'tool_call': {
+      const status = part.status ?? 'running';
+      const iconName = isSkillTool(part.toolName)
+        ? 'auto_stories'
+        : isSearchLike(part.toolName)
+          ? 'travel_explore'
+          : TOOL_STATUS_ICON[status];
+      return timelineIconForStatus(status, iconName);
+    }
+    case 'sub_agent':
+      return timelineIconForStatus(part.status ?? 'completed', 'smart_toy');
+    default:
+      // Narration (settled or live) — a plain waypoint dot rather than a
+      // literal glyph, so free-flowing prose doesn't compete visually with
+      // the more "actioned" steps (thinking / tools / sub-agents).
+      return { kind: 'dot', color: 'var(--accent-9)' };
+  }
+}
+
+/** One row of the connected activity timeline: a small icon "node" on a
+ * continuous vertical line (rail) to the left, with the actual content
+ * (thinking block, tool card, narration, ...) to the right — mirrors how
+ * Claude visually threads its reasoning steps together instead of
+ * rendering disconnected floating cards, so the read order of a
+ * multi-step response is unambiguous at a glance without opening anything.
+ * The line is drawn per-row (icon-to-icon-of-the-next-row) rather than as
+ * one absolutely-positioned strip, so it naturally keeps pace with rows
+ * that grow, shrink, or get inserted while streaming — no height
+ * measurement needed. */
+function TimelineRow({ icon, isLast, children }: { icon: TimelineIconSpec; isLast: boolean; children: React.ReactNode }) {
+  return (
+    <Flex className="agent-activity-enter">
+      <Flex direction="column" align="center" style={{ width: 24, flexShrink: 0 }}>
+        {icon.kind === 'dot' ? (
+          <Box style={{ width: 8, height: 8, marginTop: 7, borderRadius: '50%', backgroundColor: icon.color, flexShrink: 0 }} />
+        ) : icon.kind === 'lottie' ? (
+          <Box style={{ width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            {icon.node}
+          </Box>
+        ) : (
+          <Flex
+            align="center"
+            justify="center"
+            style={{
+              width: 22,
+              height: 22,
+              borderRadius: '50%',
+              backgroundColor: icon.bg,
+              border: `1px solid ${icon.border}`,
+              flexShrink: 0,
+            }}
+          >
+            {icon.node}
+          </Flex>
+        )}
+        {!isLast && (
+          <Box
+            style={{
+              width: 2,
+              flex: 1,
+              minHeight: 'var(--space-3)',
+              backgroundColor: 'var(--slate-5)',
+              marginTop: 'var(--space-1)',
+            }}
+          />
+        )}
+      </Flex>
+      <Box style={{ flex: 1, minWidth: 0, paddingLeft: 'var(--space-3)', paddingBottom: isLast ? 0 : 'var(--space-3)' }}>
+        {children}
+      </Box>
+    </Flex>
+  );
+}
+
+export function AgentActivityTimeline({ parts, isNested = false, isStreaming = false, currentStatus = null, citationMaps, citationCallbacks }: AgentActivityTimelineProps) {
+  const visible = useMemo(
+    () => (isNested ? parts : getVisibleRootParts(parts, isStreaming)),
+    [parts, isNested, isStreaming],
+  );
+  // Don't show status alongside live text with content (the text itself
+  // signals progress), or when the last visible entry already covers the
+  // status visually (a reasoning block = "Thinking", a running tool call
+  // = the same activity the status describes).
+  const hasLiveTextWithContent = isStreaming && visible.some(
+    (p) => p.type === 'text' && !p.settled && !p.isFinal && !!p.content?.trim(),
+  );
+  const items = groupConsecutiveToolCalls(visible).filter(hasRenderableContent);
+  const lastItem = items.length > 0 ? items[items.length - 1] : null;
+  const lastItemCoversStatus = lastItem !== null && (
+    (lastItem.kind === 'part' && lastItem.part.type === 'reasoning') ||
+    (lastItem.kind === 'part' && lastItem.part.type === 'tool_call' && (lastItem.part.status ?? 'running') === 'running') ||
+    (lastItem.kind === 'toolGroup' && lastItem.parts.some((p) => (p.status ?? 'running') === 'running'))
+  );
+  const showStatus = !isNested && isStreaming && !!currentStatus && !hasLiveTextWithContent && !lastItemCoversStatus;
+  if (items.length === 0 && !showStatus) return null;
+  const rowCount = items.length + (showStatus ? 1 : 0);
+
+  return (
+    <Box style={{ marginBottom: isNested ? 'var(--space-2)' : 'var(--space-3)' }}>
+      <Flex direction="column">
+        {items.map((item, idx) => (
+          <TimelineRow key={item.key} icon={getTimelineIcon(item)} isLast={idx === rowCount - 1}>
+            {item.kind === 'toolGroup' ? (
+              <ToolCallGroup parts={item.parts} />
+            ) : (
+              <AgentActivityPart part={item.part} isStreaming={isStreaming} citationMaps={citationMaps} citationCallbacks={citationCallbacks} />
+            )}
+          </TimelineRow>
+        ))}
+        {/* Status indicator as the LAST timeline entry — keeps the
+            "thinking -> tool -> thinking -> ..." flow in one place instead
+            of a disconnected element below the (possibly-suppressed)
+            answer. See ChatResponse for the simple-response fallback. */}
+        {showStatus && (
+          <TimelineRow icon={{ kind: 'lottie', node: <LottieLoader variant="thinking" size={18} /> }} isLast>
+            <StatusTimelineEntry status={currentStatus} />
+          </TimelineRow>
+        )}
+      </Flex>
+    </Box>
+  );
+}
+
+function AgentActivityPart({ part, isStreaming, citationMaps, citationCallbacks }: { part: MessagePart; isStreaming?: boolean; citationMaps?: CitationMaps; citationCallbacks?: CitationCallbacks }) {
+  switch (part.type) {
+    case 'reasoning':
+      return <ThinkingBlock content={part.content ?? ''} />;
+    case 'tool_call':
+      // Top-level rail row — the icon lives on the rail (see
+      // `getTimelineIcon`), not duplicated inline on the card itself.
+      return <ToolCallCard part={part} showIcon={false} />;
+    case 'sub_agent':
+      return <SubAgentGroup part={part} citationMaps={citationMaps} citationCallbacks={citationCallbacks} />;
+    case 'text': {
+      // Unsettled + still streaming: this text is being written right now
+      // (a multi-step response's live "candidate" turn) — render it with a
+      // typing cursor instead of the plain `NarrationText` treatment used
+      // for already-settled narration. Blank content renders nothing —
+      // `hasRenderableContent` filters the part out of the timeline and
+      // `StatusTimelineEntry` signals progress until the first delta lands.
+      const isLive = isStreaming && !part.settled && !part.isFinal;
+      if (isLive) {
+        return <LiveNarrationText content={part.content ?? ''} citationMaps={citationMaps} citationCallbacks={citationCallbacks} />;
+      }
+      return part.content ? <NarrationText content={part.content} citationMaps={citationMaps} citationCallbacks={citationCallbacks} /> : null;
+    }
+    default:
+      return null;
+  }
+}
+
+// Backend appends "---\nConfidence: High" to raw LLM output then strips it
+// via normalizedAnswer, but narration parts (flushed before a tool call) keep
+// the raw text. Strip the trailer here so it doesn't render as prose.
+const CONFIDENCE_TRAILER_RE = /(?:\n*-{3,}\s*\n)?\s*Confidence:\s*(?:Very High|High|Medium|Low)\s*$/i;
+
+// Hoisted so react-markdown sees a stable `remarkPlugins` reference across
+// renders instead of a fresh array literal each time (see the equivalent
+// constant in `answer-content.tsx`).
+const NARRATION_REMARK_PLUGINS: PluggableList = [remarkGfm];
+
+function NarrationTextImpl({ content, citationMaps, citationCallbacks }: { content: string; citationMaps?: CitationMaps; citationCallbacks?: CitationCallbacks }) {
+  const withoutConfidence = stripAnswerMarkers(content).replace(CONFIDENCE_TRAILER_RE, '');
+
+  // After stripping markers, lines like `- ::artifact[...]{...}` become
+  // bare `- ` or `- \n`. Remove empty list items / headings so they don't
+  // render as blank bullets or orphaned headers.
+  const withoutEmptyLines = withoutConfidence
+    .replace(/^[ \t]*[-*+][ \t]*$/gm, '')
+    .replace(/^#{1,6}\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n');
+
+  const cleanContent = processMarkdownContent(withoutEmptyLines);
+  if (!cleanContent.trim()) return null;
+
+  const citMapsRef = useRef(citationMaps);
+  citMapsRef.current = citationMaps;
+  const citCbRef = useRef(citationCallbacks);
+  citCbRef.current = citationCallbacks;
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const components = useMemo(() => createMarkdownComponents(citMapsRef, citCbRef), []);
+
+  return (
+    <Box className="narration-text agent-activity-enter" style={{ color: 'var(--slate-12)', fontSize: 'var(--font-size-2)', lineHeight: 1.6 }}>
+      <ReactMarkdown remarkPlugins={NARRATION_REMARK_PLUGINS} urlTransform={markdownUrlTransform} components={components}>
+        {cleanContent}
+      </ReactMarkdown>
+    </Box>
+  );
+}
+
+/**
+ * Settled narration text stops changing once its part is marked settled —
+ * memoizing avoids re-parsing it every time an unrelated sibling part (a
+ * live tool call, the still-growing live narration below) re-renders.
+ */
+const NarrationText = React.memo(NarrationTextImpl);
+
+/** The still-unsettled trailing text of a multi-step response, rendered
+ * live in the timeline (instead of `AnswerContent`) while its fate —
+ * narration vs. the final answer — is still undetermined. The Lottie rail
+ * animation (see `TimelineRow`) signals "in progress" instead of an
+ * in-text cursor, so this doesn't need its own accent bar. */
+function LiveNarrationTextImpl({ content, citationMaps, citationCallbacks }: { content: string; citationMaps?: CitationMaps; citationCallbacks?: CitationCallbacks }) {
+  const cleanContent = processMarkdownContent(stripAnswerMarkers(content));
+
+  const citMapsRef = useRef(citationMaps);
+  citMapsRef.current = citationMaps;
+  const citCbRef = useRef(citationCallbacks);
+  citCbRef.current = citationCallbacks;
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const components = useMemo(() => createMarkdownComponents(citMapsRef, citCbRef), []);
+
+  if (!cleanContent.trim()) {
+    // No content yet — the StatusTimelineEntry already signals progress,
+    // rendering an empty cursor here causes a redundant indicator.
+    return null;
+  }
+
+  return (
+    <Box
+      className="live-narration-text agent-activity-enter"
+      style={{
+        color: 'var(--slate-12)',
+        fontSize: 'var(--font-size-2)',
+        lineHeight: 1.6,
+      }}
+    >
+      <ReactMarkdown remarkPlugins={NARRATION_REMARK_PLUGINS} urlTransform={markdownUrlTransform} components={components}>
+        {cleanContent}
+      </ReactMarkdown>
+    </Box>
+  );
+}
+
+const LiveNarrationText = React.memo(LiveNarrationTextImpl);
+
+/** Status indicator ("Thinking...", "Using Jira Search...") rendered as a
+ * timeline entry rather than a standalone element below the answer — see
+ * `AgentActivityTimelineProps.currentStatus`. Its Lottie animation is the
+ * rail's icon node (see the `showStatus` branch in `AgentActivityTimeline`)
+ * so this only needs to render the shimmer text itself. */
+function StatusTimelineEntry({ status }: { status: StatusMessage }) {
+  return (
+    <Text
+      size="1"
+      weight="medium"
+      className="generating-shimmer"
+      style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', wordBreak: 'break-word', minWidth: 0 }}
+    >
+      <span className="generating-shimmer-base">{status.message}</span>
+      <span className="generating-shimmer-overlay" aria-hidden="true">{status.message}</span>
+    </Text>
+  );
+}
+
+/** Collapsible chain-of-thought block — collapsed by default, same
+ * disclosure pattern `AskUserQuestionCard` uses for its answers list. */
+export function ThinkingBlock({ content }: { content: string }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!content.trim()) return null;
+
+  return (
+    <Box
+      className="agent-activity-enter"
+      style={{
+        border: '1px solid var(--slate-4)',
+        borderRadius: 'var(--radius-3)',
+        backgroundColor: 'var(--slate-a2)',
+        overflow: 'hidden',
+      }}
+    >
+      <Flex
+        align="center"
+        gap="2"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(e) => handleToggleKeyDown(e, () => setExpanded((prev) => !prev))}
+        style={{
+          padding: 'var(--space-2) var(--space-3)',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        <Text size="1" weight="medium" style={{ color: 'var(--slate-10)', flex: 1 }}>
+          Thinking
+        </Text>
+        <MaterialIcon
+          name={expanded ? 'expand_less' : 'expand_more'}
+          size={ICON_SIZES.PRIMARY}
+          color="var(--slate-9)"
+        />
+      </Flex>
+      {expanded && (
+        <Box
+          style={{
+            padding: '0 var(--space-3) var(--space-3)',
+            color: 'var(--slate-11)',
+            fontSize: 'var(--font-size-1)',
+            whiteSpace: 'pre-wrap',
+          }}
+        >
+          {content}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+const TOOL_STATUS_ICON: Record<NonNullable<MessagePart['status']>, string> = {
+  running: 'sync',
+  completed: 'check_circle',
+  failed: 'warning',
+  blocked: 'block',
+  awaiting_approval: 'pending_actions',
+};
+
+// A failed call is red: in grey it read like a completed one.
+const TOOL_STATUS_COLOR: Record<NonNullable<MessagePart['status']>, string> = {
+  running: 'var(--blue-9)',
+  completed: 'var(--green-9)',
+  failed: 'var(--red-9)',
+  blocked: 'var(--amber-9)',
+  awaiting_approval: 'var(--amber-9)',
+};
+
+
+export function toolActivityLabel(part: Pick<MessagePart, 'toolName' | 'displayName'>): string {
+  return toolActivityLabelUtil(part.toolName, part.displayName);
+}
+
+function extractSourcesFromSummary(summary: string | undefined): string | undefined {
+  if (!summary) return undefined;
+  const match = summary.match(/^Sources:\s*(.+)$/m);
+  return match?.[1] || undefined;
+}
+
+function isSearchLike(toolName: string | undefined): boolean {
+  return !!toolName && /search/i.test(toolName);
+}
+
+/** Renders a server-computed tool summary (e.g. "Retrieved 12 blocks from
+ * 5 documents\n- Doc A\n- Doc B") as styled text rather than monospace —
+ * summaries are prose/bullet-list, not raw JSON, so they read better with
+ * the same lightweight markdown treatment `NarrationText` uses. A summary can
+ * quote a tool's output (a title), so it loads no images and links only to
+ * http(s), in a new tab. */
+function ToolSummaryText({ content }: { content: string }) {
+  return (
+    <Box style={{ fontSize: 'var(--font-size-1)', color: 'var(--slate-11)', lineHeight: 1.6 }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        disallowedElements={['img']}
+        urlTransform={(url) => safeLink(url) ?? ''}
+        components={{
+          a: ({ href, children }) =>
+            href ? (
+              <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-11)' }}>
+                {children}
+              </a>
+            ) : (
+              <>{children}</>
+            ),
+          p: ({ children }) => (
+            <Text size="1" as="p" style={{ margin: '0 0 var(--space-1) 0', color: 'inherit' }}>
+              {children}
+            </Text>
+          ),
+          ul: ({ children }) => (
+            <ul style={{ paddingLeft: 'var(--space-4)', margin: 0, listStyleType: 'disc' }}>{children}</ul>
+          ),
+          li: ({ children }) => (
+            <li style={{ marginBottom: '2px', lineHeight: 1.5 }}>{children}</li>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </Box>
+  );
+}
+
+/** Pretty-prints `raw` when it is JSON. A truncated preview is no longer
+ * valid JSON, so it is shown as-is. */
+export function formatToolPayload(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+function isEmptyToolArgs(raw: string | undefined): boolean {
+  const trimmed = raw?.trim();
+  return !trimmed || trimmed === '{}' || trimmed === 'null';
+}
+
+/** Monospace, scrollable view of a raw tool payload with a copy button. */
+function RawToolPayload({ raw }: { raw: string }) {
+  const { t } = useTranslation();
+  const { copied, copy } = useCopyText();
+  const text = useMemo(() => formatToolPayload(raw), [raw]);
+
+  return (
+    <Box
+      style={{
+        position: 'relative',
+        marginTop: 'var(--space-1)',
+        border: '1px solid var(--slate-5)',
+        borderRadius: 'var(--radius-2)',
+        backgroundColor: 'var(--slate-1)',
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => void copy(text)}
+        aria-label={copied ? t('chatStream.copiedCode') : t('chatStream.copyCode')}
+        style={{
+          position: 'absolute',
+          top: 4,
+          right: 4,
+          display: 'inline-flex',
+          alignItems: 'center',
+          background: 'var(--slate-3)',
+          border: 'none',
+          borderRadius: 'var(--radius-1)',
+          padding: 2,
+          cursor: 'pointer',
+        }}
+      >
+        <MaterialIcon
+          name={copied ? 'check' : 'content_copy'}
+          size={13}
+          color={copied ? 'var(--accent-11)' : 'var(--slate-11)'}
+        />
+      </button>
+      <Box
+        onWheel={(e) => e.stopPropagation()}
+        style={{
+          maxHeight: 240,
+          overflow: 'auto',
+          padding: 'var(--space-2)',
+          paddingRight: 'var(--space-6)',
+          fontFamily: 'var(--font-mono, monospace)',
+          fontSize: 'var(--font-size-1)',
+          color: 'var(--slate-11)',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        }}
+      >
+        {text}
+      </Box>
+    </Box>
+  );
+}
+
+/** A tool's table of records or one record's fields, from its full result. */
+function ToolResultViewBlock({ view }: { view: ToolResultView }) {
+  const { t } = useTranslation();
+  if (view.kind === 'fields') {
+    return (
+      <Box
+        data-testid="tool-result-fields"
+        style={{
+          marginTop: 'var(--space-1)',
+          padding: 'var(--space-2)',
+          border: '1px solid var(--slate-5)',
+          borderRadius: 'var(--radius-2)',
+          backgroundColor: 'var(--slate-1)',
+        }}
+      >
+        <Box style={{ display: 'grid', gridTemplateColumns: 'minmax(5rem, max-content) 1fr', columnGap: 'var(--space-3)', rowGap: 4 }}>
+          {view.fields.map((field, index) => (
+            <React.Fragment key={index}>
+              <Text size="1" style={{ color: 'var(--slate-10)' }}>
+                {field.label}
+              </Text>
+              <Text size="1" style={{ color: 'var(--slate-12)', overflowWrap: 'anywhere' }}>
+                {field.value}
+              </Text>
+            </React.Fragment>
+          ))}
+        </Box>
+        {view.url && (
+          <Text as="p" size="1" mt="2">
+            <a href={view.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-11)' }}>
+              {t('chat.toolCard.open')}
+            </a>
+          </Text>
+        )}
+      </Box>
+    );
+  }
+  return (
+    <Box
+      data-testid="tool-result-table"
+      onWheel={(e) => e.stopPropagation()}
+      style={{ marginTop: 'var(--space-1)', maxHeight: 320, overflow: 'auto' }}
+    >
+      <Table.Root size="1" variant="surface">
+        <Table.Header>
+          <Table.Row>
+            {view.columns.map((column, index) => (
+              <Table.ColumnHeaderCell key={index} style={{ whiteSpace: 'nowrap' }}>
+                {column}
+              </Table.ColumnHeaderCell>
+            ))}
+          </Table.Row>
+        </Table.Header>
+        <Table.Body>
+          {view.rows.map((row, rowIndex) => (
+            <Table.Row key={rowIndex}>
+              {row.cells.map((cell, index) => (
+                <Table.Cell key={index} style={{ maxWidth: 280, overflowWrap: 'anywhere' }}>
+                  {index === 0 && row.url ? (
+                    <a href={row.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-11)' }}>
+                      {cell || row.url}
+                    </a>
+                  ) : (
+                    cell
+                  )}
+                </Table.Cell>
+              ))}
+            </Table.Row>
+          ))}
+        </Table.Body>
+      </Table.Root>
+      {view.total > view.rows.length && (
+        <Text as="p" size="1" mt="1" style={{ color: 'var(--slate-10)' }}>
+          {t('chat.toolCard.showingOf', { shown: view.rows.length, total: view.total })}
+        </Text>
+      )}
+    </Box>
+  );
+}
+
+/** The raw result behind a toggle, when a view of it is shown. */
+function RawResultToggle({ raw }: { raw: string }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  return (
+    <Box>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((prev) => !prev)}
+        style={{
+          appearance: 'none',
+          background: 'none',
+          border: 'none',
+          padding: 0,
+          marginTop: 'var(--space-1)',
+          cursor: 'pointer',
+          color: 'var(--slate-10)',
+          fontSize: 'var(--font-size-1)',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 2,
+        }}
+      >
+        <MaterialIcon name={open ? 'expand_less' : 'expand_more'} size={14} color="var(--slate-10)" />
+        {open ? t('chat.toolCard.hideRaw') : t('chat.toolCard.viewRaw')}
+      </button>
+      {open && <RawToolPayload raw={raw} />}
+    </Box>
+  );
+}
+
+/** A result that is prose, shown as text rather than code. */
+function PlainResultText({ text }: { text: string }) {
+  return (
+    <Box
+      data-testid="tool-result-text"
+      onWheel={(e) => e.stopPropagation()}
+      style={{
+        marginTop: 'var(--space-1)',
+        maxHeight: 240,
+        overflow: 'auto',
+        fontSize: 'var(--font-size-1)',
+        color: 'var(--slate-11)',
+        lineHeight: 1.5,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+      }}
+    >
+      {text}
+    </Box>
+  );
+}
+
+/** One tool call: activity label, status icon, and (when expanded) the
+ * server summary plus the raw args / bounded result preview — never the full
+ * external tool payload, see MessagePart. `showIcon` is false when this renders as a top-level
+ * timeline row (the rail node already carries the status icon — see
+ * `getTimelineIcon`); nested usage inside an expanded `ToolCallGroup` has
+ * no rail of its own, so it keeps its own inline icon (the default). */
+export function ToolCallCard({ part, showIcon = true }: { part: MessagePart; showIcon?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const status = part.status ?? 'running';
+  const toolsetLabel = extractToolsetLabel(part.toolName);
+  const sourceInfo = extractSourcesFromSummary(part.argsSummary);
+
+  return (
+    <Box
+      className="agent-activity-enter"
+      style={{
+        border: '1px solid var(--slate-4)',
+        borderRadius: 'var(--radius-3)',
+        backgroundColor: 'var(--slate-a2)',
+        overflow: 'hidden',
+      }}
+    >
+      <Flex
+        align="center"
+        gap="2"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(e) => handleToggleKeyDown(e, () => setExpanded((prev) => !prev))}
+        style={{
+          padding: 'var(--space-2) var(--space-3)',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        {showIcon && (
+          <MaterialIcon
+            name={TOOL_STATUS_ICON[status]}
+            size={ICON_SIZES.PRIMARY}
+            color={TOOL_STATUS_COLOR[status]}
+            style={status === 'running' ? { animation: 'spin 1s linear infinite' } : undefined}
+          />
+        )}
+        {toolsetLabel && (
+          <Text
+            size="1"
+            weight="medium"
+            style={{
+              color: 'var(--accent-11)',
+              backgroundColor: 'var(--accent-a3)',
+              padding: '2px 8px',
+              borderRadius: 'var(--radius-2)',
+              fontSize: '11px',
+              lineHeight: '16px',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {toolsetLabel}
+          </Text>
+        )}
+        <Text
+          size="1"
+          weight="medium"
+          style={{
+            color: 'var(--slate-11)',
+            flex: 1,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {toolActivityLabel(part)}
+          {sourceInfo && (
+            <span style={{ color: 'var(--slate-9)', fontWeight: 400 }}>
+              {' · '}{sourceInfo}
+            </span>
+          )}
+        </Text>
+        <ApprovalChip part={part} />
+        <MaterialIcon
+          name={expanded ? 'expand_less' : 'expand_more'}
+          size={ICON_SIZES.PRIMARY}
+          color="var(--slate-9)"
+        />
+      </Flex>
+      {expanded && (
+        <Box
+          style={{
+            padding: '0 var(--space-3) var(--space-3)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 'var(--space-2)',
+          }}
+        >
+          {isMcpTool(part.toolName) ? (
+            <McpToolDetails part={part} status={status} />
+          ) : (
+            <ToolDetails part={part} status={status} />
+          )}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+const RESULT_LABEL_KEY: Record<NonNullable<MessagePart['status']>, string> = {
+  running: 'chat.toolCard.result',
+  completed: 'chat.toolCard.result',
+  failed: 'chat.toolCard.error',
+  blocked: 'chat.toolCard.blocked',
+  awaiting_approval: 'chat.toolCard.awaitingApproval',
+};
+
+function ResultLabel({ status }: { status: NonNullable<MessagePart['status']> }) {
+  const { t } = useTranslation();
+  return (
+    <Text size="1" weight="medium" style={{ color: status === 'failed' ? 'var(--red-11)' : 'var(--slate-9)' }}>
+      {t(RESULT_LABEL_KEY[status])}
+    </Text>
+  );
+}
+
+const TOOL_TEXT_STYLE: React.CSSProperties = {
+  fontFamily: 'var(--font-mono, monospace)',
+  fontSize: 'var(--font-size-1)',
+  color: 'var(--slate-11)',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+};
+
+/** A built-in or toolset tool: the server's summary, or the raw text when there is none. Web tools
+ * also list what they found (every search result, the page read), each linked. */
+function ToolDetails({ part, status }: { part: MessagePart; status: NonNullable<MessagePart['status']> }) {
+  const { t } = useTranslation();
+  const view = useMemo(
+    () => (status === 'completed' && isWebTool(part.toolName) ? toolResultView(part.resultView) : null),
+    [status, part.toolName, part.resultView],
+  );
+  const sqlQuery = extractSqlQuery(part.toolName, part.args);
+  return (
+    <>
+      {(part.argsSummary || part.args) && (
+        <Box>
+          <Text size="1" weight="medium" style={{ color: 'var(--slate-9)' }}>
+            {t('chat.toolCard.arguments')}
+          </Text>
+          {part.argsSummary ? <ToolSummaryText content={part.argsSummary} /> : <Box style={TOOL_TEXT_STYLE}>{part.args}</Box>}
+        </Box>
+      )}
+      {sqlQuery && (
+        <Box>
+          <Text size="1" weight="medium" style={{ color: 'var(--slate-9)' }}>
+            {t('chat.toolCard.query')}
+          </Text>
+          {/* No copy or download for a cut-off query: it can still run, e.g. when the cut falls in a `--` comment. */}
+          <CodeBlock
+            language="sql"
+            codeText={sqlQuery.text}
+            actions={!sqlQuery.cutOff}
+            maxHeight="260px"
+            style={{ marginBottom: 0, marginTop: 'var(--space-1)' }}
+          />
+          {sqlQuery.cutOff && (
+            <Text as="p" size="1" mt="1" style={{ color: 'var(--slate-10)' }}>
+              {t('chat.toolCard.queryCutOff')}
+            </Text>
+          )}
+        </Box>
+      )}
+      {/* A skill tool's raw `resultPreview` is a truncated SKILL.md body or bundled-file content
+          (see `LoadSkillTool`/`LoadSkillResourceTool.summarize_result`): never worth showing. */}
+      {(part.resultSummary || (part.resultPreview && !isSkillTool(part.toolName))) && (
+        <Box>
+          <ResultLabel status={status} />
+          {part.resultSummary ? (
+            <ToolSummaryText content={part.resultSummary} />
+          ) : (
+            <Box style={TOOL_TEXT_STYLE}>{part.resultPreview}</Box>
+          )}
+          {view && <ToolResultViewBlock view={view} />}
+        </Box>
+      )}
+    </>
+  );
+}
+
+/** An MCP tool: the summary plus the raw arguments, and a table or fields of what it found with
+ * the raw output, since an external server's payload is all the person can check it against. */
+function McpToolDetails({ part, status }: { part: MessagePart; status: NonNullable<MessagePart['status']> }) {
+  const { t } = useTranslation();
+  const hasRawArgs = !isEmptyToolArgs(part.args);
+  const showRawResult = Boolean(part.resultPreview);
+  const rawResult = part.resultPreview ?? '';
+  const view = useMemo(() => (status === 'completed' ? toolResultView(part.resultView) : null), [status, part.resultView]);
+  const plainResult = showRawResult && !view && !looksLikeJson(rawResult);
+  // Prose whose first line is the summary needn't say it twice.
+  const summaryShown = Boolean(part.resultSummary) && !(plainResult && part.resultSummary?.trim() === rawResult.trim().split('\n')[0]?.trim());
+  return (
+    <>
+      {(part.argsSummary || hasRawArgs) && (
+        <Box>
+          <Text size="1" weight="medium" style={{ color: 'var(--slate-9)' }}>
+            {t('chat.toolCard.arguments')}
+          </Text>
+          {part.argsSummary && <ToolSummaryText content={part.argsSummary} />}
+          {hasRawArgs && <RawToolPayload raw={part.args ?? ''} />}
+        </Box>
+      )}
+      {(part.resultSummary || showRawResult || view) && (
+        <Box>
+          <ResultLabel status={status} />
+          {summaryShown && <ToolSummaryText content={part.resultSummary ?? ''} />}
+          {view && <ToolResultViewBlock view={view} />}
+          {showRawResult &&
+            (view ? (
+              <RawResultToggle raw={rawResult} />
+            ) : plainResult ? (
+              <PlainResultText text={rawResult} />
+            ) : (
+              <RawToolPayload raw={rawResult} />
+            ))}
+        </Box>
+      )}
+    </>
+  );
+}
+
+const APPROVAL_CHIP: Record<'awaiting_approval' | NonNullable<MessagePart['approvalAnswer']>, { key: string; color: 'amber' | 'green' | 'gray' }> = {
+  awaiting_approval: { key: 'chat.toolCard.needsApproval', color: 'amber' },
+  allowed: { key: 'chat.toolCard.approved', color: 'green' },
+  declined: { key: 'chat.toolCard.declined', color: 'gray' },
+  expired: { key: 'chat.toolCard.expired', color: 'gray' },
+};
+
+/** A call that went through an approval card says how it was answered. */
+function ApprovalChip({ part }: { part: MessagePart }) {
+  const { t } = useTranslation();
+  const chip = part.approvalAnswer
+    ? APPROVAL_CHIP[part.approvalAnswer]
+    : part.status === 'awaiting_approval' ? APPROVAL_CHIP.awaiting_approval : null;
+  if (!chip) return null;
+  return (
+    <Badge size="1" variant="soft" color={chip.color} style={{ flexShrink: 0 }}>
+      {t(chip.key)}
+    </Badge>
+  );
+}
+
+/** Collapsed-by-default summary row for a burst of >= 2 consecutive tool
+ * calls — e.g. "Explored 3 searches" or "Ran 2 tools". Expanding reveals the
+ * individual `ToolCallCard`s (which stay collapsed themselves). */
+function ToolCallGroup({ parts }: { parts: MessagePart[] }) {
+  const [expanded, setExpanded] = useState(false);
+  // Skill-tool check takes precedence over the search heuristic — a burst
+  // of `skill_search`/`load_skill` calls reads as "Used N skills", not
+  // "Explored N searches" (see `getTimelineIcon`'s icon precedence above).
+  const allSkills = parts.every((part) => isSkillTool(part.toolName));
+  const allSearches = !allSkills && parts.every((part) => isSearchLike(part.toolName));
+  const label = allSkills
+    ? `Used ${parts.length} skills`
+    : allSearches
+      ? `Explored ${parts.length} searches`
+      : `Ran ${parts.length} tools`;
+
+  const toolsetLabels = [...new Set(parts.map((p) => extractToolsetLabel(p.toolName)).filter(Boolean))] as string[];
+  const groupToolsetLabel = toolsetLabels.length === 1 ? toolsetLabels[0] : undefined;
+
+  return (
+    <Box
+      className="agent-activity-enter"
+      style={{
+        border: '1px solid var(--slate-4)',
+        borderRadius: 'var(--radius-3)',
+        backgroundColor: 'var(--slate-a2)',
+        overflow: 'hidden',
+      }}
+    >
+      <Flex
+        align="center"
+        gap="2"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(e) => handleToggleKeyDown(e, () => setExpanded((prev) => !prev))}
+        style={{
+          padding: 'var(--space-2) var(--space-3)',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        {groupToolsetLabel && (
+          <Text
+            size="1"
+            weight="medium"
+            style={{
+              color: 'var(--accent-11)',
+              backgroundColor: 'var(--accent-a3)',
+              padding: '2px 8px',
+              borderRadius: 'var(--radius-2)',
+              fontSize: '11px',
+              lineHeight: '16px',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {groupToolsetLabel}
+          </Text>
+        )}
+        <Text size="1" weight="medium" style={{ color: 'var(--slate-11)', flex: 1 }}>
+          {label}
+        </Text>
+        <MaterialIcon
+          name={expanded ? 'expand_less' : 'expand_more'}
+          size={ICON_SIZES.PRIMARY}
+          color="var(--slate-9)"
+        />
+      </Flex>
+      {expanded && (
+        <Box style={{ padding: '0 var(--space-3) var(--space-3)' }}>
+          <Flex direction="column" gap="2">
+            {parts.map((part, idx) => (
+              <ToolCallCard key={part.toolCallId ?? idx} part={part} />
+            ))}
+          </Flex>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+/** A sub-agent's own nested timeline — collapsed by default so the running
+ * indicator on the header is the primary signal; expand to see tool calls. */
+export function SubAgentGroup({ part, citationMaps, citationCallbacks }: { part: MessagePart; citationMaps?: CitationMaps; citationCallbacks?: CitationCallbacks }) {
+  const [expanded, setExpanded] = useState(false);
+  const nested = part.parts ?? [];
+  const status = part.status ?? 'completed';
+
+  return (
+    <Box
+      className="agent-activity-enter"
+      style={{
+        border: `1px solid ${status === 'running' ? 'var(--blue-a5)' : 'var(--accent-a5)'}`,
+        borderRadius: 'var(--radius-3)',
+        backgroundColor: status === 'running' ? 'var(--blue-a2)' : 'var(--accent-a2)',
+        overflow: 'hidden',
+      }}
+    >
+      <Flex
+        align="center"
+        gap="2"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(e) => handleToggleKeyDown(e, () => setExpanded((prev) => !prev))}
+        style={{
+          padding: 'var(--space-2) var(--space-3)',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        <Text size="1" weight="medium" style={{ color: 'var(--accent-11)', flex: 1 }}>
+          {part.roleName || 'Sub-agent'}
+        </Text>
+        <MaterialIcon
+          name={expanded ? 'expand_less' : 'expand_more'}
+          size={ICON_SIZES.PRIMARY}
+          color="var(--accent-9)"
+        />
+      </Flex>
+      {expanded && nested.length > 0 && (
+        <Box style={{ padding: '0 var(--space-3) var(--space-3)' }}>
+          <AgentActivityTimeline parts={nested} isNested citationMaps={citationMaps} citationCallbacks={citationCallbacks} />
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+/** Human-readable summary for `CollapsibleActivitySection`'s header, e.g.
+ * "Thought for a bit, used 3 tools". Counts are derived directly from the
+ * transcript rather than tracked separately, so it never drifts from what's
+ * actually rendered underneath. */
+export function buildActivitySummary(parts: MessagePart[]): string {
+  const toolCount = parts.filter((p) => p.type === 'tool_call').length;
+  const thinkCount = parts.filter((p) => p.type === 'reasoning').length;
+  const subAgentCount = parts.filter((p) => p.type === 'sub_agent').length;
+
+  const segments: string[] = [];
+  if (thinkCount > 0) segments.push(thinkCount === 1 ? 'Thought about this' : `Thought ${thinkCount} times`);
+  if (toolCount > 0) segments.push(`Used ${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}`);
+  if (subAgentCount > 0) segments.push(`Delegated to ${subAgentCount} sub-${subAgentCount === 1 ? 'agent' : 'agents'}`);
+  return segments.length > 0 ? segments.join(' · ') : 'Worked on this';
+}
+
+/**
+ * Wraps an activity timeline in a collapsible summary. Expanded while
+ * streaming so the live trace stays visible; collapsed by default for
+ * historical messages. Never auto-collapses — the user toggles it.
+ */
+export function CollapsibleActivitySection({ parts, isStreaming = false, children }: { parts: MessagePart[]; isStreaming?: boolean; children: React.ReactNode }) {
+  const [collapsed, setCollapsed] = useState(!isStreaming);
+  const summary = useMemo(() => buildActivitySummary(parts), [parts]);
+
+  const handleToggle = useCallback(() => {
+    setCollapsed((prev) => !prev);
+  }, []);
+
+  return (
+    <Box style={{ marginBottom: 'var(--space-3)' }}>
+      <Flex
+        align="center"
+        gap="1"
+        role="button"
+        tabIndex={0}
+        aria-expanded={!collapsed}
+        onClick={handleToggle}
+        onKeyDown={(e) => handleToggleKeyDown(e, handleToggle)}
+        style={{
+          cursor: 'pointer',
+          userSelect: 'none',
+          marginBottom: collapsed ? 0 : 'var(--space-2)',
+          transition: 'margin-bottom 200ms ease-out',
+          width: 'fit-content',
+        }}
+      >
+        <MaterialIcon
+          name={collapsed ? 'expand_more' : 'expand_less'}
+          size={ICON_SIZES.PRIMARY}
+          color="var(--slate-9)"
+        />
+        <Text size="1" style={{ color: 'var(--slate-9)' }}>
+          {summary}
+        </Text>
+      </Flex>
+      {/* 0fr/1fr grid animates to the content's intrinsic height — no fixed
+          maxHeight cap that would clip long transcripts. */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateRows: collapsed ? '0fr' : '1fr',
+          transition: 'grid-template-rows 300ms ease-out, opacity 200ms ease-out',
+          opacity: collapsed ? 0 : 1,
+        }}
+      >
+        <div
+          style={{ overflow: 'hidden', minHeight: 0 }}
+          aria-hidden={collapsed || undefined}
+          inert={collapsed || undefined}
+        >
+          {children}
+        </div>
+      </div>
+    </Box>
+  );
+}

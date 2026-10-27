@@ -1,0 +1,627 @@
+from datetime import datetime
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from uuid import uuid4
+import hashlib
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+if TYPE_CHECKING:
+    pass
+
+class Point(BaseModel):
+    x: float
+    y: float
+
+class CommentFormat(str, Enum):
+    TXT = "txt"
+    BIN = "bin"
+    MARKDOWN = "markdown"
+    HTML = "html"
+
+class BlockType(str, Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    TABLE_ROW = "table_row"
+    RECORD_SUMMARY = "record_summary"
+    CODE = "code"  # source-code symbol, emitted by CodeFileParser
+    # Do not use these types as currently not supported
+    PARAGRAPH = "paragraph"
+    TEXTSECTION = "textsection"
+    TABLE = "table"
+    TABLE_CELL = "table_cell"
+    FILE = "file"
+    VIDEO = "video"
+    AUDIO = "audio"
+    LINK = "link"
+    BULLET_LIST = "bullet_list"
+    NUMBERED_LIST = "numbered_list"
+    HEADING = "heading"
+    QUOTE = "quote"
+    DIVIDER = "divider"
+    VIEW = "view"
+    SQL = "sql"
+
+class BlockSubType(str, Enum):
+    CHILD_RECORD = "child_record"
+    COMMENT = "comment"
+    PARAGRAPH = "paragraph"
+    HEADING = "heading"
+    QUOTE = "quote"
+    LIST_ITEM = "list_item"
+    CODE = "code"
+    EQUATION = "equation"
+    DIVIDER = "divider"
+    LINK = "link"
+    MESSAGE = "message"  # Slack / messaging platform individual message block
+    COMMIT = "commit"
+
+class DataFormat(str, Enum):
+    TXT = "txt"
+    BIN = "bin"
+    MARKDOWN = "markdown"
+    HTML = "html"
+    JSON = "json"
+    XML = "xml"
+    CSV = "csv"
+    YAML = "yaml"
+    BASE64 = "base64"
+    UTF8 = "utf8"
+    PATCH = "patch"
+    DIFF = "diff"
+    CODE = "code"
+
+
+class CommentAttachment(BaseModel):
+    """Attachment model for comments"""
+    name: str = Field(description="Name of the attachment")
+    id: str = Field(description="ID of the attachment")
+
+class BlockComment(BaseModel):
+    text: str
+    format: DataFormat
+    author_id: Optional[str] = Field(default=None, description="ID of the user who created the comment")
+    author_name: Optional[str] = Field(default=None, description="Name of the user who created the comment")
+    thread_id: Optional[str] = None
+    resolution_status: Optional[str] = Field(default=None, description="Status of the comment (e.g., 'resolved', 'open')")
+    weburl: Optional[HttpUrl] = Field(default=None, description="Web URL for the comment (e.g., direct link to comment in the source system)")
+    created_at: Optional[datetime] = Field(default=None, description="Timestamp when the comment was created")
+    updated_at: Optional[datetime] = Field(default=None, description="Timestamp when the comment was updated")
+    attachments: Optional[list[CommentAttachment]] = Field(default=None, description="List of attachments associated with the comment")
+    quoted_text: Optional[str] = Field(default=None, description="Quoted text for inline comments")
+
+class CitationMetadata(BaseModel):
+    """Citation-specific metadata for referencing source locations"""
+    # All File formatsspecific
+    section_title: Optional[str] = None
+
+    # PDF specific
+    page_number: Optional[int] = None
+    has_more_pages: Optional[bool] = None
+    more_page_numbers: Optional[list[int]] = None
+    bounding_boxes: Optional[list[Point]] = None
+    more_page_bounding_boxes: Optional[list[list[Point]]] = None
+
+    # PDF/Word/Text specific
+    line_number: Optional[int] = None
+    paragraph_number: Optional[int] = None
+
+    # Excel specific
+    sheet_number: Optional[int] = None
+    sheet_name: Optional[str] = None
+    cell_reference: Optional[str] = None  # e.g., "A1", "B5"
+
+    # Excel/CSV specific
+    row_number: Optional[int] = None
+    column_number: Optional[int] = None
+
+    # Slide specific
+    slide_number: Optional[int] = None
+
+    # Video/Audio specific
+    start_timestamp: Optional[str] = None  # For video/audio content
+    end_timestamp: Optional[str] = None  # For video/audio content
+    duration_ms: Optional[int] = None  # For video/audio
+
+    @field_validator('bounding_boxes')
+    @classmethod
+    def validate_bounding_boxes(cls, v: list[Point] | None) -> list[Point] | None:
+        """Validate that the bounding boxes contain exactly 4 points"""
+        if v is None:
+            return v
+        COORDINATE_COUNT = 4
+        if len(v) != COORDINATE_COUNT:
+            raise ValueError(f'bounding_boxes must contain exactly {COORDINATE_COUNT} points')
+        return v
+
+class TableCellMetadata(BaseModel):
+    """Metadata specific to table cell blocks"""
+    row_number: Optional[int] = None
+    column_number: Optional[int] = None
+    row_span: Optional[int] = None
+    column_span: Optional[int] = None
+    column_header: Optional[bool] = None
+    row_header: Optional[bool] = None
+
+class ChildType(str, Enum):
+    """Type of child reference"""
+    RECORD = "record"
+    USER = "user"
+
+class ChildRecord(BaseModel):
+    """Metadata for child references (records, users, or other types)"""
+    child_type: ChildType = Field(description="Type of child: 'record', 'user', etc.")
+    child_id: str = Field(description="ID of the child (ArangoDB record ID, user ID, etc.)")
+    child_name: Optional[str] = Field(default=None, description="Name/title of the child")
+
+class TableRowMetadata(BaseModel):
+    """Metadata specific to table row blocks"""
+    row_number: Optional[int] = None
+    row_span: Optional[int] = None
+    is_header: bool = False
+    children_records: Optional[list[ChildRecord]] = None
+
+class TableMetadata(BaseModel):
+    """Metadata specific to table blocks"""
+    num_of_rows: Optional[int] = None
+    num_of_cols: Optional[int] = None
+    num_of_cells: Optional[int] = None
+    has_header: bool = False
+    column_names: Optional[list[str]] = None
+    captions: Optional[list[str]] = Field(default_factory=list)
+    footnotes: Optional[list[str]] = Field(default_factory=list)
+
+
+def summary_with_captions(summary: str | None, captions: list[str] | None) -> str:
+    """*summary* led by each caption it does not already contain.
+
+    A caption is often all that tells apart sibling tables with the same
+    columns, and an LLM summary written from the grid never sees it.
+    """
+    summary = summary or ""
+    missing = [
+        caption
+        for caption in dict.fromkeys((c or "").strip() for c in captions or [])
+        if caption and caption not in summary
+    ]
+    return "\n".join([*missing, summary] if summary else missing)
+
+
+class CodeMetadata(BaseModel):
+    """Metadata specific to code blocks"""
+    language: Optional[str] = None
+    execution_context: Optional[str] = None
+    is_executable: bool = False
+    dependencies: Optional[list[str]] = None
+    # Populated by CodeFileParser for source files.
+    kind: Optional[str] = None  # function | method | class | interface | field | ...
+    signature: Optional[str] = None
+    docstring: Optional[str] = None
+    decorators: Optional[list[str]] = None
+    # Repo-unique, human-readable resolution identity. The graph block key is
+    # hashed from this, so the blob and the graph must agree on it exactly.
+    qualified_name: Optional[str] = None  # "method:Outer.Inner.run"
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    # Cross-file edges whose source is this block and whose target is still a
+    # bare name; resolved by the corpus pass after every file is indexed.
+    pending_edges: Optional[list[dict]] = None
+    # Receiver-variable -> declared type for the whole file. Cannot be rebuilt
+    # without re-parsing, so the file-summary block carries it.
+    type_table: Optional[dict[str, str]] = None
+
+class MediaMetadata(BaseModel):
+    """Metadata for media blocks (image, video, audio)"""
+    duration_ms: Optional[int] = None  # For video/audio
+    dimensions: Optional[dict[str, int]] = None  # {"width": 1920, "height": 1080}
+    file_size_bytes: Optional[int] = None
+    mime_type: Optional[str] = None
+    alt_text: Optional[str] = None
+    transcription: Optional[str] = None  # For audio/video
+
+class ListMetadata(BaseModel):
+    """Metadata specific to list blocks"""
+    list_style: Optional[Literal["bullet", "numbered", "checkbox", "dash"]] = None
+    indent_level: int = 0
+    parent_list_id: Optional[str] = None
+    item_count: Optional[int] = None
+
+class FileMetadata(BaseModel):
+    """Metadata specific to file blocks"""
+    file_name: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    mime_type: Optional[str] = None
+    file_extension: Optional[str] = None
+    file_path: Optional[str] = None
+
+class LinkMetadata(BaseModel):
+    """Metadata specific to link blocks"""
+    link_text: Optional[str] = None
+    link_url: Optional[HttpUrl] = None
+    link_type: Optional[Literal["internal", "external"]] = None
+    link_target: Optional[str] = None
+
+class ImageMetadata(BaseModel):
+    """Metadata specific to image blocks"""
+    # What the image shows, written at indexing time by a vision model when
+    # one is configured (see `ImageDescriber`). This is the only
+    # representation of the image available to a text-only LLM, to a request
+    # where the image lost its slot, and to lexical search -- captions alone
+    # are empty for most PDFs.
+    description: Optional[str] = None
+    image_type: Optional[Literal["image", "drawing"]] = None
+    image_format: Optional[str] = None
+    image_size: Optional[dict[str, int]] = None
+    image_resolution: Optional[dict[str, int]] = None
+    image_dpi: Optional[int] = None
+    captions: Optional[list[str]] = Field(default_factory=list)
+    footnotes: Optional[list[str]] = Field(default_factory=list)
+    annotations: Optional[list[str]] = Field(default_factory=list)
+
+class Confidence(str, Enum):
+    VERY_HIGH = "very_high"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+class GroupType(str, Enum):
+    TEXT_SECTION = "text_section"
+    LIST = "list"
+    TABLE = "table"
+    COMMITS = "commits"
+    PATCH = "patch"
+    SHEET = "sheet"
+    FORM_AREA = "form_area"
+    INLINE = "inline"
+    KEY_VALUE_AREA = "key_value_area"
+    ORDERED_LIST = "ordered_list"
+    COLUMN = "column"
+    COLUMN_LIST = "column_list"
+    CONVERSATION = "conversation"  # Slack / messaging platform conversation group
+
+    VIEW = "view"
+    CODE = "code"  # class / interface / enum group in a source file
+    # Do not use these types as currently not supported
+    MEDIA = "media"
+    FULL_CODE_PATCH = "full_code_patch"
+
+class GroupSubType(str, Enum):
+    MILESTONE = "milestone" # Milestone block group
+    UPDATE = "update" # Update block group
+    CHILD_RECORD = "child_record" # Child record reference block group
+    CONTENT = "content" # Content block group
+    RECORD = "record" # Record block group
+    COMMENT_THREAD = "comment_thread" # Comment thread block group (used for comments in a thread)
+    COMMENT = "comment" # Comment block group
+    PROJECT_CONTENT = "project_content"
+    ISSUE_CONTENT = "issue_content"
+    TOGGLE = "toggle"
+    CALLOUT = "callout"
+    QUOTE = "quote"
+    SYNCED_BLOCK = "synced_block"
+    NESTED_BLOCK = "nested_block"  # Generic wrapper for blocks with children
+    # Slack / messaging platform subtypes
+    BURST = "burst"              # A burst of consecutive messages from the same user
+    THREAD = "thread"            # A threaded conversation under a parent message
+    SINGLE_MESSAGE = "single_message"  # A standalone single message
+    PR_FILE_CHANGE = "pr_file_change"
+    SQL_TABLE = "sql_table"
+    SQL_VIEW = "sql_view"
+    CODE_CLASS = "code_class"  # class / interface / enum group in a source file
+
+class SemanticMetadata(BaseModel):
+    entities: Optional[list[dict[str, Any]]] = None
+    named_entities: Optional[dict[str, Any]] = None
+    section_numbers: Optional[list[str]] = None
+    summary: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    departments: Optional[list[str]] = None
+    languages: Optional[list[str]] = None
+    topics: Optional[list[str]] = None
+    record_id: Optional[str] = None
+    categories: Optional[list[str]] = Field(default_factory=list)
+    sub_category_level_1: Optional[str] = None
+    sub_category_level_2: Optional[str] = None
+    sub_category_level_3: Optional[str] = None
+    confidence: Optional[Confidence] = None
+    # Set when the labels above are the names extracted from this record's
+    # own content (app.modules.indexing.record_label_repair reads it).
+    own_labels: bool | None = None
+    # Populated for CODE_FILE records only. They reach chat context through the
+    # blob record, not the graph -- nothing creates taxonomy nodes for them.
+    architecture_role: Optional[str] = None
+    design_patterns: Optional[list[str]] = None
+    external_dependencies: Optional[list[str]] = None
+
+    def to_llm_context(self) -> list[str]:
+        lines = []
+        if self.summary:
+            lines.append(f"Summary: {self.summary}")
+        if self.topics:
+            lines.append(f"Topics: {self.topics}")
+        cat_parts = []
+        if self.categories:
+            cat_parts.append(self.categories[0])
+        if self.sub_category_level_1:
+            cat_parts.append(self.sub_category_level_1)
+        if self.sub_category_level_2:
+            cat_parts.append(self.sub_category_level_2)
+        if self.sub_category_level_3:
+            cat_parts.append(self.sub_category_level_3)
+        if cat_parts:
+            lines.append(f"Category: {' > '.join(cat_parts)}")
+        if self.architecture_role:
+            lines.append(f"Architecture Role: {self.architecture_role}")
+        if self.design_patterns:
+            lines.append(f"Design Patterns: {', '.join(self.design_patterns)}")
+        if self.external_dependencies:
+            lines.append(f"External Dependencies: {', '.join(self.external_dependencies)}")
+        return lines
+
+class Block(BaseModel):
+    # Core block properties
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    index: int = None
+    parent_index: Optional[int] = Field(default=None, description="Index of the parent block group")
+    parent_block_index: Optional[int] = Field(
+        default=None,
+        description="Index of the container block when this block is a fragment split from a parent block that contained images",
+    )
+    type: BlockType
+    sub_type: Optional[BlockSubType] = None
+    name: Optional[str] = None
+    format: DataFormat = None
+    comments: list[list[BlockComment]] = Field(default_factory=list, description="2D list of comments grouped by thread_id, with each thread's comments in API order")
+    source_creation_date: Optional[datetime] = None
+    source_update_date: Optional[datetime] = None
+    source_id: Optional[str] = None
+    source_name: Optional[str] = None
+    source_type: Optional[str] = None
+    # Content and links
+    data: Optional[Any] = None
+    links: Optional[list[str]] = None
+    weburl: Optional[HttpUrl] = None
+    public_data_link: Optional[HttpUrl] = None
+    public_data_link_expiration_epoch_time_in_ms: Optional[int] = None
+    citation_metadata: Optional[CitationMetadata] = None
+    list_metadata: Optional[ListMetadata] = None
+    table_row_metadata: Optional[TableRowMetadata] = None
+    table_cell_metadata: Optional[TableCellMetadata] = None
+    code_metadata: Optional[CodeMetadata] = None
+    media_metadata: Optional[MediaMetadata] = None
+    file_metadata: Optional[FileMetadata] = None
+    link_metadata: Optional[LinkMetadata] = None
+    image_metadata: Optional[ImageMetadata] = None
+    semantic_metadata: Optional[SemanticMetadata] = None
+    children_records: Optional[List[ChildRecord]] = Field(default=None, description="List of child records associated with this block")
+    content_hash: Optional[str] = Field(default=None, description="Hash of the content")
+    
+
+class Blocks(BaseModel):
+    blocks: list[Block] = Field(default_factory=list)
+
+class BlockContainerIndex(BaseModel):
+    """Legacy model for backward compatibility - use BlockGroupChildren instead"""
+    block_index: Optional[int] = None
+    block_group_index: Optional[int] = None
+
+class IndexRange(BaseModel):
+    """Represents a range of indices (inclusive)"""
+    start: int = Field(description="Starting index (inclusive)")
+    end: int = Field(description="Ending index (inclusive)")
+
+class BlockGroupChildren(BaseModel):
+    """Container for child block and block group references using ranges"""
+    block_ranges: list[IndexRange] = Field(default_factory=list, description="Ranges of block indices")
+    block_group_ranges: list[IndexRange] = Field(default_factory=list, description="Ranges of block group indices")
+
+    def add_block_index(self, index: int) -> None:
+        """Add a block index, merging into existing ranges if contiguous"""
+        if not self.block_ranges:
+            self.block_ranges.append(IndexRange(start=index, end=index))
+            return
+
+        # Try to merge with existing ranges
+        for range_obj in self.block_ranges:
+            if index == range_obj.end + 1:
+                range_obj.end = index
+                return
+            elif index == range_obj.start - 1:
+                range_obj.start = index
+                return
+            elif range_obj.start <= index <= range_obj.end:
+                # Already in range
+                return
+
+        # Add new range and sort
+        self.block_ranges.append(IndexRange(start=index, end=index))
+        self.block_ranges.sort(key=lambda r: r.start)
+
+    def add_block_group_index(self, index: int) -> None:
+        """Add a block group index, merging into existing ranges if contiguous"""
+        if not self.block_group_ranges:
+            self.block_group_ranges.append(IndexRange(start=index, end=index))
+            return
+
+        # Try to merge with existing ranges
+        for range_obj in self.block_group_ranges:
+            if index == range_obj.end + 1:
+                range_obj.end = index
+                return
+            elif index == range_obj.start - 1:
+                range_obj.start = index
+                return
+            elif range_obj.start <= index <= range_obj.end:
+                # Already in range
+                return
+
+        # Add new range and sort
+        self.block_group_ranges.append(IndexRange(start=index, end=index))
+        self.block_group_ranges.sort(key=lambda r: r.start)
+
+    @staticmethod
+    def from_indices(block_indices: Optional[list[int]] = None,
+                     block_group_indices: Optional[list[int]] = None) -> 'BlockGroupChildren':
+        """Create BlockGroupChildren from lists of indices by grouping into ranges"""
+        def indices_to_ranges(indices: list[int]) -> list[IndexRange]:
+            if not indices:
+                return []
+
+            # Sort and remove duplicates
+            sorted_indices = sorted(set(indices))
+            ranges = []
+            start = sorted_indices[0]
+            end = sorted_indices[0]
+
+            for i in range(1, len(sorted_indices)):
+                if sorted_indices[i] == end + 1:
+                    # Contiguous, extend current range
+                    end = sorted_indices[i]
+                else:
+                    # Gap found, save current range and start new one
+                    ranges.append(IndexRange(start=start, end=end))
+                    start = sorted_indices[i]
+                    end = sorted_indices[i]
+
+            # Add the last range
+            ranges.append(IndexRange(start=start, end=end))
+            return ranges
+
+        block_ranges = indices_to_ranges(block_indices or [])
+        block_group_ranges = indices_to_ranges(block_group_indices or [])
+
+        return BlockGroupChildren(
+            block_ranges=block_ranges,
+            block_group_ranges=block_group_ranges
+        )
+
+class BlockGroup(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    index: int = None
+    name: Optional[str] = Field(description="Name of the block group",default=None)
+    type: GroupType = Field(description="Type of the block group")
+    sub_type: Optional[GroupSubType] = Field(default=None, description="Subtype of the block group (e.g., milestone, update, content)")
+    parent_index: Optional[int] = Field(description="Index of the parent block group",default=None)
+    description: Optional[str] = Field(description="Description of the block group",default=None)
+    source_group_id: Optional[str] = Field(description="Source group identifier",default=None)
+    requires_processing : bool = Field(default=False, description="Indicates if further processing is needed for this block group")
+    citation_metadata: Optional[CitationMetadata] = None
+    list_metadata: Optional[ListMetadata] = None
+    table_metadata: Optional[TableMetadata] = None
+    table_row_metadata: Optional[TableRowMetadata] = None
+    table_cell_metadata: Optional[TableCellMetadata] = None
+    code_metadata: Optional[CodeMetadata] = None
+    media_metadata: Optional[MediaMetadata] = None
+    file_metadata: Optional[FileMetadata] = None
+    link_metadata: Optional[LinkMetadata] = None
+    semantic_metadata: Optional[SemanticMetadata] = None
+    children_records: Optional[List[ChildRecord]] = Field(default=None, description="List of child records associated with this block group")
+    content_hash: Optional[str] = Field(default=None, description="Hash of the content for reconciliation")
+    children: Optional[BlockGroupChildren] = None
+    data: Optional[Any] = None
+
+    @field_validator('children', mode='before')
+    @classmethod
+    def convert_children_format(cls, v:Optional[BlockGroupChildren|dict|list]) -> Optional[BlockGroupChildren|dict|list]:
+        """Convert old List[BlockContainerIndex] format to new BlockGroupChildren format"""
+        if v is None:
+            return None
+
+        # If it's already a BlockGroupChildren instance or dict with the new format, return as-is
+        if isinstance(v, BlockGroupChildren):
+            return v
+        if isinstance(v, dict) and ('block_ranges' in v or 'block_group_ranges' in v):
+            return v
+
+        # If it's a list, it's the old format (List[BlockContainerIndex])
+        if isinstance(v, list):
+            block_indices = []
+            block_group_indices = []
+
+            for item in v:
+                if isinstance(item, dict):
+                    if item.get('block_index') is not None:
+                        block_indices.append(item['block_index'])
+                    if item.get('block_group_index') is not None:
+                        block_group_indices.append(item['block_group_index'])
+                elif hasattr(item, 'block_index') or hasattr(item, 'block_group_index'):
+                    if hasattr(item, 'block_index') and item.block_index is not None:
+                        block_indices.append(item.block_index)
+                    if hasattr(item, 'block_group_index') and item.block_group_index is not None:
+                        block_group_indices.append(item.block_group_index)
+
+            return BlockGroupChildren.from_indices(block_indices, block_group_indices)
+
+        return v
+    format: Optional[DataFormat] = None
+    weburl: Optional[HttpUrl] = Field(default=None, description="Web URL for the original source context (e.g., Linear project page). This will be used as primary webUrl in citations for all generated blocks")
+    comments: list[list[BlockComment]] = Field(default_factory=list, description="2D list of comments grouped by thread_id, with each thread's comments sorted by created_at")
+    source_modified_date: Optional[datetime] = None
+
+class BlockGroups(BaseModel):
+    block_groups: list[BlockGroup] = Field(default_factory=list)
+
+class BlocksContainer(BaseModel):
+    block_groups: list[BlockGroup] = Field(default_factory=list)
+    blocks: list[Block] = Field(default_factory=list)
+    # PARSER_VERSION of a code parse, so a stored blob says which fact schema it holds.
+    code_facts_version: Optional[str] = None
+
+    def extend(self, other: 'BlocksContainer') -> None:
+        """Append *other*'s content, rebasing its indices onto this container.
+
+        Every cross-reference in the model is positional (BlockContainerValidator
+        requires index == list position), so each one has to shift by the
+        current lengths. *other*'s items are mutated and re-parented rather
+        than copied, so merging a sequence of page/batch results never holds
+        two copies of one batch; treat *other* as consumed afterwards.
+        """
+        block_offset = len(self.blocks)
+        group_offset = len(self.block_groups)
+
+        for block in other.blocks:
+            block.index += block_offset
+            if block.parent_index is not None:
+                block.parent_index += group_offset
+            if block.parent_block_index is not None:
+                block.parent_block_index += block_offset
+            self.blocks.append(block)
+
+        for block_group in other.block_groups:
+            block_group.index += group_offset
+            if block_group.parent_index is not None:
+                block_group.parent_index += group_offset
+            if block_group.children:
+                for block_range in block_group.children.block_ranges:
+                    block_range.start += block_offset
+                    block_range.end += block_offset
+                for group_range in block_group.children.block_group_ranges:
+                    group_range.start += group_offset
+                    group_range.end += group_offset
+            self.block_groups.append(block_group)
+
+        other.blocks = []
+        other.block_groups = []
+
+
+def wire_block_group_parent_children(block_groups: list[BlockGroup]) -> None:
+    """Set parent.children.block_group_ranges from each child's parent_index.
+
+    Keeps existing block_ranges on the parent when present. Without this the
+    container validator reports REVERSE_LINKAGE_MISSING, since parent_index is
+    a one-way pointer.
+    """
+    children_map: dict[int, list[int]] = {}
+    for bg in block_groups:
+        if bg.parent_index is not None:
+            children_map.setdefault(bg.parent_index, []).append(bg.index)
+
+    for bg in block_groups:
+        child_indices = children_map.get(bg.index)
+        if not child_indices:
+            continue
+        wired = BlockGroupChildren.from_indices(block_group_indices=sorted(child_indices))
+        if bg.children is None:
+            bg.children = wired
+        else:
+            bg.children.block_group_ranges = wired.block_group_ranges
+

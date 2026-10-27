@@ -1,0 +1,668 @@
+// ========================================
+// Connector page types
+// ========================================
+
+/** Scope determines whether we're viewing team or personal connectors. */
+export type ConnectorScope = 'team' | 'personal';
+
+/** Filter tabs displayed for team connectors. */
+export type TeamFilterTab = 'all' | 'configured' | 'not_configured';
+
+/** Filter tabs displayed for personal connectors. */
+export type PersonalFilterTab = 'all' | 'active' | 'inactive';
+
+/**
+ * Core connector object returned by both the active-list
+ * and registry endpoints.
+ */
+export interface Connector {
+  _key?: string;
+  name: string;
+  type: string;
+  appGroup: string;
+  appDescription: string;
+  appCategories: string[];
+  iconPath: string;
+  supportedAuthTypes: string[];
+  supportsRealtime: boolean;
+  supportsSync: boolean;
+  supportsAgent: boolean;
+  /** Documentation links promoted from config; present on list responses. */
+  documentationLinks?: DocumentationLink[];
+  /** Promoted from config; used for team connector admin-access prompt. */
+  isAdminAccessRequired?: boolean;
+  /** Promoted from config; redirect target when user lacks native-app admin access. */
+  personalConnectorType?: string | null;
+  scope: string;
+  /** Only present on active connectors. */
+  isActive: boolean;
+  isAgentActive: boolean;
+  isConfigured: boolean;
+  isAuthenticated: boolean;
+  pendingFullSync?: boolean;
+  createdAtTimestamp?: number;
+  updatedAtTimestamp?: number;
+  /** When the last sync run started and ended, and how it ended. Absent until a run finishes. */
+  lastSyncStartedAtTimestamp?: number | null;
+  lastSyncFinishedAtTimestamp?: number | null;
+  lastSyncOutcome?: 'succeeded' | 'failed' | 'stopped' | 'skipped' | null;
+  /** What the last run did, in the connector's own terms (see LastSyncSummary for the web connector's). */
+  lastSyncSummary?: LastSyncSummary | null;
+  /** What the connector's admin has to do; shown as an action-needed badge until it is done. */
+  actionItems?: ConnectorActionItem[];
+  createdBy?: string;
+  updatedBy?: string;
+  authType?: string;
+  connectorInfo?: string | Record<string, unknown> | null;
+  /**
+   * @deprecated Full config schema is no longer included in list responses.
+   * Use `GET /registry/{type}/schema` to retrieve auth/sync/filter schemas.
+   * `documentationLinks`, `isAdminAccessRequired`, and `personalConnectorType`
+   * are promoted to top-level fields on list responses.
+   */
+  config?: Record<string, unknown>;
+  /**
+   * Transient operational status from the backend.
+   * Prefer comparing to `CONNECTOR_INSTANCE_STATUS` from `./constants`; other strings may appear before the UI is updated.
+   */
+  status?: string | null;
+  /**
+   * Local FS only, and only while sync is enabled. Live: the owner device
+   * (`ownerDeviceId`) is connected, stamped by Node at response time.
+   * Absent when unknown, unclaimed, or when the connector is disabled.
+   */
+  desktopOnline?: boolean;
+  /** Local FS only. The desktop device that claimed this connector on first enable. */
+  ownerDeviceId?: string;
+  ownerDeviceName?: string;
+}
+
+/** API list response shape. */
+export interface ConnectorListResponse {
+  success: boolean;
+  connectors: Connector[];
+}
+
+// ========================================
+// Auth types
+// ========================================
+
+export type AuthType =
+  | 'OAUTH'
+  | 'OAUTH_ADMIN_CONSENT'
+  | 'OAUTH_CERTIFICATE'
+  | 'API_TOKEN'
+  | 'USERNAME_PASSWORD'
+  | 'BEARER_TOKEN'
+  | 'CUSTOM'
+  | 'NONE';
+
+// ========================================
+// Sync types
+// ========================================
+
+export type SyncStrategy = 'WEBHOOK' | 'SCHEDULED' | 'MANUAL' | 'REALTIME';
+
+// ========================================
+// Field types (shared across auth, sync, filter)
+// ========================================
+
+/**
+ * Mirror of Python ``ValidationRuleType`` in
+ * ``backend/python/app/connectors/core/registry/types.py``.
+ * Keep values in sync — they are the wire format exchanged with the backend.
+ */
+export const ValidationRuleType = {
+  JSON_VALID:        'json_valid',
+  JSON_HAS_FIELDS:   'json_has_fields',
+  JSON_FIELD_EQUALS: 'json_field_equals',
+  TEXT_CONTAINS:     'text_contains',
+  TEXT_NOT_CONTAINS: 'text_not_contains',
+} as const;
+
+export type ValidationRuleTypeValue = typeof ValidationRuleType[keyof typeof ValidationRuleType];
+
+export interface ValidationRule {
+  type: ValidationRuleTypeValue;
+  /** For json_has_fields: list of required top-level keys */
+  requiredFields?: string[];
+  /** For json_field_equals: the key to check */
+  field?: string;
+  /** For json_field_equals: the expected value */
+  value?: string;
+  /** For text_contains / text_not_contains: substring or PEM marker to test */
+  pattern?: string;
+  /** Human-readable error shown when the rule fails. Supports {missing} placeholder for json_has_fields. */
+  errorMessage?: string;
+}
+
+/**
+ * Shared validation payload from connector/sync schemas.
+ * The backend omits `acceptedFileTypes` and `validationRules` unless
+ * `fieldType === 'FILE'` — treat them as absent unless the field is a file input.
+ */
+export interface FieldValidation {
+  minLength?: number;
+  maxLength?: number;
+  /** Allowed whole-number range for NUMBER fields (minLength/maxLength are text lengths and ignored there). */
+  min?: number;
+  max?: number;
+  pattern?: string;
+  format?: string;
+  /** Present when `fieldType === 'FILE'` (wire schema from Python). */
+  acceptedFileTypes?: string[];
+  /** Present when `fieldType === 'FILE'`. Ordered rules on file content after selection. */
+  validationRules?: ValidationRule[];
+}
+
+export interface AuthSchemaField {
+  name: string;
+  displayName: string;
+  placeholder?: string;
+  description?: string;
+  fieldType:
+    | 'TEXT'
+    | 'PASSWORD'
+    | 'EMAIL'
+    | 'URL'
+    | 'TEXTAREA'
+    | 'SELECT'
+    | 'MULTISELECT'
+    | 'CHECKBOX'
+    | 'NUMBER'
+    | 'FILE'
+    | 'TAGS'
+    | 'FOLDER';
+  required?: boolean;
+  defaultValue?: unknown;
+  options?: string[];
+  validation?: FieldValidation;
+  isSecret?: boolean;
+  /**
+   * Optional labeled example values rendered below the input as a compact
+   * copyable note. Intended for fields where a single placeholder can't
+   * carry all the variants a user may need (e.g. Azure AI endpoints).
+   */
+  examples?: { label: string; value: string }[];
+  /**
+   * Shown only on an instance that already has a value saved for this field, never on a new one:
+   * a way of signing in kept for instances set up with it (see `authSchemaForInstance`).
+   */
+  savedOnly?: boolean;
+  /** Required, except on an instance that has a value saved for this other field. */
+  requiredUnlessSaved?: string;
+}
+
+/** Something a connector's admin has to do, reported by the connector (backend `ActionItem`). */
+export interface ConnectorActionItem {
+  code: string;
+  severity: 'warning' | 'error';
+  /** Shown as written; the connector words it. */
+  title: string;
+  message: string;
+  /** Where in the panel it is done: `authenticate` opens the Authenticate tab. */
+  action?: 'authenticate' | null;
+  /** The steps, on the docs site. */
+  docsUrl?: string | null;
+}
+
+export interface SyncCustomField {
+  name: string;
+  displayName: string;
+  description?: string;
+  fieldType:
+    | 'TEXT'
+    | 'PASSWORD'
+    | 'EMAIL'
+    | 'URL'
+    | 'TEXTAREA'
+    | 'SELECT'
+    | 'MULTISELECT'
+    | 'CHECKBOX'
+    | 'NUMBER'
+    | 'FILE'
+    | 'JSON'
+    | 'BOOLEAN'
+    | 'TAGS'
+    | 'FOLDER';
+  required?: boolean;
+  defaultValue?: unknown;
+  options?: string[];
+  validation?: FieldValidation;
+  isSecret?: boolean;
+  nonEditable?: boolean;
+  placeholder?: string;
+  /** Display label per SELECT option value. */
+  optionLabels?: Record<string, string>;
+  /** Unit shown after a NUMBER input, such as "pages". */
+  unit?: string;
+  /** Name of a group in `ConnectorSyncConfig.customFieldGroups`. */
+  group?: string;
+  /** Shown only while, for every key, that field's current value is one of the listed values. */
+  showWhen?: Record<string, unknown[]>;
+}
+
+export interface SyncCustomFieldGroup {
+  name: string;
+  displayName: string;
+  description?: string;
+  /** Starts closed, with a summary of its changed settings. */
+  collapsed?: boolean;
+}
+
+export interface FilterSchemaField {
+  name: string;
+  displayName: string;
+  description?: string;
+  fieldType?:
+    | 'TEXT'
+    | 'SELECT'
+    | 'MULTISELECT'
+    | 'DATE'
+    | 'DATERANGE'
+    | 'NUMBER'
+    | 'BOOLEAN'
+    | 'TAGS';
+  filterType?: 'list' | 'datetime' | 'text' | 'string' | 'number' | 'boolean' | 'multiselect' | 'select';
+  category?: 'sync' | 'indexing';
+  required?: boolean;
+  defaultValue?: unknown;
+  defaultOperator?: string;
+  /** When true, empty operator row stays empty (no fallback to operators[0]). */
+  noImplicitOperatorDefault?: boolean;
+  /**
+   * The window the connector applies when this filter is not set at all (e.g. a
+   * sync filter that falls back to the last 30 days). Shown while the filter is cleared.
+   */
+  fallbackOperator?: string;
+  operators?: string[];
+  optionSourceType?: 'manual' | 'static' | 'dynamic';
+  options?: { id: string; label: string }[];
+}
+
+/** Union field type for SchemaFormField component */
+export type SchemaField = AuthSchemaField | SyncCustomField | FilterSchemaField;
+
+// ========================================
+// Schema response structures
+// ========================================
+
+export interface DocumentationLink {
+  title: string;
+  url: string;
+  type: 'setup' | 'api' | 'connector' | 'pipeshub';
+}
+
+export interface ConditionalDisplayRule {
+  field: string;
+  operator:
+    | 'equals'
+    | 'not_equals'
+    | 'contains'
+    | 'not_contains'
+    | 'greater_than'
+    | 'less_than'
+    | 'is_empty'
+    | 'is_not_empty';
+  value?: unknown;
+}
+
+export interface ConditionalDisplayConfig {
+  [key: string]: { showWhen: ConditionalDisplayRule };
+}
+
+export interface AuthSchemaDefinition {
+  fields: AuthSchemaField[];
+  redirectUri?: string;
+  displayRedirectUri?: boolean;
+}
+
+export interface ConnectorAuthConfig {
+  type?: string;
+  supportedAuthTypes: string[];
+  displayRedirectUri?: boolean;
+  redirectUri?: string;
+  conditionalDisplay?: ConditionalDisplayConfig;
+  schema?: AuthSchemaDefinition;
+  schemas?: Record<string, AuthSchemaDefinition>;
+  values: Record<string, unknown>;
+  customFields?: AuthSchemaField[];
+  customValues?: Record<string, unknown>;
+}
+
+export interface ScheduledConfig {
+  intervalMinutes?: number;
+  cronExpression?: string;
+  timezone?: string;
+  startTime?: number;
+  nextTime?: number;
+  endTime?: number;
+  maxRepetitions?: number;
+  repetitionCount?: number;
+  startDateTime?: string;
+}
+
+export interface WebhookConfig {
+  supported?: boolean;
+  webhookUrl?: string;
+  events?: string[];
+  verificationToken?: string;
+  secretKey?: string;
+}
+
+export interface RealtimeConfig {
+  supported?: boolean;
+  connectionType?: string;
+}
+
+export interface ConnectorSyncConfig {
+  supportedStrategies: SyncStrategy[];
+  selectedStrategy?: SyncStrategy;
+  webhookConfig?: WebhookConfig;
+  scheduledConfig?: ScheduledConfig;
+  realtimeConfig?: RealtimeConfig;
+  customFields: SyncCustomField[];
+  /** Render order of grouped custom fields; fields without a group stay in the shared block. */
+  customFieldGroups?: SyncCustomFieldGroup[];
+  customValues: Record<string, unknown>;
+  values?: Record<string, unknown>;
+}
+
+export interface FilterCategoryConfig {
+  schema?: { fields: FilterSchemaField[] };
+  values?: Record<string, unknown>;
+  customFields?: FilterSchemaField[];
+  customValues?: Record<string, unknown>;
+}
+
+export interface ConnectorFiltersConfig {
+  sync?: FilterCategoryConfig;
+  indexing?: FilterCategoryConfig;
+  schema?: { fields: FilterSchemaField[] };
+  values?: Record<string, unknown>;
+}
+
+export interface ConnectorSchemaResponse {
+  success: boolean;
+  schema: {
+    iconPath: string;
+    supportsRealtime: boolean;
+    supportsSync: boolean;
+    supportsAgent: boolean;
+    documentationLinks: DocumentationLink[];
+    hideConnector: boolean;
+    isAdminAccessRequired?: boolean;
+    personalConnectorType?: string | null;
+    /** The credentials can be tried with `testConnection` before they are saved. */
+    supportsConnectionCheck?: boolean;
+    auth: ConnectorAuthConfig;
+    sync: ConnectorSyncConfig;
+    filters: ConnectorFiltersConfig;
+  };
+}
+
+/** Body of `POST /registry/:connectorType/test-connection`; a failed check is `success: false`. */
+export interface ConnectionCheckResponse {
+  success: boolean;
+  message: string;
+}
+
+// ========================================
+// Config response
+// ========================================
+
+export interface ConnectorConfig {
+  name: string;
+  type: string;
+  appGroup: string;
+  appGroupId: string;
+  authType: string;
+  isActive: boolean;
+  isConfigured: boolean;
+  isAuthenticated?: boolean;
+  supportsRealtime: boolean;
+  appDescription: string;
+  appCategories: string[];
+  iconPath: string;
+  config: {
+    auth: Partial<ConnectorAuthConfig>;
+    sync: Partial<ConnectorSyncConfig>;
+    filters: Partial<ConnectorFiltersConfig>;
+    documentationLinks?: DocumentationLink[];
+  };
+}
+
+// ========================================
+// Filter options (dynamic)
+// ========================================
+
+export interface FilterOptionsResponse {
+  success: boolean;
+  options: { id: string; label: string }[];
+  page: number;
+  limit: number;
+  hasMore: boolean;
+  cursor?: string;
+  message?: string;
+}
+
+// ========================================
+// Panel form data
+// ========================================
+
+export interface PanelFormData {
+  auth: Record<string, unknown>;
+  sync: {
+    selectedStrategy: SyncStrategy;
+    scheduledConfig: {
+      intervalMinutes?: number;
+      startDateTime?: string;
+      timezone?: string;
+    };
+    customValues: Record<string, unknown>;
+  };
+  filters: {
+    sync: Record<string, unknown>;
+    indexing: Record<string, unknown>;
+  };
+}
+
+// ========================================
+// Panel tab + view types
+// ========================================
+
+export type PanelTab = 'authenticate' | 'authorize' | 'configure';
+export type PanelView = 'tabs' | 'select-records';
+export type AuthCardState = 'empty' | 'success' | 'failed';
+
+/** Connection check run by the Authenticate tab's Next button. */
+export interface ConnectionCheckState {
+  status: 'idle' | 'checking' | 'failed';
+  message: string | null;
+  /** Set while checking; a reset (panel opened or closed, auth type changed) drops it, voiding the result. */
+  id?: number;
+}
+
+// ========================================
+// Instance page types
+// ========================================
+
+/**
+ * Sync status for a connector instance.
+ *
+ * Derived states (via deriveSyncStatus — always reachable):
+ *   ready_to_sync | syncing | sync_complete | sync_failed | sync_disabled | auth_incomplete
+ *
+ * Requires future backend signal (not reachable today via derivation):
+ *   detecting_records — needs a dedicated API field before stats are available
+ */
+export type InstanceSyncStatus =
+  | 'ready_to_sync'
+  | 'detecting_records'
+  | 'syncing'
+  | 'sync_complete'
+  | 'sync_failed'
+  | 'auth_incomplete'
+  | 'sync_disabled';
+
+/** Instance card data (enriched connector with sync info) */
+export interface ConnectorInstance extends Connector {
+  /** Sync status */
+  syncStatus?: InstanceSyncStatus;
+  /** Number of records/channels selected */
+  recordsSelected?: number;
+  /** Sync strategy label */
+  syncStrategy?: string;
+  /** Sync interval label */
+  syncInterval?: string;
+  /** User who enabled the connector */
+  enabledBy?: { name: string; avatar?: string };
+  /** Last synced timestamp */
+  lastSynced?: string | null;
+  /** Sync progress info */
+  syncProgress?: {
+    total?: number;
+    synced?: number;
+    percentage?: number;
+    label?: string;
+  };
+}
+
+/** Electron local-folder watcher state per connector instance */
+export interface LocalSyncStatus {
+  connectorId: string;
+  watcherState: 'starting' | 'watching' | 'stopped';
+  /** Strategy the mounted watcher is running under — falls back to journal meta when stopped. */
+  syncStrategy: 'MANUAL' | 'SCHEDULED';
+  rootPath: string | null;
+  lastError: string | null;
+  pendingCount: number;
+  failedCount: number;
+  syncedCount: number;
+  lastBatchId: string | null;
+  lastAckAt: number | null;
+}
+
+/** Management panel tab */
+export type InstancePanelTab = 'overview' | 'settings';
+
+/** Indexing status counters from the stats API */
+export interface IndexingStatus {
+  NOT_STARTED: number;
+  IN_PROGRESS: number;
+  COMPLETED: number;
+  FAILED: number;
+  FILE_TYPE_NOT_SUPPORTED: number;
+  AUTO_INDEX_OFF: number;
+  ENABLE_MULTIMODAL_MODELS: number;
+  EMPTY: number;
+  QUEUED: number;
+  PAUSED: number;
+  SKIPPED?: number;
+  PASSWORD_PROTECTED?: number;
+}
+
+/**
+ * Record counts keyed by a pipeline stage's status: classify (`extractionStatus`)
+ * or named-entity extraction (`entitiesStatus`).
+ */
+export type ExtractionStatusCounts = Partial<Record<string, number>>;
+
+/** Pipeline stages that can be re-run on their own via the reindex endpoint. */
+export type ReindexStage = 'classify' | 'entities';
+
+/** Stats breakdown by record type */
+export interface RecordTypeStats {
+  recordType: string;
+  total: number;
+  indexingStatus: IndexingStatus;
+  /** Absent on backends that predate pipeline stages. */
+  extractionStatus?: ExtractionStatusCounts;
+  /** Absent on backends that predate the entities stage. */
+  entitiesStatus?: ExtractionStatusCounts;
+}
+
+/** One entry of GET /api/v1/code-graph/repos */
+export interface CodeGraphRepo {
+  repo: string;
+  source: string;
+  connector_id: string;
+  graph_status: CodeGraphStatus;
+  last_built_at?: number;
+  last_error?: string;
+}
+
+export type CodeGraphStatus =
+  | 'never_built'
+  | 'building'
+  | 'ready'
+  | 'stale'
+  | 'waiting_on_indexing'
+  | 'retrying'
+  | 'failed'
+  | 'too_large'
+  | 'unknown';
+
+/** Response from GET /api/v1/connectors/{connectorId}/stats */
+export interface ConnectorStatsResponse {
+  success: boolean;
+  data: {
+    orgId: string;
+    connectorId: string;
+    origin: string;
+    stats: {
+      total: number;
+      indexingStatus: IndexingStatus;
+      /** Absent on backends that predate pipeline stages. */
+      extractionStatus?: ExtractionStatusCounts;
+      /** Absent on backends that predate the entities stage. */
+      entitiesStatus?: ExtractionStatusCounts;
+    };
+    byRecordType: RecordTypeStats[];
+  };
+}
+
+/** Records status counters (derived from stats for UI display) */
+export interface RecordsStatus {
+  total: number;
+  completed: number;
+  failed: number;
+  unsupported: number;
+  inProgress: number;
+  notStarted: number;
+  autoIndexOff: number;
+  queued: number;
+  empty: number;
+  passwordProtected: number;
+}
+
+/** Indexed record item */
+export interface IndexedRecord {
+  id: string;
+  name: string;
+}
+
+/** Instance overview data */
+export interface InstanceOverview {
+  recordsStatus: RecordsStatus;
+  indexedRecords: IndexedRecord[];
+  totalSelected: number;
+}
+
+/** Counts a connector reports for its last run. Every field is optional: connectors fill what applies. */
+export interface LastSyncSummary {
+  pagesSaved?: number;
+  /** Pages the connector keeps after the run; what Maximum pages caps. */
+  pagesStored?: number | null;
+  pagesVisited?: number;
+  failed?: number;
+  failedByStatus?: Record<string, number>;
+  robotsSkipped?: number;
+  noindexSkipped?: number;
+  skippedMaxPages?: number;
+  deferred?: number;
+  pruned?: number;
+  sitemapUrls?: number;
+  stopReason?: 'max_pages' | 'time_limit' | 'stalled' | 'rate_limited' | null;
+  resumed?: boolean;
+}

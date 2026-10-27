@@ -1,0 +1,225 @@
+"""
+Tests for MessagingFactory: create_producer and create_consumer.
+"""
+
+import logging
+import os
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from app.services.messaging.config import (
+    ConsumerType,
+    MessageBrokerType,
+    RedisStreamsConfig,
+)
+from app.services.messaging.kafka.config.kafka_config import (
+    KafkaConsumerConfig,
+    KafkaProducerConfig,
+)
+from app.services.messaging.messaging_factory import MessagingFactory
+
+
+def _unwrap(producer):
+    """The broker producer behind any lane-routing decorator.
+
+    create_producer wraps the producer when laning is enabled, so a test
+    about which broker was selected has to look through that.
+    """
+    return getattr(producer, "inner", producer)
+
+
+
+@pytest.fixture
+def logger():
+    return logging.getLogger("test_messaging_factory")
+
+
+@pytest.fixture
+def producer_config():
+    return KafkaProducerConfig(
+        bootstrap_servers=["localhost:9092"],
+        client_id="test-producer",
+    )
+
+
+@pytest.fixture
+def consumer_config():
+    return KafkaConsumerConfig(
+        topics=["test-topic"],
+        client_id="test-consumer",
+        group_id="test-group",
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        bootstrap_servers=["localhost:9092"],
+    )
+
+
+# ===========================================================================
+# create_producer
+# ===========================================================================
+
+
+class TestCreateProducer:
+    """MessagingFactory.create_producer()"""
+
+    def test_kafka_broker_returns_kafka_producer(self, logger, producer_config):
+        producer = MessagingFactory.create_producer(
+            logger, config=producer_config, broker_type=MessageBrokerType.KAFKA
+        )
+        from app.services.messaging.kafka.producer.producer import (
+            KafkaMessagingProducer,
+        )
+        assert isinstance(_unwrap(producer), KafkaMessagingProducer)
+
+    def test_none_config_raises_value_error(self, logger):
+        with pytest.raises(ValueError, match="Kafka producer config is required"):
+            MessagingFactory.create_producer(
+                logger, config=None, broker_type=MessageBrokerType.KAFKA
+            )
+
+    def test_default_broker_is_kafka(self, logger, producer_config):
+        """When broker_type is omitted and MESSAGE_BROKER=kafka, defaults to kafka."""
+        from app.services.messaging.kafka.producer.producer import (
+            KafkaMessagingProducer,
+        )
+        with patch.dict(os.environ, {"MESSAGE_BROKER": "kafka"}):
+            producer = MessagingFactory.create_producer(logger, config=producer_config)
+        assert isinstance(_unwrap(producer), KafkaMessagingProducer)
+
+
+# ===========================================================================
+# create_consumer
+# ===========================================================================
+
+
+class TestCreateConsumer:
+    """MessagingFactory.create_consumer()"""
+
+    def test_kafka_simple_consumer(self, logger, consumer_config):
+        from app.services.messaging.kafka.consumer.consumer import (
+            KafkaMessagingConsumer,
+        )
+        consumer = MessagingFactory.create_consumer(
+            logger,
+            config=consumer_config,
+            broker_type=MessageBrokerType.KAFKA,
+            consumer_type=ConsumerType.SIMPLE,
+        )
+        assert isinstance(consumer, KafkaMessagingConsumer)
+
+    def test_kafka_indexing_consumer(self, logger, consumer_config):
+        from app.services.messaging.kafka.consumer.indexing_consumer import (
+            IndexingKafkaConsumer,
+        )
+        consumer = MessagingFactory.create_consumer(
+            logger,
+            config=consumer_config,
+            broker_type=MessageBrokerType.KAFKA,
+            consumer_type=ConsumerType.INDEXING,
+        )
+        assert isinstance(consumer, IndexingKafkaConsumer)
+
+    def test_default_consumer_type_is_simple(self, logger, consumer_config):
+        from app.services.messaging.kafka.consumer.consumer import (
+            KafkaMessagingConsumer,
+        )
+        consumer = MessagingFactory.create_consumer(
+            logger, config=consumer_config, broker_type=MessageBrokerType.KAFKA
+        )
+        assert isinstance(consumer, KafkaMessagingConsumer)
+
+    def test_none_config_raises_value_error(self, logger):
+        with pytest.raises(ValueError, match="Kafka consumer config is required"):
+            MessagingFactory.create_consumer(
+                logger, config=None, broker_type=MessageBrokerType.KAFKA
+            )
+
+    def test_wrong_config_type_raises_type_error(self, logger):
+        """Passing a RedisStreamsConfig to a Kafka consumer → TypeError."""
+        from app.services.messaging.config import RedisStreamsConfig
+        wrong = RedisStreamsConfig(
+            host="localhost", port=6379,
+            client_id="c", group_id="g", topics=["t"],
+        )
+        with pytest.raises(TypeError, match="Expected KafkaConsumerConfig"):
+            MessagingFactory.create_consumer(
+                logger, config=wrong, broker_type=MessageBrokerType.KAFKA
+            )
+
+    def test_default_broker_is_kafka_consumer(self, logger, consumer_config):
+        """Auto-detect broker type for consumer when broker_type is omitted."""
+        from app.services.messaging.kafka.consumer.consumer import (
+            KafkaMessagingConsumer,
+        )
+        with patch(
+            "app.services.messaging.messaging_factory.get_message_broker_type",
+            return_value=MessageBrokerType.KAFKA,
+        ):
+            consumer = MessagingFactory.create_consumer(logger, config=consumer_config)
+        assert isinstance(consumer, KafkaMessagingConsumer)
+
+
+class TestCreateProducerTypeError:
+    """Passing the wrong config type to a Kafka producer must raise TypeError."""
+
+    def test_wrong_config_type_raises_type_error(self, logger):
+        from app.services.messaging.config import RedisStreamsConfig
+        wrong = RedisStreamsConfig(
+            host="localhost", port=6379,
+            client_id="c", group_id="g", topics=["t"],
+        )
+        with pytest.raises(TypeError, match="Expected KafkaProducerConfig"):
+            MessagingFactory.create_producer(
+                logger, config=wrong, broker_type=MessageBrokerType.KAFKA
+            )
+
+
+
+
+class TestNamespacedRedisStreamsRejected:
+    """`REDIS_KEY_NAMESPACE` promises isolation that Redis Streams does not
+    deliver, so the combination is refused rather than silently mis-routing.
+
+    Stream names and consumer groups are unprefixed, so two releases pointed
+    at one endpoint share both: a message produced by release A can be handed
+    to release B's consumer and acked there, and A never sees it.
+    """
+
+    def test_a_namespaced_redis_broker_is_refused(self, monkeypatch) -> None:
+        monkeypatch.setenv("REDIS_KEY_NAMESPACE", "tenant-a")
+        with pytest.raises(ValueError, match="does not isolate Redis Streams"):
+            MessagingFactory.create_producer(
+                logger=MagicMock(),
+                config=RedisStreamsConfig(host="localhost", port=6379),
+                broker_type=MessageBrokerType.REDIS,
+            )
+
+    def test_the_consumer_path_is_refused_too(self, monkeypatch) -> None:
+        monkeypatch.setenv("REDIS_KEY_NAMESPACE", "tenant-a")
+        with pytest.raises(ValueError, match="does not isolate Redis Streams"):
+            MessagingFactory.create_consumer(
+                logger=MagicMock(),
+                config=RedisStreamsConfig(host="localhost", port=6379),
+                broker_type=MessageBrokerType.REDIS,
+            )
+
+    def test_kafka_is_unaffected_by_the_namespace(self, monkeypatch) -> None:
+        """The namespace is a Redis concept; it must not block a Kafka broker."""
+        monkeypatch.setenv("REDIS_KEY_NAMESPACE", "tenant-a")
+        with pytest.raises(ValueError, match="Kafka producer config is required"):
+            MessagingFactory.create_producer(
+                logger=MagicMock(), config=None, broker_type=MessageBrokerType.KAFKA
+            )
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_an_unset_or_blank_namespace_is_allowed(
+        self, monkeypatch, value: str
+    ) -> None:
+        monkeypatch.setenv("REDIS_KEY_NAMESPACE", value)
+        producer = MessagingFactory.create_producer(
+            logger=MagicMock(),
+            config=RedisStreamsConfig(host="localhost", port=6379),
+            broker_type=MessageBrokerType.REDIS,
+        )
+        assert producer is not None

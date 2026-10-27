@@ -1,0 +1,291 @@
+"""
+Extended tests for app/containers/utils/utils.py — ContainerUtils.
+
+Targets additional coverage for:
+- get_vector_db_service: verifies correct params passed
+- create_indexing_pipeline: verifies VECTOR_DB_COLLECTION_NAME used
+- create_parsers: verifies all extension types present
+- create_feature_flag_service: with None config_service calls get_service
+- create_feature_flag_service: with config_service and refresh failure
+- create_vector_store: verifies args forwarded correctly
+- create_sink_orchestrator: verifies args forwarded correctly
+- create_retrieval_service: verifies VECTOR_DB_COLLECTION_NAME used
+"""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.containers.utils.utils import ContainerUtils
+
+
+class TestGetVectorDbServiceExtended:
+    @pytest.mark.asyncio
+    async def test_passes_correct_params(self):
+        """Verifies config_service is forwarded to create_provider."""
+        cu = ContainerUtils()
+        config_service = MagicMock()
+
+        with patch(
+            "app.containers.utils.utils.VectorDBProviderFactory.create_provider",
+            new_callable=AsyncMock,
+        ) as mock_factory:
+            mock_factory.return_value = MagicMock()
+            await cu.get_vector_db_service(config_service)
+
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args[1]
+            assert call_kwargs["config_service"] is config_service
+
+
+# ---------------------------------------------------------------------------
+# create_indexing_pipeline: verifies collection name
+# ---------------------------------------------------------------------------
+
+
+class TestCreateIndexingPipelineExtended:
+    @pytest.mark.asyncio
+    async def test_forwards_collection_registry(self):
+        """Verifies the shared CollectionRegistry is passed through."""
+        cu = ContainerUtils()
+        registry = MagicMock()
+
+        with patch("app.containers.utils.utils.IndexingPipeline") as MockPipeline:
+            mock_instance = MagicMock()
+            MockPipeline.return_value = mock_instance
+
+            await cu.create_indexing_pipeline(
+                MagicMock(), MagicMock(), MagicMock(), MagicMock(), registry
+            )
+
+            call_kwargs = MockPipeline.call_args[1]
+            assert call_kwargs["collection_registry"] is registry
+
+
+# ---------------------------------------------------------------------------
+# create_parsers: verify all extension types present
+# ---------------------------------------------------------------------------
+
+
+class TestCreateParsersExtended:
+    @pytest.mark.asyncio
+    async def test_all_expected_extensions(self):
+        """Verify all file extension types have parsers."""
+        cu = ContainerUtils()
+        with patch("app.containers.utils.utils.DocParser"), \
+             patch("app.containers.utils.utils.PPTXParser"), \
+             patch("app.containers.utils.utils.PPTParser"), \
+             patch("app.containers.utils.utils.HTMLParser"), \
+             patch("app.containers.utils.utils.MarkdownParser"), \
+             patch("app.containers.utils.utils.MDXParser"), \
+             patch("app.containers.utils.utils.CSVParser"), \
+             patch("app.containers.utils.utils.ExcelParser"), \
+             patch("app.containers.utils.utils.XLSParser"), \
+             patch("app.containers.utils.utils.ImageParser"):
+            parsers = await cu.create_parsers(MagicMock(), MagicMock())
+
+            expected_keys = [
+                "doc", "pptx", "ppt", "html", "md", "mdx",
+                "csv", "tsv", "xlsx", "xls",
+                "png", "jpg", "jpeg", "webp", "svg", "heic", "heif",
+                "sql_table", "sql_view",
+                "json", "yaml", "yml",
+            ]
+            for key in expected_keys:
+                assert key in parsers, f"Missing parser for extension: {key}"
+
+    @pytest.mark.asyncio
+    async def test_json_and_yaml_parsers_registered(self):
+        """Indexing create_parsers must wire JSON/YAML so events routing can resolve them."""
+        from app.modules.parsers.json.json_parser import JSONParser
+        from app.modules.parsers.yaml.yaml_parser import YAMLParser
+
+        cu = ContainerUtils()
+        with patch("app.containers.utils.utils.DocParser"), \
+             patch("app.containers.utils.utils.PPTXParser"), \
+             patch("app.containers.utils.utils.PPTParser"), \
+             patch("app.containers.utils.utils.HTMLParser"), \
+             patch("app.containers.utils.utils.MarkdownParser"), \
+             patch("app.containers.utils.utils.MDXParser"), \
+             patch("app.containers.utils.utils.CSVParser"), \
+             patch("app.containers.utils.utils.ExcelParser"), \
+             patch("app.containers.utils.utils.XLSParser"), \
+             patch("app.containers.utils.utils.ImageParser"):
+            parsers = await cu.create_parsers(MagicMock(), MagicMock())
+
+            assert isinstance(parsers["json"], JSONParser)
+            assert isinstance(parsers["yaml"], YAMLParser)
+            assert isinstance(parsers["yml"], YAMLParser)
+
+    @pytest.mark.asyncio
+    async def test_image_parsers_share_same_instance(self):
+        """All image extensions should share the same ImageParser instance."""
+        cu = ContainerUtils()
+        with patch("app.containers.utils.utils.DocParser"), \
+             patch("app.containers.utils.utils.PPTXParser"), \
+             patch("app.containers.utils.utils.PPTParser"), \
+             patch("app.containers.utils.utils.HTMLParser"), \
+             patch("app.containers.utils.utils.MarkdownParser"), \
+             patch("app.containers.utils.utils.MDXParser"), \
+             patch("app.containers.utils.utils.CSVParser"), \
+             patch("app.containers.utils.utils.ExcelParser"), \
+             patch("app.containers.utils.utils.XLSParser"), \
+             patch("app.containers.utils.utils.ImageParser") as MockImg:
+                mock_img = MagicMock()
+                MockImg.return_value = mock_img
+                parsers = await cu.create_parsers(MagicMock(), MagicMock())
+
+                image_exts = ["png", "jpg", "jpeg", "webp", "svg", "heic", "heif"]
+                for ext in image_exts:
+                    assert parsers[ext] is mock_img
+
+
+# ---------------------------------------------------------------------------
+# create_feature_flag_service: edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestCreateFeatureFlagServiceExtended:
+    @pytest.mark.asyncio
+    async def test_without_config_returns_env_service(self):
+        """When config_service is None, uses EnvFileProvider fallback."""
+        cu = ContainerUtils()
+        with patch("app.containers.utils.utils.FeatureFlagService") as MockFF:
+            mock_ff = MagicMock()
+            MockFF.get_service.return_value = mock_ff
+            result = await cu.create_feature_flag_service(None)
+            assert result is mock_ff
+            MockFF.get_service.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_with_config_creates_etcd_provider(self):
+        """When config_service provided, creates EtcdProvider."""
+        cu = ContainerUtils()
+        config_service = MagicMock()
+        with patch("app.containers.utils.utils.EtcdProvider") as MockEtcd, \
+             patch("app.containers.utils.utils.FeatureFlagService") as MockFF:
+            mock_provider = MagicMock()
+            mock_provider.refresh = AsyncMock()
+            MockEtcd.return_value = mock_provider
+            mock_ff = MagicMock()
+            MockFF.init_with_etcd_provider = AsyncMock(return_value=mock_ff)
+
+            result = await cu.create_feature_flag_service(config_service)
+            assert result is mock_ff
+            MockEtcd.assert_called_once_with(config_service)
+            mock_provider.refresh.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_still_creates_service(self):
+        """Even if refresh fails, service is still created."""
+        cu = ContainerUtils()
+        config_service = MagicMock()
+        with patch("app.containers.utils.utils.EtcdProvider") as MockEtcd, \
+             patch("app.containers.utils.utils.FeatureFlagService") as MockFF:
+            mock_provider = MagicMock()
+            mock_provider.refresh = AsyncMock(side_effect=ConnectionError("etcd unreachable"))
+            MockEtcd.return_value = mock_provider
+            mock_ff = MagicMock()
+            MockFF.init_with_etcd_provider = AsyncMock(return_value=mock_ff)
+
+            result = await cu.create_feature_flag_service(config_service)
+            assert result is mock_ff
+
+
+# ---------------------------------------------------------------------------
+# create_retrieval_service: verifies collection name
+# ---------------------------------------------------------------------------
+
+
+class TestCreateRetrievalServiceExtended:
+    @pytest.mark.asyncio
+    async def test_forwards_collection_registry(self):
+        """Verifies the collection_registry dependency is passed through."""
+        cu = ContainerUtils()
+
+        with patch("app.containers.utils.utils.RetrievalService") as MockRS:
+            mock_instance = MagicMock()
+            MockRS.return_value = mock_instance
+            registry = MagicMock()
+
+            await cu.create_retrieval_service(
+                MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), registry
+            )
+
+            call_kwargs = MockRS.call_args[1]
+            assert call_kwargs["collection_registry"] is registry
+
+
+# ---------------------------------------------------------------------------
+# create_processor: verifies all args forwarded
+# ---------------------------------------------------------------------------
+
+
+class TestCreateProcessorExtended:
+    @pytest.mark.asyncio
+    async def test_all_args_forwarded(self):
+        """Verify all arguments are forwarded to Processor constructor."""
+        cu = ContainerUtils()
+        mock_logger = MagicMock()
+        mock_config = MagicMock()
+        mock_pipeline = MagicMock()
+        mock_gp = MagicMock()
+        mock_parsers = {"ext": MagicMock()}
+        mock_extractor = MagicMock()
+        mock_sink = MagicMock()
+        mock_runtime = MagicMock()
+
+        with patch("app.containers.utils.utils.Processor") as MockProc:
+            mock_instance = MagicMock()
+            MockProc.return_value = mock_instance
+
+            result = await cu.create_processor(
+                mock_logger, mock_config, mock_pipeline,
+                mock_gp, mock_parsers, mock_extractor, mock_sink, mock_runtime
+            )
+            assert result is mock_instance
+
+            call_kwargs = MockProc.call_args[1]
+            assert call_kwargs["logger"] is mock_logger
+            assert call_kwargs["config_service"] is mock_config
+            assert call_kwargs["indexing_pipeline"] is mock_pipeline
+            assert call_kwargs["graph_provider"] is mock_gp
+            assert call_kwargs["parsers"] is mock_parsers
+            assert call_kwargs["document_extractor"] is mock_extractor
+            assert call_kwargs["sink_orchestrator"] is mock_sink
+            assert call_kwargs["stage_ingress"] is mock_runtime.ingress
+
+
+# ---------------------------------------------------------------------------
+# create_event_processor: verifies all args forwarded
+# ---------------------------------------------------------------------------
+
+
+class TestCreateEventProcessorExtended:
+    @pytest.mark.asyncio
+    async def test_all_args_forwarded(self):
+        cu = ContainerUtils()
+        mock_logger = MagicMock()
+        mock_proc = MagicMock()
+        mock_gp = MagicMock()
+        mock_config = MagicMock()
+        mock_registry = MagicMock()
+
+        with patch("app.containers.utils.utils.EventProcessor") as MockEP:
+            mock_instance = MagicMock()
+            MockEP.return_value = mock_instance
+
+            result = await cu.create_event_processor(
+                mock_logger, mock_proc, mock_gp, mock_config, mock_registry
+            )
+            assert result is mock_instance
+
+            call_kwargs = MockEP.call_args[1]
+            assert call_kwargs["logger"] is mock_logger
+            assert call_kwargs["processor"] is mock_proc
+            assert call_kwargs["graph_provider"] is mock_gp
+            assert call_kwargs["config_service"] is mock_config
+            # The strategy must be the registry's own instance, not a second
+            # one resolved here — dedup and the write path have to agree on
+            # which collection a record belongs to.
+            assert call_kwargs["collection_strategy"] is mock_registry.strategy

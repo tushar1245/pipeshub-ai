@@ -1,0 +1,39 @@
+import 'reflect-metadata';
+import { expect } from 'chai';
+import { mailConfigUrl, mailConfigInternalUrl, ORG_CREATED_EVENT } from '../../../../src/modules/user_management/constants/constants';
+
+describe('User Management Constants', () => {
+  describe('mailConfigUrl', () => {
+    it('should be a non-empty string', () => {
+      expect(mailConfigUrl).to.be.a('string');
+      expect(mailConfigUrl).to.not.be.empty;
+    });
+
+    it('should contain the expected API path for SMTP config', () => {
+      expect(mailConfigUrl).to.equal('api/v1/configurationManager/smtpConfig');
+    });
+
+    it('should start with api/v1', () => {
+      expect(mailConfigUrl).to.match(/^api\/v1\//);
+    });
+  });
+
+  describe('mailConfigInternalUrl', () => {
+    it('should point at the service-token SMTP config path', () => {
+      expect(mailConfigInternalUrl).to.equal(
+        'api/v1/configurationManager/internal/smtpConfig',
+      );
+    });
+  });
+
+  describe('ORG_CREATED_EVENT', () => {
+    it('should be a non-empty string', () => {
+      expect(ORG_CREATED_EVENT).to.be.a('string');
+      expect(ORG_CREATED_EVENT).to.not.be.empty;
+    });
+
+    it('should equal org_created', () => {
+      expect(ORG_CREATED_EVENT).to.equal('org_created');
+    });
+  });
+});

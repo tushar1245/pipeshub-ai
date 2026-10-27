@@ -1,0 +1,460 @@
+from __future__ import annotations
+
+import base64
+import logging
+import re
+import uuid
+from collections import Counter
+from io import BytesIO
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+from app.models.blocks import (
+    Block,
+    BlockGroup,
+    BlockGroupChildren,
+    BlocksContainer,
+    BlockSubType,
+    BlockType,
+    CitationMetadata,
+    DataFormat,
+    GroupType,
+    ImageMetadata,
+    ListMetadata,
+    Point,
+    TableMetadata,
+)
+from app.modules.parsers import parse_pool
+from app.modules.parsers.pdf.layout_pages import ParsedPageData, parse_pdf_layout
+from app.modules.parsers.pdf.opencv_layout_analyzer import (
+    LayoutRegion,
+    LayoutRegionType,
+)
+from app.services.messaging.config import messaging_env
+from app.utils.indexing_helpers import generate_simple_row_text
+from app.utils.indexing_metrics import track_indexing_enrichment
+from app.utils.llm import get_llm_for_role
+from app.utils.table_enrichment import (
+    TableEnrichmentResult,
+    enrich_table_grid,
+    enrich_tables,
+)
+
+if TYPE_CHECKING:
+    from app.config.configuration_service import ConfigurationService
+
+
+_NUMBERED_LIST_ITEM_RE = re.compile(
+    r"^\s*(?:\(\s*\d+\s*\)|\d+[.)])\s+\S",
+)
+
+# A heading: one short line set apart from body text by weight or size.
+_HEADING_MAX_CHARS = 160
+_HEADING_SIZE_RATIO = 1.15
+
+# Page numbers and running headers/footers. Docling keeps them out of the document
+# body, so they never become blocks; left in, a page number sits between every pair
+# of pages and a short repeated line ("3M Company") is indexed once per page.
+_MARGIN_BAND = 0.08
+_RUNNING_MAX_CHARS = 80
+_RUNNING_REPEATS = 3
+# A repeated line must also span this share of pages: a title continued over two or
+# three pages ("Consolidated Balance Sheets (continued)") is content, not furniture.
+_RUNNING_PAGE_SHARE = 0.2
+_PAGE_NUMBER_RE = re.compile(r"^(?:page\s+)?[-–—]?\s*\d{1,4}\s*[-–—]?(?:\s+of\s+\d{1,4})?$", re.IGNORECASE)
+# A lone number off the margins is a page number only when at least this many pages
+# share its offset from the page index; otherwise it is a diagram label, a list item
+# number or a contents entry.
+_PAGE_SEQUENCE_PAGES = 3
+
+
+def body_font_size(regions: list[LayoutRegion]) -> float:
+    """The median size of text regions: what an unremarkable line looks like."""
+    sizes = sorted(
+        r.font_size for r in regions if r.type == LayoutRegionType.TEXT and r.font_size > 0
+    )
+    return sizes[len(sizes) // 2] if sizes else 0.0
+
+
+def is_heading(region: LayoutRegion, body_size: float) -> bool:
+    text = region.text.strip()
+    if not text or len(text) > _HEADING_MAX_CHARS or "\n" in text:
+        return False
+    larger = body_size > 0 and region.font_size >= body_size * _HEADING_SIZE_RATIO
+    return region.is_bold or larger
+
+
+def running_noise(pages: list[ParsedPageData]) -> set[int]:
+    """``id(region)`` of page numbers and of short lines repeated in the top or
+    bottom margin of many pages."""
+    candidates = []
+    for pd in pages:
+        texts = [r for r in pd.regions if r.type == LayoutRegionType.TEXT and (r.text or "").strip()]
+        for region in texts:
+            text = region.text.strip()
+            if len(text) > _RUNNING_MAX_CHARS:
+                continue
+            # A page number follows the page's last line, wherever that falls
+            # (3M_2022_10K p.49 prints "49" a third of the way down a short page).
+            in_margin = region.bbox[1] <= pd.height * _MARGIN_BAND or region.bbox[3] >= pd.height * (1 - _MARGIN_BAND)
+            at_edge = (region is texts[0] or region is texts[-1]) and _PAGE_NUMBER_RE.match(text)
+            if in_margin or at_edge:
+                norm = re.sub(r"\d+", "#", " ".join(text.lower().split()))
+                candidates.append((region, text, norm, in_margin, pd.page_number))
+    repeats = Counter(norm for _, _, norm, in_margin, _ in candidates if in_margin)
+    needed = max(_RUNNING_REPEATS, len(pages) * _RUNNING_PAGE_SHARE)
+    offsets = Counter(
+        _page_offset(text, page) for _, text, _, _, page in candidates if _PAGE_NUMBER_RE.match(text)
+    )
+    # The first copy of a running line stays: a footer's "Data Last Update" or a
+    # filing's "Date Filed" is often stated nowhere else in the document.
+    first_copy = {}
+    for region, _, norm, in_margin, _ in candidates:
+        if in_margin:
+            first_copy.setdefault(norm, region)
+    return {
+        id(region)
+        for region, text, norm, in_margin, page in candidates
+        if (in_margin and repeats[norm] >= needed and first_copy[norm] is not region)
+        or (
+            _PAGE_NUMBER_RE.match(text)
+            and (in_margin or offsets[_page_offset(text, page)] >= _PAGE_SEQUENCE_PAGES)
+        )
+    }
+
+
+def _page_offset(text: str, page_number: int) -> int:
+    match = re.search(r"\d+", text)
+    return int(match.group()) - page_number if match else 0
+
+
+def _normalize_bbox_to_points(
+    bbox: Tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
+) -> List[Point]:
+    x0, y0, x1, y1 = bbox
+    return [
+        Point(x=x0 / page_width, y=y0 / page_height),
+        Point(x=x1 / page_width, y=y0 / page_height),
+        Point(x=x1 / page_width, y=y1 / page_height),
+        Point(x=x0 / page_width, y=y1 / page_height),
+    ]
+
+class PDFPlumberOpenCVProcessor:
+    """PDF parser combining pdfplumber with OpenCV layout analysis (opencv_layout_analyzer).
+
+    Uses pdfplumber for rasterization and table detection plus OpenCV segmentation for
+    regions. No ML models required.
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        config: ConfigurationService,
+    ) -> None:
+        self.logger = logger
+        self.config = config
+
+    async def parse_document(
+        self, doc_name: str, content: bytes | BytesIO
+    ) -> List[ParsedPageData]:
+        stream = content if isinstance(content, BytesIO) else BytesIO(content)
+        stream.seek(0)
+        pdf_bytes = stream.read()
+
+        # The worker may run as long as the PDF record it parses for.
+        pages_data = await parse_pool.submit(
+            parse_pdf_layout,
+            pdf_bytes,
+            label=doc_name,
+            size=len(pdf_bytes),
+            timeout=messaging_env.pdf_record_processing_timeout,
+        )
+        for pd in pages_data:
+            self.logger.debug(
+                f"Page {pd.page_number}: detected {len(pd.regions)} layout regions"
+            )
+        return pages_data
+
+    async def create_blocks(
+        self,
+        parsed_data: List[ParsedPageData],
+        page_number: Optional[int] = None,
+        skip_llm_enrichment: bool = False,
+    ) -> BlocksContainer:
+        blocks: List[Block] = []
+        block_groups: List[BlockGroup] = []
+
+        pages = [
+            pd for pd in parsed_data if page_number is None or pd.page_number == page_number
+        ]
+
+        # Pre-pass: collect every table region in walk order (grid extraction is pure
+        # CPU/pdfplumber work), enrich them all concurrently, then build blocks below in
+        # the same order as before - append order, and every index=len(blocks)
+        # assignment, is unaffected by when the enrichment itself finished.
+        table_regions: List[LayoutRegion] = []
+        if not skip_llm_enrichment:
+            for pd in pages:
+                for region in pd.regions:
+                    if region.type == LayoutRegionType.TABLE and region.table_grid:
+                        table_regions.append(region)
+
+        table_enrichments: dict[int, TableEnrichmentResult] = {}
+        if table_regions:
+            with track_indexing_enrichment(self.logger, label="pdfplumber"):
+                try:
+                    llm, _ = await get_llm_for_role(self.config, "indexing", reasoning_effort="low")
+                except Exception as e:
+                    # Without an LLM the tables still index as plain rows; failing the
+                    # parse would send the whole document to OCR, which needs one too.
+                    self.logger.warning("No indexing LLM for table enrichment, keeping plain rows: %s", e)
+                    skip_llm_enrichment = True
+                else:
+                    results = await enrich_tables(
+                        llm,
+                        [region.table_grid for region in table_regions],
+                        logger=self.logger,
+                    )
+                    table_enrichments = dict(zip((id(r) for r in table_regions), results))
+
+        body_size = body_font_size([r for pd in pages for r in pd.regions])
+        noise = running_noise(pages)
+        for pd in pages:
+
+            for region in pd.regions:
+                if id(region) in noise:
+                    continue
+                # A table with no cell grid builds no group; its text goes out as a text block instead.
+                if region.type == LayoutRegionType.TABLE and region.table_grid:
+                    await self._build_table_group(
+                        region,
+                        pd,
+                        blocks,
+                        block_groups,
+                        skip_llm_enrichment=skip_llm_enrichment,
+                        enrichment=table_enrichments.get(id(region)),
+                    )
+                elif region.type == LayoutRegionType.IMAGE:
+                    self._build_image_block(region, pd, blocks)
+                    # Text-layer words inside the picture (chart labels and values)
+                    # would otherwise exist only as pixels.
+                    if region.text and region.text.strip():
+                        self._build_text_block(region, pd, blocks)
+                elif region.type == LayoutRegionType.LIST:
+                    self._build_list_group(region, pd, blocks, block_groups)
+                else:
+                    heading = region.heading or is_heading(region, body_size)
+                    self._build_text_block(region, pd, blocks, BlockSubType.HEADING if heading else None)
+
+        return BlocksContainer(blocks=blocks, block_groups=block_groups)
+
+    def _make_citation(
+        self, bbox: Tuple[float, float, float, float], page_data: ParsedPageData
+    ) -> CitationMetadata:
+        points = _normalize_bbox_to_points(bbox, page_data.width, page_data.height)
+        return CitationMetadata(
+            page_number=page_data.page_number,
+            bounding_boxes=points,
+        )
+
+    def _build_text_block(
+        self,
+        region: LayoutRegion,
+        page_data: ParsedPageData,
+        blocks: List[Block],
+        sub_type: Optional[BlockSubType] = None,
+    ) -> Block:
+        block = Block(
+            id=str(uuid.uuid4()),
+            index=len(blocks),
+            type=BlockType.TEXT,
+            sub_type=sub_type,
+            format=DataFormat.TXT,
+            data=region.text,
+            comments=[],
+            citation_metadata=self._make_citation(region.bbox, page_data),
+        )
+        blocks.append(block)
+        return block
+
+    def _build_image_block(
+        self,
+        region: LayoutRegion,
+        page_data: ParsedPageData,
+        blocks: List[Block],
+    ) -> Optional[Block]:
+        if not region.image_data:
+            return None
+
+        mime = f"image/{region.image_ext}"
+        b64 = base64.b64encode(region.image_data).decode("utf-8")
+        data_uri = f"data:{mime};base64,{b64}"
+
+        block = Block(
+            id=str(uuid.uuid4()),
+            index=len(blocks),
+            type=BlockType.IMAGE,
+            format=DataFormat.BASE64,
+            data={"uri": data_uri},
+            comments=[],
+            citation_metadata=self._make_citation(region.bbox, page_data),
+            image_metadata=ImageMetadata(
+                captions=[region.caption] if region.caption else [],
+                image_format=region.image_ext,
+                image_size={
+                    "width": int(region.bbox[2] - region.bbox[0]),
+                    "height": int(region.bbox[3] - region.bbox[1]),
+                },
+            ),
+        )
+        blocks.append(block)
+        return block
+
+    async def _build_table_group(
+        self,
+        region: LayoutRegion,
+        page_data: ParsedPageData,
+        blocks: List[Block],
+        block_groups: List[BlockGroup],
+        skip_llm_enrichment: bool = False,
+        enrichment: Optional[TableEnrichmentResult] = None,
+    ) -> Optional[BlockGroup]:
+        grid = region.table_grid
+        if not grid or len(grid) == 0:
+            return None
+
+        if skip_llm_enrichment:
+            table_summary = ""
+            column_headers: List[str] = []
+            # Derive headers from the first row if it looks like a header row
+            first_row = grid[0] if grid else []
+            raw_headers = [
+                (cell.get("text", "") if isinstance(cell, dict) else str(cell or ""))
+                for cell in first_row
+            ]
+            data_rows = grid[1:] if grid else []
+            table_rows_text = []
+            for row in data_rows:
+                row_dict = {
+                    (raw_headers[i] if i < len(raw_headers) else f"Column_{i + 1}"): (
+                        cell.get("text", "") if isinstance(cell, dict) else str(cell or "")
+                    )
+                    for i, cell in enumerate(row)
+                }
+                table_rows_text.append(generate_simple_row_text(row_dict))
+        else:
+            if enrichment is None:
+                # The pre-pass and this walk are meant to visit the same table
+                # regions; a miss means they drifted apart. Enrich inline so
+                # correctness never depends on the two walks staying in sync.
+                self.logger.warning("Table missed pre-enrichment; enriching inline")
+                llm, _ = await get_llm_for_role(self.config, "indexing", reasoning_effort="low")
+                # Outside the pre-pass's row budget: summary and headers only.
+                enrichment = await enrich_table_grid(
+                    llm, grid, logger=self.logger, describe_rows=False
+                )
+
+            table_summary = enrichment.summary
+            column_headers = enrichment.headers
+            table_rows_text = enrichment.descriptions
+
+        num_rows = len(grid)
+        num_cols = len(grid[0]) if grid else 0
+        num_cells = num_rows * num_cols if num_cols else None
+
+        citation = self._make_citation(region.bbox, page_data)
+
+        bg = BlockGroup(
+            id=str(uuid.uuid4()),
+            index=len(block_groups),
+            type=GroupType.TABLE,
+            table_metadata=TableMetadata(
+                num_of_rows=num_rows,
+                num_of_cols=num_cols,
+                num_of_cells=num_cells,
+                has_header=bool(column_headers),
+                column_names=column_headers or None,
+            ),
+            data={
+                "table_summary": table_summary,
+                "column_headers": column_headers,
+            },
+            format=DataFormat.JSON,
+            citation_metadata=citation,
+        )
+
+        row_indices: List[int] = []
+        for i, row_text in enumerate(table_rows_text):
+            if not row_text:
+                continue
+            idx = len(blocks)
+            block = Block(
+                id=str(uuid.uuid4()),
+                index=idx,
+                type=BlockType.TABLE_ROW,
+                format=DataFormat.JSON,
+                comments=[],
+                parent_index=bg.index,
+                data={
+                    "row_natural_language_text": row_text,
+                    "row_number": i + 1,
+                },
+                citation_metadata=citation,
+            )
+            blocks.append(block)
+            row_indices.append(idx)
+
+        bg.children = BlockGroupChildren.from_indices(block_indices=row_indices)
+        block_groups.append(bg)
+        return bg
+
+    def _build_list_group(
+        self,
+        region: LayoutRegion,
+        page_data: ParsedPageData,
+        blocks: List[Block],
+        block_groups: List[BlockGroup],
+    ) -> BlockGroup:
+        group_type = GroupType.LIST
+
+        bg = BlockGroup(
+            id=str(uuid.uuid4()),
+            index=len(block_groups),
+            type=group_type,
+            citation_metadata=self._make_citation(region.bbox, page_data),
+            list_metadata=ListMetadata(
+                item_count=len(region.list_items),
+            ),
+        )
+
+        item_indices: List[int] = []
+        for item_text in region.list_items:
+            idx = len(blocks)
+            block = Block(
+                id=str(uuid.uuid4()),
+                index=idx,
+                type=BlockType.TEXT,
+                sub_type=BlockSubType.LIST_ITEM,
+                format=DataFormat.TXT,
+                data=item_text,
+                comments=[],
+                parent_index=bg.index,
+                citation_metadata=self._make_citation(region.bbox, page_data),
+            )
+            blocks.append(block)
+            item_indices.append(idx)
+
+        bg.children = BlockGroupChildren.from_indices(block_indices=item_indices)
+        block_groups.append(bg)
+        return bg
+
+    async def load_document(
+        self,
+        doc_name: str,
+        content: bytes | BytesIO,
+        page_number: Optional[int] = None,
+    ) -> BlocksContainer:
+        parsed = await self.parse_document(doc_name, content)
+        return await self.create_blocks(parsed, page_number=page_number)
+

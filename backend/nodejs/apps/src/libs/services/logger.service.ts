@@ -1,0 +1,352 @@
+import winston from 'winston';
+import { Request } from 'express';
+import { injectable } from 'inversify';
+import path from 'path';
+import { threadId } from 'worker_threads';
+import { currentDisplayId, getRequestContext } from '../context/request-context';
+import {
+  redactHeadersForLog,
+  redactLogMetadata,
+  redactQueryForLog,
+  redactSecretsInText,
+} from '../utils/log-redaction.utils';
+
+const redactMetadata = winston.format((info) => {
+  if (info.metadata !== undefined) {
+    info.metadata = redactLogMetadata(info.metadata);
+  }
+  return info;
+});
+
+export enum LogLevel {
+  Debug = 'debug',
+  Info = 'info',
+  Warning = 'warning',
+  Error = 'error',
+}
+
+
+const customLevels = {
+  levels: {
+    error: 0,
+    warning: 1,
+    info: 2,
+    debug: 3,
+  },
+  colors: {
+    error: 'red',
+    warning: 'yellow',
+    info: 'green',
+    debug: 'green',
+  },
+};
+
+winston.addColors(customLevels.colors);
+
+const REDACTED = '[REDACTED]';
+
+/**
+ * Matched against the key with separators stripped, so `api-key`, `api_key`
+ * and `apiKey` all hit. Numeric values are passed through, which keeps LLM
+ * usage counters (maxTokens, totalTokens) readable.
+ */
+const SENSITIVE_KEY_FRAGMENTS = [
+  'authorization',
+  'cookie',
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'apikey',
+  'accesskey',
+  'privatekey',
+  'credential',
+  'signature',
+  'sessionid',
+  'salt',
+];
+
+/** Decoded claims and scope lists are not credentials and stay useful in logs. */
+const SAFE_KEY_EXCEPTIONS = new Set([
+  'tokenpayload',
+  'tokenscopes',
+  'tokenusage',
+]);
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (SAFE_KEY_EXCEPTIONS.has(normalized)) {
+    return false;
+  }
+  return SENSITIVE_KEY_FRAGMENTS.some((fragment) =>
+    normalized.includes(fragment),
+  );
+}
+
+export function getLogLevel(): LogLevel {
+  const level = process.env.LOG_LEVEL?.toLowerCase();
+  if (Object.values(LogLevel).includes(level as LogLevel)) {
+    return level as LogLevel;
+  }
+  return LogLevel.Info;
+}
+
+
+export interface LoggerConfig {
+  service: string;
+  level?: string;
+  additionalMeta?: Record<string, any>;
+}
+
+@injectable()
+export class Logger {
+  private static instance: Logger;
+  private logger: winston.Logger = {} as winston.Logger;
+  private defaultMeta: Record<string, any> = {};
+
+  constructor(config?: LoggerConfig) {
+    if (!Logger.instance) {
+      this.defaultMeta = {
+        service_tier: 'nodejs_service',
+        service: config?.service || 'default-service',
+        ...config?.additionalMeta,
+      };
+
+      this.logger = this.initializeLogger(config);
+      Logger.instance = this;
+    } else if (config) {
+      this.updateDefaultMeta({
+        service: config.service,
+        ...config.additionalMeta,
+      });
+      if (config.level) {
+        this.logger.level = config.level;
+      }
+    }
+    return Logger.instance;
+  }
+
+  private initializeLogger(config?: LoggerConfig): winston.Logger {
+    const logFormat = winston.format.combine(
+      // First, so the console line and the JSON file lines both get it.
+      redactMetadata(),
+      winston.format.timestamp(),
+      winston.format.errors({ stack: true }),
+      winston.format.printf((info) => {
+        const { message, metadata, stack, filename, line, request_id, thread_id } = info;
+        const serviceTier = info.service_tier || 'nodejs_service';
+
+        const ts =
+          typeof info.timestamp === 'string'
+            ? info.timestamp.replace('T', ' ').replace('Z', '').replace('.', ',')
+            : info.timestamp;
+
+        const rawLevel = String(info[Symbol.for('level')] || info.level).toUpperCase();
+        const levelColors: Record<string, string> = { ERROR: '\x1b[31m', WARNING: '\x1b[33m' };
+        const levelStr = levelColors[rawLevel]
+          ? `${levelColors[rawLevel]}${rawLevel}\x1b[0m`
+          : rawLevel;
+
+        // Already redacted and de-cycled by logWithLevel.
+        let metaString = '';
+        if (metadata) {
+          try {
+            metaString = `\nmetadata: ${JSON.stringify(metadata, null, 2)}`;
+          } catch (error) {
+            metaString = '\nmetadata: [Circular Structure]';
+          }
+        }
+        const stackString = stack ? `\nstack: ${stack}` : '';
+        const fileInfo = filename ? `[${filename}:${line}]` : '';
+        // Present only when a request context is in flight.
+        const traceInfo =
+          request_id !== undefined ? `[req:${request_id} thr:${thread_id}] ` : '';
+
+        return `${ts} - ${serviceTier} - ${levelStr} - ${traceInfo}${fileInfo} - ${message}${metaString}${stackString}`;
+      })
+    );
+
+    return winston.createLogger({
+      levels: customLevels.levels,
+      level: config?.level || getLogLevel(),
+      format: logFormat,
+      defaultMeta: this.defaultMeta,
+      transports: [
+        new winston.transports.File({
+          filename: 'error.log',
+          level: LogLevel.Error,
+          format: winston.format.combine(logFormat, winston.format.json())
+        }),
+        new winston.transports.File({
+          filename: 'combined.log',
+          format: winston.format.combine(logFormat, winston.format.json())
+        }),
+        new winston.transports.Console({
+          format: logFormat,
+        }),
+      ],
+    });
+  }
+
+  private sanitizeForLogging(obj: any, seen = new WeakSet()): any {
+    // Handle non-object types
+    if (obj === null || typeof obj !== 'object') {
+      return obj;
+    }
+
+    // Handle circular references
+    if (seen.has(obj)) {
+      return '[Circular]';
+    }
+    seen.add(obj);
+
+    // Handle arrays
+    if (Array.isArray(obj)) {
+      return obj.map(item => this.sanitizeForLogging(item, seen));
+    }
+
+    if (obj instanceof Error) {
+      return {
+        name: obj.name,
+        message: redactSecretsInText(obj.message),
+        stack:
+          obj.stack === undefined ? undefined : redactSecretsInText(obj.stack),
+      };
+    }
+    // Dates and Mongo ids have no own keys worth walking; JSON shows them through toJSON.
+    const { toJSON } = obj as { toJSON?: unknown };
+    if (typeof toJSON === 'function') {
+      return this.sanitizeForLogging((toJSON as () => unknown).call(obj), seen);
+    }
+
+    // Handle objects
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      // Skip certain properties that might cause circular references
+      if (key === 'parent' || key === '_readableState' || key === 'pipes') {
+        continue;
+      }
+      if (isSensitiveKey(key)) {
+        sanitized[key] = typeof value === 'number' ? value : REDACTED;
+        continue;
+      }
+      try {
+        sanitized[key] = this.sanitizeForLogging(value, seen);
+      } catch (error) {
+        sanitized[key] = '[Unable to serialize]';
+      }
+    }
+    return sanitized;
+  }
+
+  static getInstance(config?: LoggerConfig): Logger {
+    if (!Logger.instance) {
+      Logger.instance = new Logger(config || { service: 'default-service', level: LogLevel.Info });
+    } else if (config) {
+      Logger.instance.updateDefaultMeta({
+        service: config.service,
+        ...config.additionalMeta,
+      });
+      if (config.level) {
+        Logger.instance.logger.level = config.level;
+      }
+    }
+    return Logger.instance;
+  }
+  
+
+  updateDefaultMeta(metadata: Record<string, any>): void {
+    this.defaultMeta = {
+      ...this.defaultMeta,
+      ...metadata,
+    };
+    this.logger.defaultMeta = this.defaultMeta;
+  }
+
+  private getCallerInfo(): { filename: string, line: number } {
+    const error = new Error();
+    Error.captureStackTrace(error);
+
+    // Get the full stack trace
+    const stackLines = error.stack?.split('\n') || [];
+
+    // Find the first line that's not from the logger itself
+    const callerLine = stackLines.find(line =>
+      !line.includes('logger.service.ts') &&
+      !line.includes('at Logger.') &&
+      line.includes('at ')
+    );
+
+    let filename = 'unknown';
+    let lineNumber = 0;
+    if (callerLine) {
+      // Extract filename from the last part of the path
+      const regex = /at\s+(?:.+?\s+)?\(?(.+?):(\d+):(\d+)\)?/;
+      const match = callerLine.match(regex);
+      if (match && match[1]) {
+        filename = path.basename(match[1]);
+      }
+      if (match && match[2]) {
+        lineNumber = parseInt(match[2], 10);
+      }
+    }
+
+    return { filename, line: lineNumber };
+  }
+
+  private logWithLevel(level: string, message: string, meta?: any) {
+    // Bail before getCallerInfo(): it captures and symbolises a stack trace,
+    // which profiling put at ~5% of gateway CPU -- and it was being paid in
+    // full for debug lines that the configured level then discarded.
+    // Guarded on the method existing: `logger` starts life as an empty cast
+    // and is only replaced once initializeLogger has run.
+    if (
+      typeof this.logger.isLevelEnabled === 'function' &&
+      !this.logger.isLevelEnabled(level)
+    ) {
+      return;
+    }
+    const callerInfo = this.getCallerInfo();
+    // Read at emit time; omitted entirely when there is no context.
+    const traceMeta = getRequestContext()
+      ? { request_id: currentDisplayId(), thread_id: threadId }
+      : {};
+    // Redact here, not in the printf format: the file transports append
+    // winston's json() after it, and json() re-serialises `info` from scratch,
+    // so anything only cleaned inside printf still reaches the log file raw.
+    this.logger.log({
+      level,
+      message,
+      metadata: meta === undefined ? undefined : this.sanitizeForLogging(meta),
+      ...traceMeta,
+      ...callerInfo,
+    });
+  }
+
+  error(message: string, meta?: any) {
+    this.logWithLevel(LogLevel.Error, message, meta);
+  }
+
+  warn(message: string, meta?: any) {
+    this.logWithLevel(LogLevel.Warning, message, meta);
+  }
+
+  info(message: string, meta?: any) {
+    this.logWithLevel(LogLevel.Info, message, meta);
+  }
+
+  debug(message: string, meta?: any) {
+    this.logWithLevel(LogLevel.Debug, message, meta);
+  }
+
+  logRequest(req: Request, meta?: any) {
+    const callerInfo = this.getCallerInfo();
+    this.info(`${req.method} ${req.path}`, {
+      ...meta,
+      ...callerInfo,
+      query: redactQueryForLog(req.query),
+      params: req.params,
+      headers: redactHeadersForLog(req.headers),
+    });
+  }
+}

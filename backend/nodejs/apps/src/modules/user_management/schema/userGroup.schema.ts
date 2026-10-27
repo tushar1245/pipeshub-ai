@@ -1,0 +1,61 @@
+import { generateUniqueSlug } from '../../../libs/utils/counter';
+import { Document, Schema, Types, Model } from 'mongoose';
+import mongoose from 'mongoose';
+
+export const groupTypes = ['admin', 'standard', 'everyone', 'custom'];
+
+export interface UserGroup extends Document {
+  slug?: string;
+  name: string;
+  type: 'admin' | 'standard' | 'custom' | 'everyone';
+  orgId: Types.ObjectId;
+  users: Array<Types.ObjectId>;
+  isDeleted?: boolean;
+  deletedBy?: Types.ObjectId;
+}
+const userGroupsSchema = new Schema<UserGroup>(
+  {
+    slug: { type: String, unique: true },
+    name: {
+      type: String,
+      required: [true, 'Group name is required'],
+    },
+    type: {
+      type: String,
+      enum: groupTypes,
+      required: true,
+    },
+    orgId: {
+      type: Schema.Types.ObjectId,
+      ref: 'org',
+      required: true,
+    },
+    users: [{ type: Schema.Types.ObjectId }],
+    isDeleted: { type: Boolean, default: false },
+    deletedBy: { type: Schema.Types.ObjectId, ref: 'users' },
+  },
+  { timestamps: true },
+);
+
+// Built by UserGroupNameIndexMigration rather than declared on the schema:
+// autoIndex would try to build it at boot and fail on installs that already
+// hold duplicate names, so the migration checks for those first.
+export const ACTIVE_GROUP_NAME_INDEX = {
+  keys: { orgId: 1, name: 1 },
+  options: {
+    name: 'orgId_1_name_1_active_unique',
+    unique: true,
+    partialFilterExpression: { isDeleted: false },
+  },
+} as const;
+
+userGroupsSchema.pre<UserGroup>('save', async function () {
+  // Mongoose 9: async hooks signal failure by throwing, with no next callback.
+  if (!this.slug) {
+    this.slug = await generateUniqueSlug('UserGroup');
+  }
+});
+
+export const UserGroups: Model<UserGroup> =
+  (mongoose.models['userGroups'] as Model<UserGroup>) ||
+  mongoose.model<UserGroup>('userGroups', userGroupsSchema, 'userGroups');

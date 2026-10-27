@@ -1,0 +1,4362 @@
+"""
+Comprehensive coverage tests for app.connectors.sources.atlassian.jira_cloud.connector.
+
+Targets the ~607 uncovered lines to achieve 95%+ coverage by testing:
+- init() with OAuth, API_TOKEN, and error paths
+- _get_fresh_datasource() API_TOKEN, no client, no config, no token
+- get_filter_options() project_keys and unsupported key
+- _get_project_options() pagination, search, error
+- run_sync() full orchestration
+- _get_issues_sync_checkpoint() success and error
+- _update_issues_sync_checkpoint() with/without stats
+- _handle_issue_deletions() with audit_last_sync_time path
+- _handle_deleted_issue() epic, non-epic, still exists, not found
+- _delete_issue_children() recursive, FILE type, error
+- _fetch_users() pagination, inactive, no email
+- _fetch_groups() pagination, isLast, error
+- _fetch_group_members() pagination, isLast, error
+- _fetch_projects() NOT_IN, IN, no filter, ADF description
+- _sync_all_project_issues() success and error
+- _sync_project_issues() new project, incremental, resume
+- _fetch_issues_batched() pagination, filters, empty, error
+- _build_issue_records() new/updated/unchanged records, attachments
+- _fetch_issue_attachments() new/existing/no attachments, error
+- _handle_attachment_deletions_from_changelog() all branches
+- _organize_issue_comments_to_threads() threads, no id
+- _parse_issue_to_blocks() description, comments, attachments, images
+- _process_issue_blockgroups_for_streaming() success and error
+- _process_issue_attachments_for_children() new/existing records
+- create_connector() factory method
+- Various ADF edge cases, media, marks, list types
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch, call
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import HTTPException
+
+from app.connectors.sources.atlassian.core.jira_issue_security import IssueSecurityContext, SchemeKnowledge
+from app.config.constants.arangodb import Connectors, MimeTypes, OriginTypes, ProgressStatus, RecordRelations
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.sources.atlassian.jira_cloud.connector import (
+    AUDIT_PAGE_SIZE,
+    BATCH_PROCESSING_SIZE,
+    DEFAULT_MAX_RESULTS,
+    GROUP_MEMBER_PAGE_SIZE,
+    GROUP_PAGE_SIZE,
+    ISSUE_SEARCH_FIELDS,
+    USER_PAGE_SIZE,
+    JiraConnector,
+)
+from app.models.entities import (
+    AppRole,
+    AppUser,
+    AppUserGroup,
+    FileRecord,
+    Record,
+    RecordGroupType,
+    RecordType,
+    TicketRecord,
+)
+from app.models.permission import EntityType, Permission, PermissionType
+from app.services.notification.types import NotificationSeverity, NotificationType
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+
+def _make_mock_logger():
+    return logging.getLogger("test.jira.coverage")
+
+
+def _make_mock_deps():
+    logger = _make_mock_logger()
+    dep = MagicMock()
+    dep.org_id = "org-cov-1"
+    dep.on_new_app_users = AsyncMock()
+    dep.on_new_user_groups = AsyncMock()
+    dep.on_new_records = AsyncMock()
+    dep.on_new_record_groups = AsyncMock()
+    dep.on_record_deleted = AsyncMock()
+    dep.on_record_content_update = AsyncMock()
+    dep.on_records_deleted_cascade = AsyncMock(return_value={
+        "success": True, "deleted_records": [], "failed_records": [],
+        "total_requested": 0, "successfully_deleted": 0, "failed_count": 0,
+    })
+    dep.on_records_deleted_cascade = AsyncMock(return_value={
+        "success": True, "deleted_records": [], "failed_records": [],
+        "total_requested": 0, "successfully_deleted": 0, "failed_count": 0,
+    })
+    dep.on_new_app_roles = AsyncMock()
+    dep.reindex_existing_records = AsyncMock()
+    dep.get_all_active_users = AsyncMock(return_value=[
+        MagicMock(email="active@example.com"),
+    ])
+    dep.get_all_app_users = AsyncMock(return_value=[])
+    dep.get_record_by_external_id = AsyncMock(return_value=None)
+    dep.get_record_by_issue_key = AsyncMock(return_value=None)
+    dep.get_records_by_parent = AsyncMock(return_value=[])
+    dep.delete_records_and_relations = AsyncMock()
+    dep.get_placeholder_records = AsyncMock(return_value=[])
+    dep.initialize = AsyncMock()
+
+    dsp = MagicMock()
+    cs = MagicMock()
+    cs.get_config = AsyncMock()
+    return logger, dep, dsp, cs
+
+
+def _make_connector():
+    logger, dep, dsp, cs = _make_mock_deps()
+    connector = JiraConnector(logger, dep, dsp, cs, "conn-jira-cov", "team", "test-user-id")
+    # No issue security scheme: unsecured issues are unchanged
+    connector._load_issue_security = AsyncMock(return_value=IssueSecurityContext(knowledge=SchemeKnowledge.NONE))
+    return connector
+
+
+def _make_mock_response(status=200, data=None):
+    resp = MagicMock()
+    resp.status = status
+    resp.json = MagicMock(return_value=data or {})
+    resp.text = MagicMock(return_value="")
+    resp.bytes = MagicMock(return_value=b"file-bytes-content")
+    return resp
+
+
+def _make_app_user(email="user@example.com", account_id="acc-1", name="User One"):
+    return AppUser(
+        app_name=Connectors.JIRA,
+        connector_id="conn-jira-cov",
+        source_user_id=account_id,
+        org_id="org-cov-1",
+        email=email,
+        full_name=name,
+        is_active=True,
+    )
+
+
+def _make_ticket_record(external_id="12345", issue_key="PROJ-1", version=1, **kwargs):
+    defaults = dict(
+        id=str(uuid4()),
+        org_id="org-cov-1",
+        record_name=f"[{issue_key}] Test Issue",
+        record_type=RecordType.TICKET,
+        external_record_id=external_id,
+        version=version,
+        origin=OriginTypes.CONNECTOR,
+        connector_name=Connectors.JIRA,
+        connector_id="conn-jira-cov",
+        mime_type=MimeTypes.BLOCKS.value,
+        source_created_at=1700000000000,
+        source_updated_at=1700000000000,
+        weburl="https://company.atlassian.net/browse/PROJ-1",
+        external_record_group_id="proj-id-1",
+        parent_external_record_id=None,
+        record_group_type=RecordGroupType.PROJECT,
+    )
+    defaults.update(kwargs)
+    return TicketRecord(**defaults)
+
+
+def _make_file_record(attachment_id="99", issue_id="12345", version=0, **kwargs):
+    defaults = dict(
+        id=str(uuid4()),
+        org_id="org-cov-1",
+        record_name="screenshot.png",
+        record_type=RecordType.FILE,
+        external_record_id=f"attachment_{attachment_id}",
+        version=version,
+        origin=OriginTypes.CONNECTOR,
+        connector_name=Connectors.JIRA,
+        connector_id="conn-jira-cov",
+        mime_type="image/png",
+        parent_external_record_id=issue_id,
+        parent_record_type=RecordType.TICKET,
+        external_record_group_id="proj-id-1",
+        record_group_type=RecordGroupType.PROJECT,
+        is_file=True,
+        source_updated_at=1700000000000,
+    )
+    defaults.update(kwargs)
+    return FileRecord(**defaults)
+
+
+def _make_tx_store(existing_record=None):
+    """Create a mock transaction store."""
+    mock_tx_store = AsyncMock()
+    mock_tx_store.get_record_by_external_id = AsyncMock(return_value=existing_record)
+    mock_tx_store.get_record_by_issue_key = AsyncMock(return_value=existing_record)
+    mock_tx_store.get_records_by_parent = AsyncMock(return_value=[])
+    mock_tx_store.delete_records_and_relations = AsyncMock()
+    mock_tx = AsyncMock()
+    mock_tx.__aenter__ = AsyncMock(return_value=mock_tx_store)
+    mock_tx.__aexit__ = AsyncMock(return_value=False)
+    return mock_tx, mock_tx_store
+
+
+def _make_issue(
+    issue_id="100",
+    key="PROJ-1",
+    summary="Test Issue",
+    issue_type="Task",
+    hierarchy_level=0,
+    parent_id=None,
+    parent_key=None,
+    status="Open",
+    priority="Medium",
+    creator_id="acc-1",
+    assignee_id=None,
+    created="2024-01-15T10:30:45.000+0000",
+    updated="2024-01-16T10:30:45.000+0000",
+    attachments=None,
+    description=None,
+    issuelinks=None,
+    changelog=None,
+    security=None,
+):
+    issue = {
+        "id": issue_id,
+        "key": key,
+        "fields": {
+            "summary": summary,
+            "description": description,
+            "issuetype": {"name": issue_type, "hierarchyLevel": hierarchy_level},
+            "status": {"name": status},
+            "priority": {"name": priority},
+            "creator": {"accountId": creator_id, "displayName": "Creator"} if creator_id else None,
+            "reporter": None,
+            "assignee": {"accountId": assignee_id, "displayName": "Assignee"} if assignee_id else None,
+            "created": created,
+            "updated": updated,
+            "parent": {"id": parent_id, "key": parent_key} if parent_id else None,
+            "attachment": attachments or [],
+            "security": security,
+            "issuelinks": issuelinks or [],
+            "project": {"id": "proj-id-1"},
+        },
+    }
+    if changelog:
+        issue["changelog"] = changelog
+    return issue
+
+
+# ===========================================================================
+# init() - OAuth, API_TOKEN, and Error paths
+# ===========================================================================
+
+
+class TestInitCoverage:
+
+    @pytest.mark.asyncio
+    async def test_init_success_reads_site_url_from_client(self):
+        """init() surfaces the site URL that build_from_services resolved on the client;
+        it no longer re-resolves the site or tracks cloud_id (auth-type resolution lives
+        in the client)."""
+        connector = _make_connector()
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraClient") as MockJiraClient:
+            mock_client = MagicMock()
+            mock_client.get_site_url.return_value = "https://company.atlassian.net"
+            MockJiraClient.build_from_services = AsyncMock(return_value=mock_client)
+
+            result = await connector.init()
+            assert result is True
+            assert connector.site_url == "https://company.atlassian.net"
+
+    @pytest.mark.asyncio
+    async def test_init_raises_connector_init_error_on_build_error(self):
+        from app.connectors.core.base.connector.connector_service import ConnectorInitError
+
+        connector = _make_connector()
+        connector.notify = AsyncMock()
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraClient") as MockJiraClient:
+            MockJiraClient.build_from_services = AsyncMock(side_effect=Exception("network fail"))
+
+            with pytest.raises(ConnectorInitError, match="network fail"):
+                await connector.init()
+            # Setup path: FE gets the error via ConnectorInitError; no inbox notify.
+            connector.notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("base_url", ["http://169.254.169.254", "https://jira.corp.internal", "https://acme.atlassian.net.evil.com"])
+    async def test_init_refuses_an_api_token_site_that_is_not_atlassian_cloud(self, base_url: str) -> None:
+        """PP-205: the email + API token goes to the configured URL itself, so it must be the Atlassian site."""
+        from app.connectors.core.base.connector.connector_service import (
+            ConnectorInitError,
+        )
+        from app.sources.client.jira.jira import JiraClient, JiraRESTClientViaApiKey
+
+        connector = _make_connector()
+        client = JiraClient(JiraRESTClientViaApiKey(base_url, "sync@acme.com", "token"))
+        with patch.object(connector, "_build_jira_client", AsyncMock(return_value=client)), \
+                patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraDataSource") as data_source:
+            with pytest.raises(ConnectorInitError, match="your-company.atlassian.net"):
+                await connector.init()
+        data_source.assert_not_called()  # nothing was sent to that host
+        assert connector.data_source is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("base_url", [
+        "https://acme.atlassian.net",
+        "https://acme.atlassian.net/jira",                              # Jira answers there too: synced before
+        "https://acme.atlassian.net/jira/software/projects/ENG/boards/1",
+        "http://acme.atlassian.net",
+    ])
+    async def test_init_talks_to_the_site_root_of_an_atlassian_url(self, base_url: str) -> None:
+        """A URL that synced before the PP-205 check keeps syncing, at the site root, over https."""
+        from app.sources.client.jira.jira import JiraClient, JiraRESTClientViaApiKey
+
+        connector = _make_connector()
+        client = JiraClient(JiraRESTClientViaApiKey(base_url, "sync@acme.com", "token"))
+        client.site_url = base_url
+        with patch.object(connector, "_build_jira_client", AsyncMock(return_value=client)), \
+                patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraDataSource") as data_source:
+            data_source.return_value.get_current_user = AsyncMock(side_effect=Exception("offline"))
+            assert await connector.init() is True
+        assert client.get_client().get_base_url() == "https://acme.atlassian.net"
+        assert connector.site_url == "https://acme.atlassian.net"  # web links: /browse/KEY at the root
+
+    @pytest.mark.asyncio
+    async def test_init_multi_site_raises_connector_init_error(self):
+        """Multi-site OAuth token → init() propagates ConnectorInitError with the
+        actionable message (so the API surfaces it), not a generic False."""
+        from app.connectors.core.base.connector.connector_service import ConnectorInitError
+        from app.sources.external.common.atlassian import AtlassianMultiSiteError
+
+        connector = _make_connector()
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraClient") as MockJiraClient:
+            MockJiraClient.build_from_services = AsyncMock(
+                side_effect=AtlassianMultiSiteError(
+                    "This OAuth app has access to multiple Jira sites. "
+                    "Create a single-site (resource-restricted) OAuth app in the "
+                    "Atlassian Developer Console, then reconnect."
+                )
+            )
+            connector.config_service.get_config = AsyncMock(return_value={
+                "auth": {"authType": "OAUTH"},
+                "credentials": {"access_token": "test-token"},
+            })
+
+            with pytest.raises(ConnectorInitError, match="multiple Jira sites"):
+                await connector.init()
+
+
+# ===========================================================================
+# _get_fresh_datasource()
+# ===========================================================================
+
+
+class TestGetFreshDatasource:
+
+    @pytest.mark.asyncio
+    async def test_no_client_raises(self):
+        connector = _make_connector()
+        connector.external_client = None
+        with pytest.raises(HTTPException) as exc_info:
+            await connector._get_fresh_datasource()
+        assert exc_info.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_no_config_raises(self):
+        connector = _make_connector()
+        connector.external_client = MagicMock()
+        connector.config_service.get_config = AsyncMock(return_value=None)
+        with pytest.raises(HTTPException) as exc_info:
+            await connector._get_fresh_datasource()
+        assert exc_info.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_api_token_returns_datasource(self):
+        connector = _make_connector()
+        connector.external_client = MagicMock()
+        connector.config_service.get_config = AsyncMock(return_value={
+            "auth": {"authType": "API_TOKEN"},
+        })
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraDataSource") as MockDS:
+            mock_ds = MagicMock()
+            MockDS.return_value = mock_ds
+            result = await connector._get_fresh_datasource()
+            assert result == mock_ds
+
+
+# ===========================================================================
+# get_filter_options()
+# ===========================================================================
+
+
+class TestGetFilterOptions:
+
+    @pytest.mark.asyncio
+    async def test_project_keys(self):
+        connector = _make_connector()
+        connector._get_project_options = AsyncMock(return_value=MagicMock())
+        await connector.get_filter_options("project_keys")
+        connector._get_project_options.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_key(self):
+        connector = _make_connector()
+        with pytest.raises(ValueError, match="Unsupported"):
+            await connector.get_filter_options("invalid_key")
+
+
+# ===========================================================================
+# _get_project_options()
+# ===========================================================================
+
+
+class TestGetProjectOptions:
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        connector = _make_connector()
+        connector.external_client = MagicMock()
+        connector.config_service.get_config = AsyncMock(return_value={
+            "auth": {"authType": "API_TOKEN"},
+        })
+
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [
+                {"key": "PROJ1", "name": "Project One"},
+                {"key": "PROJ2", "name": "Project Two"},
+            ],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._get_project_options(page=1, limit=20, search=None)
+        assert result.success is True
+        assert len(result.options) == 2
+        assert result.has_more is False
+
+    @pytest.mark.asyncio
+    async def test_with_search(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"key": "PROJ1", "name": "Project One"}],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._get_project_options(page=1, limit=10, search="Project")
+        assert result.success is True
+        assert len(result.options) == 1
+
+    @pytest.mark.asyncio
+    async def test_has_more(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"key": "PROJ1", "name": "Project One"}],
+            "isLast": False,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._get_project_options(page=1, limit=10, search=None)
+        assert result.has_more is True
+
+    @pytest.mark.asyncio
+    async def test_api_failure(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(RuntimeError, match="Failed to fetch"):
+            await connector._get_project_options(page=1, limit=10, search=None)
+
+    @pytest.mark.asyncio
+    async def test_none_response(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=None)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(RuntimeError, match="Failed to fetch"):
+            await connector._get_project_options(page=1, limit=10, search=None)
+
+    @pytest.mark.asyncio
+    async def test_json_parse_failure(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        resp = _make_mock_response(200)
+        resp.json.side_effect = Exception("parse error")
+        mock_ds.search_projects = AsyncMock(return_value=resp)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(RuntimeError, match="Failed to fetch"):
+            await connector._get_project_options(page=1, limit=10, search=None)
+
+    @pytest.mark.asyncio
+    async def test_page_2_offset(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._get_project_options(page=2, limit=5, search=None)
+        # startAt should be 5 for page 2 with limit 5
+        call_kwargs = mock_ds.search_projects.call_args
+        assert call_kwargs[1]["startAt"] == 5
+
+    @pytest.mark.asyncio
+    async def test_skips_projects_without_key_or_name(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [
+                {"key": None, "name": "No Key"},
+                {"key": "PROJ", "name": None},
+                {"key": "GOOD", "name": "Good Project"},
+            ],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._get_project_options(page=1, limit=20, search=None)
+        assert len(result.options) == 1
+        assert result.options[0].id == "GOOD"
+
+
+# ===========================================================================
+# run_sync() orchestration
+# ===========================================================================
+
+
+class TestRunSync:
+
+    @pytest.mark.asyncio
+    async def test_full_sync_skips_when_pipeshub_directory_empty(self):
+        """Empty PipesHub directory short-circuits run_sync early.
+
+        ``get_all_active_users`` returns the org/directory roster. When it is
+        empty (fresh or single-user deployment) ``run_sync`` returns early
+        without hitting Jira — downstream methods must not be called.
+        """
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.site_url = "https://company.atlassian.net"
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[])
+        connector._fetch_users = AsyncMock(return_value=[])
+        connector._sync_user_groups = AsyncMock(return_value={})
+        connector._fetch_projects = AsyncMock(return_value=([], []))
+        connector._sync_all_project_issues = AsyncMock(
+            return_value={"total_synced": 0, "new_count": 0, "updated_count": 0}
+        )
+        connector._handle_issue_deletions = AsyncMock()
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.load_connector_filters",
+                   new_callable=AsyncMock, return_value=(None, None)):
+            await connector.run_sync()
+
+        # Early return — none of the Jira-side fetches should have been called.
+        connector._fetch_users.assert_not_awaited()
+        connector._fetch_projects.assert_not_awaited()
+        connector._sync_all_project_issues.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_sync_raises_when_not_initialized(self):
+        """Mirrors Confluence: run_sync must not call init(); fail if data_source is missing."""
+        connector = _make_connector()
+        connector.data_source = None
+        connector.init = AsyncMock(return_value=True)
+        connector.notify = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="not initialized") as exc_info:
+            await connector.run_sync()
+        connector.init.assert_not_awaited()
+        assert getattr(exc_info.value, "_notification_sent", False) is True
+        connector.notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_full_sync_with_users_and_projects(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.site_url = "https://company.atlassian.net"
+
+        user = _make_app_user()
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[user])
+
+        connector._fetch_users = AsyncMock(return_value=[user])
+        connector._sync_user_groups = AsyncMock(return_value={})
+
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+        mock_rg.external_group_id = "proj-id-1"
+        connector._fetch_projects = AsyncMock(return_value=(
+            [(mock_rg, [])],
+            [{"key": "PROJ", "lead": None}]
+        ))
+        connector._sync_project_roles = AsyncMock()
+        connector._sync_project_lead_roles = AsyncMock()
+        connector._get_issues_sync_checkpoint = AsyncMock(return_value=None)
+        connector._sync_all_project_issues = AsyncMock(return_value={
+            "total_synced": 5, "new_count": 3, "updated_count": 2
+        })
+        connector._update_issues_sync_checkpoint = AsyncMock()
+        connector._handle_issue_deletions = AsyncMock()
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.load_connector_filters",
+                   new_callable=AsyncMock, return_value=(None, None)):
+            await connector.run_sync()
+
+        connector._fetch_users.assert_awaited_once()
+        connector._sync_user_groups.assert_awaited_once()
+        connector._fetch_projects.assert_awaited_once()
+        connector._sync_all_project_issues.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_run_sync_notifies_when_any_project_fails(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.site_url = "https://company.atlassian.net"
+        connector.notify = AsyncMock()
+
+        user = _make_app_user()
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[user])
+        connector._fetch_users = AsyncMock(return_value=[user])
+        connector._sync_user_groups = AsyncMock(return_value={})
+
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+        mock_rg.external_group_id = "proj-id-1"
+        connector._fetch_projects = AsyncMock(return_value=(
+            [(mock_rg, [])],
+            [{"key": "PROJ", "lead": None}],
+        ))
+        connector._sync_project_roles = AsyncMock()
+        connector._sync_project_lead_roles = AsyncMock()
+        connector._get_issues_sync_checkpoint = AsyncMock(return_value=None)
+        connector._sync_all_project_issues = AsyncMock(return_value={
+            "total_synced": 2,
+            "new_count": 1,
+            "updated_count": 1,
+            "failed_count": 1,
+            "failed_project_keys": ["KAN"],
+        })
+        connector._update_issues_sync_checkpoint = AsyncMock()
+        connector._handle_issue_deletions = AsyncMock()
+
+        with patch(
+            "app.connectors.sources.atlassian.jira_cloud.connector.load_connector_filters",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        ):
+            await connector.run_sync()
+
+        connector.notify.assert_awaited_once()
+        notify_kwargs = connector.notify.await_args.kwargs
+        assert notify_kwargs["type"] == NotificationType.CONNECTOR_SYNC_ERROR
+        assert notify_kwargs["severity"] == NotificationSeverity.ERROR
+        assert "KAN" in notify_kwargs["message"]
+        connector._handle_issue_deletions.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_run_sync_error_raises(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        # ``_fetch_users`` is the first orchestrated step now that the
+        # ``get_all_active_users`` gate was removed; an exception there must
+        # propagate out of ``run_sync``.
+        connector._fetch_users = AsyncMock(side_effect=Exception("upstream error"))
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.load_connector_filters",
+                   new_callable=AsyncMock, return_value=(None, None)):
+            with pytest.raises(Exception, match="upstream error"):
+                await connector.run_sync()
+
+    @pytest.mark.asyncio
+    async def test_run_sync_with_project_keys_filter_in(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.site_url = "https://company.atlassian.net"
+
+        user = _make_app_user()
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[user])
+
+        connector._fetch_users = AsyncMock(return_value=[user])
+        connector._sync_user_groups = AsyncMock(return_value={})
+
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+        mock_rg.external_group_id = "proj-id-1"
+        connector._fetch_projects = AsyncMock(return_value=([(mock_rg, [])], [{"key": "PROJ", "lead": None}]))
+        connector._sync_project_roles = AsyncMock()
+        connector._sync_project_lead_roles = AsyncMock()
+        connector._get_issues_sync_checkpoint = AsyncMock(return_value=None)
+        connector._sync_all_project_issues = AsyncMock(return_value={
+            "total_synced": 0, "new_count": 0, "updated_count": 0
+        })
+        connector._update_issues_sync_checkpoint = AsyncMock()
+        connector._handle_issue_deletions = AsyncMock()
+
+        # Set up sync filter with project_keys IN
+        mock_filter = MagicMock()
+        mock_filter.get_value.return_value = ["PROJ"]
+        mock_filter.get_operator.return_value = MagicMock(value="in")
+        from app.connectors.core.registry.filters import SyncFilterKey
+        mock_sync_filters = MagicMock()
+        mock_sync_filters.get.return_value = mock_filter
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.load_connector_filters",
+                   new_callable=AsyncMock, return_value=(mock_sync_filters, None)):
+            await connector.run_sync()
+
+    @pytest.mark.asyncio
+    async def test_run_sync_with_empty_project_keys_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.site_url = "https://company.atlassian.net"
+
+        user = _make_app_user()
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[user])
+        connector._fetch_users = AsyncMock(return_value=[])
+        connector._sync_user_groups = AsyncMock(return_value={})
+
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+        mock_rg.external_group_id = "proj-id-1"
+        connector._fetch_projects = AsyncMock(return_value=([(mock_rg, [])], [{"key": "PROJ", "lead": None}]))
+        connector._sync_project_roles = AsyncMock()
+        connector._sync_project_lead_roles = AsyncMock()
+        connector._get_issues_sync_checkpoint = AsyncMock(return_value=None)
+        connector._sync_all_project_issues = AsyncMock(return_value={
+            "total_synced": 0, "new_count": 0, "updated_count": 0
+        })
+        connector._update_issues_sync_checkpoint = AsyncMock()
+        connector._handle_issue_deletions = AsyncMock()
+
+        mock_filter = MagicMock()
+        mock_filter.get_value.return_value = []
+        mock_filter.get_operator.return_value = None
+        mock_sync_filters = MagicMock()
+        mock_sync_filters.get.return_value = mock_filter
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.load_connector_filters",
+                   new_callable=AsyncMock, return_value=(mock_sync_filters, None)):
+            await connector.run_sync()
+
+
+# ===========================================================================
+# _get_issues_sync_checkpoint()
+# ===========================================================================
+
+
+class TestGetIssuesSyncCheckpoint:
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        connector = _make_connector()
+        connector.issues_sync_point.read_sync_point = AsyncMock(
+            return_value={"last_sync_time": 1700000000000}
+        )
+        result = await connector._get_issues_sync_checkpoint()
+        assert result == 1700000000000
+
+    @pytest.mark.asyncio
+    async def test_no_data(self):
+        connector = _make_connector()
+        connector.issues_sync_point.read_sync_point = AsyncMock(return_value=None)
+        result = await connector._get_issues_sync_checkpoint()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_none(self):
+        connector = _make_connector()
+        connector.issues_sync_point.read_sync_point = AsyncMock(side_effect=Exception("err"))
+        result = await connector._get_issues_sync_checkpoint()
+        assert result is None
+
+
+# ===========================================================================
+# _update_issues_sync_checkpoint()
+# ===========================================================================
+
+
+class TestUpdateIssuesSyncCheckpoint:
+
+    @pytest.mark.asyncio
+    async def test_with_synced_issues(self):
+        connector = _make_connector()
+        connector.issues_sync_point.update_sync_point = AsyncMock()
+        await connector._update_issues_sync_checkpoint({"total_synced": 5}, 2)
+        connector.issues_sync_point.update_sync_point.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_with_zero_synced_but_projects(self):
+        connector = _make_connector()
+        connector.issues_sync_point.update_sync_point = AsyncMock()
+        await connector._update_issues_sync_checkpoint({"total_synced": 0}, 3)
+        connector.issues_sync_point.update_sync_point.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_synced_no_projects(self):
+        connector = _make_connector()
+        connector.issues_sync_point.update_sync_point = AsyncMock()
+        await connector._update_issues_sync_checkpoint({"total_synced": 0}, 0)
+        connector.issues_sync_point.update_sync_point.assert_not_awaited()
+
+
+# ===========================================================================
+# _handle_issue_deletions() with audit_last_sync_time
+# ===========================================================================
+
+
+class TestHandleIssueDeletionsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_uses_audit_sync_time_when_available(self):
+        connector = _make_connector()
+        connector.issues_sync_point.read_sync_point = AsyncMock(
+            return_value={"last_sync_time": 1700000000000}
+        )
+        connector.issues_sync_point.update_sync_point = AsyncMock()
+        connector._detect_and_handle_deletions = AsyncMock(return_value=(1700000000001, True))
+
+        await connector._handle_issue_deletions(1600000000000)
+        # Should use audit sync time (1700000000000) not global (1600000000000)
+        connector._detect_and_handle_deletions.assert_awaited_once_with(1700000000000)
+
+    @pytest.mark.asyncio
+    async def test_exception_reading_audit_sync(self):
+        connector = _make_connector()
+        connector.issues_sync_point.read_sync_point = AsyncMock(side_effect=Exception("err"))
+        connector.issues_sync_point.update_sync_point = AsyncMock()
+        connector._detect_and_handle_deletions = AsyncMock(return_value=(1700000000001, True))
+
+        await connector._handle_issue_deletions(1600000000000)
+        connector._detect_and_handle_deletions.assert_awaited_once_with(1600000000000)
+
+
+# ===========================================================================
+# _handle_deleted_issue() - various paths
+# ===========================================================================
+
+
+class TestHandleDeletedIssueCoverage:
+
+    @pytest.mark.asyncio
+    async def test_issue_still_exists_at_source(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(200))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await connector._handle_deleted_issue("PROJ-1")
+        # Should return early since issue still exists
+
+    @pytest.mark.asyncio
+    async def test_issue_not_found_in_db(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(404))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        connector.data_entities_processor.get_record_by_issue_key = AsyncMock(return_value=None)
+
+        await connector._handle_deleted_issue("PROJ-1")
+
+    @pytest.mark.asyncio
+    async def test_deletes_issue_and_attachments_via_cascade(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(404))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_record = MagicMock()
+        mock_record.id = "rec-1"
+        mock_record.external_record_id = "ext-1"
+
+        connector.data_entities_processor.get_record_by_issue_key = AsyncMock(return_value=mock_record)
+
+        await connector._handle_deleted_issue("PROJ-1")
+        connector.data_entities_processor.on_records_deleted_cascade.assert_awaited_once_with(
+            ["rec-1"], connector.connector_id, cascade_children=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reraises_on_error(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(404))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        # DB lookup blows up -> the method logs and re-raises so the caller can hold the checkpoint.
+        connector.data_entities_processor.get_record_by_issue_key = AsyncMock(side_effect=Exception("db boom"))
+
+        with pytest.raises(Exception, match="db boom"):
+            await connector._handle_deleted_issue("PROJ-1")
+
+    @pytest.mark.asyncio
+    async def test_issue_get_inconclusive_raises_no_delete(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        # Re-confirm GET fails transiently -> deletion is UNCONFIRMED. The method must not
+        # delete a possibly-live issue; it raises so _detect_and_handle_deletions holds
+        # the deletion checkpoint and retries this window next sync.
+        mock_ds.get_issue = AsyncMock(side_effect=Exception("timeout"))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_record = MagicMock()
+        mock_record.id = "rec-1"
+        mock_record.external_record_id = "ext-1"
+
+        connector.data_entities_processor.get_record_by_issue_key = AsyncMock(return_value=mock_record)
+
+        with pytest.raises(Exception, match="timeout"):
+            await connector._handle_deleted_issue("PROJ-1")
+        connector.data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_issue_get_non_ok_status_raises_no_delete(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        # A 500 (not a definitive 404/410) is inconclusive -> no delete, raise to retry.
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(Exception, match="unconfirmed"):
+            await connector._handle_deleted_issue("PROJ-1")
+        connector.data_entities_processor.on_records_deleted_cascade.assert_not_awaited()
+
+
+# ===========================================================================
+# _fetch_users() - pagination, inactive, no email
+# ===========================================================================
+
+
+class TestFetchUsersCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_datasource(self):
+        connector = _make_connector()
+        connector.data_source = None
+        with pytest.raises(ValueError, match="not initialized"):
+            await connector._fetch_users()
+
+    @pytest.mark.asyncio
+    async def test_single_page(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        users_data = [
+            {"accountId": "u1", "accountType": "atlassian", "emailAddress": "u1@test.com", "displayName": "User 1", "active": True},
+            {"accountId": "u2", "accountType": "atlassian", "emailAddress": None, "displayName": "No Email", "active": True},
+            {"accountId": "u3", "accountType": "atlassian", "emailAddress": "u3@test.com", "displayName": "Inactive", "active": False},
+        ]
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, users_data))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert len(result) == 1
+        assert result[0].email == "u1@test.com"
+
+    @pytest.mark.asyncio
+    async def test_pagination(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        batch1 = [{"accountId": f"u{i}", "accountType": "atlassian", "emailAddress": f"u{i}@test.com", "active": True}
+                   for i in range(USER_PAGE_SIZE)]
+        batch2 = [{"accountId": "last", "accountType": "atlassian", "emailAddress": "last@test.com", "active": True}]
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(side_effect=[
+            _make_mock_response(200, batch1),
+            _make_mock_response(200, batch2),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert len(result) == USER_PAGE_SIZE + 1
+
+    @pytest.mark.asyncio
+    async def test_api_failure_raises(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(Exception, match="Failed to fetch users"):
+            await connector._fetch_users()
+
+    @pytest.mark.asyncio
+    async def test_bulk_403_returns_partial_and_sets_flag(self):
+        """Regression: 403 on /users/search must NOT raise — it must fall back
+        to whatever the bulk fetch had already collected and flag
+        ``_user_bulk_forbidden`` so Phase 5 can take over."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        # No PipesHub directory candidates → Phase 5 short-circuits, so this
+        # isolates the bulk-fetch fallback specifically.
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[])
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(403))
+        mock_ds.find_users = AsyncMock()
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector.notify = AsyncMock()
+
+        result = await connector._fetch_users()
+        assert result == []
+        assert connector._user_bulk_forbidden is True
+        # 403 is a genuine missing-permission → the "couldn't list users" notification fires.
+        connector.notify.assert_awaited_once()
+        assert "Browse users and groups" in connector.notify.await_args.kwargs["message"]
+        # No PipesHub candidates → reverse lookup must not have been attempted.
+        mock_ds.find_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bulk_401_sets_flag_but_no_permission_notification(self):
+        """401 (auth/token failure) still degrades to reverse lookup and sets the flag, but must
+        NOT fire the 'needs Browse users and groups permission' notification — that message is for
+        a 403, and the connection/sync-failed notification already reports the auth error."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[])
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(401))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector.notify = AsyncMock()
+
+        result = await connector._fetch_users()
+        assert result == []
+        assert connector._user_bulk_forbidden is True
+        connector.notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_json_parse_failure_breaks(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        resp = _make_mock_response(200)
+        resp.json.side_effect = Exception("bad json")
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=resp)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_dict_response_with_values_key(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"accountId": "u1", "accountType": "atlassian", "emailAddress": "u1@test.com", "active": True}]
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert len(result) == 1
+
+
+# ===========================================================================
+# _fetch_users() - 5-phase features (DB cache, reverse lookup)
+# ===========================================================================
+
+
+class TestFetchUsersPhases:
+
+    @pytest.mark.asyncio
+    async def test_db_cache_resolves_hidden_email_user(self):
+        """Phase 3B: cached AppUser from prior sync resolves user without visible email."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        cached_user = MagicMock()
+        cached_user.source_user_id = "u2"
+        cached_user.email = "cached@example.com"
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[cached_user])
+
+        users_data = [
+            {"accountId": "u1", "accountType": "atlassian", "emailAddress": "visible@example.com", "active": True},
+            {"accountId": "u2", "accountType": "atlassian", "active": True},
+        ]
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, users_data))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        emails = {u.email for u in result}
+        assert "cached@example.com" in emails
+        assert "visible@example.com" in emails
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_reverse_lookup_resolves_hidden_email(self):
+        """Phase 5: reverse lookup resolves user with hidden email via PipesHub directory."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+        pipeshub_user = MagicMock()
+        pipeshub_user.email = "hidden@example.com"
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[pipeshub_user])
+
+        users_data = [
+            {"accountId": "u1", "accountType": "atlassian", "emailAddress": "visible@example.com", "active": True},
+            {"accountId": "u2", "accountType": "atlassian", "active": True},
+        ]
+
+        reverse_resp = _make_mock_response(200, [{"accountId": "u2", "displayName": "Hidden User"}])
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, users_data))
+        mock_ds.find_users = AsyncMock(return_value=reverse_resp)
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        emails = {u.email for u in result}
+        assert "hidden@example.com" in emails
+        assert "visible@example.com" in emails
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_reverse_lookup_never_resolves_a_deactivated_account(self) -> None:
+        """A deactivated Jira account with a PipesHub user's email must not become an app user."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+        connector.data_entities_processor.get_all_active_users = AsyncMock(
+            return_value=[MagicMock(email="gone@example.com")]
+        )
+        users_data = [
+            {"accountId": "u2", "accountType": "atlassian", "active": True},
+            {"accountId": "u9", "accountType": "atlassian", "emailAddress": "gone@example.com", "active": False},
+        ]
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, users_data))
+        mock_ds.find_users = AsyncMock(return_value=_make_mock_response(200, [
+            {"accountId": "u9", "accountType": "atlassian", "emailAddress": "gone@example.com", "active": False},
+        ]))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        assert await connector._fetch_users() == []
+        assert connector._deactivated_account_ids == {"u9"}
+
+    @pytest.mark.asyncio
+    async def test_reverse_lookup_rejects_an_account_the_bulk_listing_did_not_offer(self) -> None:
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+        connector.data_entities_processor.get_all_active_users = AsyncMock(
+            return_value=[MagicMock(email="hidden@example.com")]
+        )
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, [
+            {"accountId": "u2", "accountType": "atlassian", "active": True},
+        ]))
+        mock_ds.find_users = AsyncMock(return_value=_make_mock_response(200, [{"accountId": "other"}]))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        assert await connector._fetch_users() == []
+
+    @pytest.mark.asyncio
+    async def test_users_without_product_access_are_left_out(self) -> None:
+        connector = _make_connector()
+        licensed, unlicensed = (
+            AppUser(app_name=Connectors.JIRA, connector_id="c", source_user_id=i, email=f"{i}@x.com", full_name=i)
+            for i in ("lic", "unlic")
+        )
+        connector._fetch_group_members = AsyncMock(return_value=(["lic"], True))
+        mapping = {"jira-software": [{"groupId": "g1", "name": "jira-software-users"}]}
+
+        assert await connector._keep_licensed_users([licensed, unlicensed], mapping) == [licensed]
+        connector._fetch_group_members.assert_awaited_once_with("g1", "jira-software-users")
+
+    @pytest.mark.asyncio
+    async def test_product_access_unknown_keeps_every_user(self) -> None:
+        connector = _make_connector()
+        users = [AppUser(app_name=Connectors.JIRA, connector_id="c", source_user_id="u", email="u@x.com", full_name="u")]
+        connector._fetch_group_members = AsyncMock(return_value=([], False))
+        mapping = {"jira-software": [{"groupId": "g1", "name": "jira-software-users"}]}
+
+        assert await connector._keep_licensed_users(users, {}) == users
+        assert await connector._keep_licensed_users(users, mapping) == users
+
+    @pytest.mark.asyncio
+    async def test_a_partly_read_role_list_keeps_every_user(self) -> None:
+        connector = _make_connector()
+        users = [
+            AppUser(app_name=Connectors.JIRA, connector_id="c", source_user_id=i, email=f"{i}@x.com", full_name=i)
+            for i in ("lic", "other")
+        ]
+        connector._fetch_group_members = AsyncMock(return_value=(["lic"], True))
+        connector._app_roles_unread = True
+        mapping = {"jira-software": [{"groupId": "g1", "name": "jira-software-users"}]}
+
+        assert await connector._keep_licensed_users(users, mapping) == users
+        connector._fetch_group_members.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_withdraws_stored_users_jira_reports_ineligible(self) -> None:
+        connector = _make_connector()
+        connector.data_entities_processor.withdraw_app_user_access = AsyncMock()
+        stored = [
+            AppUser(id=f"node-{i}", app_name=Connectors.JIRA, connector_id="c", source_user_id=i, email=e, full_name=i)
+            for i, e in (("dead", "a@x.com"), ("unlic", "b@x.com"), ("ok", "c@x.com"), ("old", "d@x.com"))
+        ]
+        connector._stored_app_users = stored
+        # d@x.com was deactivated under one account but kept under another.
+        kept = [stored[2], AppUser(app_name=Connectors.JIRA, connector_id="c", source_user_id="new", email="d@x.com", full_name="d")]
+
+        await connector._withdraw_ineligible_app_users(kept, {"dead", "unlic", "old"})
+
+        connector.data_entities_processor.withdraw_app_user_access.assert_awaited_once_with(
+            "conn-jira-cov", [stored[0], stored[1]]
+        )
+
+    @pytest.mark.asyncio
+    async def test_reverse_lookup_skipped_when_all_resolved(self):
+        """Phase 5 not triggered when all users have visible email."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+
+        users_data = [
+            {"accountId": "u1", "accountType": "atlassian", "emailAddress": "u1@test.com", "active": True},
+        ]
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, users_data))
+        mock_ds.find_users = AsyncMock()
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert len(result) == 1
+        mock_ds.find_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reverse_lookup_api_failure_graceful(self):
+        """_resolve_private_email_users handles API failure without crashing."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+        pipeshub_user = MagicMock()
+        pipeshub_user.email = "user@example.com"
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[pipeshub_user])
+
+        users_data = [
+            {"accountId": "u1", "accountType": "atlassian", "active": True},
+        ]
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(200, users_data))
+        mock_ds.find_users = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert len(result) == 0
+
+    @pytest.mark.asyncio
+    async def test_bulk_forbidden_triggers_directory_sweep(self):
+        """Regression: when /users/search is forbidden, Phase 5 must still run
+        against the full PipesHub directory (not be skipped by the
+        ``unresolved_count == 0`` early exit) and resolve users via per-email
+        ``find_users``, which is typically permitted even when the bulk
+        enumeration is not."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+
+        u1 = MagicMock(email="alice@example.com")
+        u2 = MagicMock(email="bob@example.com")
+        connector.data_entities_processor.get_all_active_users = AsyncMock(
+            return_value=[u1, u2]
+        )
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(403))
+        mock_ds.find_users = AsyncMock(side_effect=[
+            _make_mock_response(200, [{"accountId": "acc-alice", "displayName": "Alice"}]),
+            _make_mock_response(200, [{"accountId": "acc-bob", "displayName": "Bob"}]),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+
+        assert connector._user_bulk_forbidden is True
+        emails = {u.email for u in result}
+        assert emails == {"alice@example.com", "bob@example.com"}
+        # Both directory candidates must have been swept.
+        assert mock_ds.find_users.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_bulk_forbidden_with_empty_directory_resolves_nothing(self):
+        """With both bulk forbidden AND an empty PipesHub directory, there are
+        no candidates and reverse-lookup is a no-op — sync still returns
+        cleanly without raising."""
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.data_entities_processor.get_all_app_users = AsyncMock(return_value=[])
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[])
+
+        mock_ds = MagicMock()
+        mock_ds.get_all_users = AsyncMock(return_value=_make_mock_response(403))
+        mock_ds.find_users = AsyncMock()
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_users()
+        assert result == []
+        assert connector._user_bulk_forbidden is True
+        mock_ds.find_users.assert_not_awaited()
+
+
+# ===========================================================================
+# _fetch_groups() - pagination, isLast, error
+# ===========================================================================
+
+
+class TestFetchGroupsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_datasource(self):
+        connector = _make_connector()
+        connector.data_source = None
+        with pytest.raises(ValueError, match="not initialized"):
+            await connector._fetch_groups()
+
+    @pytest.mark.asyncio
+    async def test_single_page_isLast(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"groupId": "g1", "name": "devs"}],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, fetch_failed = await connector._fetch_groups()
+        assert len(result) == 1
+        assert fetch_failed is False
+
+    @pytest.mark.asyncio
+    async def test_pagination(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        batch1_groups = [{"groupId": f"g{i}", "name": f"group_{i}"} for i in range(GROUP_PAGE_SIZE)]
+        batch2_groups = [{"groupId": "last", "name": "last_group"}]
+
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(side_effect=[
+            _make_mock_response(200, {"values": batch1_groups, "isLast": False}),
+            _make_mock_response(200, {"values": batch2_groups, "isLast": True}),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, fetch_failed = await connector._fetch_groups()
+        assert len(result) == GROUP_PAGE_SIZE + 1
+        assert fetch_failed is False
+
+    @pytest.mark.asyncio
+    async def test_api_failure(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, fetch_failed = await connector._fetch_groups()
+        assert result == []
+        assert fetch_failed is True
+
+    @pytest.mark.asyncio
+    async def test_exception_breaks(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(side_effect=Exception("timeout"))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, fetch_failed = await connector._fetch_groups()
+        assert result == []
+        assert fetch_failed is True
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_breaks(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, fetch_failed = await connector._fetch_groups()
+        assert result == []
+        assert fetch_failed is False
+
+
+# ===========================================================================
+# _fetch_group_members() - pagination, isLast, error
+# ===========================================================================
+
+
+class TestFetchGroupMembersCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_datasource(self):
+        connector = _make_connector()
+        connector.data_source = None
+        with pytest.raises(ValueError, match="not initialized"):
+            await connector._fetch_group_members("g1", "devs")
+
+    @pytest.mark.asyncio
+    async def test_single_page(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_users_from_group = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"accountId": "acc-1", "emailAddress": "u1@test.com"}],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_group_members("g1", "devs")
+        assert result == (["acc-1"], True)
+
+    @pytest.mark.asyncio
+    async def test_pagination(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        batch1 = [{"accountId": f"acc-{i}"} for i in range(GROUP_MEMBER_PAGE_SIZE)]
+        batch2 = [{"accountId": "acc-last"}]
+
+        mock_ds = MagicMock()
+        mock_ds.get_users_from_group = AsyncMock(side_effect=[
+            _make_mock_response(200, {"values": batch1, "isLast": False}),
+            _make_mock_response(200, {"values": batch2, "isLast": True}),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_group_members("g1", "devs")
+        assert result[1] is True
+        assert len(result[0]) == GROUP_MEMBER_PAGE_SIZE + 1
+
+    @pytest.mark.asyncio
+    async def test_api_failure(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_users_from_group = AsyncMock(return_value=_make_mock_response(403))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_group_members("g1", "devs")
+        assert result == ([], False)
+
+    @pytest.mark.asyncio
+    async def test_exception_breaks(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_users_from_group = AsyncMock(side_effect=Exception("timeout"))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_group_members("g1", "devs")
+        assert result == ([], False)
+
+    @pytest.mark.asyncio
+    async def test_members_without_email(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_users_from_group = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"emailAddress": None}, {"accountId": "acc-1", "emailAddress": "u1@test.com"}],
+            "isLast": True,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result = await connector._fetch_group_members("g1", "devs")
+        assert result == (["acc-1"], True)
+
+
+# ===========================================================================
+# _fetch_projects() - NOT_IN, IN, no filter, ADF description
+# ===========================================================================
+
+
+class TestFetchProjectsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_datasource(self):
+        connector = _make_connector()
+        connector.data_source = None
+        with pytest.raises(ValueError, match="not initialized"):
+            await connector._fetch_projects()
+
+    @pytest.mark.asyncio
+    async def test_no_filter_fetch_all(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"id": "1", "key": "PROJ", "name": "Project", "description": "Desc", "url": "https://x"}],
+            "isLast": True,
+            "total": 1,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector._fetch_application_roles_to_groups_mapping = AsyncMock(return_value={})
+        connector._fetch_project_permission_scheme = AsyncMock(return_value=[])
+
+        rgs, raw = await connector._fetch_projects()
+        assert len(rgs) == 1
+        assert len(raw) == 1
+
+    @pytest.mark.asyncio
+    async def test_in_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [{"id": "1", "key": "PROJ", "name": "Project", "description": None}],
+            "isLast": True,
+            "total": 1,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector._fetch_application_roles_to_groups_mapping = AsyncMock(return_value={})
+        connector._fetch_project_permission_scheme = AsyncMock(return_value=[])
+
+        from app.connectors.core.registry.filters import ListOperator
+        rgs, raw = await connector._fetch_projects(["PROJ"], ListOperator.IN)
+        assert len(rgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_not_in_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(200, {
+            "values": [
+                {"id": "1", "key": "PROJ", "name": "Project", "description": None},
+                {"id": "2", "key": "EXCL", "name": "Excluded", "description": None},
+            ],
+            "isLast": True,
+            "total": 2,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector._fetch_application_roles_to_groups_mapping = AsyncMock(return_value={})
+        connector._fetch_project_permission_scheme = AsyncMock(return_value=[])
+
+        from app.connectors.core.registry.filters import ListOperator
+        rgs, raw = await connector._fetch_projects(["EXCL"], ListOperator.NOT_IN)
+        assert len(rgs) == 1
+        assert rgs[0][0].short_name == "PROJ"
+
+    @pytest.mark.asyncio
+    async def test_pagination_no_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        batch1 = {
+            "values": [{"id": "1", "key": "P1", "name": "P1", "description": None}],
+            "isLast": False,
+            "total": 2,
+        }
+        batch2 = {
+            "values": [{"id": "2", "key": "P2", "name": "P2", "description": None}],
+            "isLast": True,
+            "total": 2,
+        }
+
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(side_effect=[
+            _make_mock_response(200, batch1),
+            _make_mock_response(200, batch2),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector._fetch_application_roles_to_groups_mapping = AsyncMock(return_value={})
+        connector._fetch_project_permission_scheme = AsyncMock(return_value=[])
+
+        rgs, raw = await connector._fetch_projects()
+        assert len(rgs) == 2
+
+    @pytest.mark.asyncio
+    async def test_api_failure_raises(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.search_projects = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(Exception, match="Failed to fetch"):
+            await connector._fetch_projects()
+
+
+# ===========================================================================
+# _sync_all_project_issues()
+# ===========================================================================
+
+
+class TestSyncAllProjectIssues:
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        connector = _make_connector()
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+
+        connector._sync_project_issues = AsyncMock(return_value={
+            "total_synced": 5, "new_count": 3, "updated_count": 2
+        })
+
+        result = await connector._sync_all_project_issues(
+            [(mock_rg, [])], [_make_app_user()], None
+        )
+        assert result["total_synced"] == 5
+
+    @pytest.mark.asyncio
+    async def test_error_continues(self):
+        connector = _make_connector()
+        mock_rg1 = MagicMock()
+        mock_rg1.short_name = "P1"
+        mock_rg2 = MagicMock()
+        mock_rg2.short_name = "P2"
+
+        connector._sync_project_issues = AsyncMock(side_effect=[
+            Exception("fail"),
+            {"total_synced": 3, "new_count": 2, "updated_count": 1}
+        ])
+
+        result = await connector._sync_all_project_issues(
+            [(mock_rg1, []), (mock_rg2, [])], [], None
+        )
+        assert result["total_synced"] == 3
+        assert result["failed_count"] == 1
+        assert result["failed_project_keys"] == ["P1"]
+
+
+# ===========================================================================
+# _sync_project_issues() - new project, incremental, resume
+# ===========================================================================
+
+
+class TestSyncProjectIssuesCoverage:
+
+    @pytest.mark.asyncio
+    async def test_new_project_no_checkpoint(self):
+        connector = _make_connector()
+        mock_rg = MagicMock()
+        mock_rg.short_name = "NEW"
+        mock_rg.external_group_id = "proj-new"
+
+        connector._get_project_sync_checkpoint = AsyncMock(return_value={})
+        connector._update_project_sync_checkpoint = AsyncMock()
+
+        # Yield one batch then signal done
+        async def gen():
+            yield ([(_make_ticket_record(version=0), [])], False, 1700000000000)
+
+        connector._fetch_issues_batched = MagicMock(return_value=gen())
+        connector._process_new_records = AsyncMock()
+
+        result = await connector._sync_project_issues(mock_rg, [], None)
+        assert result["total_synced"] == 1
+
+    @pytest.mark.asyncio
+    async def test_incremental_with_checkpoint(self):
+        connector = _make_connector()
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+        mock_rg.external_group_id = "proj-1"
+
+        connector._get_project_sync_checkpoint = AsyncMock(return_value={
+            "last_sync_time": 1600000000000,
+            "last_issue_updated": 1650000000000,
+        })
+        connector._update_project_sync_checkpoint = AsyncMock()
+
+        async def gen():
+            yield ([], False, 1650000000000)
+
+        connector._fetch_issues_batched = MagicMock(return_value=gen())
+
+        result = await connector._sync_project_issues(mock_rg, [], 1500000000000)
+        assert result["total_synced"] == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_updates_checkpoint(self):
+        connector = _make_connector()
+        mock_rg = MagicMock()
+        mock_rg.short_name = "PROJ"
+        mock_rg.external_group_id = "proj-1"
+
+        connector._get_project_sync_checkpoint = AsyncMock(return_value={
+            "last_sync_time": 1600000000000,
+            "last_issue_updated": 1650000000000,
+        })
+        connector._update_project_sync_checkpoint = AsyncMock()
+
+        async def gen():
+            yield ([], True, 1700000000000)
+            yield ([(_make_ticket_record(version=0), [])], False, 1710000000000)
+
+        connector._fetch_issues_batched = MagicMock(return_value=gen())
+        connector._process_new_records = AsyncMock()
+
+        result = await connector._sync_project_issues(mock_rg, [], 1500000000000)
+        assert result["total_synced"] == 1
+
+
+# ===========================================================================
+# _fetch_issues_batched() - pagination, filters, empty, error
+# ===========================================================================
+
+
+class TestFetchIssuesBatchedCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_datasource(self):
+        connector = _make_connector()
+        connector.data_source = None
+        connector.sync_filters = None
+
+        with pytest.raises(ValueError, match="not initialized"):
+            async for _ in connector._fetch_issues_batched("PROJ", "p1", []):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_single_page(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.sync_filters = None
+
+        issue = _make_issue()
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {
+                "issues": [issue],
+                "nextPageToken": None,
+            })
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_tx, mock_tx_store = _make_tx_store(None)
+        connector.data_store_provider.transaction = MagicMock(return_value=mock_tx)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+
+        batches = []
+        async for batch, has_more, ts in connector._fetch_issues_batched("PROJ", "p1", []):
+            batches.append((batch, has_more, ts))
+
+        assert len(batches) >= 1
+
+    @pytest.mark.asyncio
+    async def test_with_modified_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_modified = MagicMock()
+        mock_modified.get_value.return_value = (1600000000000, 1700000000000)
+        mock_created = MagicMock()
+        mock_created.get_value.return_value = (1500000000000, None)
+
+        from app.connectors.core.registry.filters import SyncFilterKey
+        mock_sync_filters = MagicMock()
+        mock_sync_filters.get.side_effect = lambda key: {
+            SyncFilterKey.MODIFIED: mock_modified,
+            SyncFilterKey.CREATED: mock_created,
+        }.get(key)
+        connector.sync_filters = mock_sync_filters
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {"issues": [], "nextPageToken": None})
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        async for batch, has_more, ts in connector._fetch_issues_batched("PROJ", "p1", []):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_api_failure_raises(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.sync_filters = None
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(500)
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        with pytest.raises(Exception, match="Failed to fetch"):
+            async for _ in connector._fetch_issues_batched("PROJ", "p1", []):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_pagination_with_next_page_token(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.sync_filters = None
+
+        issue1 = _make_issue(issue_id="1", key="PROJ-1")
+        issue2 = _make_issue(issue_id="2", key="PROJ-2")
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(side_effect=[
+            _make_mock_response(200, {"issues": [issue1], "nextPageToken": "page2"}),
+            _make_mock_response(200, {"issues": [issue2], "nextPageToken": None}),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_tx, mock_tx_store = _make_tx_store(None)
+        connector.data_store_provider.transaction = MagicMock(return_value=mock_tx)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+
+        batches = []
+        async for batch, has_more, ts in connector._fetch_issues_batched("PROJ", "p1", []):
+            batches.append((batch, has_more, ts))
+
+        assert len(batches) == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_from_timestamp(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.sync_filters = None
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {"issues": [], "nextPageToken": None})
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        async for batch, has_more, ts in connector._fetch_issues_batched(
+            "PROJ", "p1", [], last_sync_time=None, resume_from_timestamp=1650000000000
+        ):
+            pass
+
+        # JQL should contain the resume timestamp
+        call_kwargs = mock_ds.search_and_reconsile_issues_using_jql_post.call_args[1]
+        assert "updated >" in call_kwargs["jql"]
+
+
+# ===========================================================================
+# _build_issue_records() - new/updated/unchanged records
+# ===========================================================================
+
+
+class TestBuildIssueRecordsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_new_issue(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue()
+        user = _make_app_user()
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [user])
+        assert len(result) == 1
+        assert result[0][0].version == 0
+
+    @pytest.mark.asyncio
+    async def test_updated_issue(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(updated="2024-06-01T00:00:00.000+0000")
+
+        existing = MagicMock()
+        existing.id = "rec-1"
+        existing.version = 1
+        existing.is_placeholder = False
+        existing.source_updated_at = 1700000000000  # Different from issue updated
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=existing
+        )
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert len(result) == 1
+        assert result[0][0].version == 2
+
+    @pytest.mark.asyncio
+    async def test_unchanged_issue_skipped(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        ts = 1705401045000
+        issue = _make_issue(updated="2024-01-16T10:30:45.000+0000")
+
+        existing = MagicMock()
+        existing.id = "rec-1"
+        existing.version = 1
+        existing.is_placeholder = False
+        existing.source_updated_at = ts
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=existing
+        )
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert len(result) == 0
+
+    @pytest.mark.asyncio
+    async def test_epic_issue(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(issue_type="Epic", hierarchy_level=1)
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_subtask_with_parent(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(
+            issue_type="Sub-task",
+            hierarchy_level=-1,
+            parent_id="parent-100",
+            parent_key="PROJ-100",
+        )
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert len(result) == 1
+        assert result[0][0].parent_external_record_id == "parent-100"
+
+    @pytest.mark.asyncio
+    async def test_indexing_filter_off(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+
+        mock_indexing_filters = MagicMock()
+        mock_indexing_filters.is_enabled.return_value = False
+        connector.indexing_filters = mock_indexing_filters
+
+        issue = _make_issue()
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert result[0][0].indexing_status == ProgressStatus.AUTO_INDEX_OFF.value
+
+    @pytest.mark.asyncio
+    async def test_with_issue_links(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(issuelinks=[{
+            "type": {"outward": "blocks", "name": "Blocks"},
+            "outwardIssue": {"id": "99"},
+        }])
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert result[0][0].related_external_records is not None
+
+    @pytest.mark.asyncio
+    async def test_with_attachments(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(attachments=[
+            {"id": "att-1", "filename": "report.pdf", "size": 1024, "mimeType": "application/pdf", "created": "2024-01-15T10:30:45.000+0000"}
+        ])
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[
+            (_make_file_record(attachment_id="att-1"), [], True)
+        ])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_attachment_fetch_error_continues(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(attachments=[{"id": "att-1"}])
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(side_effect=Exception("fetch err"))
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_site_url(self):
+        connector = _make_connector()
+        connector.site_url = None
+        connector.indexing_filters = None
+
+        issue = _make_issue()
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert result[0][0].weburl is None
+
+    @pytest.mark.asyncio
+    async def test_task_with_epic_parent(self):
+        """A story under an epic hangs off its project: Jira does not give it the epic's level."""
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        issue = _make_issue(
+            issue_type="Story",
+            hierarchy_level=0,
+            parent_id="epic-100",
+            parent_key="PROJ-100",
+        )
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        connector._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        connector._fetch_issue_attachments = AsyncMock(return_value=[])
+
+        result, _soft = await connector._build_issue_records([issue], "proj-1", [])
+        assert result[0][0].parent_external_record_id is None
+        assert result[0][0].parent_record_type is None
+
+
+# ===========================================================================
+# _fetch_issue_attachments()
+# ===========================================================================
+
+
+class TestFetchIssueAttachmentsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_attachments(self):
+        connector = _make_connector()
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", {}, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_new_attachment(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {"attachment": [
+            {"id": "att-1", "filename": "report.pdf", "size": 1024, "mimeType": "application/pdf",
+             "created": "2024-01-15T10:30:45.000+0000"}
+        ]}
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert len(result) == 1
+        assert result[0][0].record_name == "report.pdf"
+        assert result[0][0].version == 0
+
+    @pytest.mark.asyncio
+    async def test_existing_attachment_unchanged(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {"attachment": [
+            {"id": "att-1", "filename": "report.pdf", "size": 1024, "mimeType": "application/pdf",
+             "created": "2024-01-15T10:30:45.000+0000"}
+        ]}
+
+        existing = MagicMock()
+        existing.id = "rec-att-1"
+        existing.version = 1
+        ts = connector._parse_jira_timestamp("2024-01-15T10:30:45.000+0000")
+        existing.source_updated_at = ts
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=existing
+        )
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert len(result) == 1
+        assert result[0][0].version == 1
+
+    @pytest.mark.asyncio
+    async def test_attachment_without_id_skipped(self):
+        connector = _make_connector()
+        fields = {"attachment": [{"filename": "no-id.txt"}]}
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_empty(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+
+        fields = {"attachment": [{"id": "att-1"}]}
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            side_effect=Exception("db err")
+        )
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_with_parent_node_id(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {"attachment": [
+            {"id": "att-1", "filename": "doc.pdf", "size": 100, "mimeType": "application/pdf",
+             "created": "2024-01-15T10:30:45.000+0000"}
+        ]}
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT,
+            parent_node_id="node-123"
+        )
+        assert len(result) == 1
+        assert result[0][0].parent_node_id == "node-123"
+
+    @pytest.mark.asyncio
+    async def test_skips_inline_image_from_adf_alt(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {
+            "description": {
+                "type": "doc",
+                "content": [{
+                    "type": "mediaSingle",
+                    "content": [{
+                        "type": "media",
+                        "attrs": {
+                            "id": "media-uuid",
+                            "type": "file",
+                            "alt": "image-20240115-103045.png",
+                        },
+                    }],
+                }],
+            },
+            "attachment": [
+                {
+                    "id": "img-1",
+                    "filename": "image-20240115-103045.png",
+                    "size": 500,
+                    "mimeType": "image/png",
+                    "created": "2024-01-15T10:30:45.000+0000",
+                },
+                {
+                    "id": "pdf-1",
+                    "filename": "report.pdf",
+                    "size": 1024,
+                    "mimeType": "application/pdf",
+                    "created": "2024-01-15T10:30:45.000+0000",
+                },
+            ],
+        }
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert len(result) == 1
+        assert result[0][0].record_name == "report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_skips_inline_image_from_comment_adf(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {
+            "description": None,
+            "comment": {
+                "comments": [{
+                    "body": {
+                        "type": "doc",
+                        "content": [{
+                            "type": "mediaInline",
+                            "attrs": {"alt": "shot.png", "id": "m1", "type": "file"},
+                        }],
+                    },
+                }],
+            },
+            "attachment": [
+                {
+                    "id": "img-2",
+                    "filename": "shot.png",
+                    "size": 200,
+                    "mimeType": "image/png",
+                    "created": "2024-01-15T10:30:45.000+0000",
+                },
+            ],
+        }
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_keeps_unreferenced_image_attachment(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {
+            "description": {
+                "type": "doc",
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": "hi"}]}],
+            },
+            "attachment": [
+                {
+                    "id": "img-3",
+                    "filename": "standalone.png",
+                    "size": 200,
+                    "mimeType": "image/png",
+                    "created": "2024-01-15T10:30:45.000+0000",
+                },
+            ],
+        }
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert len(result) == 1
+        assert result[0][0].record_name == "standalone.png"
+
+    @pytest.mark.asyncio
+    async def test_keeps_previously_synced_inline_image_file_record(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+        connector.indexing_filters = None
+
+        fields = {
+            "description": {
+                "type": "doc",
+                "content": [{
+                    "type": "media",
+                    "attrs": {"alt": "old-inline.png", "id": "m2", "type": "file"},
+                }],
+            },
+            "attachment": [
+                {
+                    "id": "img-4",
+                    "filename": "old-inline.png",
+                    "size": 200,
+                    "mimeType": "image/png",
+                    "created": "2024-01-15T10:30:45.000+0000",
+                },
+            ],
+        }
+
+        existing = MagicMock()
+        existing.id = "rec-inline-4"
+        existing.version = 1
+        existing.source_updated_at = connector._parse_jira_timestamp(
+            "2024-01-15T10:30:45.000+0000"
+        )
+
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=existing
+        )
+
+        result = await connector._fetch_issue_attachments(
+            "issue-1", "PROJ-1", fields, [], "proj-1", RecordGroupType.PROJECT
+        )
+        assert len(result) == 1
+        assert result[0][0].id == "rec-inline-4"
+        assert result[0][0].version == 1
+
+    def test_resolve_inline_image_ids_from_html_url(self):
+        connector = _make_connector()
+        fields = {
+            "description": (
+                '<p><img src="/rest/api/3/attachment/content/99" alt="x"/></p>'
+            ),
+            "attachment": [
+                {"id": "99", "filename": "x.png", "mimeType": "image/png"},
+                {"id": "100", "filename": "y.pdf", "mimeType": "application/pdf"},
+            ],
+        }
+        assert connector._resolve_inline_image_attachment_ids(fields) == {"99"}
+
+    def test_resolve_inline_image_ids_from_comment_body(self):
+        # Comment-embedded images must be detected at sync time too, or they get a FileRecord
+        # here AND are inlined into the comment block at stream time — indexed twice.
+        connector = _make_connector()
+        fields = {
+            "description": None,
+            "comment": {
+                "comments": [
+                    {"id": "1", "body": '<p><img src="/rest/api/3/attachment/content/99"/></p>'},
+                ]
+            },
+            "attachment": [
+                {"id": "99", "filename": "x.png", "mimeType": "image/png", "size": 1024},
+                {"id": "100", "filename": "y.pdf", "mimeType": "application/pdf", "size": 1024},
+            ],
+        }
+        assert connector._resolve_inline_image_attachment_ids(fields) == {"99"}
+
+    def test_oversized_inline_image_is_not_suppressed(self):
+        # Over the inline budget it is dropped to alt text at stream time, so it must keep a
+        # FileRecord rather than ending up with neither record nor content.
+        from app.connectors.sources.atlassian.jira_cloud.connector import MAX_INLINE_IMAGE_BYTES
+
+        connector = _make_connector()
+        fields = {
+            "description": '<p><img src="/rest/api/3/attachment/content/99"/></p>',
+            "attachment": [
+                {
+                    "id": "99", "filename": "big.png", "mimeType": "image/png",
+                    "size": MAX_INLINE_IMAGE_BYTES + 1,
+                },
+            ],
+        }
+        assert connector._resolve_inline_image_attachment_ids(fields) == set()
+
+
+# ===========================================================================
+# _process_issue_blockgroups_for_streaming()
+# ===========================================================================
+
+
+class TestProcessIssueBlockgroupsForStreaming:
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+
+        issue_data = {
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Test Issue",
+                "description": None,
+                "attachment": [],
+                "comment": {"comments": []},
+            },
+        }
+
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(200, issue_data))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_tx, mock_tx_store = _make_tx_store()
+        connector.data_store_provider.transaction = MagicMock(return_value=mock_tx)
+
+        record = _make_ticket_record()
+        result = await connector._process_issue_blockgroups_for_streaming(record)
+        assert isinstance(result, bytes)
+
+    @pytest.mark.asyncio
+    async def test_with_attachments_and_comments(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+
+        issue_data = {
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Test",
+                "description": {
+                    "type": "doc",
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Hello"}]}]
+                },
+                "attachment": [
+                    {"id": "att1", "filename": "file.pdf", "size": 100, "mimeType": "application/pdf"}
+                ],
+                "comment": {"comments": [
+                    {"id": "c1", "body": {"type": "doc", "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "A comment"}]}
+                    ]}, "author": {"displayName": "Author"}, "created": "2024-01-15T10:00:00.000Z"}
+                ]},
+            },
+        }
+
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(200, issue_data))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_tx, mock_tx_store = _make_tx_store()
+        connector.data_store_provider.transaction = MagicMock(return_value=mock_tx)
+
+        connector._process_issue_attachments_for_children = AsyncMock(return_value={})
+
+        record = _make_ticket_record()
+        result = await connector._process_issue_blockgroups_for_streaming(record)
+        assert isinstance(result, bytes)
+
+    @pytest.mark.asyncio
+    async def test_api_failure(self):
+        connector = _make_connector()
+
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        record = _make_ticket_record()
+        with pytest.raises(HTTPException) as exc_info:
+            await connector._process_issue_blockgroups_for_streaming(record)
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_no_issue_data(self):
+        connector = _make_connector()
+
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(200, None))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        record = _make_ticket_record()
+        with pytest.raises(HTTPException) as exc_info:
+            await connector._process_issue_blockgroups_for_streaming(record)
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_without_site_url_uses_record_weburl(self):
+        connector = _make_connector()
+        connector.site_url = None
+
+        issue_data = {
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Test",
+                "description": None,
+                "attachment": [],
+                "comment": {},
+            },
+        }
+
+        mock_ds = MagicMock()
+        mock_ds.get_issue = AsyncMock(return_value=_make_mock_response(200, issue_data))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mock_tx, mock_tx_store = _make_tx_store()
+        connector.data_store_provider.transaction = MagicMock(return_value=mock_tx)
+
+        record = _make_ticket_record()
+        result = await connector._process_issue_blockgroups_for_streaming(record)
+        assert isinstance(result, bytes)
+
+
+# ===========================================================================
+# _process_issue_attachments_for_children()
+# ===========================================================================
+
+
+class TestProcessIssueAttachmentsForChildren:
+
+    @pytest.mark.asyncio
+    async def test_existing_record(self):
+        connector = _make_connector()
+        connector.indexing_filters = None
+
+        existing = MagicMock()
+        existing.id = "rec-att-1"
+        existing.record_name = "file.pdf"
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=existing
+        )
+
+        attachments = [{"id": "att1", "filename": "file.pdf", "size": 100, "mimeType": "application/pdf"}]
+
+        result = await connector._process_issue_attachments_for_children(
+            attachments, "issue-1", "node-1", "proj-1", "https://jira/browse/PROJ-1"
+        )
+        assert "att1" in result
+
+    @pytest.mark.asyncio
+    async def test_new_record_created(self):
+        connector = _make_connector()
+        connector.indexing_filters = None
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=None
+        )
+
+        attachments = [{"id": "att1", "filename": "new.pdf", "size": 200, "mimeType": "application/pdf",
+                        "created": "2024-01-15T10:00:00.000Z"}]
+
+        result = await connector._process_issue_attachments_for_children(
+            attachments, "issue-1", "node-1", "proj-1", "https://jira/browse/PROJ-1"
+        )
+        assert "att1" in result
+        connector.data_entities_processor.on_new_records.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_id(self):
+        connector = _make_connector()
+
+        attachments = [{"id": "", "filename": "no-id.txt"}]
+
+        result = await connector._process_issue_attachments_for_children(
+            attachments, "issue-1", "node-1", "proj-1", None
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_exception_continues(self):
+        connector = _make_connector()
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            side_effect=Exception("db err")
+        )
+
+        attachments = [
+            {"id": "att1", "filename": "fail.pdf"},
+            {"id": "att2", "filename": "ok.pdf", "size": 100, "mimeType": "text/plain"},
+        ]
+
+        result = await connector._process_issue_attachments_for_children(
+            attachments, "issue-1", "node-1", "proj-1", None
+        )
+        # Both may fail or second may succeed depending on implementation
+
+    @pytest.mark.asyncio
+    async def test_skips_new_inline_image_file_record(self):
+        connector = _make_connector()
+        connector.indexing_filters = None
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=None
+        )
+
+        attachments = [
+            {
+                "id": "img-1",
+                "filename": "inline.png",
+                "size": 100,
+                "mimeType": "image/png",
+                "created": "2024-01-15T10:00:00.000Z",
+            },
+            {
+                "id": "pdf-1",
+                "filename": "doc.pdf",
+                "size": 200,
+                "mimeType": "application/pdf",
+                "created": "2024-01-15T10:00:00.000Z",
+            },
+        ]
+        issue_fields = {
+            "description": {
+                "type": "doc",
+                "content": [{
+                    "type": "media",
+                    "attrs": {"alt": "inline.png", "id": "m1", "type": "file"},
+                }],
+            },
+            "attachment": attachments,
+        }
+
+        result = await connector._process_issue_attachments_for_children(
+            attachments, "issue-1", "node-1", "proj-1", "https://jira/browse/PROJ-1",
+            issue_fields=issue_fields,
+        )
+        assert "img-1" not in result
+        assert "pdf-1" in result
+        connector.data_entities_processor.on_new_records.assert_awaited_once()
+        created = connector.data_entities_processor.on_new_records.await_args.args[0]
+        assert len(created) == 1
+        assert created[0][0].record_name == "doc.pdf"
+
+    @pytest.mark.asyncio
+    async def test_keeps_existing_inline_image_in_children_map(self):
+        connector = _make_connector()
+        connector.indexing_filters = None
+
+        existing = MagicMock()
+        existing.id = "rec-img-1"
+        existing.record_name = "inline.png"
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(
+            return_value=existing
+        )
+
+        attachments = [{
+            "id": "img-1",
+            "filename": "inline.png",
+            "size": 100,
+            "mimeType": "image/png",
+        }]
+        issue_fields = {
+            "description": {
+                "type": "doc",
+                "content": [{
+                    "type": "media",
+                    "attrs": {"alt": "inline.png", "id": "m1", "type": "file"},
+                }],
+            },
+            "attachment": attachments,
+        }
+
+        result = await connector._process_issue_attachments_for_children(
+            attachments, "issue-1", "node-1", "proj-1", "https://jira/browse/PROJ-1",
+            issue_fields=issue_fields,
+        )
+        assert result["img-1"].child_id == "rec-img-1"
+        connector.data_entities_processor.on_new_records.assert_not_awaited()
+
+
+# ===========================================================================
+# _parse_issue_to_blocks() - description, comments, attachments
+# ===========================================================================
+
+
+class TestParseIssueToBlocksCoverage:
+    """`_parse_issue_to_blocks` now consumes Jira's rendered HTML (renderedFields) instead of
+    ADF: description/comment block groups are ``format=HTML``, image attachments are base64
+    inlined, non-image linked files become children of the owning block, and attachments
+    referenced nowhere become description children."""
+
+    @pytest.mark.asyncio
+    async def test_basic_description_only(self):
+        connector = _make_connector()
+
+        issue_data = {"id": "100", "fields": {"summary": "Test Issue"}}
+        rendered_fields = {"description": "<p>Hello world</p>"}
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields=rendered_fields, comments_data=[],
+        )
+        assert len(result.block_groups) >= 1
+        desc = result.block_groups[0]
+        assert desc.format.value == "html"
+        assert desc.data == "<h1>[PROJ-1] Test Issue</h1>\n<p>Hello world</p>"
+
+    @pytest.mark.asyncio
+    async def test_no_description(self):
+        connector = _make_connector()
+
+        issue_data = {"id": "100", "fields": {"summary": "No Desc"}}
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields={"description": ""}, comments_data=[],
+        )
+        assert len(result.block_groups) >= 1
+        assert result.block_groups[0].data == "<h1>[PROJ-1] No Desc</h1>"
+        assert result.block_groups[0].name == "[PROJ-1] No Desc"
+
+    @pytest.mark.asyncio
+    async def test_title_is_html_escaped(self):
+        connector = _make_connector()
+
+        issue_data = {"id": "100", "fields": {"summary": "A <b> & B"}}
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields={"description": ""}, comments_data=[],
+        )
+        assert result.block_groups[0].data == "<h1>[PROJ-1] A &lt;b&gt; &amp; B</h1>"
+
+    @pytest.mark.asyncio
+    async def test_no_weburl_raises(self):
+        connector = _make_connector()
+        issue_data = {"id": "100", "fields": {"summary": "Test"}}
+
+        with pytest.raises(ValueError, match="weburl is required"):
+            await connector._parse_issue_to_blocks(
+                issue_data, "PROJ-1", weburl=None, rendered_fields={}, comments_data=[],
+            )
+
+    @pytest.mark.asyncio
+    async def test_with_comments(self):
+        connector = _make_connector()
+        connector.site_url = "https://company.atlassian.net"
+
+        issue_data = {"id": "100", "fields": {"summary": "Test"}}
+        comments_data = [
+            {"id": "c1", "author": {"displayName": "Author"}, "created": "2024-01-15T10:00:00.000Z"},
+        ]
+        rendered_fields = {
+            "description": "",
+            "comment": {"comments": [{"id": "c1", "body": "<p>Comment 1</p>"}]},
+        }
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields=rendered_fields, comments_data=comments_data,
+        )
+        # description + thread + comment block groups
+        assert len(result.block_groups) >= 3
+        comment_bg = next(bg for bg in result.block_groups if bg.source_group_id == "c1")
+        assert comment_bg.format.value == "html"
+        assert comment_bg.data == "<p>Comment 1</p>"
+
+    @pytest.mark.asyncio
+    async def test_restricted_comments_are_left_out(self) -> None:
+        connector = _make_connector()
+        issue_data = {"id": "100", "fields": {"summary": "Test"}}
+        comments_data = [
+            {"id": "c1", "author": {"displayName": "A"}, "created": "2024-01-15T10:00:00.000Z"},
+            {"id": "c2", "author": {"displayName": "B"}, "created": "2024-01-16T10:00:00.000Z",
+             "visibility": {"type": "role", "value": "Administrators"}},
+            {"id": "c3", "author": {"displayName": "C"}, "created": "2024-01-17T10:00:00.000Z",
+             "visibility": {"type": "group", "value": "jira-admins", "identifier": "g1"}},
+        ]
+        rendered_fields = {"description": "", "comment": {"comments": [
+            {"id": "c1", "body": "<p>open</p>"},
+            {"id": "c2", "body": "<p>role secret</p>"},
+            {"id": "c3", "body": "<p>group secret</p>"},
+        ]}}
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields=rendered_fields, comments_data=comments_data,
+        )
+        assert {bg.source_group_id for bg in result.block_groups} & {"c1", "c2", "c3"} == {"c1"}
+        assert "secret" not in result.model_dump_json()
+
+    def test_restricted_comment_images_are_not_treated_as_inline(self) -> None:
+        connector = _make_connector()
+        fields = {
+            "attachment": [{"id": "9", "filename": "s.png", "mimeType": "image/png", "size": 10}],
+            "comment": {"comments": [{"id": "c2", "body": "!s.png!",
+                                      "visibility": {"type": "role", "value": "Administrators"}}]},
+        }
+        # The attachment is still visible on the issue in Jira, so it keeps its own record.
+        assert connector._resolve_inline_image_attachment_ids(fields) == set()
+        fields["comment"]["comments"][0].pop("visibility")
+        assert connector._resolve_inline_image_attachment_ids(fields) == {"9"}
+
+    @pytest.mark.asyncio
+    async def test_comment_rendered_body_fallback(self):
+        """Comment HTML may arrive on the comment object itself (renderedBody) rather than in
+        renderedFields.comment — that path is used when present."""
+        connector = _make_connector()
+
+        issue_data = {"id": "100", "fields": {"summary": "Test"}}
+        comments_data = [
+            {"id": "c1", "renderedBody": "<p>Inline body</p>",
+             "author": {"displayName": "A"}, "created": "2024-01-01T00:00:00.000Z"},
+        ]
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields={"description": ""}, comments_data=comments_data,
+        )
+        assert len(result.block_groups) >= 3
+        comment_bg = next(bg for bg in result.block_groups if bg.source_group_id == "c1")
+        assert comment_bg.data == "<p>Inline body</p>"
+
+    @pytest.mark.asyncio
+    async def test_comment_without_rendered_html_skipped(self):
+        connector = _make_connector()
+
+        issue_data = {"id": "100", "fields": {"summary": "Test"}}
+        comments_data = [
+            {"id": "c1", "author": {"displayName": "A"}, "created": "2024-01-01T00:00:00.000Z"},
+        ]
+        # No renderedFields.comment and no renderedBody → comment has no HTML → skipped.
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields={"description": ""}, comments_data=comments_data,
+        )
+        assert not any(bg.source_group_id == "c1" for bg in result.block_groups)
+
+    @pytest.mark.asyncio
+    async def test_standalone_attachment_becomes_description_child(self):
+        connector = _make_connector()
+        from app.models.blocks import ChildRecord, ChildType
+
+        # att1 is attached but referenced nowhere in the description → standalone → desc child.
+        issue_data = {
+            "id": "100",
+            "fields": {
+                "summary": "Test",
+                "attachment": [{"id": "att1", "mimeType": "application/pdf", "size": 10}],
+            },
+        }
+        attachment_children_map = {
+            "att1": ChildRecord(child_type=ChildType.RECORD, child_id="rec-att1", child_name="report.pdf"),
+        }
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields={"description": ""}, comments_data=[],
+            attachment_children_map=attachment_children_map,
+        )
+        desc_bg = result.block_groups[0]
+        assert desc_bg.children_records is not None
+        assert len(desc_bg.children_records) == 1
+        assert desc_bg.children_records[0].child_id == "rec-att1"
+
+    @pytest.mark.asyncio
+    async def test_image_inlined_file_linked_child(self):
+        connector = _make_connector()
+        connector._fetch_attachment_as_base64 = AsyncMock(return_value="data:image/png;base64,AAA")
+        from app.models.blocks import ChildRecord, ChildType
+
+        issue_data = {
+            "id": "100",
+            "fields": {
+                "summary": "Test",
+                "attachment": [
+                    {"id": "10", "mimeType": "image/png", "size": 100},
+                    {"id": "20", "mimeType": "application/pdf", "size": 100},
+                ],
+            },
+        }
+        rendered_fields = {
+            "description": (
+                '<p><img src="https://x/rest/api/3/attachment/content/10" alt="img.png"/></p>'
+                '<p><a href="/rest/api/3/attachment/content/20">file.pdf</a></p>'
+            ),
+        }
+        attachment_children_map = {
+            "10": ChildRecord(child_type=ChildType.RECORD, child_id="rec-10", child_name="img.png"),
+            "20": ChildRecord(child_type=ChildType.RECORD, child_id="rec-20", child_name="file.pdf"),
+        }
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields=rendered_fields, comments_data=[],
+            attachment_children_map=attachment_children_map,
+        )
+        desc_bg = result.block_groups[0]
+        # image base64-inlined into HTML, its content URL gone
+        assert "data:image/png;base64,AAA" in desc_bg.data
+        assert "attachment/content/10" not in desc_bg.data
+        # non-image linked file becomes a description child; the image does NOT
+        assert desc_bg.children_records is not None
+        child_ids = {c.child_id for c in desc_bg.children_records}
+        assert child_ids == {"rec-20"}
+
+    @pytest.mark.asyncio
+    async def test_comment_linked_file_is_comment_child(self):
+        connector = _make_connector()
+        from app.models.blocks import ChildRecord, ChildType
+
+        issue_data = {
+            "id": "100",
+            "fields": {
+                "summary": "Test",
+                "attachment": [{"id": "30", "mimeType": "text/plain", "size": 50}],
+            },
+        }
+        comments_data = [
+            {"id": "c1", "author": {"displayName": "A"}, "created": "2024-01-01T00:00:00.000Z"},
+        ]
+        rendered_fields = {
+            "description": "",
+            "comment": {"comments": [
+                {"id": "c1", "body": '<p><a href="/rest/api/3/attachment/content/30">log.txt</a></p>'},
+            ]},
+        }
+        attachment_children_map = {
+            "30": ChildRecord(child_type=ChildType.RECORD, child_id="rec-30", child_name="log.txt"),
+        }
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, "PROJ-1", weburl="https://jira/browse/PROJ-1",
+            rendered_fields=rendered_fields, comments_data=comments_data,
+            attachment_children_map=attachment_children_map,
+        )
+        # the comment owns the file — description has no children
+        assert result.block_groups[0].children_records is None
+        comment_bg = next(bg for bg in result.block_groups if bg.source_group_id == "c1")
+        assert comment_bg.children_records is not None
+        assert [c.child_id for c in comment_bg.children_records] == ["rec-30"]
+
+    @pytest.mark.asyncio
+    async def test_no_title_or_key_fallback(self):
+        connector = _make_connector()
+
+        issue_data = {"id": "100", "fields": {"summary": ""}}
+
+        result = await connector._parse_issue_to_blocks(
+            issue_data, None, weburl="https://jira/browse/X",
+            rendered_fields={"description": ""}, comments_data=[],
+        )
+        assert "100" in result.block_groups[0].data or "Issue" in result.block_groups[0].data
+
+
+# ===========================================================================
+# create_connector() factory
+# ===========================================================================
+
+
+class TestCreateConnector:
+
+    @pytest.mark.asyncio
+    async def test_factory(self):
+        logger = _make_mock_logger()
+        dsp = MagicMock()
+        cs = MagicMock()
+        cs.get_config = AsyncMock()
+
+        processor = MagicMock()
+        processor.org_id = "org-1"
+
+        connector = await JiraConnector.create_connector(
+            logger, dsp, cs, "conn-id", "team", "test-user-id",
+            data_entities_processor=processor,
+        )
+        assert isinstance(connector, JiraConnector)
+
+
+# ===========================================================================
+# _fetch_deleted_issues_from_audit() - pagination
+# ===========================================================================
+
+
+class TestFetchDeletedIssuesFromAuditCoverage:
+
+    @pytest.mark.asyncio
+    async def test_pagination(self):
+        connector = _make_connector()
+
+        page1 = {
+            "records": [
+                {"objectItem": {"typeName": "ISSUE_DELETE", "name": "P-1"}, "created": "2024-01-01"},
+            ] * AUDIT_PAGE_SIZE,
+            "total": AUDIT_PAGE_SIZE + 1,
+        }
+        page2 = {
+            "records": [
+                {"objectItem": {"typeName": "ISSUE_DELETE", "name": "P-LAST"}, "created": "2024-01-02"},
+            ],
+            "total": AUDIT_PAGE_SIZE + 1,
+        }
+
+        mock_ds = MagicMock()
+        mock_ds.get_audit_records = AsyncMock(side_effect=[
+            _make_mock_response(200, page1),
+            _make_mock_response(200, page2),
+        ])
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, _ok = await connector._fetch_deleted_issues_from_audit("2024-01-01", "2024-01-02")
+        assert "P-LAST" in result
+
+    @pytest.mark.asyncio
+    async def test_non_delete_records_skipped(self):
+        connector = _make_connector()
+
+        mock_ds = MagicMock()
+        mock_ds.get_audit_records = AsyncMock(return_value=_make_mock_response(200, {
+            "records": [
+                {"objectItem": {"typeName": "ISSUE_UPDATE", "name": "P-1"}},
+                {"objectItem": {"typeName": "ISSUE_DELETE", "name": None}},
+            ],
+            "total": 2,
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, _ok = await connector._fetch_deleted_issues_from_audit("2024-01-01", "2024-01-02")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_exception_during_pagination(self):
+        connector = _make_connector()
+
+        mock_ds = MagicMock()
+        mock_ds.get_audit_records = AsyncMock(side_effect=Exception("network err"))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        result, _ok = await connector._fetch_deleted_issues_from_audit("2024-01-01", "2024-01-02")
+        assert result == []
+
+
+# ===========================================================================
+# _handle_attachment_deletions_from_changelog() - more branches
+# ===========================================================================
+
+
+class TestHandleAttachmentDeletionsFromChangelogCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_histories(self):
+        connector = _make_connector()
+        issue = {"key": "P-1", "changelog": {"histories": []}}
+        await connector._handle_attachment_deletions_from_changelog(issue)
+
+    @pytest.mark.asyncio
+    async def test_no_issue_id(self):
+        connector = _make_connector()
+        issue = {"changelog": {"histories": [{"items": []}]}}
+        await connector._handle_attachment_deletions_from_changelog(issue)
+
+    @pytest.mark.asyncio
+    async def test_description_change_removed_inline_image(self):
+        connector = _make_connector()
+        issue = {
+            "id": "1",
+            "key": "P-1",
+            "fields": {"attachment": [{"id": "200", "filename": "image.png"}]},
+            "changelog": {
+                "histories": [{
+                    "items": [{
+                        "field": "Description",
+                        "fieldId": "description",
+                        "fromString": "!image.png|thumbnail! some text !removed.png|thumbnail!",
+                        "toString": "some text",
+                    }],
+                }],
+            },
+        }
+
+        mock_record = MagicMock()
+        mock_record.id = "rec-1"
+        mock_record.external_record_id = "attachment_300"
+        mock_record.record_name = "removed.png"
+
+        mock_record2 = MagicMock()
+        mock_record2.id = "rec-2"
+        mock_record2.external_record_id = "attachment_400"
+        mock_record2.record_name = "orphan.pdf"
+
+        connector.data_entities_processor.get_records_by_parent = AsyncMock(return_value=[mock_record, mock_record2])
+        connector.data_entities_processor.delete_records_and_relations = AsyncMock()
+        connector._find_attachment_record_by_id = AsyncMock(side_effect=[None])
+
+        result = await connector._handle_attachment_deletions_from_changelog(issue)
+        # removed.png deleted by filename match; orphan.pdf by ID diff (not in current attachments).
+        assert set(result) == {"rec-1", "rec-2"}
+
+    @pytest.mark.asyncio
+    async def test_attachment_to_empty_string(self):
+        """Attachment deletion where to is empty string."""
+        connector = _make_connector()
+        issue = {
+            "id": "1",
+            "key": "P-1",
+            "fields": {"attachment": []},
+            "changelog": {
+                "histories": [{
+                    "items": [{
+                        "field": "attachment",
+                        "fieldId": "attachment",
+                        "from": "55",
+                        "to": "",
+                    }],
+                }],
+            },
+        }
+
+        mock_record = MagicMock()
+        mock_record.id = "rec-1"
+        mock_record.external_record_id = "attachment_55"
+        mock_record.record_name = "file.txt"
+
+        connector.data_entities_processor.delete_records_and_relations = AsyncMock()
+        connector._find_attachment_record_by_id = AsyncMock(return_value=mock_record)
+
+        result = await connector._handle_attachment_deletions_from_changelog(issue)
+        assert result == ["rec-1"]
+
+    @pytest.mark.asyncio
+    async def test_attachment_not_found_in_db(self):
+        connector = _make_connector()
+        issue = {
+            "id": "1",
+            "key": "P-1",
+            "fields": {"attachment": []},
+            "changelog": {
+                "histories": [{
+                    "items": [{
+                        "field": "Attachment",
+                        "fieldId": "attachment",
+                        "from": "999",
+                        "to": None,
+                    }],
+                }],
+            },
+        }
+
+        connector._find_attachment_record_by_id = AsyncMock(return_value=None)
+
+        await connector._handle_attachment_deletions_from_changelog(issue)
+
+    @pytest.mark.asyncio
+    async def test_attachment_still_exists_at_source(self):
+        """Record exists in DB and its ID is in current_attachment_ids - should NOT be deleted."""
+        connector = _make_connector()
+        issue = {
+            "id": "1",
+            "key": "P-1",
+            "fields": {
+                "attachment": [{"id": "200", "filename": "kept.png"}],
+            },
+            "changelog": {
+                "histories": [{
+                    "items": [{
+                        "field": "description",
+                        "fieldId": "description",
+                        "fromString": "!removed.png|thumbnail!",
+                        "toString": "",
+                    }],
+                }],
+            },
+        }
+
+        mock_record = MagicMock()
+        mock_record.id = "rec-1"
+        mock_record.external_record_id = "attachment_200"
+        mock_record.record_name = "kept.png"
+
+        connector.data_entities_processor.get_records_by_parent = AsyncMock(return_value=[mock_record])
+        connector._find_attachment_record_by_id = AsyncMock(return_value=None)
+
+        result = await connector._handle_attachment_deletions_from_changelog(issue)
+        # kept.png is still in current attachments, should NOT be deleted
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_description_unlink_does_not_delete_still_attached_file(self):
+        """Removing a wiki filename from description must not delete the FileRecord while still attached."""
+        connector = _make_connector()
+        issue = {
+            "id": "1",
+            "key": "P-1",
+            "fields": {
+                "attachment": [{"id": "13828", "filename": "image-20260619-124828.png"}],
+            },
+            "changelog": {
+                "histories": [{
+                    "items": [{
+                        "field": "description",
+                        "fieldId": "description",
+                        "fromString": "!image-20260619-124828.png|thumbnail! some text",
+                        "toString": "some text",
+                    }],
+                }],
+            },
+        }
+
+        mock_record = MagicMock()
+        mock_record.id = "rec-1"
+        mock_record.external_record_id = "attachment_13828"
+        mock_record.record_name = "image-20260619-124828.png"
+
+        connector.data_entities_processor.get_records_by_parent = AsyncMock(return_value=[mock_record])
+        connector._find_attachment_record_by_id = AsyncMock(return_value=mock_record)
+
+        result = await connector._handle_attachment_deletions_from_changelog(issue)
+        assert result == []
+        connector._find_attachment_record_by_id.assert_not_awaited()
+
+
+# ===========================================================================
+# Permission scheme - user without email, unknown holder type, dedup
+# ===========================================================================
+
+
+class TestFetchProjectPermissionSchemeCoverage:
+
+    @pytest.mark.asyncio
+    async def test_the_default_scheme_with_id_zero_is_read(self) -> None:
+        """Jira's built-in "Default Permission Scheme" has id 0; it was taken for a missing
+        id, so a project using it got no access."""
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(
+            return_value=_make_mock_response(200, {"id": 0, "name": "Default Permission Scheme"}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {"permissions": []}))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        permissions = await connector._fetch_project_permission_scheme("PPC")
+
+        assert permissions is not None
+        assert mock_ds.get_permission_scheme_grants.await_args.kwargs["schemeId"] == 0
+
+    @pytest.mark.asyncio
+    async def test_user_without_email(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [{
+                "permission": "BROWSE_PROJECTS",
+                "holder": {
+                    "type": "user",
+                    "parameter": "acc-1",
+                    "user": {},
+                },
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        permissions = await connector._fetch_project_permission_scheme("PROJ")
+        assert permissions == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_holder_type(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [{
+                "permission": "BROWSE_PROJECTS",
+                "holder": {"type": "unknownType", "parameter": "x"},
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        permissions = await connector._fetch_project_permission_scheme("PROJ")
+        assert permissions == []
+
+    @pytest.mark.asyncio
+    async def test_duplicate_holder_deduplication(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [
+                {
+                    "permission": "BROWSE_PROJECTS",
+                    "holder": {"type": "group", "value": "g1"},
+                },
+                {
+                    "permission": "BROWSE_PROJECTS",
+                    "holder": {"type": "group", "value": "g1"},
+                },
+            ],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        permissions = await connector._fetch_project_permission_scheme("PROJ")
+        assert len(permissions) == 1
+
+    @pytest.mark.asyncio
+    async def test_application_role_dedup_with_existing_group(self):
+        """applicationRole resolves group, but group already exists from direct grant."""
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [
+                {
+                    "permission": "BROWSE_PROJECTS",
+                    "holder": {"type": "group", "value": "g1"},
+                },
+                {
+                    "permission": "BROWSE_PROJECTS",
+                    "holder": {"type": "applicationRole", "parameter": "jira-software"},
+                },
+            ],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mapping = {"jira-software": [{"groupId": "g1", "name": "devs"}]}
+        permissions = await connector._fetch_project_permission_scheme("PROJ", mapping)
+        # g1 already added by direct group grant, should not be duplicated
+        assert len(permissions) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_browse_permission_skipped(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [{
+                "permission": "ADMINISTER_PROJECTS",
+                "holder": {"type": "group", "value": "admin-group"},
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        permissions = await connector._fetch_project_permission_scheme("PROJ")
+        assert permissions == []
+
+    @pytest.mark.asyncio
+    async def test_application_role_no_param(self):
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [{
+                "permission": "BROWSE_PROJECTS",
+                "holder": {"type": "applicationRole", "parameter": None},
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        mapping = {
+            "jira-software": [{"groupId": "g-sw"}, {"groupId": "g-shared"}],
+            "jira-servicedesk": [{"groupId": "g-sd"}, {"groupId": "g-shared"}],
+        }
+        permissions = await connector._fetch_project_permission_scheme("PROJ", mapping)
+        # "Any logged in user" = the union of the product-access groups, never an ORG grant
+        assert {(p.entity_type, p.external_id) for p in permissions} == {
+            (EntityType.GROUP, "g-sw"), (EntityType.GROUP, "g-shared"), (EntityType.GROUP, "g-sd")}
+        assert len(permissions) == 3
+
+        # No application roles known: nothing is granted (an unlicensed account must not get in)
+        assert await connector._fetch_project_permission_scheme("PROJ", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_application_role_no_param_with_a_role_unread_keeps_the_stored_access(self) -> None:
+        """The union needs every role: with one unread it is partial, so the project is held back."""
+        connector = _make_connector()
+        mock_ds = MagicMock()
+        mock_ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 1}))
+        mock_ds.get_permission_scheme_grants = AsyncMock(return_value=_make_mock_response(200, {
+            "permissions": [{
+                "permission": "BROWSE_PROJECTS",
+                "holder": {"type": "applicationRole", "parameter": None},
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+        connector._app_roles_unread = True
+
+        await connector._fetch_project_permission_scheme("PROJ", {"jira-software": [{"groupId": "g-sw"}]})
+        assert "PROJ" in connector._projects_naming_unread_roles
+        assert connector._project_access_may_be_partial("PROJ")
+
+
+# ===========================================================================
+# _sync_project_roles() - more branches
+# ===========================================================================
+
+
+class TestSyncProjectRolesCoverage:
+
+    @pytest.mark.asyncio
+    async def test_no_roles_dict(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {}))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await connector._sync_project_roles(["PROJ"], [], {})
+        connector.data_entities_processor.on_new_app_roles.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_role_response_failure(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {
+            "Developers": "https://jira/rest/api/3/project/PROJ/role/10001",
+        }))
+        mock_ds.get_project_role = AsyncMock(return_value=_make_mock_response(500))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await connector._sync_project_roles(["PROJ"], [], {})
+
+    @pytest.mark.asyncio
+    async def test_group_actor_by_name(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {
+            "Devs": "https://jira/rest/api/3/project/PROJ/role/10001",
+        }))
+        mock_ds.get_project_role = AsyncMock(return_value=_make_mock_response(200, {
+            "name": "Devs",
+            "actors": [{
+                "type": "atlassian-group-role-actor",
+                "name": "devs",
+                "groupId": "unknown-gid",
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        user = _make_app_user()
+        groups_map = {"devs": [user]}
+        await connector._sync_project_roles(["PROJ"], [user], groups_map)
+        connector.data_entities_processor.on_new_app_roles.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_user_actor_by_email(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {
+            "Devs": "https://jira/rest/api/3/project/PROJ/role/10001",
+        }))
+        mock_ds.get_project_role = AsyncMock(return_value=_make_mock_response(200, {
+            "name": "Devs",
+            "actors": [{
+                "type": "atlassian-user-role-actor",
+                "actorUser": {"accountId": "unknown-acc", "emailAddress": "user@example.com"},
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        user = _make_app_user()
+        await connector._sync_project_roles(["PROJ"], [user], {})
+        connector.data_entities_processor.on_new_app_roles.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_user_actor_not_found(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {
+            "Devs": "https://jira/rest/api/3/project/PROJ/role/10001",
+        }))
+        mock_ds.get_project_role = AsyncMock(return_value=_make_mock_response(200, {
+            "name": "Devs",
+            "actors": [{
+                "type": "atlassian-user-role-actor",
+                "actorUser": {"accountId": "ghost", "emailAddress": "ghost@x.com"},
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await connector._sync_project_roles(["PROJ"], [], {})
+        connector.data_entities_processor.on_new_app_roles.assert_awaited_once()
+        role, members = connector.data_entities_processor.on_new_app_roles.call_args[0][0][0]
+        assert len(members) == 0
+
+    @pytest.mark.asyncio
+    async def test_role_error_continues(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {
+            "Bad": "https://jira/rest/api/3/project/PROJ/role/bad",
+        }))
+        mock_ds.get_project_role = AsyncMock(side_effect=Exception("err"))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await connector._sync_project_roles(["PROJ"], [], {})
+
+    @pytest.mark.asyncio
+    async def test_group_actor_not_in_map(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_ds = MagicMock()
+        mock_ds.get_project_roles = AsyncMock(return_value=_make_mock_response(200, {
+            "Devs": "https://jira/rest/api/3/project/PROJ/role/10001",
+        }))
+        mock_ds.get_project_role = AsyncMock(return_value=_make_mock_response(200, {
+            "name": "Devs",
+            "actors": [{
+                "type": "atlassian-group-role-actor",
+                "name": "unknown-group",
+                "groupId": "unknown-gid",
+            }],
+        }))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        await connector._sync_project_roles(["PROJ"], [], {})
+
+
+# ===========================================================================
+# _sync_project_lead_roles() - more branches
+# ===========================================================================
+
+
+class TestSyncProjectLeadRolesCoverage:
+
+    @pytest.mark.asyncio
+    async def test_lead_no_account_id(self):
+        connector = _make_connector()
+        projects = [{"key": "PROJ", "lead": {"displayName": "Lead"}}]
+
+        await connector._sync_project_lead_roles(projects, [])
+        connector.data_entities_processor.on_new_app_roles.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_projects(self):
+        connector = _make_connector()
+        await connector._sync_project_lead_roles([], [])
+        connector.data_entities_processor.on_new_app_roles.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_with_project_timestamps(self):
+        connector = _make_connector()
+        user = _make_app_user(account_id="lead-acc")
+        projects = [{
+            "key": "PROJ",
+            "lead": {"accountId": "lead-acc", "displayName": "Lead"},
+            "createdAt": "2024-01-01T00:00:00.000Z",
+            "updatedAt": "2024-06-01T00:00:00.000Z",
+        }]
+
+        await connector._sync_project_lead_roles(projects, [user])
+        connector.data_entities_processor.on_new_app_roles.assert_awaited_once()
+
+
+# ===========================================================================
+# _sync_user_groups() - member not in users
+# ===========================================================================
+
+
+class TestSyncUserGroupsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_member_not_in_synced_users(self):
+        connector = _make_connector()
+        connector._fetch_groups = AsyncMock(return_value=([
+            {"groupId": "g1", "name": "developers"},
+        ], False))
+        # Returns (account_ids, ok); this member's accountId is not among synced users.
+        connector._fetch_group_members = AsyncMock(return_value=(["unknown-acc"], True))
+
+        result = await connector._sync_user_groups([_make_app_user(email="user@example.com")])
+        assert len(result["g1"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_each_group_is_written_in_its_own_transaction(self) -> None:
+        # All groups of a large site in one transaction outlived its timeout and
+        # every group was rolled back.
+        connector = _make_connector()
+        connector._fetch_groups = AsyncMock(return_value=([
+            {"groupId": "g1", "name": "developers"},
+            {"groupId": "g2", "name": "designers"},
+            {"groupId": "g3", "name": "support"},
+        ], False))
+        connector._fetch_group_members = AsyncMock(return_value=([], True))
+
+        await connector._sync_user_groups([])
+
+        calls = connector.data_entities_processor.on_new_user_groups.await_args_list
+        assert [len(c.args[0]) for c in calls] == [1, 1, 1]
+        assert sorted(c.args[0][0][0].source_user_group_id for c in calls) == ["g1", "g2", "g3"]
+
+
+# ===========================================================================
+# Misc constants
+# ===========================================================================
+
+
+class TestConstants:
+
+    def test_audit_page_size(self):
+        assert AUDIT_PAGE_SIZE == 500
+
+    def test_user_page_size(self):
+        assert USER_PAGE_SIZE == 50
+
+    def test_group_page_size(self):
+        assert GROUP_PAGE_SIZE == 50
+
+    def test_group_member_page_size(self):
+        assert GROUP_MEMBER_PAGE_SIZE == 50
+
+
+# ===========================================================================
+# _process_new_records() - with file records in batch
+# ===========================================================================
+
+
+class TestProcessNewRecordsCoverage:
+
+    @pytest.mark.asyncio
+    async def test_with_mixed_record_types(self):
+        connector = _make_connector()
+
+        r1 = (_make_ticket_record(external_id="1", version=0), [], True)
+        r2 = (_make_file_record(attachment_id="1", version=0), [], True)
+        r3 = (_make_ticket_record(external_id="2", version=1, parent_external_record_id="1"), [], True)
+
+        stats = {"new_count": 0, "updated_count": 0}
+        await connector._process_new_records([r1, r2, r3], "PROJ", stats)
+
+        assert stats["new_count"] == 2
+        assert stats["updated_count"] == 1
+        connector.data_entities_processor.on_new_records.assert_awaited()
+        connector.data_entities_processor.on_record_content_update.assert_awaited_once()
+
+
+# ===========================================================================
+# _fetch_issues_batched() - with created filters
+# ===========================================================================
+
+
+class TestFetchIssuesBatchedFilters:
+
+    @pytest.mark.asyncio
+    async def test_with_created_before_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_created = MagicMock()
+        mock_created.get_value.return_value = (None, 1700000000000)
+
+        from app.connectors.core.registry.filters import SyncFilterKey
+        mock_sync_filters = MagicMock()
+        mock_sync_filters.get.side_effect = lambda key: {
+            SyncFilterKey.MODIFIED: None,
+            SyncFilterKey.CREATED: mock_created,
+        }.get(key)
+        connector.sync_filters = mock_sync_filters
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {"issues": [], "nextPageToken": None})
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        async for batch, has_more, ts in connector._fetch_issues_batched("PROJ", "p1", []):
+            pass
+
+        jql = mock_ds.search_and_reconsile_issues_using_jql_post.call_args[1]["jql"]
+        assert "created <=" in jql
+
+    @pytest.mark.asyncio
+    async def test_modified_filter_without_resume(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_modified = MagicMock()
+        mock_modified.get_value.return_value = (1600000000000, None)
+
+        from app.connectors.core.registry.filters import SyncFilterKey
+        mock_sync_filters = MagicMock()
+        mock_sync_filters.get.side_effect = lambda key: {
+            SyncFilterKey.MODIFIED: mock_modified,
+            SyncFilterKey.CREATED: None,
+        }.get(key)
+        connector.sync_filters = mock_sync_filters
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {"issues": [], "nextPageToken": None})
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        async for batch, has_more, ts in connector._fetch_issues_batched(
+            "PROJ", "p1", [], last_sync_time=1650000000000
+        ):
+            pass
+
+        jql = mock_ds.search_and_reconsile_issues_using_jql_post.call_args[1]["jql"]
+        assert "updated >" in jql
+
+    @pytest.mark.asyncio
+    async def test_last_sync_time_only(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        connector.sync_filters = None
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {"issues": [], "nextPageToken": None})
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        async for batch, has_more, ts in connector._fetch_issues_batched(
+            "PROJ", "p1", [], last_sync_time=1650000000000
+        ):
+            pass
+
+        jql = mock_ds.search_and_reconsile_issues_using_jql_post.call_args[1]["jql"]
+        assert "updated >" in jql
+
+    @pytest.mark.asyncio
+    async def test_modified_before_filter(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+
+        mock_modified = MagicMock()
+        mock_modified.get_value.return_value = (None, 1700000000000)
+
+        from app.connectors.core.registry.filters import SyncFilterKey
+        mock_sync_filters = MagicMock()
+        mock_sync_filters.get.side_effect = lambda key: {
+            SyncFilterKey.MODIFIED: mock_modified,
+            SyncFilterKey.CREATED: None,
+        }.get(key)
+        connector.sync_filters = mock_sync_filters
+
+        mock_ds = MagicMock()
+        mock_ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            return_value=_make_mock_response(200, {"issues": [], "nextPageToken": None})
+        )
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        async for batch, has_more, ts in connector._fetch_issues_batched("PROJ", "p1", []):
+            pass
+
+        jql = mock_ds.search_and_reconsile_issues_using_jql_post.call_args[1]["jql"]
+        assert "updated <=" in jql
+
+
+# ===========================================================================
+# Patch fix 1 (Cloud): _fallback_permissions_for_forbidden_scheme
+# ===========================================================================
+
+
+class TestFallbackPermissionsForForbiddenSchemeCloud:
+
+    @pytest.mark.asyncio
+    async def test_returns_user_permission_for_authenticated_jira_account(self):
+        conn = _make_connector()
+        conn.creator_email = "owner@example.com"
+        conn._authenticated_jira_email = "dev@jira.com"
+        result = await conn._fallback_permissions_for_forbidden_scheme("PROJ", 403, "permission scheme")
+        assert len(result) == 1
+        assert result[0].entity_type == EntityType.USER
+        assert result[0].email == "dev@jira.com"
+        assert result[0].type == PermissionType.READ
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_jira_email_unknown_even_with_creator_email(self):
+        conn = _make_connector()
+        conn.creator_email = "owner@example.com"
+        conn._authenticated_jira_email = None
+        assert await conn._fallback_permissions_for_forbidden_scheme("PROJ", 401, "permission scheme") is None
+
+    @pytest.mark.asyncio
+    async def test_works_for_both_401_and_403(self):
+        conn = _make_connector()
+        conn._authenticated_jira_email = "e@x.com"
+        for status in (401, 403):
+            result = await conn._fallback_permissions_for_forbidden_scheme("P", status, "grants")
+            assert len(result) == 1
+            assert result[0].entity_type == EntityType.USER
+
+    def test_cache_authenticated_jira_email_from_myself_response(self):
+        conn = _make_connector()
+        response = _make_mock_response(
+            200,
+            {"emailAddress": "  dev@jira.com  ", "accountId": "acc-1"},
+        )
+        conn._cache_authenticated_jira_profile(response)
+        assert conn._authenticated_jira_email == "dev@jira.com"
+
+    def test_cache_authenticated_jira_email_ignores_non_ok(self):
+        conn = _make_connector()
+        response = _make_mock_response(401, {})
+        conn._cache_authenticated_jira_profile(response)
+        assert conn._authenticated_jira_email is None
+
+    def test_cache_authenticated_jira_email_ignores_none_response(self):
+        conn = _make_connector()
+        conn._cache_authenticated_jira_profile(None)
+        assert conn._authenticated_jira_email is None
+
+    @pytest.mark.asyncio
+    async def test_notify_message_uses_cached_myself_email_not_creator_email(self):
+        conn = _make_connector()
+        conn.creator_email = "admin@pipes.com"
+        conn._authenticated_jira_email = "dev@jira.com"
+        conn.site_url = "https://example.atlassian.net"
+        conn.notify = AsyncMock()
+        result = await conn._fallback_permissions_for_forbidden_scheme("PROJ", 403, "permission scheme")
+        conn.notify.assert_called_once()
+        message = conn.notify.call_args.kwargs["message"]
+        assert "dev@jira.com" in message
+        assert "admin@pipes.com" not in message
+        assert len(result) == 1
+        assert result[0].email == "dev@jira.com"
+
+    @pytest.mark.asyncio
+    async def test_no_notify_and_no_grant_when_myself_email_not_cached(self):
+        conn = _make_connector()
+        conn.creator_email = "admin@pipes.com"
+        conn._authenticated_jira_email = None
+        conn.site_url = "https://example.atlassian.net"
+        conn.notify = AsyncMock()
+        result = await conn._fallback_permissions_for_forbidden_scheme("PROJ", 403, "permission scheme")
+        assert result is None
+        conn.notify.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_init_caches_myself_email(self):
+        conn = _make_connector()
+        mock_myself = _make_mock_response(200, {"emailAddress": "sync@jira.com"})
+
+        with patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraClient") as MockJiraClient:
+            mock_client = MagicMock()
+            MockJiraClient.build_from_services = AsyncMock(return_value=mock_client)
+
+            conn.config_service.get_config = AsyncMock(return_value={
+                "auth": {"authType": "API_TOKEN", "baseUrl": "https://mycompany.atlassian.net"},
+            })
+
+            with patch("app.connectors.sources.atlassian.jira_cloud.connector.JiraDataSource") as MockDS:
+                mock_ds_instance = MagicMock()
+                mock_ds_instance.get_current_user = AsyncMock(return_value=mock_myself)
+                MockDS.return_value = mock_ds_instance
+
+                assert await conn.init() is True
+                assert conn._authenticated_jira_email == "sync@jira.com"
+                mock_ds_instance.get_current_user.assert_called_once()
+
+
+# ===========================================================================
+# Patch fix 2 (Cloud): _fetch_project_permission_scheme — 401/403 branches
+# ===========================================================================
+
+
+def _err_resp_cloud(status: int, body: str = "error") -> MagicMock:
+    r = MagicMock()
+    r.status = status
+    r.json = MagicMock(return_value={})
+    r.text = MagicMock(return_value=body)
+    return r
+
+
+class TestFetchProjectPermissionScheme401403Cloud:
+
+    @pytest.mark.asyncio
+    async def test_scheme_401_skips_no_fallback(self):
+        # 401 is an auth/token failure, not a permission problem -> skip (None) and preserve the
+        # ACL, without running the creator-browse fallback (that's only for a genuine 403).
+        conn = _make_connector()
+        conn.creator_email = "admin@example.com"
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_err_resp_cloud(401, "Unauthorized"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch.object(conn, "_fallback_permissions_for_forbidden_scheme") as fm:
+                assert await conn._fetch_project_permission_scheme("PROJ", {}) is None
+        fm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scheme_403_returns_fallback_with_email(self):
+        conn = _make_connector()
+        conn._authenticated_jira_email = "admin@example.com"
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_err_resp_cloud(403, '{"errorMessages":["No permission"]}'))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            perms = await conn._fetch_project_permission_scheme("PROJ", {})
+        assert len(perms) == 1
+        assert perms[0].email == "admin@example.com"
+
+    @pytest.mark.asyncio
+    async def test_scheme_401_skips_regardless_of_email(self):
+        # 401 -> skip (None) whether or not a creator email is set; the ACL is preserved.
+        conn = _make_connector()
+        conn.creator_email = None
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_err_resp_cloud(401, "Unauthorized"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            assert await conn._fetch_project_permission_scheme("PROJ", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_scheme_500_does_not_call_fallback(self):
+        conn = _make_connector()
+        conn.creator_email = "admin@example.com"
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_err_resp_cloud(500, "Server error"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch.object(conn, "_fallback_permissions_for_forbidden_scheme") as fm:
+                # Transient 5xx -> None so the caller skips the project and preserves its ACL.
+                assert await conn._fetch_project_permission_scheme("PROJ", {}) is None
+        fm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_grants_403_returns_fallback(self):
+        conn = _make_connector()
+        conn._authenticated_jira_email = "admin@example.com"
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 7}))
+        ds.get_permission_scheme_grants = AsyncMock(return_value=_err_resp_cloud(403, "Forbidden"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            perms = await conn._fetch_project_permission_scheme("PROJ", {})
+        assert len(perms) == 1
+        assert perms[0].email == "admin@example.com"
+
+    @pytest.mark.asyncio
+    async def test_grants_401_skips_no_fallback(self):
+        # A 401 on the grants call is also auth/token -> skip (None), no creator-browse fallback.
+        conn = _make_connector()
+        conn.creator_email = "admin@example.com"
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 3}))
+        ds.get_permission_scheme_grants = AsyncMock(return_value=_err_resp_cloud(401, "Unauthorized"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch.object(conn, "_fallback_permissions_for_forbidden_scheme") as fm:
+                assert await conn._fetch_project_permission_scheme("PROJ", {}) is None
+        fm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_grants_500_does_not_call_fallback(self):
+        conn = _make_connector()
+        conn.creator_email = "admin@example.com"
+        ds = MagicMock()
+        ds.get_assigned_permission_scheme = AsyncMock(return_value=_make_mock_response(200, {"id": 5}))
+        ds.get_permission_scheme_grants = AsyncMock(return_value=_err_resp_cloud(500, "Server error"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch.object(conn, "_fallback_permissions_for_forbidden_scheme") as fm:
+                # Transient 5xx -> None so the caller skips the project and preserves its ACL.
+                assert await conn._fetch_project_permission_scheme("PROJ", {}) is None
+        fm.assert_not_called()
+
+
+# ===========================================================================
+# Patch fix 3 (Cloud): _search_issues_with_retry
+# ===========================================================================
+
+
+class TestSearchIssuesWithRetryCloud:
+
+    @pytest.mark.asyncio
+    async def test_happy_path_first_attempt(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"issues": [], "total": 0})
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(return_value=ok)
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            resp = await conn._search_issues_with_retry(
+                project_key="PROJ",
+                jql='project = "PROJ"',
+                next_page_token=None,
+                max_results=50,
+                fields=["summary"],
+                expand="changelog",
+            )
+        assert resp.status == HttpStatusCode.OK.value
+        ds.search_and_reconsile_issues_using_jql_post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_remote_protocol_error_then_succeeds(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"issues": [], "total": 0})
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            side_effect=[httpx.RemoteProtocolError("Server disconnected without sending a response."), ok]
+        )
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                resp = await conn._search_issues_with_retry(
+                    project_key="PROJ",
+                    jql='project = "PROJ"',
+                    next_page_token="token-1",
+                    max_results=50,
+                    fields=["summary"],
+                    expand="changelog",
+                )
+        assert resp.status == HttpStatusCode.OK.value
+        assert ds.search_and_reconsile_issues_using_jql_post.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_read_timeout(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"issues": [], "total": 0})
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            side_effect=[httpx.ReadTimeout("timed out"), ok]
+        )
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                resp = await conn._search_issues_with_retry(
+                    project_key="PROJ",
+                    jql='project = "PROJ"',
+                    next_page_token=None,
+                    max_results=50,
+                    fields=["summary"],
+                    expand="changelog",
+                )
+        assert resp.status == HttpStatusCode.OK.value
+
+    @pytest.mark.asyncio
+    async def test_exhausts_retries_and_raises(self):
+        conn = _make_connector()
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            side_effect=httpx.RemoteProtocolError("disconnected")
+        )
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                # Re-raised bare so to_stream_error can still read the
+                # timeout/status off the SDK exception.
+                with pytest.raises(httpx.RemoteProtocolError):
+                    await conn._search_issues_with_retry(
+                        project_key="PROJ",
+                        jql='project = "PROJ"',
+                        next_page_token=None,
+                        max_results=50,
+                        fields=["summary"],
+                        expand="changelog",
+                        max_attempts=3,
+                    )
+        assert ds.search_and_reconsile_issues_using_jql_post.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_non_transport_error_not_retried(self):
+        conn = _make_connector()
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(side_effect=ValueError("unexpected"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with pytest.raises(ValueError, match="unexpected"):
+                await conn._search_issues_with_retry(
+                    project_key="PROJ",
+                    jql='project = "PROJ"',
+                    next_page_token=None,
+                    max_results=50,
+                    fields=["summary"],
+                    expand="changelog",
+                )
+        ds.search_and_reconsile_issues_using_jql_post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backoff_sleep_called_between_retries(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"issues": [], "total": 0})
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            side_effect=[httpx.ConnectError("refused"), ok]
+        )
+        sleep_calls: list[float] = []
+
+        async def capture(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", side_effect=capture):
+                await conn._search_issues_with_retry(
+                    project_key="PROJ",
+                    jql='project = "PROJ"',
+                    next_page_token=None,
+                    max_results=50,
+                    fields=["summary"],
+                    expand="changelog",
+                )
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_fetch_issues_batched_retries_on_transport_error(self):
+        conn = _make_connector()
+        conn.data_source = MagicMock()
+        conn.sync_filters = None
+        issue = _make_issue()
+        page1 = _make_mock_response(200, {"issues": [issue], "nextPageToken": None})
+        ds = MagicMock()
+        ds.search_and_reconsile_issues_using_jql_post = AsyncMock(
+            side_effect=[
+                httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                page1,
+            ]
+        )
+        conn._handle_attachment_deletions_from_changelog = AsyncMock(return_value=[])
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch.object(conn, "_fetch_issue_attachments", new_callable=AsyncMock, return_value=[]):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    batches = []
+                    async for batch in conn._fetch_issues_batched("PROJ", "p1", []):
+                        batches.append(batch)
+        assert len(batches) == 1 and batches[0][0]
+        assert ds.search_and_reconsile_issues_using_jql_post.await_count == 2
+
+
+# ===========================================================================
+# Patch fix 4 (Cloud): _get_issue_with_retry
+# ===========================================================================
+
+
+class TestGetIssueWithRetryCloud:
+
+    @pytest.mark.asyncio
+    async def test_happy_path_first_attempt(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"key": "PROJ-1", "fields": {}})
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(return_value=ok)
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            resp = await conn._get_issue_with_retry("10001", fields=["summary"])
+        assert resp.status == HttpStatusCode.OK.value
+        ds.get_issue.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_remote_protocol_error_then_succeeds(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"key": "PROJ-1", "fields": {}})
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(side_effect=[httpx.RemoteProtocolError("Server disconnected without sending a response."), ok])
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                resp = await conn._get_issue_with_retry("10001", fields=["summary"])
+        assert resp.status == HttpStatusCode.OK.value
+        assert ds.get_issue.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_read_timeout(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"key": "PROJ-1", "fields": {}})
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(side_effect=[httpx.ReadTimeout("timed out"), ok])
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                resp = await conn._get_issue_with_retry("10001", fields=["summary"])
+        assert resp.status == HttpStatusCode.OK.value
+
+    @pytest.mark.asyncio
+    async def test_exhausts_retries_and_raises(self):
+        conn = _make_connector()
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(side_effect=httpx.RemoteProtocolError("disconnected"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(httpx.RemoteProtocolError):
+                    await conn._get_issue_with_retry("10001", fields=["summary"], max_attempts=3)
+        assert ds.get_issue.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_non_transport_error_not_retried(self):
+        conn = _make_connector()
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(side_effect=ValueError("unexpected"))
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with pytest.raises(ValueError, match="unexpected"):
+                await conn._get_issue_with_retry("10001", fields=["summary"])
+        ds.get_issue.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backoff_sleep_called_between_retries(self):
+        conn = _make_connector()
+        ok = _make_mock_response(200, {"key": "PROJ-1", "fields": {}})
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(side_effect=[httpx.ConnectError("refused"), ok])
+        sleep_calls: list[float] = []
+
+        async def capture(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", side_effect=capture):
+                await conn._get_issue_with_retry("10001", fields=["summary"])
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_process_issue_blockgroups_uses_retry_internally(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        issue_data = {"key": "PROJ-1", "fields": {"summary": "T", "description": None, "attachment": [], "comment": {}}}
+        ok = _make_mock_response(200, issue_data)
+        ds = MagicMock()
+        ds.get_issue = AsyncMock(side_effect=[httpx.RemoteProtocolError("gone"), ok])
+        tx = MagicMock()
+        inner = MagicMock()
+        inner.get_record_by_external_id = AsyncMock(return_value=None)
+        tx.__aenter__ = AsyncMock(return_value=inner)
+        tx.__aexit__ = AsyncMock(return_value=None)
+        conn.data_store_provider.transaction = MagicMock(return_value=tx)
+        with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await conn._process_issue_blockgroups_for_streaming(_make_ticket_record())
+        assert isinstance(result, bytes)
+        assert ds.get_issue.await_count == 2
+
+
+# ===========================================================================
+# Patch fix 4 (Cloud): stream_record FILE — 404 propagates as HTTPException(404)
+# ===========================================================================
+
+
+def _raising_download(status: int):
+    """A ``download_attachment_content`` stand-in that raises ``httpx.HTTPStatusError`` on the
+    first chunk — the shape a non-success source status takes now that attachments stream in
+    chunks (the connector maps it to a clean HTTPException before the response body starts)."""
+    async def _gen(**kwargs):
+        resp = MagicMock()
+        resp.status_code = status
+        raise httpx.HTTPStatusError("upstream error", request=MagicMock(), response=resp)
+        yield b""  # pragma: no cover - never reached; marks this an async generator
+    return _gen
+
+
+class TestStreamRecordFileCloud:
+
+    @pytest.mark.asyncio
+    async def test_404_raises_http_exception(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        ds = MagicMock()
+        ds.download_attachment_content = _raising_download(404)
+        with patch.object(conn, "init", new_callable=AsyncMock):
+            with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+                with pytest.raises(HTTPException) as exc_info:
+                    await conn.stream_record(_make_file_record())
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_500_raises_http_exception_with_upstream_status(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        ds = MagicMock()
+        ds.download_attachment_content = _raising_download(500)
+        with patch.object(conn, "init", new_callable=AsyncMock):
+            with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+                with pytest.raises(HTTPException) as exc_info:
+                    await conn.stream_record(_make_file_record())
+        assert exc_info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_http_exception_not_swallowed_by_outer_handler(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        ds = MagicMock()
+        ds.download_attachment_content = _raising_download(404)
+        with patch.object(conn, "init", new_callable=AsyncMock):
+            with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+                try:
+                    await conn.stream_record(_make_file_record())
+                    pytest.fail("Expected HTTPException")
+                except HTTPException as exc:
+                    assert exc.status_code == 404
+                except Exception:
+                    pytest.fail("HTTPException was swallowed by the outer handler")
+
+    @pytest.mark.asyncio
+    async def test_ok_returns_streaming_response(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        ds = MagicMock()
+        ds.get_attachment_content = AsyncMock(return_value=_make_mock_response(200, None))
+        with patch.object(conn, "init", new_callable=AsyncMock):
+            with patch.object(conn, "_get_fresh_datasource", new_callable=AsyncMock, return_value=ds):
+                from fastapi.responses import StreamingResponse
+                result = await conn.stream_record(_make_file_record())
+        assert isinstance(result, StreamingResponse)
+
+
+# ===========================================================================
+# Patch fix 5 (Cloud): stream_record unsupported type → HTTPException(400)
+# ===========================================================================
+
+
+class TestStreamRecordUnsupportedTypeCloud:
+
+    @pytest.mark.asyncio
+    async def test_unsupported_type_raises_400(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        record = _make_ticket_record()
+        record.record_type = RecordType.MESSAGE
+        with patch.object(conn, "init", new_callable=AsyncMock):
+            with pytest.raises(HTTPException) as exc_info:
+                await conn.stream_record(record)
+        assert exc_info.value.status_code == HttpStatusCode.BAD_REQUEST.value
+
+    @pytest.mark.asyncio
+    async def test_unsupported_type_error_not_swallowed(self):
+        conn = _make_connector()
+        conn.site_url = "https://company.atlassian.net"
+        record = _make_ticket_record()
+        record.record_type = RecordType.MESSAGE
+        with patch.object(conn, "init", new_callable=AsyncMock):
+            try:
+                await conn.stream_record(record)
+                pytest.fail("Expected HTTPException")
+            except HTTPException as exc:
+                assert exc.status_code == HttpStatusCode.BAD_REQUEST.value
+            except Exception:
+                pytest.fail("HTTPException(400) was swallowed by the outer handler")
+
+
+class TestGroupSyncForbiddenNotification:
+    """The group-sync 'needs Browse users and groups permission' notification must fire only on
+    a genuine 403 — a 401 auth/token failure is reported by the connection/sync-failed
+    notification, not misdiagnosed as a missing permission."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_groups_403_flags_forbidden(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(return_value=_make_mock_response(403))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        groups, fetch_failed = await connector._fetch_groups()
+        assert groups == []
+        assert fetch_failed is True
+        assert connector._group_bulk_forbidden is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_groups_401_does_not_flag_forbidden(self):
+        connector = _make_connector()
+        connector.data_source = MagicMock()
+        mock_ds = MagicMock()
+        mock_ds.bulk_get_groups = AsyncMock(return_value=_make_mock_response(401))
+        connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
+
+        groups, fetch_failed = await connector._fetch_groups()
+        assert groups == []
+        assert fetch_failed is True
+        assert connector._group_bulk_forbidden is False
+
+    @pytest.mark.asyncio
+    async def test_sync_user_groups_notifies_only_on_403(self):
+        connector = _make_connector()
+        connector.notify = AsyncMock()
+        connector._fetch_groups = AsyncMock(return_value=([], True))
+
+        # 403 → forbidden flag set → the permission notification fires.
+        connector._group_bulk_forbidden = True
+        await connector._sync_user_groups([])
+        connector.notify.assert_awaited_once()
+
+        # 401 → flag not set → no permission notification.
+        connector.notify.reset_mock()
+        connector._group_bulk_forbidden = False
+        await connector._sync_user_groups([])
+        connector.notify.assert_not_awaited()

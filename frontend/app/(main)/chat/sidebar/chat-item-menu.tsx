@@ -1,0 +1,192 @@
+'use client';
+
+import { useState } from 'react';
+import { DropdownMenu, Flex, Text } from '@radix-ui/themes';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { useTranslation } from 'react-i18next';
+import { useCanHover } from '@/lib/hooks/use-can-hover';
+
+interface ChatItemMenuProps {
+  /** Whether the parent item is hovered (controls meatball visibility) */
+  isParentHovered: boolean;
+  /** Called when the dropdown open state changes (keep parent highlighted) */
+  onOpenChange?: (open: boolean) => void;
+  onRename: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
+  /** Saves the whole chat as a Markdown file. Omit to hide the option. */
+  onExport?: () => void;
+  /** Pins the chat, or unpins it when `isPinned`. Omit to hide the option. */
+  onTogglePin?: () => void;
+  isPinned?: boolean;
+  /** Agent-scoped sidebar: only delete is supported by the API */
+  showRename?: boolean;
+  showArchive?: boolean;
+  /** Opens the move-to-project picker. Omit to hide the option entirely. */
+  onMoveToProject?: () => void;
+  /** Unlinks the conversation from its current project. Only shown when the row is already linked. */
+  onRemoveFromProject?: () => void;
+}
+
+/**
+ * Meatball (three-dot) dropdown menu for a chat sidebar item.
+ *
+ * Shows on hover of the parent row. Options: Rename, Pin, Export, Archive, Delete.
+ * Matches Figma spec (node 2496:29091).
+ */
+export function ChatItemMenu({
+  isParentHovered,
+  onOpenChange: onOpenChangeProp,
+  onRename,
+  onArchive,
+  onDelete,
+  onExport,
+  onTogglePin,
+  isPinned = false,
+  showRename = true,
+  showArchive = true,
+  onMoveToProject,
+  onRemoveFromProject,
+}: ChatItemMenuProps) {
+  const { t } = useTranslation();
+  const [isOpen, setIsOpen] = useState(false);
+  const [isMeatballHovered, setIsMeatballHovered] = useState(false);
+  const canHover = useCanHover();
+  const visible = isParentHovered || isOpen || !canHover;
+
+  const handleOpenChange = (open: boolean) => {
+    setIsOpen(open);
+    onOpenChangeProp?.(open);
+  };
+
+  if (!visible) return null;
+
+  return (
+    <DropdownMenu.Root open={isOpen} onOpenChange={handleOpenChange} modal={false}>
+      <DropdownMenu.Trigger>
+        <button
+          type="button"
+          className="touch-hit"
+          onMouseEnter={() => setIsMeatballHovered(true)}
+          onMouseLeave={() => setIsMeatballHovered(false)}
+          onClick={(e) => {
+            e.stopPropagation();
+          }}
+          style={{
+            appearance: 'none',
+            border: 'none',
+            background: isMeatballHovered || isOpen ? 'var(--olive-5)' : 'transparent',
+            borderRadius: 'var(--radius-1)',
+            padding: 2,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: 'pointer',
+            flexShrink: 0,
+          }}
+        >
+          <MaterialIcon name="more_horiz" size={18} color="var(--slate-11)" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Content
+        side="bottom"
+        align="start"
+        sideOffset={4}
+        style={{ minWidth: 140 }}
+      >
+        {showRename && (
+          <DropdownMenu.Item
+            onClick={(e) => {
+              e.stopPropagation();
+              onRename();
+            }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name="drive_file_rename_outline" size={16} color="var(--slate-11)" />
+              <Text size="2" style={{ color: 'var(--slate-11)' }}>{t('chat.rename')}</Text>
+            </Flex>
+          </DropdownMenu.Item>
+        )}
+        {onTogglePin && (
+          <DropdownMenu.Item
+            onClick={(e) => {
+              e.stopPropagation();
+              onTogglePin();
+            }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name={isPinned ? 'keep_off' : 'keep'} size={16} color="var(--slate-11)" />
+              <Text size="2" style={{ color: 'var(--slate-11)' }}>
+                {isPinned ? t('chat.unpin') : t('chat.pin')}
+              </Text>
+            </Flex>
+          </DropdownMenu.Item>
+        )}
+        {onExport && (
+          <DropdownMenu.Item
+            onClick={(e) => {
+              e.stopPropagation();
+              onExport();
+            }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name="download" size={16} color="var(--slate-11)" />
+              <Text size="2" style={{ color: 'var(--slate-11)' }}>{t('chat.export.menuItem')}</Text>
+            </Flex>
+          </DropdownMenu.Item>
+        )}
+        {showArchive && (
+          <DropdownMenu.Item
+            onClick={(e) => {
+              e.stopPropagation();
+              onArchive();
+            }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name="archive" size={16} color="var(--slate-11)" />
+              <Text size="2" style={{ color: 'var(--slate-11)' }}>{t('chat.archive')}</Text>
+            </Flex>
+          </DropdownMenu.Item>
+        )}
+        {onMoveToProject && (
+          <DropdownMenu.Item
+            onClick={(e) => {
+              e.stopPropagation();
+              onMoveToProject();
+            }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name="drive_file_move" size={16} color="var(--slate-11)" />
+              <Text size="2" style={{ color: 'var(--slate-11)' }}>{t('chat.projects.moveToProject')}</Text>
+            </Flex>
+          </DropdownMenu.Item>
+        )}
+        {onRemoveFromProject && (
+          <DropdownMenu.Item
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemoveFromProject();
+            }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name="folder_off" size={16} color="var(--slate-11)" />
+              <Text size="2" style={{ color: 'var(--slate-11)' }}>{t('chat.projects.removeFromProject')}</Text>
+            </Flex>
+          </DropdownMenu.Item>
+        )}
+        <DropdownMenu.Item
+          color="red"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+        >
+          <Flex align="center" gap="1">
+            <MaterialIcon name="delete" size={16} color="var(--red-11)" />
+            <Text size="2" style={{ color: 'var(--red-11)' }}>{t('chat.deleteChat')}</Text>
+          </Flex>
+        </DropdownMenu.Item>
+      </DropdownMenu.Content>
+    </DropdownMenu.Root>
+  );
+}

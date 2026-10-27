@@ -1,0 +1,235 @@
+"""Knowledge Hub Unified Browse API Request and Response Models"""
+
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from app.services.graph_db.common.utils import KB_MAX_FOLDER_DEPTH
+
+
+class NodeType(str, Enum):
+    """Valid node types in the knowledge hub hierarchy"""
+    FOLDER = "folder"
+    APP = "app"
+    RECORD_GROUP = "recordGroup"
+    RECORD = "record"
+
+class OriginType(str, Enum):
+    """Valid origin types for nodes"""
+    COLLECTION = "COLLECTION"
+    CONNECTOR = "CONNECTOR"
+
+class SortField(str, Enum):
+    """Valid sort fields"""
+    NAME = "name"
+    CREATED_AT = "createdAt"
+    UPDATED_AT = "updatedAt"
+    SIZE = "size"
+    TYPE = "type"
+
+class SortOrder(str, Enum):
+    """Valid sort order values"""
+    ASC = "asc"
+    DESC = "desc"
+
+class IncludeOption(str, Enum):
+    """Valid include options for response expansions"""
+    BREADCRUMBS = "breadcrumbs"
+    COUNTS = "counts"
+    AVAILABLE_FILTERS = "availableFilters"
+    PERMISSIONS = "permissions"
+
+# Request Models
+class DateRangeFilter(BaseModel):
+    """Date range filter with optional gte/lte bounds"""
+    gte: Optional[int] = Field(None, description="Greater than or equal to (epoch ms)")
+    lte: Optional[int] = Field(None, description="Less than or equal to (epoch ms)")
+
+class SizeRangeFilter(BaseModel):
+    """Size range filter with optional gte/lte bounds"""
+    gte: Optional[int] = Field(None, description="Greater than or equal to (bytes)")
+    lte: Optional[int] = Field(None, description="Less than or equal to (bytes)")
+
+# Response Models
+class ItemPermission(BaseModel):
+    """Permission info for a single node item"""
+    role: str = Field(..., description="User's role on this item (OWNER, WRITER, READER, etc.)")
+    canEdit: bool = Field(..., description="Whether user can edit this item")
+    canDelete: bool = Field(..., description="Whether user can delete this item")
+
+class ParentRef(BaseModel):
+    """The parent a node is listed under.
+
+    Browsing to it needs `/nodes/{parentType}/{parentId}`, so the type travels
+    with the id. It is the node's *placement* parent, which is not always its
+    storage parent: an ancestor the user cannot open is replaced, never named.
+    """
+    id: str = Field(..., description="Parent node ID")
+    nodeType: str = Field(..., description="Parent node type (app, recordGroup, folder, record)")
+    name: Optional[str] = Field(None, description="Parent display name")
+
+class NodeItem(BaseModel):
+    """Response model for a single node in the knowledge hub hierarchy"""
+    id: str = Field(..., description="Unique identifier for the node")
+    name: str = Field(..., description="Display name of the node")
+    nodeType: NodeType = Field(..., description="Type of the node")
+    parentId: Optional[str] = Field(None, description="ID of the parent node")
+    parent: Optional[ParentRef] = Field(None, description="The parent this node is listed under")
+    origin: OriginType = Field(..., description="Origin type (COLLECTION or CONNECTOR)")
+    connector: Optional[str] = Field(None, description="Connector name (only for CONNECTOR origin)")
+    connectorId: Optional[str] = Field(None, description="Connector instance id (only for CONNECTOR origin)")
+    recordType: Optional[str] = Field(None, description="Record type (only when nodeType is record)")
+    recordGroupType: Optional[str] = Field(None, description="Record group type (only when nodeType is recordGroup, e.g. SLACK_CHANNEL, CONFLUENCE_SPACES)")
+    indexingStatus: Optional[str] = Field(None, description="Indexing status (only when nodeType is record)")
+    reason: Optional[str] = Field(None, description="Reason for current indexing status (e.g. failure reason)")
+    createdAt: int = Field(..., description="Creation timestamp (epoch ms)")
+    updatedAt: int = Field(..., description="Update timestamp (epoch ms)")
+    sizeInBytes: Optional[int] = Field(None, description="File size in bytes (only for file records)")
+    mimeType: Optional[str] = Field(None, description="MIME type (only for file records)")
+    extension: Optional[str] = Field(None, description="File extension (only for file records)")
+    webUrl: Optional[str] = Field(None, description="Web URL for the node")
+    hasChildren: bool = Field(..., description="True if node has any children (for sidebar)")
+    previewRenderable: Optional[bool] = Field(None, description="Whether preview can be rendered for this record")
+    permission: Optional[ItemPermission] = Field(None, description="User's permission on this item")
+    sharingStatus: Optional[str] = Field(None, description="Sharing status: 'private', 'shared', or 'workspace' (only for kb and app node types)")
+    isInternal: bool = Field(False, description="True when the node is an internal/system record group or record (doesn't come from source)")
+    isPlaceholder: bool = Field(False, description="True when the node is a placeholder stub for an out-of-scope ancestor (rendered read-only, no content actions)")
+
+    class Config:
+        use_enum_values = True
+        exclude_none = True
+
+class CurrentNode(BaseModel):
+    """Response model for the current node being browsed"""
+    id: str = Field(..., description="Current node ID")
+    name: str = Field(..., description="Current node name")
+    nodeType: str = Field(..., description="Current node type (app, recordGroup, folder, record)")
+    subType: Optional[str] = Field(None, description="Sub-type: connector name for apps/recordGroups, recordType for records")
+
+    class Config:
+        exclude_none = True
+
+class BreadcrumbItem(BaseModel):
+    """Response model for a breadcrumb item"""
+    id: str = Field(..., description="Node ID")
+    name: str = Field(..., description="Node name")
+    nodeType: str = Field(..., description="Node type (app, recordGroup, folder, record)")
+    subType: Optional[str] = Field(None, description="Sub-type: connector name for apps/recordGroups, recordType for records")
+
+    class Config:
+        exclude_none = True
+
+class PaginationInfo(BaseModel):
+    """Pagination, carrying both the page shape and the cursor shape.
+
+    The cursor fields are the contract: keyset paging has no page number to
+    report. `page` and `totalPages` stay, optional, for clients that still page
+    by number.
+    """
+    limit: int = Field(..., description="Items per page")
+    totalItems: int = Field(..., description="Total number of items")
+    hasNext: bool = Field(..., description="Whether there is a next page")
+    hasPrev: bool = Field(..., description="Whether there is a previous page")
+    startIndex: Optional[int] = Field(None, description="1-based index of the first item on this page")
+    endIndex: Optional[int] = Field(None, description="1-based index of the last item on this page")
+    currentPageItems: Optional[int] = Field(None, description="Number of items on this page")
+    nextCursor: Optional[str] = Field(None, description="Opaque cursor for the next page")
+    prevCursor: Optional[str] = Field(None, description="Opaque cursor for the previous page")
+    page: Optional[int] = Field(None, description="Current page number (legacy, being removed)")
+    totalPages: Optional[int] = Field(None, description="Total number of pages (legacy, being removed)")
+
+class FilterOption(BaseModel):
+    """Response model for a filter option"""
+    id: str = Field(..., description="Filter ID value to send in requests")
+    label: str = Field(..., description="Display label for the filter")
+    type: Optional[str] = Field(None, description="Additional type information (e.g., connector type for apps)")
+    connectorType: Optional[str] = Field(None, description="Connector type/name (for connectors only)")
+
+class AvailableFilters(BaseModel):
+    """Response model for available filter options"""
+    nodeTypes: List[FilterOption] = Field(default_factory=list, description="Available node types")
+    recordTypes: List[FilterOption] = Field(default_factory=list, description="Available record types")
+    origins: List[FilterOption] = Field(default_factory=list, description="Available origins")
+    connectors: List[FilterOption] = Field(default_factory=list, description="Available connectors (instances)")
+    indexingStatus: List[FilterOption] = Field(default_factory=list, description="Available indexing statuses")
+    sortBy: List[FilterOption] = Field(default_factory=list, description="Available sort fields")
+    sortOrder: List[FilterOption] = Field(default_factory=list, description="Available sort orders")
+
+class AppliedFilters(BaseModel):
+    """Response model for applied filters"""
+    q: Optional[str] = Field(None, description="Search query")
+    nodeTypes: Optional[List[str]] = Field(None, description="Applied node type filters")
+    recordTypes: Optional[List[str]] = Field(None, description="Applied record type filters")
+    origins: Optional[List[str]] = Field(None, description="Applied origin filters")
+    connectorIds: Optional[List[str]] = Field(None, description="Applied connector instance ID filters")
+    indexingStatus: Optional[List[str]] = Field(None, description="Applied indexing status filters")
+    createdAt: Optional[DateRangeFilter] = Field(None, description="Applied created date range")
+    updatedAt: Optional[DateRangeFilter] = Field(None, description="Applied updated date range")
+    size: Optional[SizeRangeFilter] = Field(None, description="Applied size range")
+    sortBy: str = Field("name", description="Sort field")
+    sortOrder: str = Field("asc", description="Sort order")
+
+    class Config:
+        exclude_none = True
+
+class FiltersInfo(BaseModel):
+    """Response model for filters information"""
+    applied: AppliedFilters = Field(..., description="Currently applied filters")
+    available: Optional[AvailableFilters] = Field(None, description="Available filter options")
+
+    class Config:
+        exclude_none = True
+
+class CountItem(BaseModel):
+    """A single count item with label and count"""
+    label: str = Field(..., description="Label for this count (e.g., 'folders', 'files', 'pages')")
+    count: int = Field(..., description="Number of items")
+
+class CountsInfo(BaseModel):
+    """Response model for counts information"""
+    items: List[CountItem] = Field(..., description="Breakdown of counts by type")
+    total: int = Field(..., description="Total number of nodes")
+
+class PermissionsInfo(BaseModel):
+    """Response model for permissions information"""
+    role: str = Field(..., description="User's role")
+    canUpload: bool = Field(..., description="Whether user can upload files")
+    canCreateFolders: bool = Field(..., description="Whether user can create folders")
+    canEdit: bool = Field(..., description="Whether user can edit")
+    canDelete: bool = Field(..., description="Whether user can delete")
+    canManagePermissions: bool = Field(..., description="Whether user can manage permissions")
+    collectionRole: str | None = Field(
+        None,
+        description=(
+            "The user's own role on the collection this node is in, as restore and the trash list "
+            "check it; null outside a collection. Unlike role, it is the same at every level inside."
+        ),
+    )
+
+class KnowledgeHubNodesResponse(BaseModel):
+    """Response model for the Knowledge Hub nodes API"""
+    success: bool = Field(..., description="Whether the request was successful")
+    error: Optional[str] = Field(None, description="Error message if success is False")
+    errorCode: Optional[int] = Field(None, description="HTTP status the router answers with when success is False; 4xx means `error` was written for the reader")
+    id: Optional[str] = Field(None, description="Current parent node ID (null for root)")
+    currentNode: Optional[CurrentNode] = Field(None, description="The node being browsed (when parentId is provided)")
+    parentNode: Optional[CurrentNode] = Field(None, description="The parent of currentNode (one level up)")
+    items: List[NodeItem] = Field(default_factory=list, description="List of nodes")
+    pagination: Optional[PaginationInfo] = Field(None, description="Pagination information")
+    filters: Optional[FiltersInfo] = Field(None, description="Filter information")
+    breadcrumbs: Optional[List[BreadcrumbItem]] = Field(None, description="Breadcrumb trail")
+    counts: Optional[CountsInfo] = Field(None, description="Counts summary")
+    permissions: Optional[PermissionsInfo] = Field(None, description="User permissions")
+    maxFolderDepth: int = Field(KB_MAX_FOLDER_DEPTH, description="Deepest a collection folder may be nested (a folder directly in the collection is depth 1)")
+    typed_records: Optional[Dict[str, Any]] = Field(None, description="Typed Record instances keyed by record ID (only when include_typed_records is requested)")
+
+    class Config:
+        # Exclude None values from JSON response
+        exclude_none = True
+
+class KnowledgeHubErrorResponse(BaseModel):
+    """Response model for errors"""
+    success: bool = Field(False, description="Success status")
+    reason: str = Field(..., description="Error reason")
+    code: Optional[int] = Field(None, description="Error code")

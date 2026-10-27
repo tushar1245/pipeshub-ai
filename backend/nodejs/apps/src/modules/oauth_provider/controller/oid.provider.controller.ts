@@ -1,0 +1,259 @@
+import { injectable, inject } from 'inversify';
+import crypto from 'crypto';
+import { Request, Response, NextFunction } from 'express';
+import { Types } from 'mongoose';
+import { OAuthTokenService } from '../services/oauth_token.service';
+import { ScopeValidatorService } from '../services/scope.validator.service';
+import {
+  OpenIDConfiguration,
+  OAuthProtectedResourceMetadata,
+  JWKS,
+  JWK,
+} from '../types/oauth.types';
+import { AppConfig } from '../../tokens_manager/config/config';
+import { Users } from '../../user_management/schema/users.schema';
+import {
+  OAuthRequest,
+  buildWwwAuthenticateHeader,
+} from '../middlewares/oauth.auth.middleware';
+import { FirstPartyDeviceAppService } from '../services/oauth.first_party_device.service';
+import { mcpDiscoveryScopes } from '../config/scopes.config';
+
+/**
+ * OpenID Connect Provider Controller
+ *
+ * Handles OIDC-specific endpoints:
+ * - /.well-known/openid-configuration (Discovery)
+ * - /.well-known/jwks.json (JSON Web Key Set)
+ * - /userinfo (User Info endpoint)
+ *
+ * @see https://openid.net/specs/openid-connect-discovery-1_0.html
+ * @see https://openid.net/specs/openid-connect-core-1_0.html
+ */
+@injectable()
+export class OIDCProviderController {
+  constructor(
+    @inject('OAuthTokenService') private oauthTokenService: OAuthTokenService,
+    @inject('ScopeValidatorService')
+    private scopeValidatorService: ScopeValidatorService,
+    @inject('AppConfig') private appConfig: AppConfig,
+    @inject('FirstPartyDeviceAppService')
+    private firstPartyDeviceAppService: FirstPartyDeviceAppService,
+    /** Whether this edition offers delegation; see `config.ts`. */
+    @inject('DelegationAvailable') private delegationAvailable: boolean,
+  ) {}
+
+  /**
+   * UserInfo endpoint - GET /oauth2/userinfo
+   * Authentication and scope validation handled by OAuthAuthMiddleware
+   * @see OpenID Connect Core 1.0 Section 5.3
+   */
+  async userInfo(
+    req: OAuthRequest,
+    res: Response,
+    _next: NextFunction,
+  ): Promise<void> {
+    // OAuth data is attached by OAuthAuthMiddleware
+    const { oauth } = req;
+    const scopes = oauth!.scopes;
+    const userId = oauth!.payload.userId;
+
+    // Get user info
+    const user = await Users.findById(userId);
+    if (!user) {
+      res.setHeader(
+        'WWW-Authenticate',
+        buildWwwAuthenticateHeader('invalid_token', 'User not found'),
+      );
+      res.status(401).json({
+        error: 'invalid_token',
+        error_description: 'User not found',
+      });
+      return;
+    }
+
+    const userInfo: Record<string, unknown> = {
+      user_id: (user._id as Types.ObjectId).toString(),
+    };
+
+    // Add claims based on scopes
+    if (scopes.includes('profile')) {
+      userInfo.name = `${user.firstName || ''} ${user.lastName || ''}`.trim();
+      userInfo.given_name = user.firstName;
+      userInfo.family_name = user.lastName;
+      const userDoc = user as unknown as { updatedAt?: Date };
+      if (userDoc.updatedAt) {
+        userInfo.updated_at = Math.floor(userDoc.updatedAt.getTime() / 1000);
+      }
+    }
+
+    if (scopes.includes('email')) {
+      userInfo.email = user.email;
+      userInfo.email_verified = user.hasLoggedIn;
+    }
+
+    res.json(userInfo);
+  }
+
+  /**
+   * OpenID Configuration discovery endpoint
+   * GET /.well-known/openid-configuration
+   *
+   * @see https://openid.net/specs/openid-connect-discovery-1_0.html
+   * @see RFC 8414 - OAuth 2.0 Authorization Server Metadata
+   */
+  async openidConfiguration(
+    _req: Request,
+    res: Response,
+    _next: NextFunction,
+  ): Promise<void> {
+    const backendUrl = this.appConfig.oauthIssuer;
+    const baseUrl = `${backendUrl}/api/v1/oauth2`;
+    const dcrEnabled = process.env.PIPESHUB_ENABLE_DCR === 'true';
+    const deviceEnabled = process.env.PIPESHUB_ENABLE_DEVICE_GRANT !== 'false';
+    const deviceClientId = deviceEnabled
+      ? await this.firstPartyDeviceAppService.getOrCreate()
+      : null;
+
+    const config: OpenIDConfiguration = {
+      issuer: this.appConfig.oauthIssuer,
+      authorization_endpoint: `${baseUrl}/authorize`,
+      token_endpoint: `${baseUrl}/token`,
+      userinfo_endpoint: `${baseUrl}/userinfo`,
+      revocation_endpoint: `${baseUrl}/revoke`,
+      introspection_endpoint: `${baseUrl}/introspect`,
+      jwks_uri: `${backendUrl}/.well-known/jwks.json`,
+      ...(dcrEnabled ? { registration_endpoint: `${baseUrl}/register` } : {}),
+      ...(deviceEnabled
+        ? { device_authorization_endpoint: `${baseUrl}/device_authorization` }
+        : {}),
+      ...(deviceClientId
+        ? { pipeshub_device_client_id: deviceClientId }
+        : {}),
+      scopes_supported: this.scopeValidatorService
+        .getAllScopes()
+        .map((s) => s.name),
+      response_types_supported: ['code'],
+      grant_types_supported: [
+        'authorization_code',
+        'client_credentials',
+        'refresh_token',
+        ...(deviceEnabled
+          ? ['urn:ietf:params:oauth:grant-type:device_code']
+          : []),
+        // Service-account delegation, advertised only where it exists.
+        // Listing a grant the token endpoint will always refuse would send
+        // integrators down a road that ends in an error, and discovery is
+        // precisely what they read to decide what to build against.
+        ...(this.delegationAvailable
+          ? ['urn:ietf:params:oauth:grant-type:token-exchange']
+          : []),
+      ],
+      token_endpoint_auth_methods_supported: [
+        'none',
+        'client_secret_basic',
+        'client_secret_post',
+      ],
+      subject_types_supported: ['public'],
+      id_token_signing_alg_values_supported: [
+        this.oauthTokenService.getAlgorithm(),
+      ],
+      claims_supported: [
+        'user_id',
+        'iss',
+        'aud',
+        'exp',
+        'iat',
+        'name',
+        'given_name',
+        'family_name',
+        'email',
+        'email_verified',
+        'picture',
+      ],
+      code_challenge_methods_supported: ['S256'],
+    };
+
+    res.json(config);
+  }
+
+  /**
+   * OAuth Protected Resource Metadata endpoint
+   * GET /.well-known/oauth-protected-resource
+   *
+   * @see RFC 9728 - OAuth 2.0 Protected Resource Metadata
+   */
+  async oauthProtectedResource(
+    _req: Request,
+    res: Response,
+    _next: NextFunction,
+  ): Promise<void> {
+    const backendUrl = this.appConfig.oauthIssuer;
+    const deviceEnabled = process.env.PIPESHUB_ENABLE_DEVICE_GRANT !== 'false';
+    const deviceClientId = deviceEnabled
+      ? await this.firstPartyDeviceAppService.getOrCreate()
+      : null;
+
+    const metadata: OAuthProtectedResourceMetadata = {
+      resource: `${backendUrl}/mcp`,
+      authorization_servers: [backendUrl],
+      scopes_supported: mcpDiscoveryScopes(this.appConfig.mcpScopes),
+      bearer_methods_supported: ['header'],
+      resource_documentation: `${backendUrl}/api/v1/docs`,
+      ...(deviceClientId
+        ? { pipeshub_device_client_id: deviceClientId }
+        : {}),
+    };
+
+    res.json(metadata);
+  }
+
+  /**
+   * JWKS endpoint - GET /.well-known/jwks.json
+   * JSON Web Key Set endpoint
+   *
+   * Returns the public keys used to verify JWT signatures.
+   * Only available when using asymmetric algorithms (RS256).
+   * For symmetric algorithms (HS256), returns an empty key set.
+   *
+   * @see https://datatracker.ietf.org/doc/html/rfc7517
+   */
+  async jwks(_req: Request, res: Response, _next: NextFunction): Promise<void> {
+    const algorithm = this.oauthTokenService.getAlgorithm();
+
+    if (algorithm === 'RS256') {
+      const publicKey = this.oauthTokenService.getPublicKey();
+      const keyId = this.oauthTokenService.getKeyId();
+
+      if (publicKey && keyId) {
+        const jwk = this.publicKeyToJWK(publicKey, keyId);
+        const jwks: JWKS = { keys: [jwk] };
+        res.json(jwks);
+        return;
+      }
+    }
+
+    // For HS256 or if no public key available, return empty JWKS
+    res.json({ keys: [] });
+  }
+
+  /**
+   * Convert PEM public key to JWK format
+   */
+  private publicKeyToJWK(publicKeyPem: string, kid: string): JWK {
+    const publicKeyObject = crypto.createPublicKey(publicKeyPem);
+    const jwkExport = publicKeyObject.export({ format: 'jwk' }) as {
+      n: string;
+      e: string;
+    };
+
+    return {
+      kty: 'RSA',
+      use: 'sig',
+      alg: 'RS256',
+      kid,
+      n: jwkExport.n,
+      e: jwkExport.e,
+    };
+  }
+}

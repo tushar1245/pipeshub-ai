@@ -1,0 +1,568 @@
+'use client';
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Box, Flex, Text, TextField } from '@radix-ui/themes';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { isPersonalToolset, type BuilderSidebarToolset } from '@/app/(main)/toolsets/api';
+import {
+  buildToolDragPayload,
+  buildToolsetDragPayload,
+  findMergeTargetToolsetNode,
+  getToolsetSidebarStatus,
+  groupToolsetsByType,
+  normalizeToolsetTypeKey,
+  type ToolsetTypeKeyFlowNode,
+} from '../sidebar-toolset-utils';
+import { normalizePaletteLabel } from '../display-utils';
+import { SidebarCategoryRow } from './sidebar-category-row';
+import { SidebarToolDragRow } from './sidebar-draggable-row';
+import { UserToolsetConfigDialog } from './user-toolset-config-dialog';
+import { isToolsetOAuthSuccessMessageType } from '@/app/(main)/toolsets/oauth/toolset-oauth-window-messages';
+import { AgentBuilderPaletteSkeletonList } from './agent-builder-palette-skeleton';
+import { AgentBuilderWebSearchSection } from './sidebar-web-search-section';
+import type { UseWebSearchConfigResult } from '../hooks/use-web-search-config';
+import { useSearchAwareExpanded } from '../sidebar-expand-utils';
+import { filterToolsetTools } from '../sidebar-utils';
+import { isApiToolsetRow } from '../api-toolset-attachments';
+import { usableByServiceAccount } from '../../../workspace/api-toolsets/toolset-form';
+import type { AgentWebSearchAttachment } from '../types';
+
+/** Toolset type row (e.g. Slack): expanded by default so instance rows are listed. */
+const DEFAULT_TOOLSET_TYPE_EXPANDED = true;
+/** Toolset instance row: collapsed by default; user expands to see tools (Knowledge stops at instance rows). */
+const DEFAULT_TOOLSET_INSTANCE_EXPANDED = false;
+const TOOLSET_SHOW_MORE_LIMIT = 5;
+/** Where a member connects an API toolset: it's listed with their own actions. */
+const API_TOOLSETS_CONNECT_PAGE = '/workspace/actions/personal/';
+
+/** Row-level drag/configure flags for one toolset instance (shared by single-type and grouped UI). */
+function getToolsetPaletteRowState(
+  ts: BuilderSidebarToolset,
+  ui: {
+    isFromRegistry: boolean;
+    forceShowConfigureIcon: boolean;
+    configureUseKeyIcon: boolean;
+    configureIconColor: string;
+    configureTooltip: string;
+  },
+  activeToolsetTypeKeys: Set<string>,
+  structureLocked: boolean,
+  orgCredentialUiLocked: boolean,
+  isServiceAccount: boolean,
+  onStructureDragBlocked: () => void,
+  onDuplicate: () => void,
+  onUnconfigured: () => void
+) {
+  const needsConfiguration = !ts.isConfigured || !ts.isAuthenticated;
+  const normalizedType = normalizeToolsetTypeKey(ts.toolsetType || ts.name || '');
+  const dup = activeToolsetTypeKeys.has(normalizedType);
+  const dragPayload = buildToolsetDragPayload(ts);
+  const dragBlocked = structureLocked || needsConfiguration || dup;
+  const dragType = dragBlocked ? undefined : dragPayload['application/reactflow'];
+  const showCfg = ui.forceShowConfigureIcon || (!isServiceAccount && needsConfiguration);
+  const cfgClickable = showCfg && !orgCredentialUiLocked;
+  const configureLocked = orgCredentialUiLocked && showCfg;
+  const onDragAttempt = structureLocked
+    ? onStructureDragBlocked
+    : dup
+      ? onDuplicate
+      : needsConfiguration
+        ? onUnconfigured
+        : undefined;
+
+  return {
+    needsConfiguration,
+    dragPayload,
+    dragBlocked,
+    dragType,
+    showCfg,
+    cfgClickable,
+    configureLocked,
+    onDragAttempt,
+  };
+}
+
+function ToolDragRow(props: {
+  tool: BuilderSidebarToolset['tools'][0];
+  toolset: BuilderSidebarToolset;
+  needsConfiguration: boolean;
+  /** Viewer without edit: block dragging tools onto the canvas. */
+  structureLocked?: boolean;
+  /** Same type already on canvas and this row would not merge (different instance). */
+  duplicateTypeDragBlocked: boolean;
+  onDragBlocked?: () => void;
+}) {
+  const {
+    tool,
+    toolset,
+    needsConfiguration,
+    structureLocked = false,
+    duplicateTypeDragBlocked,
+    onDragBlocked,
+  } = props;
+  const blocked = needsConfiguration || structureLocked || duplicateTypeDragBlocked;
+  return (
+    <SidebarToolDragRow
+      name={tool.name}
+      data={buildToolDragPayload(tool, toolset)}
+      disabled={blocked}
+      onBlocked={onDragBlocked}
+      mb="1"
+    />
+  );
+}
+
+export function AgentBuilderToolsetsSection(props: {
+  toolsets: BuilderSidebarToolset[];
+  /** Palette-wide search query, applied on top of this section's own server-side search. */
+  search?: string;
+  /** Web search config loaded by the sidebar, handed to the web search group. */
+  webSearchConfig: UseWebSearchConfigResult;
+  loading: boolean;
+  refreshToolsets: (
+    agentKey?: string | null,
+    isServiceAccount?: boolean,
+    search?: string
+  ) => Promise<void>;
+  activeToolsetTypeKeys: Set<string>;
+  /** Flow nodes for merge vs duplicate-type checks on single-tool drags (same shape as canvas). */
+  toolsetMergeCheckNodes: ToolsetTypeKeyFlowNode[];
+  isServiceAccount: boolean;
+  agentKey: string | null;
+  onManageAgentToolsetCredentials?: (ts: BuilderSidebarToolset) => void;
+  onNotify: (message: string) => void;
+  /** Viewer without edit: block tool/toolset drags onto the canvas. */
+  structureLocked?: boolean;
+  /** SA viewer without edit: block search and org credential controls only. */
+  orgCredentialUiLocked?: boolean;
+  /** Same toast as main palette when structure-only drag is blocked (from sidebar). */
+  onPaletteStructureDragBlocked?: () => void;
+  /** Web-search provider currently attached to the agent (null if none). */
+  webSearchAttached: AgentWebSearchAttachment | null;
+  /** Shared with the org or a service account: personal actions can't go on it. */
+  agentShared?: boolean;
+}) {
+  const {
+    toolsets,
+    search = '',
+    loading,
+    refreshToolsets,
+    activeToolsetTypeKeys,
+    toolsetMergeCheckNodes,
+    isServiceAccount,
+    agentKey,
+    onManageAgentToolsetCredentials,
+    onNotify,
+    structureLocked = false,
+    orgCredentialUiLocked = false,
+    onPaletteStructureDragBlocked,
+    webSearchAttached,
+    agentShared = false,
+  } = props;
+
+  const { t } = useTranslation();
+  const [searchInput, setSearchInput] = useState('');
+  const searching = search.trim() !== '';
+  const { isOpen, toggle: onAppToggle } = useSearchAwareExpanded(searching);
+  const [userConfigToolset, setUserConfigToolset] = useState<BuilderSidebarToolset | null>(null);
+  const [showAllToolsetsState, setShowAllToolsets] = useState(false);
+  const showAllToolsets = showAllToolsetsState || searching;
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const handleSearchChange = useCallback(
+    (value: string) => {
+      if (orgCredentialUiLocked) return;
+      setSearchInput(value);
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => {
+        void refreshToolsets(agentKey, isServiceAccount, value);
+      }, 400);
+    },
+    [agentKey, orgCredentialUiLocked, isServiceAccount, refreshToolsets]
+  );
+
+  useEffect(
+    () => () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (pollRef.current) clearInterval(pollRef.current);
+    },
+    []
+  );
+
+  useEffect(() => {
+    const onOAuthMessage = async (event: MessageEvent) => {
+      if (typeof window !== 'undefined' && event.origin !== window.location.origin) return;
+      const messageType = event.data?.type;
+      if (!isToolsetOAuthSuccessMessageType(messageType)) return;
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      await refreshToolsets(agentKey, isServiceAccount, searchInput);
+      onNotify(t('agentBuilder.oauthSuccessNotify'));
+    };
+    window.addEventListener('message', onOAuthMessage);
+    return () => window.removeEventListener('message', onOAuthMessage);
+  }, [agentKey, isServiceAccount, onNotify, refreshToolsets, searchInput, t]);
+
+  const buildUiState = useCallback(
+    (ts: BuilderSidebarToolset) => {
+      const isFromRegistry = ts.isFromRegistry === true || !ts.instanceId;
+      if (isApiToolsetRow(ts)) {
+        return {
+          isFromRegistry,
+          forceShowConfigureIcon: false,
+          configureUseKeyIcon: false,
+          configureIconColor: 'var(--slate-11)',
+          configureTooltip: t('agentBuilder.apiToolsets.connectTooltip'),
+        };
+      }
+      if (isServiceAccount && !isFromRegistry) {
+        return {
+          isFromRegistry,
+          forceShowConfigureIcon: true,
+          configureUseKeyIcon: true,
+          configureIconColor: 'var(--slate-11)',
+          configureTooltip: ts.isAuthenticated
+            ? t('agentBuilder.manageAgentCredentialsTooltip')
+            : t('agentBuilder.setAgentCredentialsTooltip'),
+        };
+      }
+      if (isFromRegistry) {
+        return {
+          isFromRegistry,
+          forceShowConfigureIcon: true,
+          configureUseKeyIcon: false,
+          configureIconColor: 'var(--slate-10)',
+          configureTooltip: t('agentBuilder.notConfiguredTooltip'),
+        };
+      }
+      return {
+        isFromRegistry,
+        forceShowConfigureIcon: false,
+        configureUseKeyIcon: false,
+        configureIconColor: 'var(--slate-11)',
+        configureTooltip:
+          ts.isConfigured && !ts.isAuthenticated
+            ? t('agentBuilder.authenticateToolsetTooltip')
+            : t('agentBuilder.configureToolsetTooltip'),
+      };
+    },
+    [isServiceAccount, t]
+  );
+
+  const handleConfigureClick = useCallback(
+    (ts: BuilderSidebarToolset) => {
+      if (orgCredentialUiLocked) {
+        onNotify(t('agentBuilder.paletteActionBlockedViewOnly'));
+        return;
+      }
+      // API toolsets aren't connected from the builder: members do it from their actions page.
+      if (isApiToolsetRow(ts)) {
+        window.open(API_TOOLSETS_CONNECT_PAGE, '_blank', 'noopener');
+        return;
+      }
+      const instanceId = ts.instanceId || '';
+      const isFromRegistry = ts.isFromRegistry === true || !instanceId;
+
+      if (isServiceAccount && onManageAgentToolsetCredentials && !isFromRegistry) {
+        onManageAgentToolsetCredentials(ts);
+        return;
+      }
+      if (isFromRegistry) {
+        onNotify(
+          t('agentBuilder.toolsetNotConfiguredNotify', {
+            name: ts.instanceName?.trim() || ts.displayName || ts.name || '',
+          })
+        );
+        return;
+      }
+
+      setUserConfigToolset(ts);
+    },
+    [orgCredentialUiLocked, isServiceAccount, onManageAgentToolsetCredentials, onNotify, t]
+  );
+
+  // API toolsets come from their own list, which the server-side search doesn't filter.
+  const visibleToolsets = useMemo(() => {
+    const query = searchInput.trim().toLowerCase();
+    return toolsets.filter(
+      (ts) =>
+        (!query || !isApiToolsetRow(ts) || ts.displayName.toLowerCase().includes(query)) &&
+        filterToolsetTools(ts, search) !== null
+    );
+  }, [toolsets, searchInput, search]);
+
+  const toolsetsByType = useMemo(() => groupToolsetsByType(visibleToolsets), [visibleToolsets]);
+
+  const handleUnconfiguredDrag = useCallback(
+    (ts: BuilderSidebarToolset, isFromRegistry: boolean) => {
+      if (isFromRegistry) {
+        onNotify(
+          t('agentBuilder.toolsetNotConfiguredNotify', {
+            name: ts.instanceName?.trim() || ts.displayName || ts.name || '',
+          })
+        );
+        return;
+      }
+      const reason = !ts.isConfigured
+        ? t('agentBuilder.notConfiguredReason')
+        : t('agentBuilder.notAuthenticatedReason');
+      onNotify(
+        t('agentBuilder.toolsetNotReadyNotify', {
+          name: ts.instanceName?.trim() || ts.displayName || ts.name || '',
+          reason,
+        })
+      );
+    },
+    [onNotify, t]
+  );
+
+  const handleDuplicateDrag = useCallback(
+    (ts: BuilderSidebarToolset) => {
+      onNotify(
+        t('agentBuilder.toolsetDuplicateNotify', {
+          name: normalizePaletteLabel(ts.toolsetType || ts.name),
+        })
+      );
+    },
+    [onNotify, t]
+  );
+
+  const notifyStructureDragBlocked = useCallback(() => {
+    if (onPaletteStructureDragBlocked) onPaletteStructureDragBlocked();
+    else onNotify(t('agentBuilder.viewerPaletteDragBlocked'));
+  }, [onPaletteStructureDragBlocked, onNotify, t]);
+
+  const notifyPersonalOnSharedAgent = useCallback(
+    (ts: BuilderSidebarToolset) => {
+      onNotify(
+        t('agentBuilder.toolsetPersonalOnSharedAgentNotify', {
+          name: ts.instanceName?.trim() || ts.displayName || ts.name || '',
+        })
+      );
+    },
+    [onNotify, t]
+  );
+
+  const orgCredentialLockedTooltip = t('agentBuilder.paletteActionBlockedViewOnly');
+
+  return (
+    <Box style={{ minWidth: 0 }}>
+      <Box pb="2" style={{ minWidth: 0 }}>
+        <TextField.Root
+          className="agent-builder-toolsets-search"
+          size="2"
+          variant="surface"
+          color="gray"
+          placeholder={t('agentBuilder.searchToolsets')}
+          value={searchInput}
+          onChange={(e) => handleSearchChange(e.target.value)}
+          disabled={loading || orgCredentialUiLocked}
+        >
+          <TextField.Slot side="left">
+            <MaterialIcon name="search" size={18} color="var(--slate-11)" />
+          </TextField.Slot>
+        </TextField.Root>
+      </Box>
+
+      <AgentBuilderWebSearchSection
+        attached={webSearchAttached}
+        search={search}
+        config={props.webSearchConfig}
+        onNotify={onNotify}
+        structureLocked={structureLocked}
+      />
+
+      {loading ? (
+        <AgentBuilderPaletteSkeletonList count={6} />
+      ) : null}
+
+      {!loading && visibleToolsets.length === 0 ? (
+        <Box pl="3" py="2">
+          <Text size="1" style={{ color: 'var(--slate-11)', fontStyle: 'italic' }}>
+            {searchInput.trim() || searching
+            ? t('agentBuilder.noToolsetsMatch', { query: searchInput.trim() || search.trim() })
+            : t('agentBuilder.noToolsetsAvailable')}
+          </Text>
+        </Box>
+      ) : null}
+
+      {!loading
+        ? (() => {
+            const typeEntries = Object.entries(toolsetsByType).sort(([, a], [, b]) => {
+              const priority = (instances: BuilderSidebarToolset[]) => {
+                if (instances.some((ts) => ts.isConfigured && ts.isAuthenticated)) return 0;
+                if (instances.some((ts) => ts.isConfigured)) return 1;
+                return 2;
+              };
+              return priority(a) - priority(b);
+            });
+            const visibleEntries = showAllToolsets ? typeEntries : typeEntries.slice(0, TOOLSET_SHOW_MORE_LIMIT);
+            return (
+              <>
+              {visibleEntries.map(([toolsetType, typeToolsets]) => {
+                const first = typeToolsets[0];
+                const typeKey = `toolset-type-${toolsetType}`;
+                const isTypeExpanded = isOpen(typeKey, DEFAULT_TOOLSET_TYPE_EXPANDED);
+
+                return (
+                  <Box key={toolsetType} mb="2">
+                    <SidebarCategoryRow
+                      groupLabel={
+                        isApiToolsetRow(first)
+                          ? t('agentBuilder.apiToolsets.section')
+                          : normalizePaletteLabel((first.toolsetType || toolsetType) as string)
+                      }
+                      groupConnectorType={(first.toolsetType || toolsetType) as string}
+                      groupIcon={first.iconPath}
+                      itemCount={typeToolsets.length}
+                      isExpanded={isTypeExpanded}
+                      onToggle={() => onAppToggle(typeKey, DEFAULT_TOOLSET_TYPE_EXPANDED)}
+                    >
+                      {typeToolsets.map((ts) => {
+                        const instKey = `toolset-${ts.instanceId || ts.name.toLowerCase()}`;
+                        const isInstanceExpanded = isOpen(instKey, DEFAULT_TOOLSET_INSTANCE_EXPANDED);
+                        const shownTools = filterToolsetTools(ts, search) ?? ts.tools;
+                        const ui = buildUiState(ts);
+                        // A personal action holds one user's sign-in: others running the agent couldn't use it.
+                        const personalBlocked = agentShared && isPersonalToolset(ts);
+                        // A service account runs as nobody: it can't use an API toolset that needs a member's credential.
+                        const serviceAccountBlocked =
+                          isServiceAccount && isApiToolsetRow(ts) && !usableByServiceAccount(ts.apiToolset);
+                        const rowLocked = structureLocked || personalBlocked || serviceAccountBlocked;
+                        const notifyRowLocked = personalBlocked
+                          ? () => notifyPersonalOnSharedAgent(ts)
+                          : serviceAccountBlocked
+                            ? () => onNotify(t('agentBuilder.apiToolsets.serviceAccountBlocked'))
+                            : notifyStructureDragBlocked;
+                        const {
+                          needsConfiguration,
+                          dragPayload,
+                          dragBlocked,
+                          dragType,
+                          showCfg,
+                          cfgClickable,
+                          configureLocked,
+                          onDragAttempt,
+                        } = getToolsetPaletteRowState(
+                          ts,
+                          ui,
+                          activeToolsetTypeKeys,
+                          rowLocked,
+                          orgCredentialUiLocked,
+                          isServiceAccount,
+                          notifyRowLocked,
+                          () => handleDuplicateDrag(ts),
+                          () => handleUnconfiguredDrag(ts, ui.isFromRegistry)
+                        );
+
+                        const toolsetNameForMerge = ts.toolsetType || ts.name || '';
+                        const dupType = activeToolsetTypeKeys.has(
+                          normalizeToolsetTypeKey(toolsetNameForMerge)
+                        );
+                        const mergeTarget = findMergeTargetToolsetNode(
+                          toolsetMergeCheckNodes,
+                          toolsetNameForMerge,
+                          ts.instanceId
+                        );
+                        const duplicateTypeDragBlocked = dupType && !mergeTarget;
+
+                        return (
+                          <SidebarCategoryRow
+                            key={ts.instanceId || ts.displayName}
+                            groupLabel={normalizePaletteLabel(ts.instanceName || ts.displayName || ts.name || '')}
+                            groupConnectorType={ts.toolsetType}
+                            groupIcon={ts.iconPath}
+                            itemCount={shownTools.length}
+                            isExpanded={isInstanceExpanded}
+                            onToggle={() => onAppToggle(instKey, DEFAULT_TOOLSET_INSTANCE_EXPANDED)}
+                            dragType={dragType}
+                            dragData={dragBlocked ? undefined : dragPayload}
+                            onDragAttempt={onDragAttempt}
+                            showConfigureIcon={showCfg}
+                            onConfigureClick={
+                              cfgClickable ? () => void handleConfigureClick(ts) : undefined
+                            }
+                            configureDisabled={configureLocked}
+                            configureDisabledTooltip={orgCredentialLockedTooltip}
+                            configureTooltip={ui.configureTooltip}
+                            configureUseKeyIcon={ui.configureUseKeyIcon}
+                            configureIconColor={ui.configureIconColor}
+                            toolsetStatus={getToolsetSidebarStatus(ts)}
+                          >
+                            {shownTools.map((tool) => (
+                              <ToolDragRow
+                                key={`${ts.instanceId}-${tool.fullName || tool.name}`}
+                                tool={tool}
+                                toolset={ts}
+                                needsConfiguration={needsConfiguration}
+                                structureLocked={rowLocked}
+                                duplicateTypeDragBlocked={duplicateTypeDragBlocked}
+                                onDragBlocked={() => {
+                                  if (rowLocked) notifyRowLocked();
+                                  else if (needsConfiguration) handleUnconfiguredDrag(ts, ui.isFromRegistry);
+                                  else if (duplicateTypeDragBlocked) handleDuplicateDrag(ts);
+                                }}
+                              />
+                            ))}
+                          </SidebarCategoryRow>
+                        );
+                      })}
+                    </SidebarCategoryRow>
+                  </Box>
+                );
+              })}
+              {!searching && typeEntries.length > TOOLSET_SHOW_MORE_LIMIT && (
+                <button
+                  type="button"
+                  aria-expanded={showAllToolsets}
+                  onClick={() => setShowAllToolsets((v) => !v)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    width: '100%',
+                    gap: 4,
+                    padding: '6px 8px',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    borderRadius: 'var(--radius-1)',
+                    border: 'none',
+                    background: 'none',
+                    fontFamily: 'inherit',
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--olive-a3)'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
+                >
+                  <MaterialIcon
+                    name={showAllToolsets ? 'expand_less' : 'expand_more'}
+                    size={16}
+                    color="var(--accent-9)"
+                  />
+                  <Text size="1" weight="medium" style={{ color: 'var(--accent-9)' }}>
+                    {showAllToolsets ? t('agentBuilder.showLess') : `${t('agentBuilder.showMore')} (${typeEntries.length - TOOLSET_SHOW_MORE_LIMIT})`}
+                  </Text>
+                </button>
+              )}
+              </>
+            );
+          })()
+        : null}
+
+      {userConfigToolset?.instanceId ? (
+        <UserToolsetConfigDialog
+          key={userConfigToolset.instanceId}
+          toolset={userConfigToolset}
+          instanceId={userConfigToolset.instanceId}
+          onClose={() => setUserConfigToolset(null)}
+          onSuccess={async () => {
+            await refreshToolsets(agentKey, isServiceAccount, searchInput);
+          }}
+          onNotify={onNotify}
+        />
+      ) : null}
+    </Box>
+  );
+}

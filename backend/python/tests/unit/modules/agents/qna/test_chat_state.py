@@ -1,0 +1,803 @@
+"""Unit tests for app.modules.agents.qna.chat_state — state builders and helpers."""
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from app.modules.agents.qna.chat_state import (
+    _build_tool_to_toolset_map,
+    _extract_kb_app_ids,
+    _extract_knowledge_connector_ids,
+    _extract_tools_from_toolsets,
+    build_initial_state,
+    cleanup_old_tool_results,
+    cleanup_state_after_retrieval,
+    remember_record_ids,
+    remember_shown_results,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def mock_deps():
+    """Return a dict of mock dependencies required by build_initial_state."""
+    return {
+        "llm": MagicMock(),
+        "logger": MagicMock(),
+        "retrieval_service": MagicMock(),
+        "graph_provider": MagicMock(),
+        "reranker_service": MagicMock(),
+        "config_service": MagicMock(),
+        "model_name": "gpt-test",
+        "model_key": "test-model-key",
+        "has_sql_connector": False,
+    }
+
+
+@pytest.fixture
+def minimal_chat_query():
+    return {"query": "What is the revenue?"}
+
+
+@pytest.fixture
+def minimal_user_info():
+    return {
+        "orgId": "org-1",
+        "userId": "user-1",
+        "userEmail": "user@test.com",
+        "sendUserInfo": True,
+    }
+
+
+# ===================================================================
+# build_initial_state
+# ===================================================================
+class TestBuildInitialState:
+    @pytest.mark.parametrize(("chat_query", "expected"), [
+        ({"query": "q", "artifact_owner_user_id": "u-caller"}, "u-caller"),
+        ({"query": "q", "artifact_owner_user_id": None}, "user-1"),
+        ({"query": "q"}, "user-1"),
+    ], ids=["set", "none", "absent"])
+    def test_artifacts_belong_to_the_run_user_unless_an_owner_is_set(
+        self, mock_deps, minimal_user_info, chat_query, expected,
+    ) -> None:
+        state = build_initial_state(chat_query=chat_query, user_info=minimal_user_info, **mock_deps)
+        assert state["artifact_owner_user_id"] == expected
+        assert state["user_id"] == "user-1"
+
+    @pytest.mark.parametrize(("chat_query", "expected"), [
+        ({"query": "q", "keywordSearchBudget": "short"}, "short"),
+        ({"query": "q", "keyword_search_budget": "full"}, "full"),
+        ({"query": "q"}, None),
+    ], ids=["camel-case", "snake-case", "absent"])
+    def test_keyword_search_budget_reaches_the_search_tools(
+        self, mock_deps, minimal_user_info, chat_query, expected,
+    ) -> None:
+        state = build_initial_state(chat_query=chat_query, user_info=minimal_user_info, **mock_deps)
+        assert state["keyword_search_budget"] == expected
+
+    @pytest.mark.parametrize(("chat_query", "expected"), [
+        ({"query": "q", "deepResearch": True}, True),
+        ({"query": "q", "deepResearch": False}, False),
+        ({"query": "q"}, False),
+    ], ids=["on", "off", "absent"])
+    def test_deep_research_reaches_the_agent(self, mock_deps, minimal_user_info, chat_query, expected) -> None:
+        state = build_initial_state(chat_query=chat_query, user_info=minimal_user_info, **mock_deps)
+        assert state["deep_research"] is expected
+
+    def test_the_resolved_web_config_keeps_every_stored_provider(self, mock_deps, minimal_user_info) -> None:
+        """The agent route resolves the fallbacks and page readers; they must reach the tools."""
+        others = [{"provider": "crawl4ai", "configuration": {"baseUrl": "http://crawl4ai:11235"}}, "junk"]
+        chat_query = {"query": "q", "webSearchConfig": {"provider": "serper", "configuration": {"apiKey": "k"}, "providers": others}}
+        state = build_initial_state(chat_query=chat_query, user_info=minimal_user_info, **mock_deps)
+        assert state["web_search_config"] == {
+            "provider": "serper", "configuration": {"apiKey": "k"},
+            "providers": [{"provider": "crawl4ai", "configuration": {"baseUrl": "http://crawl4ai:11235"}}],
+        }
+
+    def test_default_values(self, mock_deps, minimal_chat_query, minimal_user_info):
+        state = build_initial_state(
+            chat_query=minimal_chat_query,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["query"] == "What is the revenue?"
+        assert state["limit"] == 50
+        assert state["messages"] == []
+        assert state["previous_conversations"] == []
+        assert state["quick_mode"] is False
+        assert state["retrieval_mode"] == "HYBRID"
+        assert state["chat_mode"] == "standard"
+        assert state["graph_type"] == "legacy"
+        assert state["decomposed_queries"] == []
+        assert state["rewritten_queries"] == []
+        assert state["expanded_queries"] == []
+        assert state["web_search_queries"] == []
+        assert state["search_results"] == []
+        assert state["final_results"] == []
+        assert state["response"] is None
+        assert state["error"] is None
+        assert state["org_id"] == "org-1"
+        assert state["user_id"] == "user-1"
+        assert state["user_email"] == "user@test.com"
+        assert state["send_user_info"] is True
+        assert state["system_prompt"] == "You are an enterprise questions answering expert"
+        assert state["pending_tool_calls"] is False
+        assert state["tool_results"] is None
+        assert state["retry_count"] == 0
+        assert state["max_retries"] == 1
+        assert state["is_retry"] is False
+        assert state["iteration_count"] == 0
+        assert state["is_continue"] is False
+        assert state["force_final_response"] is False
+        assert state["loop_detected"] is False
+        assert state["has_knowledge"] is False
+        assert state["virtual_record_id_to_result"] == {}
+        assert state["record_label_to_uuid_map"] == {}
+        assert state["is_multimodal_llm"] is False
+        assert state["model_name"] == "gpt-test"
+        assert state["model_key"] == "test-model-key"
+        # Opt-in, disabled by default — see `ChatQuery.enableRecordIdShortening`.
+        assert state["enable_record_id_shortening"] is False
+
+    @pytest.mark.parametrize("key", ["enableRecordIdShortening", "enable_record_id_shortening"])
+    def test_enable_record_id_shortening_accepts_either_key_name(
+        self, mock_deps, minimal_user_info, key,
+    ):
+        """The route passes camelCase (`ChatQuery.enableRecordIdShortening`);
+        internal callers may pass the snake_case form directly."""
+        cq = {"query": "q", key: True}
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["enable_record_id_shortening"] is True
+
+    def test_custom_chat_query_fields(self, mock_deps, minimal_user_info):
+        cq = {
+            "query": "q",
+            "limit": 10,
+            "quickMode": True,
+            "chatMode": "analysis",
+            "retrievalMode": "VECTOR",
+            "systemPrompt": "Be brief",
+            "instructions": "Focus on finance",
+            "timezone": "America/New_York",
+            "currentTime": "2025-01-01T00:00:00",
+            "outputFilePath": "/tmp/out.txt",
+            "conversationId": "conv-123",
+            "previousConversations": [{"role": "user_query", "content": "hi"}],
+        }
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["limit"] == 10
+        assert state["quick_mode"] is True
+        assert state["chat_mode"] == "analysis"
+        assert state["retrieval_mode"] == "VECTOR"
+        assert state["system_prompt"] == "Be brief"
+        assert state["instructions"] == "Focus on finance"
+        assert state["timezone"] == "America/New_York"
+        assert state["current_time"] == "2025-01-01T00:00:00"
+        assert state["output_file_path"] == "/tmp/out.txt"
+        assert state["conversation_id"] == "conv-123"
+        assert len(state["previous_conversations"]) == 1
+
+    def test_default_project_instructions_is_none(self, mock_deps, minimal_chat_query, minimal_user_info):
+        state = build_initial_state(
+            chat_query=minimal_chat_query,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["project_instructions"] is None
+
+    def test_project_instructions_passthrough(self, mock_deps, minimal_user_info):
+        """`projectInstructions` (Node `ChatQuery` field) flows into
+        `chat_state["project_instructions"]` unchanged — additive, distinct
+        from both `instructions` (agent-specific) and `custom_instructions`
+        (org-level)."""
+        cq = {
+            "query": "q",
+            "instructions": "Focus on finance",
+            "custom_instructions": "Always respond in Spanish.",
+            "projectInstructions": "Cite the Q3 report for every financial claim.",
+        }
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["instructions"] == "Focus on finance"
+        assert state["custom_instructions"] == "Always respond in Spanish."
+        assert state["project_instructions"] == "Cite the Q3 report for every financial claim."
+
+    def test_with_toolsets(self, mock_deps, minimal_user_info):
+        cq = {
+            "query": "q",
+            "toolsets": [
+                {
+                    "name": "slack",
+                    "instanceId": "inst-1",
+                    "tools": [
+                        {"fullName": "slack.send_message", "name": "send_message"},
+                        {"name": "list_channels"},
+                    ],
+                    "selectedTools": [],
+                }
+            ],
+        }
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert "slack.send_message" in state["tools"]
+        assert "slack.list_channels" in state["tools"]
+        assert state["tool_to_toolset_map"]["slack.send_message"] == "inst-1"
+
+    def test_with_knowledge(self, mock_deps, minimal_user_info):
+        """KB apps now use type=KB and are extracted by _extract_kb_app_ids"""
+        kb_uuid = "550e8400-e29b-41d4-a716-446655440100"
+        cq = {
+            "query": "q",
+            "knowledge": [
+                {
+                    "connectorId": "conn-1",
+                    "type": "connector",
+                },
+                {
+                    "connectorId": kb_uuid,
+                    "type": "KB",
+                },
+            ],
+        }
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["apps"] == ["conn-1"]  # Regular connector
+        assert state["kb"] == [kb_uuid]  # KB app UUID
+        assert state["has_knowledge"] is True
+
+    def test_has_knowledge_true_when_agent_knowledge_present(self, mock_deps, minimal_user_info):
+        """KB apps with NO_KB_SELECTED are filtered by type=KB"""
+        kb_uuid = "NO_KB_SELECTED"
+        cq = {
+            "query": "q",
+            "knowledge": [
+                {"connectorId": kb_uuid, "type": "KB"},
+            ],
+        }
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        # agent_knowledge is truthy (list with 1 item), so has_knowledge is True
+        assert state["has_knowledge"] is True
+        # KB sentinel should be in kb list
+        assert state["kb"] == [kb_uuid]
+        assert state["apps"] == []
+
+    def test_has_knowledge_false_when_no_knowledge(self, mock_deps, minimal_user_info):
+        """When knowledge is empty, has_knowledge is False."""
+        cq = {
+            "query": "q",
+            "knowledge": [],
+        }
+        state = build_initial_state(
+            chat_query=cq,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["has_knowledge"] is False
+
+    def test_graph_type_parameter(self, mock_deps, minimal_chat_query, minimal_user_info):
+        state = build_initial_state(
+            chat_query=minimal_chat_query,
+            user_info=minimal_user_info,
+            graph_type="enhanced",
+            **mock_deps,
+        )
+        assert state["graph_type"] == "enhanced"
+
+    def test_org_info_defaults_to_none(self, mock_deps, minimal_chat_query, minimal_user_info):
+        state = build_initial_state(
+            chat_query=minimal_chat_query,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["org_info"] is None
+
+    def test_org_info_passed(self, mock_deps, minimal_chat_query, minimal_user_info):
+        org = {"name": "Acme"}
+        state = build_initial_state(
+            chat_query=minimal_chat_query,
+            user_info=minimal_user_info,
+            org_info=org,
+            **mock_deps,
+        )
+        assert state["org_info"] == {"name": "Acme"}
+
+    def test_has_sql_knowledge_false_when_no_knowledge(
+        self, mock_deps, minimal_chat_query, minimal_user_info
+    ):
+        state = build_initial_state(
+            chat_query=minimal_chat_query,
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["has_sql_knowledge"] is False
+
+    def test_has_sql_knowledge_false_when_only_non_sql_knowledge(
+        self, mock_deps, minimal_user_info
+    ):
+        cq = {
+            "query": "q",
+            "knowledge": [
+                {"connectorId": "c1", "type": "GOOGLE_DRIVE", "filters": {}},
+            ],
+        }
+        state = build_initial_state(
+            chat_query=cq, user_info=minimal_user_info, **mock_deps
+        )
+        assert state["has_sql_knowledge"] is False
+
+    def test_has_sql_knowledge_true_when_postgresql_attached(
+        self, mock_deps, minimal_user_info
+    ):
+        cq = {
+            "query": "q",
+            "knowledge": [
+                {"connectorId": "c1", "type": "POSTGRESQL", "filters": {}},
+            ],
+        }
+        state = build_initial_state(
+            chat_query=cq, user_info=minimal_user_info, **mock_deps
+        )
+        assert state["has_sql_knowledge"] is True
+
+    def test_has_sql_knowledge_true_for_snowflake_and_mariadb(
+        self, mock_deps, minimal_user_info
+    ):
+        for t in ("SNOWFLAKE", "MARIADB"):
+            cq = {
+                "query": "q",
+                "knowledge": [{"connectorId": "c1", "type": t, "filters": {}}],
+            }
+            state = build_initial_state(
+                chat_query=cq, user_info=minimal_user_info, **mock_deps
+            )
+            assert state["has_sql_knowledge"] is True, f"expected True for type={t}"
+
+    def test_has_sql_connector_propagates_from_kwarg(
+        self, mock_deps, minimal_chat_query, minimal_user_info
+    ):
+        deps = {**mock_deps, "has_sql_connector": True}
+        state = build_initial_state(
+            chat_query=minimal_chat_query, user_info=minimal_user_info, **deps
+        )
+        assert state["has_sql_connector"] is True
+
+    def test_has_sql_connector_is_required_kwarg(
+        self, mock_deps, minimal_chat_query, minimal_user_info
+    ):
+        deps = {k: v for k, v in mock_deps.items() if k != "has_sql_connector"}
+        with pytest.raises(TypeError):
+            build_initial_state(
+                chat_query=minimal_chat_query, user_info=minimal_user_info, **deps
+            )
+
+
+# ===================================================================
+# cleanup_state_after_retrieval
+# ===================================================================
+class TestCleanupStateAfterRetrieval:
+    def test_clears_intermediate_fields(self):
+        state = {
+            "final_results": [{"doc": 1}],
+            "decomposed_queries": ["q1"],
+            "rewritten_queries": ["rw1"],
+            "expanded_queries": ["eq1"],
+            "web_search_queries": ["ws1"],
+            "search_results": [{"doc": 2}],
+            "query_analysis": {
+                "intent": "search",
+                "complexity": "simple",
+                "needs_tools": False,
+                "verbose_field": "should be dropped",
+            },
+        }
+        cleanup_state_after_retrieval(state)
+        assert state["decomposed_queries"] == []
+        assert state["rewritten_queries"] == []
+        assert state["expanded_queries"] == []
+        assert state["web_search_queries"] == []
+        assert state["search_results"] == []
+        # query_analysis should only keep intent, complexity, needs_tools
+        assert "verbose_field" not in state["query_analysis"]
+        assert state["query_analysis"]["intent"] == "search"
+        assert state["query_analysis"]["complexity"] == "simple"
+        assert state["query_analysis"]["needs_tools"] is False
+
+    def test_no_op_when_final_results_is_none(self):
+        state = {
+            "final_results": None,
+            "decomposed_queries": ["q1"],
+            "query_analysis": None,
+        }
+        cleanup_state_after_retrieval(state)
+        # Should not clear anything
+        assert state["decomposed_queries"] == ["q1"]
+
+    def test_no_op_when_query_analysis_is_none(self):
+        state = {
+            "final_results": [{"doc": 1}],
+            "decomposed_queries": ["q1"],
+            "rewritten_queries": [],
+            "expanded_queries": [],
+            "web_search_queries": [],
+            "search_results": [],
+            "query_analysis": None,
+        }
+        cleanup_state_after_retrieval(state)
+        assert state["decomposed_queries"] == []
+        assert state["query_analysis"] is None
+
+
+# ===================================================================
+# cleanup_old_tool_results
+# ===================================================================
+class TestRememberRecordIds:
+    """Three tools write through this, and `citation_tracking` reads the set
+    to decide whether `dynamic_fetch_full_record` may be registered."""
+
+    def test_accumulates_across_calls_in_place(self):
+        """The state dict IS `AgentContext.tool_state`, so a replacement
+        instead of an in-place update would be invisible to the hook holding
+        the original set."""
+        state = {"known_record_ids": set()}
+        original = state["known_record_ids"]
+
+        remember_record_ids(state, ["r1"])
+        remember_record_ids(state, ["r2", "r1"])
+
+        assert state["known_record_ids"] == {"r1", "r2"}
+        assert state["known_record_ids"] is original
+
+    def test_creates_the_set_when_absent(self):
+        state = {}
+
+        remember_record_ids(state, ["r1"])
+
+        assert state["known_record_ids"] == {"r1"}
+
+    def test_empty_and_falsy_ids_are_ignored(self):
+        state = {}
+
+        remember_record_ids(state, [])
+        remember_record_ids(state, ["", None])
+
+        assert "known_record_ids" not in state
+
+    def test_no_state_is_a_noop(self):
+        remember_record_ids(None, ["r1"])
+
+    def test_keeps_names_in_the_order_shown_latest_last(self) -> None:
+        """`knowledgegraph__fetch_record` lists these, most recent first, when
+        the model asks for an id that does not resolve."""
+        state = {}
+
+        remember_record_ids(state, ["r1", "r2"], names={"r1": "Plan", "r2": "Notes"})
+        remember_record_ids(state, ["r3"])
+        remember_record_ids(state, ["r1"])
+
+        assert list(state["known_record_names"].items()) == [
+            ("r2", "Notes"), ("r3", ""), ("r1", "Plan"),
+        ]
+
+    def test_shown_results_are_remembered_but_trimmed_ones_are_not(self) -> None:
+        """Retrieval fills its map before trimming to the top blocks; a record
+        whose blocks were all trimmed never reached the model."""
+        state = {}
+        vr_map = {
+            "vr-1": {"id": "r1", "record_name": "Plan"},
+            "vr-2": {"id": "r2", "record_name": "Trimmed"},
+            "vr-3": {"_key": "r3", "recordName": "Keyword hit"},
+        }
+
+        remember_shown_results(
+            state,
+            [{"virtual_record_id": "vr-1"}, {"virtual_record_id": "vr-1"}, {"virtual_record_id": "vr-3"}],
+            vr_map,
+        )
+
+        assert state["known_record_names"] == {"r1": "Plan", "r3": "Keyword hit"}
+        assert state["known_record_ids"] == {"r1", "r3"}
+
+
+class TestCleanupOldToolResults:
+    def test_no_trim_when_under_limit(self):
+        state = {
+            "all_tool_results": [{"r": i} for i in range(5)],
+            "tool_execution_summary": {"total": 5},
+            "tool_repetition_warnings": ["warn1"],
+        }
+        cleanup_old_tool_results(state, keep_last_n=10)
+        assert len(state["all_tool_results"]) == 5
+        assert state["tool_execution_summary"] == {"total": 5}
+
+    def test_trims_when_over_limit(self):
+        state = {
+            "all_tool_results": [{"r": i} for i in range(20)],
+            "tool_execution_summary": {"total": 20},
+            "tool_repetition_warnings": ["warn"],
+        }
+        cleanup_old_tool_results(state, keep_last_n=5)
+        assert len(state["all_tool_results"]) == 5
+        # Should keep the last 5
+        assert state["all_tool_results"][0]["r"] == 15
+        assert state["tool_execution_summary"] == {}
+        assert state["tool_repetition_warnings"] == []
+
+    def test_custom_keep_last_n(self):
+        state = {
+            "all_tool_results": [{"r": i} for i in range(10)],
+            "tool_execution_summary": {},
+            "tool_repetition_warnings": [],
+        }
+        cleanup_old_tool_results(state, keep_last_n=3)
+        assert len(state["all_tool_results"]) == 3
+        assert state["all_tool_results"][0]["r"] == 7
+
+    def test_empty_results(self):
+        state = {
+            "all_tool_results": [],
+            "tool_execution_summary": {},
+            "tool_repetition_warnings": [],
+        }
+        cleanup_old_tool_results(state)
+        assert state["all_tool_results"] == []
+
+    def test_missing_key_defaults_to_empty(self):
+        state = {}
+        cleanup_old_tool_results(state)
+        # Should not crash; no all_tool_results key -> get returns []
+        assert state.get("all_tool_results") is None or state.get("all_tool_results") == []
+
+
+# ===================================================================
+# _build_tool_to_toolset_map
+# ===================================================================
+class TestBuildToolToToolsetMap:
+    def test_empty_toolsets(self):
+        assert _build_tool_to_toolset_map([]) == {}
+        assert _build_tool_to_toolset_map(None) == {}
+
+    def test_single_toolset_with_tools(self):
+        toolsets = [
+            {
+                "name": "slack",
+                "instanceId": "inst-1",
+                "tools": [
+                    {"fullName": "slack.send_message", "name": "send_message"},
+                ],
+                "selectedTools": [],
+            }
+        ]
+        result = _build_tool_to_toolset_map(toolsets)
+        assert result == {"slack.send_message": "inst-1"}
+
+    def test_falls_back_to_constructed_name(self):
+        toolsets = [
+            {
+                "name": "jira",
+                "instanceId": "inst-2",
+                "tools": [{"name": "create_issue"}],
+                "selectedTools": [],
+            }
+        ]
+        result = _build_tool_to_toolset_map(toolsets)
+        assert result == {"jira.create_issue": "inst-2"}
+
+    def test_selected_tools_fallback(self):
+        toolsets = [
+            {
+                "name": "slack",
+                "instanceId": "inst-3",
+                "tools": [],
+                "selectedTools": ["send_message", "slack.list_channels"],
+            }
+        ]
+        result = _build_tool_to_toolset_map(toolsets)
+        assert "slack.send_message" in result
+        assert "slack.list_channels" in result
+
+    def test_skips_toolset_without_instance_id(self):
+        toolsets = [
+            {
+                "name": "slack",
+                "instanceId": "",
+                "tools": [{"fullName": "slack.send"}],
+            }
+        ]
+        result = _build_tool_to_toolset_map(toolsets)
+        assert result == {}
+
+    def test_non_dict_toolset_is_skipped(self):
+        toolsets = ["not-a-dict", None, 42]
+        result = _build_tool_to_toolset_map(toolsets)
+        assert result == {}
+
+    def test_non_dict_tool_is_skipped(self):
+        toolsets = [
+            {
+                "name": "s",
+                "instanceId": "i",
+                "tools": ["string-tool", None],
+                "selectedTools": [],
+            }
+        ]
+        result = _build_tool_to_toolset_map(toolsets)
+        assert result == {}
+
+
+# ===================================================================
+# _extract_tools_from_toolsets
+# ===================================================================
+class TestExtractToolsFromToolsets:
+    def test_empty(self):
+        assert _extract_tools_from_toolsets([]) == []
+        assert _extract_tools_from_toolsets(None) == []
+
+    def test_extracts_fullName(self):
+        toolsets = [
+            {
+                "name": "slack",
+                "tools": [{"fullName": "slack.send_message"}],
+                "selectedTools": [],
+            }
+        ]
+        result = _extract_tools_from_toolsets(toolsets)
+        assert result == ["slack.send_message"]
+
+    def test_constructs_from_toolName(self):
+        toolsets = [
+            {
+                "name": "jira",
+                "tools": [{"toolName": "create_issue"}],
+                "selectedTools": [],
+            }
+        ]
+        result = _extract_tools_from_toolsets(toolsets)
+        assert result == ["jira.create_issue"]
+
+    def test_constructs_from_name_field(self):
+        toolsets = [
+            {
+                "name": "jira",
+                "tools": [{"name": "list_issues"}],
+                "selectedTools": [],
+            }
+        ]
+        result = _extract_tools_from_toolsets(toolsets)
+        assert result == ["jira.list_issues"]
+
+    def test_selected_tools_used_when_no_tools(self):
+        toolsets = [
+            {
+                "name": "slack",
+                "tools": [],
+                "selectedTools": ["send_message", "slack.list_channels"],
+            }
+        ]
+        result = _extract_tools_from_toolsets(toolsets)
+        assert "slack.send_message" in result
+        assert "slack.list_channels" in result
+
+    def test_selected_tools_not_used_when_tools_present(self):
+        toolsets = [
+            {
+                "name": "slack",
+                "tools": [{"fullName": "slack.send_message"}],
+                "selectedTools": ["list_channels"],
+            }
+        ]
+        result = _extract_tools_from_toolsets(toolsets)
+        assert result == ["slack.send_message"]
+
+    def test_non_dict_toolset_skipped(self):
+        result = _extract_tools_from_toolsets(["not-a-dict"])
+        assert result == []
+
+
+# ===================================================================
+# _extract_knowledge_connector_ids
+# ===================================================================
+class TestExtractKnowledgeConnectorIds:
+    def test_empty(self):
+        assert _extract_knowledge_connector_ids([]) == []
+        assert _extract_knowledge_connector_ids(None) == []
+
+    def test_extracts_connector_ids(self):
+        knowledge = [
+            {"connectorId": "c1"},
+            {"connectorId": "c2"},
+        ]
+        assert _extract_knowledge_connector_ids(knowledge) == ["c1", "c2"]
+
+    def test_skips_none_connector_id(self):
+        knowledge = [
+            {"connectorId": "c1"},
+            {"connectorId": None},
+            {},
+        ]
+        assert _extract_knowledge_connector_ids(knowledge) == ["c1"]
+
+    def test_non_dict_knowledge_entry_skipped(self):
+        knowledge = [{"connectorId": "c1"}, "not-a-dict", 42]
+        assert _extract_knowledge_connector_ids(knowledge) == ["c1"]
+
+    def test_skips_knowledge_base_pseudo_connectors(self):
+        """KB apps have type=KB and are not extracted as regular connectors"""
+        kb_uuid = "550e8400-e29b-41d4-a716-446655440101"
+        knowledge = [
+            {"connectorId": kb_uuid, "type": "KB"},
+            {"connectorId": "c1"},
+        ]
+        # Should only extract c1, not the KB app
+        assert _extract_knowledge_connector_ids(knowledge) == ["c1"]
+
+    def test_deduplicates_connector_ids(self):
+        knowledge = [
+            {"connectorId": "c1"},
+            {"connectorId": "c1"},
+            {"connectorId": "c2"},
+        ]
+        assert _extract_knowledge_connector_ids(knowledge) == ["c1", "c2"]
+
+
+# ===================================================================
+# _extract_kb_app_ids
+# ===================================================================
+class TestExtractKbAppIds:
+    def test_empty(self):
+        assert _extract_kb_app_ids([]) == []
+        assert _extract_kb_app_ids(None) == []
+
+    def test_extracts_kb_app_ids(self):
+        knowledge = [
+            {"type": "KB", "connectorId": "kb-1"},
+            {"type": "KB", "connectorId": "kb-2"},
+        ]
+        assert _extract_kb_app_ids(knowledge) == ["kb-1", "kb-2"]
+
+    def test_type_check_is_case_insensitive(self):
+        knowledge = [{"type": "kb", "connectorId": "kb-1"}]
+        assert _extract_kb_app_ids(knowledge) == ["kb-1"]
+
+    def test_ignores_legacy_record_groups_field(self):
+        # filters.recordGroups is legacy-only and no longer the id source.
+        knowledge = [{"type": "KB", "connectorId": "kb-1", "filters": {"recordGroups": ["stale-rg"]}}]
+        assert _extract_kb_app_ids(knowledge) == ["kb-1"]
+
+    def test_non_kb_entries_excluded(self):
+        knowledge = [
+            {"type": "KB", "connectorId": "kb-1"},
+            {"type": "GOOGLE_DRIVE", "connectorId": "conn-1"},
+        ]
+        assert _extract_kb_app_ids(knowledge) == ["kb-1"]
+
+    def test_kb_entry_missing_connector_id_skipped(self):
+        knowledge = [{"type": "KB"}]
+        assert _extract_kb_app_ids(knowledge) == []
+
+    def test_non_dict_knowledge_entry_skipped(self):
+        knowledge = [{"type": "KB", "connectorId": "kb-1"}, "bad", None]
+        assert _extract_kb_app_ids(knowledge) == ["kb-1"]

@@ -1,0 +1,218 @@
+export const storageTypes = {
+  LOCAL: 'local',
+  S3: 's3',
+  GCP: 'gcp',
+  AZURE_BLOB: 'azureBlob',
+};
+
+export const authTypes = {
+  AZURE_AD: 'azureAd',
+  SSO: 'sso',
+  GOOGLE: 'google',
+  MICROSOFT: 'microsoft',
+};
+
+export const keyValueStoreTypes = {
+  REDIS: 'redis',
+};
+
+export const googleWorkspaceTypes = {
+  INDIVIDUAL: 'individual',
+  BUSINESS: 'business',
+};
+
+export const googleWorkspaceServiceTypes = {
+  GOOGLE_DRIVE: 'googleDrive',
+  GOOGLE_DOCS: 'googleDocs',
+  GOOGLE_SHEETS: 'googleSheets',
+  GOOGLE_SLIDES: 'googleSlides',
+  GOOGLE_CALENDAR: 'googleCalendar',
+  GOOGLE_CONTACTS: 'googleContacts',
+  GOOGLE_MAIL: 'gmail',
+};
+
+/**
+ * KV buckets under `/services/aiModels`. Order is part of the invalid-type
+ * error string the admin API returns.
+ */
+export const AI_MODEL_TYPES = [
+  'llm',
+  'embedding',
+  'ocr',
+  'slm',
+  'reasoning',
+  'multiModal',
+  'imageGeneration',
+  'tts',
+  'stt',
+  'decision',
+] as const;
+
+export type AIModelType = (typeof AI_MODEL_TYPES)[number];
+
+export function isAIModelType(value: string): value is AIModelType {
+  return (AI_MODEL_TYPES as readonly string[]).includes(value);
+}
+
+export const aiModelsTypes = {
+  OCR: 'ocr',
+  EMBEDDING: 'embedding',
+  SLM: 'slm',
+  REASONING: 'reasoning',
+  LLM: 'llm',
+  MULTI_MODAL: 'multiModal',
+  IMAGE_GENERATION: 'imageGeneration',
+  TTS: 'tts',
+  STT: 'stt',
+  DECISION: 'decision',
+} as const;
+
+/**
+ * Named model roles. Each key maps to a role that can be independently
+ * assigned to a configured model via PUT /ai-models/roles.
+ * When a role is not assigned, services fall back to the isDefault model.
+ */
+export const MODEL_ROLES = {
+  INDEXING: 'indexing',
+} as const;
+
+export const dbTypes = {
+  MONGO_DB: 'mongodb',
+  ARANGO_DB: 'arangodb',
+};
+
+export const aiModelRoute = `api/v1/configurationManager/internal/aiModelsConfig`;
+
+export interface AIServiceResponse {
+  statusCode: number;
+  data?: any;
+  msg?: string;
+}
+
+// Platform feature flags (maintainable list)
+export interface PlatformFeatureFlagDef {
+  key: string;
+  label: string;
+  description?: string;
+  defaultEnabled?: boolean;
+  /**
+   * When true, the flag is still honoured by backend code and seeded with its
+   * default in the key-value store, but it is NOT returned by
+   * GET /platform/feature-flags/available and therefore never appears in the
+   * Labs UI. Use for legacy / internal-only flags we don't want users to toggle.
+   */
+  hidden?: boolean;
+  /**
+   * When true, Labs keeps the flag off the main list and shows it only after
+   * the admin opens "Show advanced feature flags".
+   */
+  advanced?: boolean;
+}
+
+export const PLATFORM_FEATURE_FLAGS: PlatformFeatureFlagDef[] = [
+  {
+    key: 'ENABLE_BETA_CONNECTORS',
+    label: 'Enable Beta Connectors',
+    description: 'Allow usage of beta connector integrations that may be unstable.',
+    defaultEnabled: false,
+    hidden: true,
+  },
+  {
+    key: 'ENABLE_MCP',
+    label: 'Enable MCP Servers',
+    description:
+      'Allow agents to use MCP (Model Context Protocol) servers and show MCP server management in the UI. Disable to hide MCP everywhere and stop agents from loading MCP tools.',
+    defaultEnabled: true,
+  },
+  {
+    key: 'ENABLE_API_TOOLSETS',
+    label: 'Enable API actions',
+    description:
+      'Allow admins to add actions from the OpenAPI spec of an internal REST API, and agents to call them. Disable to hide API actions everywhere and stop agents from loading them.',
+    defaultEnabled: false,
+  },
+  {
+    key: 'ENABLE_ACTIONS',
+    label: 'Enable Actions',
+    description:
+      'Allow agents to use toolset actions (connector integrations like Slack, Jira, etc.) and show Actions management in the UI. Disable to hide Actions everywhere and stop agents from loading toolset tools.',
+    defaultEnabled: true,
+  },
+  {
+    key: 'ENABLE_VECTOR_STORE_REBUILD',
+    label: 'Enable Vector Store Rebuild',
+    description:
+      'Allow admins to clean up (delete all embeddings) and reindex the vector store from the Connectors page. Disable to hide these actions.',
+    defaultEnabled: false,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_PROJECTS',
+    label: 'Enable Projects',
+    description:
+      'Organize conversations, files, and instructions into dedicated project workspaces. Disable to hide Projects from the chat sidebar and workspace.',
+    defaultEnabled: false,
+  },
+  {
+    key: 'ENABLE_SKILLS',
+    label: 'Enable Skills (Beta)',
+    description:
+      'Allow users to create, import and manage Skills (SKILL.md packages) and let agents load them. Disable to hide Skills everywhere and stop agents from loading skill tools.',
+    defaultEnabled: true,
+  },
+  {
+    key: 'ENABLE_SOFT_DELETE',
+    label: 'Move Deleted Records to the Trash',
+    description:
+      'When you delete a record, move it to the trash instead of removing it straight away. It disappears from search, chat and lists at once, and its search data is removed, but the record, its file and its sharing are kept. Files and folders deleted from a collection can be restored from its Recently deleted page (or the records API), and a record a connector sync put there comes back when the source has it again; restoring re-indexes it. Every two weeks a cleanup permanently removes records that have been in the trash for at least 14 days, with their files; this cannot be undone. Disable to delete records immediately, as before; records already in the trash are still removed on that schedule.',
+    defaultEnabled: false,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_NAMED_ENTITY_EXTRACTION',
+    label: 'Extract Named Entities',
+    description:
+      'During indexing, extract typed named entities (people, organizations, dates, amounts) and store them for search filters and agent tools. Disable to skip extraction and remove mention links from records indexed while this is off. Always on when the deployment sets HIGH_ACCURACY_MODE=true.',
+    defaultEnabled: false,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_ARTIFACT_WRITE',
+    label: 'Store Content Revisions as Files',
+    description:
+      "While indexing, also store each new version of a record's processed content as a set of files (blocks, text, images, metadata) beside the stored record. Search and chat read them only when Read Content Revisions from Files is on; it uses extra storage. Disable to stop writing them; files already written are kept until the record is deleted.",
+    defaultEnabled: false,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_ARTIFACT_READ_SHADOW',
+    label: 'Compare Content Revision Files on Read',
+    description:
+      'When chat, agents and the code graph read a record, also read its content revision files and compare them with the stored record. Answers still come from the stored record; differences are counted in metrics and logged without content. Adds storage reads. Needs Store Content Revisions as Files. Ignored while Read Content Revisions from Files is on.',
+    defaultEnabled: false,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_ARTIFACT_READ',
+    label: 'Read Content Revisions from Files',
+    description:
+      'When chat, agents and the code graph read a record, read its content revision files instead of the stored record. A record without files, or whose files cannot be read or fail their checks, is read from the stored record as before. Needs Store Content Revisions as Files. Disable to read only the stored record.',
+    defaultEnabled: false,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_USER_CONTEXT',
+    label: 'Send User & Organization Context to Agents',
+    description:
+      "Include the current user's name, email, and organization name in the default assistant and Universal Agent system prompts. When disabled, those agents rely solely on tools, actions, and knowledge sources without knowing who is asking. Agent Builder agents have a separate per-agent toggle.",
+    defaultEnabled: true,
+    advanced: true,
+  },
+  {
+    key: 'ENABLE_KH_SCOPE_LISTING',
+    label: 'All Records Cache',
+    description:
+      'Store, for each connector, who can see which of its records and how they sort, refreshed after every sync, and build the All Records page from that instead of working out access on every request. The page shows the same records either way. The page is built the usual way for a connector that is syncing or cannot use the cache (permissions set on whole groups, items in several places), and for a search, a filter other than source or connector, or sorting by size or type. Neo4j only. Disable to always build the page on each request.',
+    defaultEnabled: false,
+  },
+];

@@ -1,0 +1,114 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+README.md
+.env
+.nyc_output
+coverage
+.vscode
+.idea
+*.log
+dist
+build
+.DS_Store
+Thumbs.db
+**/__pycache__
+frontend/dist
+backend/**/dist
+docs
+tests
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+**/__pycache__
+**/*.py[cod]
+**/*$py.class
+**/*.so
+**/.Python
+**/build/
+**/develop-eggs/
+**/dist/
+**/downloads/
+**/eggs/
+**/.eggs/
+**/parts/
+**/sdist/
+**/var/
+**/wheels/
+**/*.egg-info/
+**/.installed.cfg
+**/*.egg
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+**/.tox/
+**/.nox/
+**/.hypothesis/
+**/.mypy_cache/
+**/.ruff_cache/
+**/venv/
+**/.venv/
+**/env/
+**/.env
+
+# Node
+**/node_modules/
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/.npm
+**/.yarn
+
+# IDE
+**/.idea/
+**/.vscode/
+**/*.swp
+**/*.swo
+**/*~
+
+# OS
+**/.DS_Store
+**/Thumbs.db
+
+# Build outputs (we rebuild in Docker)
+frontend/dist/
+backend/nodejs/apps/dist/
+
+# Documentation
+**/*.md
+**/docs/
+# Code packages named docs (the Google Docs toolset and its client), not documentation
+!backend/python/app/agents/actions/google/docs/
+!backend/python/app/sources/external/google/docs/
+**/README*
+**/CHANGELOG*
+**/LICENSE*
+
+# Builtin agent skill packs are runtime content, not documentation — the
+# SKILL.md files excluded by `**/*.md` above must ship in the image or the
+# BuiltinSkillSeeder finds zero packs and orgs get an empty skill catalog.
+!backend/python/app/agents/agent_loop/skills/builtin_packs/**/*.md
+
+# Tests
+**/tests/
+**/test/
+**/__tests__/
+**/*.test.*
+**/*.spec.*
+
+# Docker
+**/Dockerfile*
+**/.dockerignore
+**/docker-compose*.yml
+
+# Misc
+**/.env*
+**/secrets/
+**/*.log
+**/*.bak
+**/*.tmp

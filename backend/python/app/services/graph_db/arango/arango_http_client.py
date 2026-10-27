@@ -1,0 +1,1238 @@
+"""
+Async HTTP Client for ArangoDB REST API
+
+This client provides fully async operations for ArangoDB using REST API,
+replacing the synchronous python-arango SDK to avoid blocking the event loop.
+
+ArangoDB REST API Documentation: https://www.arangodb.com/docs/stable/http/
+"""
+
+import asyncio
+import json
+import threading
+from logging import Logger
+from typing import Any, Dict, List, Optional, Union, cast
+
+import aiohttp
+
+from app.config.constants.http_status_code import HttpStatusCode
+from app.exceptions.graph_db_exceptions import GraphQueryError
+
+# ArangoDB Error Code Constants
+ARANGO_ERROR_DOCUMENT_NOT_FOUND = 1202
+ARANGO_ERROR_SCHEMA_DUPLICATE = 1207
+
+# Maximum open connections for each event loop's session (aiohttp's default).
+# The client holds one session per loop, so its total is this times the
+# number of loops that use it.
+DEFAULT_POOL_LIMIT = 100
+
+
+# ArangoDB errorNum values a caller may treat as "another writer won" rather than as an outage.
+ARANGO_CONFLICT = 1200
+ARANGO_UNIQUE_CONSTRAINT_VIOLATED = 1210
+
+
+class ArangoQueryError(Exception):
+    """An AQL request the server rejected, with its HTTP status and ArangoDB errorNum."""
+
+    def __init__(self, operation: str, status: int, body: str) -> None:
+        super().__init__(f"{operation} (status={status}): {body}")
+        self.status = status
+        self.error_num: int | None = None
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            return
+        if isinstance(parsed, dict):
+            error_num = cast(dict[str, object], parsed).get("errorNum")
+            if isinstance(error_num, int):
+                self.error_num = error_num
+
+
+class ArangoHTTPClient:
+    """Fully async HTTP client for ArangoDB REST API
+
+    Uses session-per-event-loop pattern to handle Windows async compatibility.
+    Each event loop gets its own session, reused within that loop. A call from
+    one loop never closes the session of another.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        database: str,
+        logger: Logger,
+        pool_limit: int = DEFAULT_POOL_LIMIT
+    ) -> None:
+        """
+        Initialize ArangoDB HTTP client.
+
+        Args:
+            base_url: ArangoDB server URL (e.g., http://localhost:8529)
+            username: Database username
+            password: Database password
+            database: Database name
+            logger: Logger instance
+            pool_limit: Maximum open connections per event loop's session
+        """
+        self.base_url = base_url.rstrip('/')
+        self.database = database
+        self.username = username
+        self.password = password
+        self.auth = aiohttp.BasicAuth(username, password)
+        # One session per event loop. The indexing service calls this client
+        # from the consumer's worker loop and the main loop at the same time,
+        # and a session may only be used and closed on its own loop.
+        self._sessions: Dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+        # Those loops run on different threads, so changes to the table are
+        # serialised. Nothing awaits while it is held.
+        self._sessions_lock = threading.Lock()
+        self.pool_limit = pool_limit
+        self.logger = logger
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """
+        Get or create a session for the current event loop.
+
+        Each event loop gets its own session, so a call from one loop never
+        closes a session that requests on another loop are still using.
+        Sessions are reused within the same event loop for efficiency.
+
+        Returns:
+            aiohttp.ClientSession: Session for the current event loop
+        """
+        current_loop = asyncio.get_running_loop()
+        with self._sessions_lock:
+            session = self._sessions.get(current_loop)
+
+            if session is None or session.closed:
+                # Forget sessions whose loop has been closed; they can no longer be used.
+                for loop in [loop for loop in self._sessions if loop.is_closed()]:
+                    self._sessions.pop(loop, None)
+
+                session = aiohttp.ClientSession(
+                    auth=self.auth,
+                    connector=aiohttp.TCPConnector(limit=self.pool_limit),
+                )
+                self._sessions[current_loop] = session
+                self.logger.debug("🔄 Created new HTTP session for current event loop")
+
+        return session
+
+    async def connect(self) -> bool:
+        """
+        Test connection to ArangoDB.
+
+        Returns:
+            bool: True if connection successful
+        """
+        try:
+            session = await self._get_session()
+
+            # Test connection
+            async with session.get(f"{self.base_url}/_api/version") as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    version_info = await resp.json()
+                    self.logger.info(f"✅ Connected to ArangoDB {version_info.get('version')}")
+                    return True
+                else:
+                    self.logger.error(f"❌ Connection test failed: {resp.status}")
+                    return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to connect to ArangoDB: {str(e)}")
+            return False
+
+    async def disconnect(self) -> None:
+        """Close HTTP sessions"""
+        with self._sessions_lock:
+            sessions, self._sessions = self._sessions, {}
+        if sessions:
+            current_loop = asyncio.get_running_loop()
+            for loop, session in sessions.items():
+                try:
+                    if loop is current_loop:
+                        await session.close()
+                    elif loop.is_running():
+                        # A session must be closed on the loop that owns it
+                        future = asyncio.run_coroutine_threadsafe(session.close(), loop)
+                        await asyncio.wait_for(asyncio.wrap_future(future), timeout=5)
+                except Exception as error:
+                    self.logger.warning("Error closing an ArangoDB HTTP session: %s", error)
+            self.logger.info("✅ Disconnected from ArangoDB")
+
+    # ==================== Error Checking Helpers ====================
+
+    def _check_response_for_errors(self, result: Union[Dict, List], operation: str = "operation") -> None:
+        """
+        Check ArangoDB response for error flags and raise exception if found.
+
+        ArangoDB returns HTTP 202 even when operations fail, so we must check
+        the response body for error flags.
+
+        Args:
+            result: Response JSON (can be dict, list, or other)
+            operation: Description of the operation for error messages
+
+        Raises:
+            Exception: If error flag is found in response
+        """
+        # Check if result is a list (batch response)
+        if isinstance(result, list):
+            errors = []
+            for idx, item in enumerate(result):
+                if isinstance(item, dict) and item.get('error') is True:
+                    error_msg = item.get('errorMessage', 'Unknown error')
+                    error_num = item.get('errorNum', 'Unknown')
+                    errors.append(f"Item {idx}: [{error_num}] {error_msg}")
+
+            if errors:
+                error_details = "; ".join(errors)
+                self.logger.error(f"❌ {operation} had {len(errors)} error(s): {error_details}")
+                raise Exception(f"{operation} failed with {len(errors)} error(s): {error_details}")
+
+        # Check if result is a dict with error flag
+        elif isinstance(result, dict) and result.get('error') is True:
+            error_msg = result.get('errorMessage', 'Unknown error')
+            error_num = result.get('errorNum', 'Unknown')
+            self.logger.error(f"❌ {operation} failed: [{error_num}] {error_msg}")
+            raise Exception(f"{operation} failed: [{error_num}] {error_msg}")
+
+    # ==================== Database Management ====================
+
+    async def database_exists(self, db_name: str) -> bool:
+        """Check if database exists"""
+        url = f"{self.base_url}/_api/database"
+        session = await self._get_session()
+
+        async with session.get(url) as resp:
+            if resp.status == HttpStatusCode.OK.value:
+                result = await resp.json()
+                return db_name in result.get("result", [])
+            return False
+
+    async def create_database(self, db_name: str) -> bool:
+        """Create database"""
+        url = f"{self.base_url}/_api/database"
+
+        payload = {
+            "name": db_name,
+            "users": [
+                {
+                    "username": self.username,
+                    "passwd": self.password,
+                    "active": True
+                }
+            ]
+        }
+
+        session = await self._get_session()
+        async with session.post(url, json=payload) as resp:
+            if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.CREATED.value]:
+                self.logger.info(f"✅ Database '{db_name}' created")
+                return True
+            elif resp.status == HttpStatusCode.CONFLICT.value:
+                self.logger.info(f"Database '{db_name}' already exists")
+                return True
+            else:
+                error = await resp.text()
+                self.logger.error(f"❌ Failed to create database: {error}")
+                return False
+
+    # ==================== Transaction Management ====================
+
+    async def begin_transaction(
+        self,
+        read: List[str],
+        write: List[str],
+        exclusive: list[str] | None = None,
+        lock_timeout_seconds: float | None = None,
+    ) -> str:
+        """
+        Begin a database transaction.
+
+        Args:
+            read: Collections to read from
+            write: Collections to write to
+            exclusive: Collections no other transaction may write until this one ends
+            lock_timeout_seconds: How long to wait for those locks before failing
+
+        Returns:
+            str: Transaction ID
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/transaction/begin"
+
+        payload = {
+            "collections": {
+                "read": read,
+                "write": write,
+                "exclusive": exclusive or []
+            }
+        }
+        if lock_timeout_seconds is not None:
+            payload["lockTimeout"] = lock_timeout_seconds
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload) as resp:
+                if resp.status != HttpStatusCode.CREATED.value:
+                    error = await resp.text()
+                    raise Exception(f"Failed to begin transaction: {error}")
+
+                result = await resp.json()
+                txn_id = result["result"]["id"]
+                self.logger.debug(f"🔄 Transaction started: {txn_id}")
+                return txn_id
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to begin transaction: {str(e)}")
+            raise
+
+    async def commit_transaction(self, txn_id: str) -> None:
+        """
+        Commit a transaction.
+
+        Args:
+            txn_id: Transaction ID returned by begin_transaction
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/transaction/{txn_id}"
+
+        try:
+            session = await self._get_session()
+            async with session.put(url) as resp:
+                if resp.status not in [200, 204]:
+                    error = await resp.text()
+                    raise Exception(f"Failed to commit transaction: {error}")
+
+                self.logger.debug(f"✅ Transaction committed: {txn_id}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to commit transaction: {str(e)}")
+            raise
+
+    async def abort_transaction(self, txn_id: str) -> None:
+        """
+        Abort a transaction.
+
+        Args:
+            txn_id: Transaction ID returned by begin_transaction
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/transaction/{txn_id}"
+
+        try:
+            session = await self._get_session()
+            async with session.delete(url) as resp:
+                if resp.status not in [200, 204]:
+                    error = await resp.text()
+                    raise Exception(f"Failed to abort transaction: {error}")
+
+                self.logger.debug(f"🔄 Transaction aborted: {txn_id}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to abort transaction: {str(e)}")
+            raise
+
+    # ==================== Document Operations ====================
+
+    async def get_document(
+        self,
+        collection: str,
+        key: str,
+        txn_id: Optional[str] = None,
+        *,
+        raise_on_error: bool = False
+    ) -> Optional[Dict]:
+        """
+        Get a document by key.
+
+        Args:
+            collection: Collection name
+            key: Document key
+            txn_id: Optional transaction ID
+            raise_on_error: Propagate anything that is not a 404 instead of
+                answering None. Only a 404 is an absent document; a 503 from a
+                restarting server, or a connection that never landed, is the
+                server failing to answer and must not read as a deletion.
+
+        Returns:
+            Optional[Dict]: Document data or None if not found
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{collection}/{key}"
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == HttpStatusCode.NOT_FOUND.value:
+                    return None
+                elif resp.status == HttpStatusCode.OK.value:
+                    return await resp.json()
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to get document: {error}")
+                    if raise_on_error:
+                        raise GraphQueryError(
+                            f"Could not read {collection}/{key}: "
+                            f"ArangoDB answered {resp.status}"
+                        )
+                    return None
+
+        except GraphQueryError:
+            # Raised just above; the generic handler would log it a second time
+            # and, without the flag, swallow the very failure we chose to report.
+            raise
+        except Exception as e:
+            self.logger.error(f"❌ Error getting document: {str(e)}")
+            if raise_on_error:
+                raise
+            return None
+
+    async def create_document(
+        self,
+        collection: str,
+        document: Dict,
+        txn_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Create a document.
+
+        Args:
+            collection: Collection name
+            document: Document data
+            txn_id: Optional transaction ID
+
+        Returns:
+            Optional[Dict]: Created document metadata
+
+        Raises:
+            Exception: If document creation fails
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{collection}"
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=document, headers=headers) as resp:
+                if resp.status in [HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value]:
+                    result = await resp.json()
+                    self._check_response_for_errors(result, "Create document")
+                    return result
+                elif resp.status == HttpStatusCode.CONFLICT.value:
+                    # Document already exists, treat as success
+                    return {"_key": document.get("_key")}
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to create document: {error}")
+                    raise Exception(f"Failed to create document (status={resp.status}): {error}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Error creating document: {str(e)}")
+            raise
+
+    async def update_document(
+        self,
+        collection: str,
+        key: str,
+        updates: Dict,
+        txn_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Update a document.
+
+        Args:
+            collection: Collection name
+            key: Document key
+            updates: Fields to update
+            txn_id: Optional transaction ID
+
+        Returns:
+            Optional[Dict]: Updated document metadata
+
+        Raises:
+            Exception: If document update fails
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{collection}/{key}"
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.patch(url, json=updates, headers=headers) as resp:
+                if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value]:
+                    result = await resp.json()
+                    self._check_response_for_errors(result, "Update document")
+                    return result
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to update document: {error}")
+                    raise Exception(f"Failed to update document (status={resp.status}): {error}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Error updating document: {str(e)}")
+            raise
+
+    async def delete_document(
+        self,
+        collection: str,
+        key: str,
+        txn_id: Optional[str] = None
+    ) -> bool:
+        """
+        Delete a document.
+
+        Args:
+            collection: Collection name
+            key: Document key
+            txn_id: Optional transaction ID
+
+        Returns:
+            bool: True if successful
+
+        Raises:
+            Exception: If document deletion fails
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{collection}/{key}"
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.delete(url, headers=headers) as resp:
+                if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.ACCEPTED.value, HttpStatusCode.NO_CONTENT.value]:
+                    # Try to parse response for error checking
+                    try:
+                        result = await resp.json()
+                        self._check_response_for_errors(result, "Delete document")
+                    except (ValueError, TypeError, aiohttp.ContentTypeError):
+                        # Response might be empty for successful deletes
+                        pass
+                    return True
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to delete document: {error}")
+                    raise Exception(f"Failed to delete document (status={resp.status}): {error}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Error deleting document: {str(e)}")
+            raise
+
+    # ==================== Query Operations ====================
+
+    async def execute_aql(
+        self,
+        query: str,
+        bind_vars: Optional[Dict[str, Any]] = None,
+        txn_id: Optional[str] = None,
+        batch_size: int = 1000,
+        options: dict | None = None,
+        max_runtime: float | None = None,
+    ) -> List[Any]:
+        """
+        Execute AQL query.
+
+        Args:
+            query: AQL query string
+            bind_vars: Query bind variables
+            txn_id: Optional transaction ID
+            batch_size: Batch size for cursor
+            options: Cursor options, e.g. optimizer rules for one query
+            max_runtime: Server-side limit in seconds; the server kills the
+                query past it
+
+        Returns:
+            List[Dict]: Query results
+
+        Raises:
+            ArangoQueryError: The server rejected the query or a cursor fetch;
+                carries the HTTP status and ArangoDB errorNum.
+            Exception: Any other failure (connection, error flag in the body).
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/cursor"
+
+        payload = {
+            "query": query,
+            "bindVars": bind_vars or {},
+            "count": True,
+            "batchSize": batch_size
+        }
+        if options or max_runtime is not None:
+            payload["options"] = {
+                **(options or {}),
+                **({"maxRuntime": max_runtime} if max_runtime is not None else {}),
+            }
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status not in [200, 201]:
+                    error = await resp.text()
+                    raise ArangoQueryError("Query failed", resp.status, error)
+
+                result = await resp.json()
+                self._check_response_for_errors(result, "Query execution")
+                results = result.get("result", [])
+
+                # Handle cursor for large result sets
+                while result.get("hasMore"):
+                    cursor_id = result.get("id")
+                    cursor_url = f"{self.base_url}/_db/{self.database}/_api/cursor/{cursor_id}"
+
+                    async with session.put(cursor_url, headers=headers) as cursor_resp:
+                        if cursor_resp.status not in [200, 201]:
+                            error = await cursor_resp.text()
+                            raise ArangoQueryError("Cursor fetch failed", cursor_resp.status, error)
+
+                        result = await cursor_resp.json()
+                        self._check_response_for_errors(result, "Cursor fetch")
+                        results.extend(result.get("result", []))
+
+                return results
+
+        except Exception as e:
+            self.logger.error(f"❌ Query execution failed: {str(e)}")
+            raise
+
+    # ==================== Batch Operations ====================
+
+    async def batch_insert_documents(
+    self,
+    collection: str,
+    documents: List[Dict[str, Any]],
+    txn_id: Optional[str] = None,
+    overwrite: bool = True,
+    overwrite_mode: str = "update"  # New parameter: "replace", "update", "ignore", or "conflict"
+) -> Dict[str, Any]:
+        """
+        Batch insert/update documents.
+
+        Args:
+            collection: Collection name
+            documents: List of documents
+            txn_id: Optional transaction ID
+            overwrite: Whether to overwrite existing documents (legacy param, use overwrite_mode instead)
+            overwrite_mode: How to handle existing documents:
+                - "replace": Replace entire document (old behavior, destructive)
+                - "update": Merge/partial update, preserves fields not in input (recommended)
+                - "ignore": Keep existing document, ignore new one
+                - "conflict": Return error if document exists
+
+        Returns:
+            Dict: Result with created/updated counts
+
+        Raises:
+            Exception: If any document operation fails
+        """
+        if not documents:
+            return {"created": 0, "updated": 0, "errors": 0}
+
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{collection}"
+
+        # Build params - overwriteMode takes precedence over legacy overwrite param
+        params = {}
+        if overwrite:
+            params["overwriteMode"] = overwrite_mode
+        else:
+            params["overwrite"] = "false"
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.post(
+                url,
+                json=documents,
+                params=params,
+                headers=headers
+            ) as resp:
+                if resp.status in [HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value]:
+                    result = await resp.json()
+                    self.logger.debug(f"✅ Batch insert response: status={resp.status}, result={result}")
+
+                    # Check for errors in response
+                    self._check_response_for_errors(result, "Batch insert")
+
+                    # Count created vs updated based on response
+                    created_count = 0
+                    updated_count = 0
+                    error_count = 0
+
+                    if isinstance(result, list):
+                        for item in result:
+                            if isinstance(item, dict):
+                                if item.get("error"):
+                                    error_count += 1
+                                elif item.get("_oldRev"):
+                                    # Document had a previous revision = updated
+                                    updated_count += 1
+                                else:
+                                    # New document = created
+                                    created_count += 1
+                    else:
+                        # Single document response
+                        created_count = 1
+
+                    return {
+                        "created": created_count,
+                        "updated": updated_count,
+                        "errors": error_count,
+                        "result": result
+                    }
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Batch insert failed (status={resp.status}): {error}")
+                    raise Exception(f"Batch insert failed (status={resp.status}): {error}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Batch insert error: {str(e)}")
+            raise
+
+    async def batch_delete_documents(
+        self,
+        collection: str,
+        keys: List[str],
+        txn_id: Optional[str] = None
+    ) -> int:
+        """
+        Batch delete documents using ArangoDB's batch deletion endpoint.
+
+        Args:
+            collection: Collection name
+            keys: List of document keys
+            txn_id: Optional transaction ID
+
+        Returns:
+            int: Number of documents successfully deleted
+
+        Raises:
+            Exception: If batch deletion fails with errors
+        """
+        if not keys:
+            return 0
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        # ArangoDB batch delete endpoint
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{collection}"
+
+        # Construct full document IDs
+        document_ids = [f"{collection}/{key}" for key in keys]
+
+        try:
+            session = await self._get_session()
+            async with session.delete(
+                url,
+                headers=headers,
+                json=document_ids  # Send array of document IDs in request body
+            ) as resp:
+                if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.ACCEPTED.value]:
+                    results = await resp.json()
+
+                    # Results is an array of deletion results
+                    deleted_count = 0
+                    errors = []
+
+                    for idx, result in enumerate(results):
+                        # Check if this deletion was successful
+                        if result.get("error"):
+                            # Handle 404 as success (document already deleted)
+                            error_num = result.get("errorNum")
+                            if error_num == ARANGO_ERROR_DOCUMENT_NOT_FOUND:  # Document not found
+                                deleted_count += 1
+                                self.logger.debug(f"Document {document_ids[idx]} already deleted (404)")
+                            else:
+                                error_msg = result.get("errorMessage", "Unknown error")
+                                errors.append(f"Document {document_ids[idx]}: (errorNum={error_num}) {error_msg}")
+                        else:
+                            deleted_count += 1
+
+                    if errors:
+                        error_details = "; ".join(errors)
+                        self.logger.error(f"❌ Batch delete had {len(errors)} error(s): {error_details}")
+                        raise Exception(f"Batch delete failed with {len(errors)} error(s): {error_details}")
+
+                    self.logger.info(f"✅ Batch deleted {deleted_count} documents from {collection}")
+                    return deleted_count
+
+                else:
+                    error_text = await resp.text()
+                    self.logger.error(f"❌ Batch delete failed with status {resp.status}: {error_text}")
+                    raise Exception(f"Batch delete failed: HTTP {resp.status} - {error_text}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Batch delete failed: {str(e)}")
+            raise
+
+    # ==================== Edge Operations ====================
+
+    async def create_edge(
+        self,
+        edge_collection: str,
+        from_id: str,
+        to_id: str,
+        edge_data: Optional[Dict] = None,
+        txn_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Create an edge.
+
+        Args:
+            edge_collection: Edge collection name
+            from_id: Source document ID (e.g., "users/123")
+            to_id: Target document ID (e.g., "records/456")
+            edge_data: Additional edge properties
+            txn_id: Optional transaction ID
+
+        Returns:
+            Optional[Dict]: Created edge metadata
+
+        Raises:
+            Exception: If edge creation fails
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/document/{edge_collection}"
+
+        edge_doc = edge_data.copy() if edge_data else {}
+        edge_doc["_from"] = from_id
+        edge_doc["_to"] = to_id
+
+        headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=edge_doc, headers=headers) as resp:
+                if resp.status in [HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value]:
+                    result = await resp.json()
+                    self._check_response_for_errors(result, "Create edge")
+                    return result
+                elif resp.status == HttpStatusCode.CONFLICT.value:
+                    # Edge already exists
+                    return {"_key": edge_doc.get("_key")}
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to create edge: {error}")
+                    raise Exception(f"Failed to create edge (status={resp.status}): {error}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Error creating edge: {str(e)}")
+            raise
+
+    async def delete_edge(
+        self,
+        edge_collection: str,
+        from_id: str,
+        to_id: str,
+        txn_id: Optional[str] = None
+    ) -> bool:
+        """
+        Delete an edge between two nodes.
+
+        Args:
+            edge_collection: Edge collection name
+            from_id: Source document ID
+            to_id: Target document ID
+            txn_id: Optional transaction ID
+
+        Returns:
+            bool: True if successful
+        """
+        # First find the edge
+        query = f"""
+        FOR edge IN {edge_collection}
+            FILTER edge._from == @from_id AND edge._to == @to_id
+            RETURN edge._key
+        """
+
+        try:
+            edge_keys = await self.execute_aql(query, {"from_id": from_id, "to_id": to_id}, txn_id)
+
+            if edge_keys:
+                url = f"{self.base_url}/_db/{self.database}/_api/document/{edge_collection}/{edge_keys[0]}"
+                headers = {"x-arango-trx-id": txn_id} if txn_id else {}
+
+                session = await self._get_session()
+                async with session.delete(url, headers=headers) as resp:
+                    return resp.status in [HttpStatusCode.OK.value, HttpStatusCode.ACCEPTED.value, HttpStatusCode.NO_CONTENT.value]
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error deleting edge: {str(e)}")
+            return False
+
+    # ==================== Collection Operations ====================
+
+    async def collection_exists(self, collection_name: str) -> bool:
+        """Check if collection exists"""
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{collection_name}"
+
+        try:
+            session = await self._get_session()
+            async with session.get(url) as resp:
+                return resp.status == HttpStatusCode.OK.value
+        except Exception:
+            return False
+
+    async def create_collection(
+        self,
+        name: str,
+        edge: bool = False,
+        wait_for_sync: bool = False,
+        schema: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Create a collection.
+
+        Args:
+            name: Collection name
+            edge: Whether this is an edge collection
+            wait_for_sync: Wait for data to be synced to disk
+            schema: Optional JSON schema for document validation
+
+        Returns:
+            bool: True if successful
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/collection"
+
+        payload: Dict[str, Any] = {
+            "name": name,
+            "type": 3 if edge else 2,  # 3 = edge, 2 = document
+            "waitForSync": wait_for_sync,
+        }
+        if schema:
+            payload["schema"] = schema
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload) as resp:
+                if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.CREATED.value]:
+                    self.logger.info(f"✅ Collection '{name}' created")
+                    return True
+                elif resp.status == HttpStatusCode.CONFLICT.value:
+                    self.logger.debug(f"Collection '{name}' already exists")
+                    return True
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to create collection: {error}")
+                    return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error creating collection: {str(e)}")
+            return False
+
+    async def get_indexes(self, collection_name: str) -> list[dict]:
+        """The indexes on a collection, as ArangoDB describes them. Raises when they cannot be read."""
+        url = f"{self.base_url}/_db/{self.database}/_api/index?collection={collection_name}"
+        session = await self._get_session()
+        async with session.get(url) as resp:
+            if resp.status != HttpStatusCode.OK.value:
+                raise Exception(f"Could not list the indexes of {collection_name}: {await resp.text()}")
+            body = await resp.json()
+        return list(body.get("indexes", []))
+
+    async def ensure_persistent_index(
+        self,
+        collection_name: str,
+        fields: List[str],
+        unique: bool = False,  # noqa: FBT001, FBT002 - positional, as callers have always passed it
+        *,
+        sparse: bool = False,
+        name: str | None = None,
+    ) -> bool:
+        """
+        Create a persistent index on a collection (idempotent).
+
+        Args:
+            collection_name: Collection to index
+            fields: List of field names for the compound index
+            sparse: Leave out documents where any indexed field is null or
+                missing, so an index over a rarely-set field stays small
+            unique: Enforce uniqueness. Creation fails outright if the collection
+                already holds duplicates, so callers must tolerate a False return.
+            name: Index name, for queries that hint it. An index that already
+                exists on the same fields keeps the name it has.
+
+        Returns:
+            bool: True if index exists or was created
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/index?collection={collection_name}"
+        payload: dict[str, Any] = {
+            "type": "persistent",
+            "fields": fields,
+            "unique": unique,
+        }
+        if sparse:
+            payload["sparse"] = True
+        if name:
+            payload["name"] = name
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload) as resp:
+                if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.CREATED.value]:
+                    self.logger.info(
+                        f"✅ Persistent index on {fields} in '{collection_name}' ensured"
+                    )
+                    return True
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to create index: {error}")
+                    return False
+        except Exception as e:
+            self.logger.error(f"❌ Error creating index: {str(e)}")
+            return False
+
+    async def update_collection_schema(
+        self,
+        name: str,
+        schema: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Update the schema validation for an existing collection.
+
+        Args:
+            name: Collection name
+            schema: JSON schema for validation (optional)
+
+        Returns:
+            bool: True if successful
+        """
+        if not schema:
+            return True  # Nothing to update
+
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{name}/properties"
+
+        payload = {
+            "schema": schema
+        }
+
+        try:
+            session = await self._get_session()
+            async with session.put(url, json=payload) as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    self.logger.info(f"✅ Schema updated for collection '{name}'")
+                    return True
+                else:
+                    error_data = await resp.json()
+                    error_msg = error_data.get("errorMessage", await resp.text())
+
+                    # Check if schema is already configured (error code ARANGO_ERROR_SCHEMA_DUPLICATE or duplicate message)
+                    error_num = error_data.get("errorNum", 0)
+                    if error_num == ARANGO_ERROR_SCHEMA_DUPLICATE or "duplicate" in error_msg.lower():
+                        self.logger.info(f"✅ Schema for '{name}' already configured, skipping")
+                        return True
+
+                    self.logger.warning(f"Failed to update schema for '{name}': {error_msg}")
+                    return False
+
+        except Exception as e:
+            error_msg = str(e)
+            if str(ARANGO_ERROR_SCHEMA_DUPLICATE) in error_msg or "duplicate" in error_msg.lower():
+                self.logger.info(f"✅ Schema for '{name}' already configured, skipping")
+                return True
+            self.logger.error(f"❌ Error updating collection schema: {error_msg}")
+            return False
+
+    async def rename_collection(self, name: str, new_name: str) -> bool:
+        """Rename a collection.
+
+        Safe for a collection inside a named graph: ArangoDB updates the graph's
+        edge definitions to the new name itself (verified on 3.12.4), so no
+        gharial repair is needed afterwards.
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{name}/rename"
+
+        try:
+            session = await self._get_session()
+            async with session.put(url, json={"name": new_name}) as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    self.logger.info(f"✅ Renamed collection '{name}' -> '{new_name}'")
+                    return True
+
+                self.logger.warning(
+                    f"Failed to rename collection '{name}' -> '{new_name}': "
+                    f"{resp.status} {await resp.text()}"
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error renaming collection '{name}': {e}")
+            return False
+
+    async def delete_collection(self, name: str) -> bool:
+        """Drop a collection and everything in it."""
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{name}"
+
+        try:
+            session = await self._get_session()
+            async with session.delete(url) as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    self.logger.info(f"✅ Dropped collection '{name}'")
+                    return True
+
+                self.logger.warning(
+                    f"Failed to drop collection '{name}': "
+                    f"{resp.status} {await resp.text()}"
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error dropping collection '{name}': {e}")
+            return False
+
+    async def remove_edge_definition(self, graph_name: str, edge_collection: str) -> bool:
+        """Take an edge collection out of a named graph, keeping the collection.
+        True when the graph no longer names it (including when it never did)."""
+        url = f"{self.base_url}/_db/{self.database}/_api/gharial/{graph_name}/edge/{edge_collection}"
+
+        try:
+            session = await self._get_session()
+            async with session.delete(url) as resp:
+                if resp.status in [
+                    HttpStatusCode.OK.value, HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value,
+                    HttpStatusCode.NOT_FOUND.value,
+                ]:
+                    return True
+
+                self.logger.warning(
+                    f"Failed to remove edge definition '{edge_collection}' from graph '{graph_name}': "
+                    f"{resp.status} {await resp.text()}"
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error removing edge definition '{edge_collection}': {e}")
+            return False
+
+    # ==================== Graph Operations ====================
+
+    async def get_collection_schema(self, name: str) -> dict | None:
+        """The validation schema a collection holds now, or None when it has none."""
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{name}/properties"
+        session = await self._get_session()
+        async with session.get(url) as resp:
+            if resp.status != HttpStatusCode.OK.value:
+                raise RuntimeError(
+                    f"Could not read the properties of collection '{name}' (HTTP {resp.status})"
+                )
+            return (await resp.json()).get("schema") or None
+
+    async def has_collection(self, name: str) -> bool:
+        """
+        Check if a collection exists.
+
+        Args:
+            name: Collection name
+
+        Returns:
+            bool: True if collection exists, False otherwise
+        """
+        return await self.collection_exists(name)
+
+    async def has_graph(self, graph_name: str) -> bool:
+        """
+        Check if a graph exists.
+
+        Args:
+            graph_name: Graph name
+
+        Returns:
+            bool: True if graph exists, False otherwise
+        """
+        return (await self.get_graph(graph_name)) is not None
+
+    async def create_graph(
+        self,
+        graph_name: str,
+        edge_definitions: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Create a named graph with the given edge definitions.
+
+        Args:
+            graph_name: Graph name
+            edge_definitions: List of edge definitions. Each dict must have:
+                - "collection": edge collection name
+                - "from": list of vertex collection names
+                - "to": list of vertex collection names
+
+        Returns:
+            bool: True if successful
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/gharial"
+
+        # Map to ArangoDB REST format: collection, from, to
+        # Support both schema keys (edge_collection, from_vertex_collections, to_vertex_collections) and REST keys
+        payload_definitions = [
+            {
+                "collection": ed.get("edge_collection", ed.get("collection", "")),
+                "from": ed.get("from_vertex_collections", ed.get("from", [])),
+                "to": ed.get("to_vertex_collections", ed.get("to", [])),
+            }
+            for ed in edge_definitions
+        ]
+
+        payload = {"name": graph_name, "edgeDefinitions": payload_definitions}
+
+        try:
+            session = await self._get_session()
+            async with session.post(url, json=payload) as resp:
+                if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value]:
+                    self.logger.info(f"✅ Graph '{graph_name}' created")
+                    return True
+                elif resp.status == HttpStatusCode.CONFLICT.value:
+                    self.logger.debug(f"Graph '{graph_name}' already exists")
+                    return True
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to create graph: {error}")
+                    return False
+        except Exception as e:
+            self.logger.error(f"❌ Error creating graph: {str(e)}")
+            return False
+
+    async def get_graph(self, graph_name: str) -> Optional[Dict]:
+        """
+        Get graph definition including edge definitions.
+
+        Args:
+            graph_name: Graph name
+
+        Returns:
+            Optional[Dict]: Graph definition with edgeDefinitions, or None if not found
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/gharial/{graph_name}"
+
+        try:
+            session = await self._get_session()
+            async with session.get(url) as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    return await resp.json()
+                elif resp.status == HttpStatusCode.NOT_FOUND.value:
+                    self.logger.warning(f"Graph '{graph_name}' not found")
+                    return None
+                else:
+                    error = await resp.text()
+                    self.logger.error(f"❌ Failed to get graph: {error}")
+                    return None
+        except Exception as e:
+            self.logger.error(f"❌ Error getting graph: {str(e)}")
+            return None
+
+    # ==================== Helper Methods ====================
+
+    async def _handle_response(self, resp: aiohttp.ClientResponse, operation: str) -> Optional[Dict]:
+        """Helper to handle HTTP responses"""
+        if resp.status in [HttpStatusCode.OK.value, HttpStatusCode.CREATED.value, HttpStatusCode.ACCEPTED.value]:
+            return await resp.json()
+        elif resp.status == HttpStatusCode.NOT_FOUND.value:
+            return None
+        else:
+            error = await resp.text()
+            self.logger.error(f"❌ {operation} failed ({resp.status}): {error}")
+            return None
+

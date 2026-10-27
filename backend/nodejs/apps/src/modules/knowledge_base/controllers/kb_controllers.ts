@@ -1,0 +1,2316 @@
+import { randomUUID } from 'crypto';
+import * as crypto from 'crypto';
+import { AuthenticatedUserRequest } from './../../../libs/middlewares/types';
+import { NextFunction, Response } from 'express';
+import { Logger } from '../../../libs/services/logger.service';
+import {
+  BadRequestError,
+  ForbiddenError,
+  InternalServerError,
+  NotFoundError,
+  UnauthorizedError,
+} from '../../../libs/errors/http.errors';
+import {
+  markClientSafe,
+  serverFailureMessage,
+} from '../../../libs/errors/reader-friendly';
+import {
+  uploadNextVersionToStorage,
+  createPlaceholderDocument,
+  processUploadsInBackground,
+  FileUploadMetadata,
+  PlaceholderResultWithMetadata,
+  UploadStreamPublish,
+  UPLOAD_STORAGE_CONCURRENCY,
+} from '../utils/utils';
+import { mapWithConcurrency } from '../../../libs/utils/concurrency.util';
+import { isUserOrgAdmin } from '../../user_management/services/user-admin.service';
+import { setSampleAccountsSignIn } from '../../user_management/services/demo-accounts.service';
+import axios from 'axios';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import { AppConfig } from '../../tokens_manager/config/config';
+import { getMimeType } from '../../storage/mimetypes/mimetypes';
+import { HttpMethod } from '../../../libs/enums/http-methods.enum';
+import {
+  executeConnectorCommand,
+  handleBackendError,
+  handleConnectorResponse,
+} from '../../tokens_manager/utils/connector.utils';
+import { safeParsePagination } from '../../../utils/safe-integer';
+
+/** Shape of the KB detail response used during pre-upload permission checks. */
+interface KbCheckData {
+  userRole?: string;
+}
+
+/** Fields of the record detail response read before a file replace. */
+interface RecordDetailData {
+  record?: { externalRecordId?: string };
+  knowledgeBase?: { id?: string };
+}
+import {
+  validateNoFormatSpecifiers,
+  validateNoXSS,
+} from '../../../utils/xss-sanitization';
+import { FileBufferInfo, RejectedFileInfo } from '../../../libs/middlewares/file_processor/fp.interface';
+import { getFileExtension } from '../../../libs/utils/file-extension.util';
+import { scopedStorageServiceJwtGenerator } from '../../../libs/utils/createJwt';
+const logger = Logger.getInstance({
+  service: 'Knowledge Base Controller',
+});
+
+const KNOWLEDGE_HUB_MIN_QUERY_LENGTH = 2;
+const KNOWLEDGE_HUB_MAX_QUERY_LENGTH = 500;
+
+/**
+ * The search text for a knowledge-hub listing, after trim.
+ * Missing stays a browse. Empty, whitespace, or one character is the same
+ * minimum-length error the connector service returns. The cap matches that
+ * service; HTML is rejected earlier by the XSS middleware.
+ */
+function knowledgeHubQueryText(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  // Express turns `?q=a&q=b` into an array. The connector sees one string,
+  // the same join URLSearchParams used to forward. An object would stringify
+  // to "[object Object]" and pass the length check.
+  if (Array.isArray(raw)) {
+    const parts: string[] = [];
+    for (const part of raw) {
+      if (typeof part !== 'string') {
+        throw new BadRequestError('Search query must be text');
+      }
+      parts.push(part);
+    }
+    return parts.join(',');
+  }
+  if (typeof raw !== 'string') {
+    throw new BadRequestError('Search query must be text');
+  }
+  return raw;
+}
+
+export function knowledgeHubSearchQuery(raw: unknown): string | undefined {
+  const text = knowledgeHubQueryText(raw);
+  if (text === undefined) {
+    return undefined;
+  }
+  const q = text.trim();
+  if (q.length < KNOWLEDGE_HUB_MIN_QUERY_LENGTH) {
+    throw new BadRequestError(
+      `Search query must be at least ${KNOWLEDGE_HUB_MIN_QUERY_LENGTH} characters`,
+    );
+  }
+  if (q.length > KNOWLEDGE_HUB_MAX_QUERY_LENGTH) {
+    throw new BadRequestError(
+      `Search query too long (max: ${KNOWLEDGE_HUB_MAX_QUERY_LENGTH} characters)`,
+    );
+  }
+  return q;
+}
+
+/**
+ * Get Knowledge Hub nodes (unified browse API)
+ * Supports browsing KBs, apps, folders, record groups, and records
+ */
+export const getKnowledgeHubNodes =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId, orgId } = req.user || {};
+      if (!userId || !orgId) {
+        throw new UnauthorizedError('User not authenticated');
+      }
+
+      logger.debug('Getting knowledge hub nodes', {
+        userId,
+        orgId,
+        query: req.query,
+      });
+
+      // Build query string from request query params
+      const queryParams = new URLSearchParams();
+      const searchQuery = knowledgeHubSearchQuery(req.query.q);
+
+      // Map query params (camelCase to snake_case for Python backend)
+      const paramMapping: { [key: string]: string } = {
+        parentId: 'parent_id',
+        view: 'view',
+        page: 'page',
+        limit: 'limit',
+        sortBy: 'sort_by',
+        sortOrder: 'sort_order',
+        q: 'q',
+        nodeTypes: 'node_types',
+        recordTypes: 'record_types',
+        origins: 'origins',
+        connectorIds: 'connector_ids',
+        kbIds: 'kb_ids',
+        indexingStatus: 'indexing_status',
+        createdAt: 'created_at',
+        updatedAt: 'updated_at',
+        size: 'size',
+        include: 'include',
+        cursor: 'cursor',
+      };
+
+      for (const [key, snakeKey] of Object.entries(paramMapping)) {
+        if (key === 'q') {
+          continue;
+        }
+        const value = req.query[key];
+        if (value) {
+          queryParams.append(snakeKey, value as string);
+        }
+      }
+      if (searchQuery !== undefined) {
+        queryParams.append('q', searchQuery);
+      }
+
+      if (req.query.onlyContainers !== undefined) {
+        queryParams.append('only_containers', String(req.query.onlyContainers));
+      }
+
+      // Tri-state flag (true/false/omitted) — must be forwarded even when
+      // explicitly `false`, so `!== undefined` rather than a truthy check.
+      if (req.query.flattened !== undefined) {
+        queryParams.append('flattened', String(req.query.flattened));
+      }
+
+      const { parentType, parentId } = req.params;
+      let url = `${appConfig.connectorBackend}/api/v1/knowledge-hub/nodes`;
+
+      if (parentType && parentId) {
+        url += `/${encodeURIComponent(parentType)}/${encodeURIComponent(parentId)}`;
+      }
+
+      url += `?${queryParams.toString()}`;
+
+      const response = await executeConnectorCommand(
+        url,
+        HttpMethod.GET,
+        req.headers as Record<string, string>, // Forwards auth headers
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Getting knowledge hub nodes',
+        'Failed to get nodes',
+      );
+    } catch (error: any) {
+      logger.error('Error getting knowledge hub nodes', {
+        error: error.message,
+        stack: error.stack,
+      });
+      const handleError = handleBackendError(error, 'get knowledge hub nodes');
+      next(handleError);
+    }
+  };
+
+/**
+ * The demo data switch is owned by the connector service, which also applies
+ * it to search and browsing; these only forward the caller's request.
+ */
+export const getDemoDataStatus =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      if (!req.user?.userId || !req.user?.orgId) {
+        throw new UnauthorizedError('User not authenticated');
+      }
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/demo-data/status`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+      handleConnectorResponse(
+        response,
+        res,
+        'Getting demo data status',
+        'Failed to get demo data status',
+      );
+    } catch (error: unknown) {
+      logger.error('Error getting demo data status', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      next(handleBackendError(error, 'get demo data status'));
+    }
+  };
+
+export const setDemoDataPreference =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      if (!req.user?.userId || !req.user?.orgId) {
+        throw new UnauthorizedError('User not authenticated');
+      }
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/demo-data/preference`,
+        HttpMethod.PUT,
+        req.headers as Record<string, string>,
+        { include: req.body.include },
+      );
+      handleConnectorResponse(
+        response,
+        res,
+        'Saving demo data preference',
+        'Failed to save demo data preference',
+      );
+    } catch (error: unknown) {
+      logger.error('Error saving demo data preference', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      next(handleBackendError(error, 'save demo data preference'));
+    }
+  };
+
+export const setDemoDataWorkspace =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId, orgId } = req.user || {};
+      if (!userId || !orgId) {
+        throw new UnauthorizedError('User not authenticated');
+      }
+      if (!(await isUserOrgAdmin(userId, orgId))) {
+        throw new ForbiddenError('Only admins can change this for everyone');
+      }
+      const enabled: boolean = req.body.enabled;
+      const url = `${appConfig.connectorBackend}/api/v1/demo-data`;
+      const headers = req.headers as Record<string, string>;
+      const isOk = (r: { statusCode?: number }): boolean =>
+        (r.statusCode ?? 0) >= 200 && (r.statusCode ?? 0) < 300;
+
+      const before = await executeConnectorCommand(
+        `${url}/status`,
+        HttpMethod.GET,
+        headers,
+      );
+      if (!isOk(before)) {
+        throw handleBackendError(before, 'read demo data for everyone');
+      }
+      const wasEnabled =
+        (before.data as { offForEveryone?: boolean } | undefined)
+          ?.offForEveryone !== true;
+
+      // Ordered so a failure never leaves the setting "off" while the
+      // shared-password sample accounts can still sign in.
+      let response: Awaited<ReturnType<typeof executeConnectorCommand>>;
+      if (!enabled) {
+        // Off: stop the accounts first; if that fails, nothing is saved.
+        await setSampleAccountsSignIn(orgId, userId, false);
+        try {
+          response = await executeConnectorCommand(
+            `${url}/workspace`,
+            HttpMethod.PUT,
+            headers,
+            { enabled },
+          );
+        } catch (saveError: unknown) {
+          // The reply can be lost after the save, so let the accounts back in
+          // only when the setting still reads "on"; if unsure, keep them stopped.
+          if (wasEnabled) {
+            const after = await executeConnectorCommand(
+              `${url}/status`,
+              HttpMethod.GET,
+              headers,
+            ).catch(() => undefined);
+            const stillOn =
+              !!after &&
+              isOk(after) &&
+              (after.data as { offForEveryone?: boolean } | undefined)
+                ?.offForEveryone === false;
+            if (stillOn) await setSampleAccountsSignIn(orgId, userId, true);
+          }
+          throw saveError;
+        }
+        if (!isOk(response) && wasEnabled) {
+          // The demo stays on, so its accounts go back to how they were.
+          await setSampleAccountsSignIn(orgId, userId, true);
+        }
+      } else {
+        // On: save first; a failure after it leaves the accounts stopped, the safe side.
+        response = await executeConnectorCommand(
+          `${url}/workspace`,
+          HttpMethod.PUT,
+          headers,
+          { enabled },
+        );
+        if (isOk(response)) {
+          await setSampleAccountsSignIn(orgId, userId, true);
+        }
+      }
+      handleConnectorResponse(
+        response,
+        res,
+        'Saving demo data for everyone',
+        'Failed to save demo data for everyone',
+      );
+    } catch (error: unknown) {
+      logger.error('Error saving demo data for everyone', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      next(handleBackendError(error, 'save demo data for everyone'));
+    }
+  };
+export const createKnowledgeBase =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId, orgId } = req.user || {};
+      const { kbName } = req.body;
+
+      if (!userId || !orgId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      // Validate kbName for XSS and format specifiers
+      if (kbName) {
+        validateNoXSS(kbName, 'Knowledge base name');
+        validateNoFormatSpecifiers(kbName, 'Knowledge base name');
+      }
+
+      logger.info(`Creating knowledge base '${kbName}' for user ${userId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        {
+          name: kbName,
+        },
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Creating knowledge base',
+        'Knowledge base creation failed',
+      );
+      logger.info(`Knowledge base '${kbName}' created successfully`);
+    } catch (error: any) {
+      logger.error('Error creating knowledge base', { error: error.message });
+      const handleError = handleBackendError(error, 'create knowledge base');
+      next(handleError);
+    }
+  };
+
+export const getKnowledgeBase =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId } = req.user || {};
+      const { kbId } = req.params as { kbId: string };
+
+      if (!userId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      logger.info(`Getting knowledge base ${kbId} for user ${userId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+
+      if (response?.data && typeof response.data === 'object') {
+        const data = response.data as Record<string, unknown>;
+        const folders = data.folders;
+        if (Array.isArray(folders)) {
+          for (const folder of folders) {
+            if (folder && typeof folder === 'object') {
+              delete (folder as Record<string, unknown>).webUrl;
+            }
+          }
+        }
+      }
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Getting knowledge base',
+        'Knowledge base not found',
+      );
+    } catch (error: any) {
+      logger.error('Error getting knowledge base', {
+        error: error.message,
+        kbId: req.params.kbId,
+        userId: req.user?.userId,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      const handleError = handleBackendError(error, 'get knowledge base');
+      next(handleError);
+    }
+  };
+
+export const listKnowledgeBases =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId, orgId } = req.user || {};
+
+      if (!userId || !orgId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      // Extract and parse query parameters with safe integer validation
+      let page: number;
+      let limit: number;
+      try {
+        const pagination = safeParsePagination(
+          req.query.page as string | undefined,
+          req.query.limit as string | undefined,
+          1,
+          20,
+          100,
+        );
+        page = pagination.page;
+        limit = pagination.limit;
+      } catch (error: any) {
+        throw new BadRequestError(
+          error.message || 'Invalid pagination parameters',
+        );
+      }
+
+      const search = req.query.search ? String(req.query.search) : undefined;
+
+      // Additional validation for search parameter (defense in depth)
+      if (search) {
+        try {
+          validateNoXSS(search, 'search parameter');
+          validateNoFormatSpecifiers(search, 'search parameter');
+
+          if (search.length > 1000) {
+            throw new BadRequestError(
+              'Search parameter too long (max 1000 characters)',
+            );
+          }
+        } catch (error: any) {
+          throw new BadRequestError(
+            error.message ||
+              'Search parameter contains potentially dangerous content',
+          );
+        }
+      }
+
+      const permissions = req.query.permissions
+        ? String(req.query.permissions).split(',')
+        : undefined;
+      const sortBy = req.query.sortBy ? String(req.query.sortBy) : 'name';
+      const sortOrder = req.query.sortOrder
+        ? String(req.query.sortOrder)
+        : 'asc';
+
+      // Validate sort parameters
+      const validSortFields = [
+        'name',
+        'createdAtTimestamp',
+        'updatedAtTimestamp',
+        'userRole',
+      ];
+      if (!validSortFields.includes(sortBy)) {
+        throw new BadRequestError(
+          `Invalid sort field. Must be one of: ${validSortFields.join(', ')}`,
+        );
+      }
+
+      const validSortOrders = ['asc', 'desc'];
+      if (!validSortOrders.includes(sortOrder.toLowerCase())) {
+        throw new BadRequestError(
+          `Invalid sort order. Must be one of: ${validSortOrders.join(', ')}`,
+        );
+      }
+
+      // Validate permissions filter
+      if (permissions) {
+        const validPermissions = [
+          'OWNER',
+          'WRITER',
+          'READER',
+        ];
+        const invalidPermissions = permissions.filter(
+          (p) => !validPermissions.includes(p),
+        );
+        if (invalidPermissions.length > 0) {
+          throw new BadRequestError(
+            `Invalid permissions: ${invalidPermissions.join(', ')}`,
+          );
+        }
+      }
+
+      logger.info(
+        `Listing knowledge bases for user ${userId} with pagination`,
+        {
+          page,
+          limit,
+          search,
+          permissions,
+          sortBy,
+          sortOrder,
+        },
+      );
+
+      const queryParams = new URLSearchParams();
+      if (page) queryParams.set('page', String(page));
+      if (limit) queryParams.set('limit', String(limit));
+      if (search) queryParams.set('search', String(search));
+      if (permissions)
+        queryParams.set('permissions', String(permissions?.join(',')));
+      if (sortBy) queryParams.set('sort_by', String(sortBy));
+      if (sortOrder) queryParams.set('sort_order', String(sortOrder));
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/?${queryParams.toString()}`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+
+      if (response?.data && typeof response.data === 'object') {
+        const data = response.data as Record<string, unknown>;
+        const knowledgeBases = data.knowledgeBases;
+        if (Array.isArray(knowledgeBases)) {
+          for (const kb of knowledgeBases) {
+            if (!kb || typeof kb !== 'object') continue;
+            const folders = (kb as Record<string, unknown>).folders;
+            if (!Array.isArray(folders)) continue;
+            for (const folder of folders) {
+              if (folder && typeof folder === 'object') {
+                delete (folder as Record<string, unknown>).webUrl;
+              }
+            }
+          }
+        }
+      }
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Getting knowledge bases',
+        'Knowledge bases not found',
+      );
+
+      // Log successful retrieval
+      logger.debug('Knowledge bases retrieved successfully');
+    } catch (error: any) {
+      logger.error('Error listing knowledge bases', {
+        error: error.message,
+        userId: req.user?.userId,
+        orgId: req.user?.orgId,
+      });
+      const handleError = handleBackendError(error, 'list knowledge bases');
+      next(handleError);
+    }
+  };
+
+export const updateKnowledgeBase =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId } = req.user || {};
+      const { kbId } = req.params as { kbId: string };
+      const { kbName } = req.body;
+
+      if (!userId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      // Validate kbName for XSS and format specifiers
+      if (kbName) {
+        validateNoXSS(kbName, 'Knowledge base name');
+        validateNoFormatSpecifiers(kbName, 'Knowledge base name');
+      }
+
+      logger.info(`Updating knowledge base ${kbId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}`,
+        HttpMethod.PUT,
+        req.headers as Record<string, string>,
+        {
+          name: kbName,
+        },
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Updating knowledge base',
+        'Knowledge base not found',
+      );
+    } catch (error: any) {
+      logger.error('Error updating knowledge base', { error: error.message });
+      const handleError = handleBackendError(error, 'update knowledge base');
+      next(handleError);
+    }
+  };
+
+export const deleteKnowledgeBase =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId } = req.user || {};
+      const { kbId } = req.params as { kbId: string };
+
+      if (!userId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+      logger.info(`Deleting knowledge base ${kbId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}`,
+        HttpMethod.DELETE,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Deleting knowledge base',
+        'Knowledge base not found',
+      );
+    } catch (error: any) {
+      logger.error('Error deleting knowledge base', { error: error.message });
+      const handleError = handleBackendError(error, 'delete knowledge base');
+      next(handleError);
+    }
+  };
+
+export const createFolder =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId, orgId } = req.user || {};
+      const { kbId } = req.params as { kbId: string };
+      // For the subfolder route (/:kbId/folder/:folderId/subfolder) the parent
+      // id is a path parameter; the root-folder route passes it as a query
+      // param. If both are passed, verify they do not conflict to avoid creating
+      // the folder under the wrong parent.
+      const pathFolderId = (req.params as { folderId?: string }).folderId;
+      const queryFolderId = (req.query as { folderId?: string }).folderId;
+      if (pathFolderId && queryFolderId && pathFolderId !== queryFolderId) {
+        throw new BadRequestError(
+          'Conflicting folderId in path and query parameters',
+        );
+      }
+      const folderId: string | undefined = pathFolderId ?? queryFolderId;
+      const { folderName } = req.body;
+
+      if (!userId || !orgId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      if (folderName) {
+        validateNoXSS(folderName, 'Folder name');
+        validateNoFormatSpecifiers(folderName, 'Folder name');
+      }
+
+      if (folderId) {
+        logger.info(`Creating folder '${folderName}' in folder ${folderId}`);
+      } else {
+        logger.info(`Creating folder '${folderName}' in KB ${kbId}`);
+      }
+
+      const connectorUrl = folderId
+        ? `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/folder/${encodeURIComponent(folderId)}/subfolder`
+        : `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/folder`;
+
+      const response = await executeConnectorCommand(
+        connectorUrl,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        {
+          name: folderName,
+        },
+      );
+
+      if (response?.data && typeof response.data === 'object') {
+        delete (response.data as Record<string, unknown>).webUrl;
+      }
+
+      handleConnectorResponse(
+        response,
+        res,
+        folderId ? 'Creating nested folder' : 'Creating folder',
+        'Folder not found',
+      );
+    } catch (error: any) {
+      logger.error('Error creating folder for knowledge base', {
+        error: error.message,
+        kbId: req.params.kbId,
+        userId: req.user?.userId,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      const handleError = handleBackendError(error, 'create folder');
+      next(handleError);
+    }
+  };
+
+export const updateFolder =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId } = req.user || {};
+      const { kbId, folderId } = req.params as {
+        kbId: string;
+        folderId: string;
+      };
+      const { folderName } = req.body;
+      if (!userId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      // Validate folderName for XSS and format specifiers
+      if (folderName) {
+        validateNoXSS(folderName, 'Folder name');
+        validateNoFormatSpecifiers(folderName, 'Folder name');
+      }
+
+      logger.info(`Updating folder ${folderId} in KB ${kbId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/folder/${encodeURIComponent(folderId)}`,
+        HttpMethod.PUT,
+        req.headers as Record<string, string>,
+        { name: folderName },
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Updating folder',
+        'Folder not found',
+      );
+    } catch (error: any) {
+      logger.error('Error updating folder for knowledge base', {
+        error: error.message,
+        kbId: req.params.kbId,
+        folderId: req.params.folderId,
+        userId: req.user?.userId,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      const handleError = handleBackendError(error, 'update folder');
+      next(handleError);
+    }
+  };
+
+export const deleteFolder =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId } = req.user || {};
+      const { kbId, folderId } = req.params as {
+        kbId: string;
+        folderId: string;
+      };
+      if (!userId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      logger.info(`Deleting folder ${folderId} in KB ${kbId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/folder/${encodeURIComponent(folderId)}`,
+        HttpMethod.DELETE,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Deleting folder',
+        'Folder not found',
+      );
+    } catch (error: any) {
+      logger.error('Error deleting folder for knowledge base', {
+        error: error.message,
+        kbId: req.params.kbId,
+        folderId: req.params.folderId,
+        userId: req.user?.userId,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      const handleError = handleBackendError(error, 'delete folder');
+      next(handleError);
+    }
+  };
+
+/** Best-effort human-readable message from a placeholder-creation failure. */
+const placeholderErrorMessage = (err: unknown): string => {
+  if (axios.isAxiosError(err)) {
+    return (
+      err.response?.data?.error?.message ||
+      err.response?.data?.message ||
+      err.message
+    );
+  }
+  return err instanceof Error ? err.message : 'Failed to create placeholder document';
+};
+
+// SSE headers for the streaming upload response. No global compression is
+// applied (it would buffer SSE), `X-Accel-Buffering: no` disables proxy
+// buffering, and the per-response socket timeout is cleared so a long upload
+// stream is not closed by Node's default 120s timeout.
+const UPLOAD_SSE_HEADERS = {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache, no-transform',
+  Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no',
+} as const;
+
+// Heartbeat cadence and a bounded per-socket timeout so a stuck/half-open
+// connection is eventually reclaimed. We emit a keepalive every 1s — matching
+// the Python chat-streaming backend's `send_keepalive` (interval=1s) — because
+// Cloudflare aggressively reaps connections that go quiet, and a 1s comment
+// stream is the cheapest reliable way to keep the upload stream warm end to end.
+const UPLOAD_HEARTBEAT_MS = 1_000;
+const UPLOAD_SOCKET_TIMEOUT_MS = 5 * 60 * 1000;
+
+const writeUploadEvent = (
+  res: Response,
+  event: string,
+  data: Record<string, unknown>,
+): void => {
+  // The client can drop mid-stream; writing to a closed socket throws
+  // EPIPE / ERR_STREAM_WRITE_AFTER_END. Skip if the response already ended and
+  // swallow any write error here (debug, not error) so a disconnect is never
+  // surfaced by the caller as a catastrophic upload failure.
+  if (res.writableEnded || res.destroyed) return;
+  try {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    (res as unknown as { flush?: () => void }).flush?.();
+  } catch (err) {
+    logger.debug('Skipped upload event write; socket likely closed', {
+      event,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+};
+
+/**
+ * Streams one batch upload as Server-Sent Events: the upload POST response IS
+ * the event stream. It emits a terminal `file:succeeded` / `file:failed` per
+ * file (synchronous rejections first, then storage-upload + indexing outcomes)
+ * and a final `done` summary, then ends the response. Validation/permission
+ * errors are handled by the caller BEFORE this runs (so they can still be a
+ * normal 4xx); once streaming begins, all failures are streamed.
+ */
+const streamKbUpload = async (opts: {
+  req: AuthenticatedUserRequest;
+  res: Response;
+  fileBuffers: FileBufferInfo[];
+  rejectedFiles: RejectedFileInfo[];
+  orgId: string;
+  kbId: string;
+  isVersioned: boolean;
+  keyValueStoreService: KeyValueStoreService;
+  appConfig: AppConfig;
+  pythonServiceUrl: string;
+}): Promise<void> => {
+  const {
+    req,
+    res,
+    fileBuffers,
+    rejectedFiles,
+    orgId,
+    kbId,
+    isVersioned,
+    keyValueStoreService,
+    appConfig,
+    pythonServiceUrl,
+  } = opts;
+
+  const userId = req.user?.userId;
+
+  res.writeHead(200, UPLOAD_SSE_HEADERS);
+  // Bounded (not infinite) so a half-open/stuck socket is eventually reclaimed.
+  // Heartbeats below keep a legitimately-slow upload from hitting it.
+  req.socket?.setTimeout?.(UPLOAD_SOCKET_TIMEOUT_MS);
+  res.write(': connected\n\n');
+  (res as unknown as { flush?: () => void }).flush?.();
+
+  // Heartbeat comments keep proxies from killing an idle connection during slow
+  // storage/index work and let the client's idle-watchdog distinguish "slow" from
+  // "dead". Stopped in `finally`. Writes to a closed socket are swallowed.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': keepalive\n\n');
+      (res as unknown as { flush?: () => void }).flush?.();
+    } catch {
+      // Socket closed — stop firing immediately (final cleanup still runs in
+      // `finally`). Avoids useless writes while background processing finishes.
+      clearInterval(heartbeat);
+    }
+  }, UPLOAD_HEARTBEAT_MS);
+  heartbeat.unref?.();
+
+  const publish: UploadStreamPublish = (event, data) =>
+    writeUploadEvent(res, event, data);
+
+  const total = fileBuffers.length + rejectedFiles.length;
+  let succeeded = 0;
+  let failed = 0;
+
+  try {
+    // One scoped storage-service token for this upload request (valid 1h, reused
+    // for every file's internal storage call). Carries orgId + userId so the
+    // storage service keeps org scoping and initiator attribution, while routing
+    // through the INTERNAL storage route instead of the user-facing /upload
+    // route. Minted inside the try so a config error streams as an `error` event
+    // rather than silently aborting after headers are sent.
+    const storageToken = scopedStorageServiceJwtGenerator(
+      orgId,
+      appConfig.scopedJwtSecret,
+      userId,
+    );
+
+    // 1) Files the processor rejected up front (oversize / unsupported type).
+    for (const rf of rejectedFiles) {
+      publish('file:failed', {
+        fileName: rf.originalname,
+        filePath: rf.filePath,
+        extension:
+          getFileExtension(rf.filePath) ??
+          getFileExtension(rf.originalname) ??
+          undefined,
+        errors: [rf.error],
+        reason: rf.reason,
+        stage: 'upload',
+      });
+      failed += 1;
+    }
+
+    // 2) Create a placeholder (storage) document per accepted file, with
+    //    BOUNDED CONCURRENCY. For local-disk storage the file bytes are sent
+    //    here, and for S3/Azure the signed-URL round-trip happens here, so doing
+    //    this sequentially let one large file stall every other file. Now up to
+    //    UPLOAD_STORAGE_CONCURRENCY run at once; each occupies one slot.
+    const currentTime = Date.now();
+    const placeholderOutcomes = await mapWithConcurrency(
+      fileBuffers,
+      UPLOAD_STORAGE_CONCURRENCY,
+      async (file): Promise<PlaceholderResultWithMetadata | null> => {
+        // If the client has gone away mid-batch, skip the per-file HTTP
+        // round-trip to the storage service — no one is listening for it.
+        if (req.socket?.destroyed) return null;
+
+        const { originalname, mimetype, size, filePath, lastModified } = file;
+        const fileName = filePath.includes('/')
+          ? filePath.split('/').pop() || originalname
+          : filePath;
+        const extension = getFileExtension(fileName);
+        const correctMimeType = (extension && getMimeType(extension)) || mimetype;
+        const key: string = randomUUID();
+        const webUrl = `/record/${key}`;
+        const validLastModified =
+          lastModified && !isNaN(lastModified) && lastModified > 0
+            ? lastModified
+            : currentTime;
+        const metadata: FileUploadMetadata = {
+          file,
+          filePath,
+          fileName,
+          extension,
+          correctMimeType,
+          key,
+          webUrl,
+          validLastModified,
+          size,
+        };
+        try {
+          const placeholderResult = await createPlaceholderDocument(
+            req,
+            file,
+            fileName,
+            isVersioned,
+            keyValueStoreService,
+            appConfig.storage,
+            storageToken,
+          );
+          return { placeholderResult, metadata };
+        } catch (placeholderError: any) {
+          const errorMessage = placeholderErrorMessage(placeholderError);
+          publish('file:failed', {
+            recordId: key,
+            fileName,
+            filePath,
+            extension: extension ?? undefined,
+            errors: [errorMessage],
+            stage: 'upload',
+          });
+          failed += 1;
+          logger.error('Failed to create placeholder document for file', {
+            fileName,
+            filePath,
+            error: errorMessage,
+          });
+          return null;
+        }
+      },
+    );
+    const placeholderResults: PlaceholderResultWithMetadata[] =
+      placeholderOutcomes.filter(
+        (r): r is PlaceholderResultWithMetadata => r !== null,
+      );
+
+    // 3) Upload to storage + create records via indexing, streaming each
+    //    file's terminal outcome as it settles.
+    if (placeholderResults.length > 0) {
+      const counts = await processUploadsInBackground(
+        placeholderResults,
+        orgId,
+        kbId,
+        currentTime,
+        pythonServiceUrl,
+        req.headers as Record<string, string>,
+        logger,
+        publish,
+      );
+      succeeded += counts.succeeded;
+      failed += counts.failed;
+    }
+
+    writeUploadEvent(res, 'done', { summary: { total, succeeded, failed } });
+  } catch (error: any) {
+    logger.error('Streaming upload failed', { error: error?.message });
+    try {
+      writeUploadEvent(res, 'error', {
+        message: error?.message || 'Upload failed',
+      });
+    } catch {
+      /* socket already closed */
+    }
+  } finally {
+    clearInterval(heartbeat);
+    try {
+      res.end();
+    } catch {
+      /* socket already closed */
+    }
+  }
+};
+
+/**
+ * Verify the KB exists and the caller has write permission before touching
+ * storage. The GET /kb endpoint returns 200 for ANY role (READER
+ * included), so a 200 alone is insufficient — we must inspect `userRole` in the
+ * response body. Throws the appropriate HTTP error otherwise.
+ */
+const assertKbWritePermission = async (
+  connectorBackend: string,
+  kbId: string,
+  headers: Record<string, string>,
+): Promise<void> => {
+  const kbCheckResponse = await executeConnectorCommand(
+    `${connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}`,
+    HttpMethod.GET,
+    headers,
+  );
+  if (kbCheckResponse.statusCode === 404) {
+    throw new NotFoundError(`Knowledge base ${kbId} not found`);
+  }
+  if (kbCheckResponse.statusCode === 403) {
+    throw new ForbiddenError(
+      'You do not have permission to upload to this knowledge base',
+    );
+  }
+  if (kbCheckResponse.statusCode !== 200) {
+    throw handleBackendError(kbCheckResponse, 'verify knowledge base access');
+  }
+  const kbUserRole = (kbCheckResponse.data as KbCheckData | undefined)?.userRole;
+  if (!kbUserRole || !['OWNER', 'WRITER'].includes(kbUserRole)) {
+    throw new ForbiddenError(
+      'You do not have permission to upload to this knowledge base',
+    );
+  }
+};
+
+/**
+ * Upload records to a Knowledge Base root or folder. Optional `folderId` query
+ * param targets a folder; omit for KB root. The POST response is an SSE stream
+ * of per-file outcomes (see streamKbUpload). Files are processed by the file
+ * processor middleware which attaches filePath/lastModified to each buffer.
+ */
+export const uploadRecords =
+  (
+    keyValueStoreService: KeyValueStoreService,
+    appConfig: AppConfig,
+  ) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const fileBuffers: FileBufferInfo[] = req.body.fileBuffers || [];
+      // Files dropped by the processor (oversize / unsupported type). Streamed
+      // back as per-file failures rather than failing the whole batch.
+      const rejectedFiles: RejectedFileInfo[] = req.body.rejectedFiles || [];
+      const userId = req.user?.userId;
+      const orgId = req.user?.orgId;
+      const { kbId } = req.params;
+      const folderId = req.query.folderId as string | undefined;
+      const isVersioned = req.body.isVersioned ?? true;
+
+      // Validation
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      if (!kbId) {
+        throw new BadRequestError('Knowledge Base ID is required');
+      }
+      if (fileBuffers.length === 0 && rejectedFiles.length === 0) {
+        throw new BadRequestError('Knowledge Base ID and files are required');
+      }
+
+      // Verify KB exists and caller has write permission before touching storage.
+      await assertKbWritePermission(
+        appConfig.connectorBackend,
+        kbId,
+        req.headers as Record<string, string>,
+      );
+
+      if (folderId) {
+        // Validate folder exists and belongs to the KB before creating any placeholders.
+        // This turns the silent background failure (which returned 200) into a proper 404/403.
+        const validationResponse = await executeConnectorCommand(
+          `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/folder/${encodeURIComponent(folderId)}/validate`,
+          HttpMethod.GET,
+          req.headers as Record<string, string>,
+        );
+        if (
+          validationResponse.statusCode < 200 ||
+          validationResponse.statusCode >= 300
+        ) {
+          throw handleBackendError(
+            validationResponse,
+            'validate folder for upload',
+          );
+        }
+      }
+
+      logger.info(
+        folderId ? 'Processing file upload to folder' : 'Processing file upload to KB',
+        {
+          totalFiles: fileBuffers.length,
+          kbId,
+          ...(folderId ? { folderId } : {}),
+          userId,
+          samplePaths: fileBuffers.slice(0, 3).map((f) => f.filePath),
+        },
+      );
+
+      const pythonServiceUrl = folderId
+        ? `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/folder/${encodeURIComponent(folderId)}/upload`
+        : `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/upload`;
+
+      // Stream every file's outcome (rejections, storage upload, indexing) as
+      // SSE on this response. Validation/permission errors above are still
+      // normal 4xx; from here the response is a stream.
+      await streamKbUpload({
+        req,
+        res,
+        fileBuffers,
+        rejectedFiles,
+        orgId,
+        kbId,
+        isVersioned,
+        keyValueStoreService,
+        appConfig,
+        pythonServiceUrl,
+      });
+    } catch (error: any) {
+      // streamKbUpload handles its own errors after headers are sent, so this
+      // only catches pre-stream validation/permission errors.
+      if (res.headersSent) {
+        return;
+      }
+      logger.error('Record upload failed', {
+        error: error.message,
+        userId: req.user?.userId,
+        kbId: req.params.kbId,
+        folderId: req.query.folderId,
+      });
+      const backendError = handleBackendError(error, 'Record upload api');
+      next(backendError);
+    }
+  };
+
+export const updateRecord =
+  (keyValueStoreService: KeyValueStoreService, appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+      let { recordName } = req.body || {};
+
+      if (!userId || !orgId) {
+        throw new BadRequestError('User authentication is required');
+      }
+
+      // Check if there's a file in the request
+      const hasFileBuffer = req.body.fileBuffer && req.body.fileBuffer.buffer;
+      let originalname, mimetype, size, extension, lastModified, sha256Hash;
+
+      if (hasFileBuffer) {
+        ({ originalname, mimetype, size, lastModified } = req.body.fileBuffer);
+
+        // Extract extension from filename (canonical last-dot derivation)
+        extension = getFileExtension(originalname);
+        // Calculate SHA-256 checksum for security
+        const buffer = req.body.fileBuffer.buffer;
+        sha256Hash = crypto.createHash('sha256').update(buffer).digest('hex');
+      }
+
+      if (!recordName) {
+        recordName = originalname;
+        logger.info('No custom name provided');
+      }
+
+      // Validate recordName for XSS and format specifiers
+      // This validation happens after we've determined the final recordName value
+      if (recordName) {
+        validateNoXSS(recordName, 'Record name');
+        validateNoFormatSpecifiers(recordName, 'Record name');
+      }
+
+      // Prepare update data with timestamp
+      const updatedData = {
+        recordName,
+      };
+
+      // Add file-related data if file is being uploaded
+      let fileMetadata = null;
+      if (hasFileBuffer) {
+        fileMetadata = {
+          originalname,
+          mimetype,
+          size,
+          extension,
+          lastModified,
+          sha256Hash,
+          // Same clock and stage as the file processor's fallback for a missing
+          // lastModified. Python's own clock is read after the storage upload
+          // below, which has no time limit, so it cannot tell the two apart.
+          receivedAt: Date.now(),
+        };
+
+        // Get filename without extension to use as record name
+        if (originalname && originalname.includes('.')) {
+          const lastDotIndex = originalname.lastIndexOf('.');
+          if (lastDotIndex > 0) {
+            const fileNameWithoutExt = originalname.substring(0, lastDotIndex);
+            // Validate the filename (without extension) for XSS
+            validateNoXSS(fileNameWithoutExt, 'Record name');
+            validateNoFormatSpecifiers(fileNameWithoutExt, 'Record name');
+            updatedData.recordName = fileNameWithoutExt;
+            logger.info('Setting record name from file', {
+              recordName: updatedData.recordName,
+              originalFileName: originalname,
+            });
+          }
+        }
+      }
+
+      // STEP 1: If there's a file to upload, upload to storage FIRST (before DB update)
+      // This ensures the new content is available when the indexing service
+      // receives the update event and tries to download it.
+      let fileUploaded = false;
+      let storageDocumentId = null;
+
+      if (hasFileBuffer) {
+        // Get the existing record's externalRecordId for storage upload
+        const getRecordResponse = await executeConnectorCommand(
+          `${appConfig.connectorBackend}/api/v1/records/${encodeURIComponent(recordId)}`,
+          HttpMethod.GET,
+          req.headers as Record<string, string>,
+        );
+
+        if (getRecordResponse.statusCode < 200 || getRecordResponse.statusCode >= 300) {
+          throw handleBackendError(getRecordResponse, 'get record for update');
+        }
+
+        // The new file is stored before the Python update checks the KB role, so the
+        // same check runs here or a KB reader's file replaces the stored one anyway.
+        const recordDetail = getRecordResponse.data as RecordDetailData | undefined;
+        const kbId = recordDetail?.knowledgeBase?.id;
+        if (!kbId) {
+          throw new ForbiddenError('You do not have permission to edit this record');
+        }
+        await assertKbWritePermission(
+          appConfig.connectorBackend,
+          kbId,
+          req.headers as Record<string, string>,
+        );
+
+        storageDocumentId = recordDetail?.record?.externalRecordId;
+
+        if (!storageDocumentId) {
+          logger.error('No external record ID found on existing record', {
+            recordId,
+          });
+          throw new BadRequestError(
+            'Cannot update file: No external record ID found for this record',
+          );
+        }
+
+        logger.info('Uploading new version of file to storage', {
+          recordId,
+          fileName: originalname,
+          fileSize: size,
+          mimeType: mimetype,
+          extension,
+          storageDocumentId: storageDocumentId,
+        });
+
+        try {
+          const fileBuffer = req.body.fileBuffer;
+          const storageToken = scopedStorageServiceJwtGenerator(
+            orgId,
+            appConfig.scopedJwtSecret,
+            userId,
+          );
+          await uploadNextVersionToStorage(
+            req,
+            fileBuffer,
+            storageDocumentId,
+            keyValueStoreService,
+            appConfig.storage,
+            storageToken,
+          );
+
+          logger.info('File uploaded to storage successfully', {
+            recordId,
+            storageDocumentId,
+          });
+
+          fileUploaded = true;
+        } catch (storageError: any) {
+          const is404 = storageError?.response?.status === 404;
+
+          logger.error(
+            'Failed to upload file to storage',
+            {
+              recordId,
+              storageDocumentId: storageDocumentId,
+              error: storageError.message,
+              is404,
+            },
+          );
+
+          if (is404) {
+            throw new InternalServerError(
+              `File storage document not found. The original file may have been deleted` +
+                `Please delete this record and re-upload the file.`,
+            );
+          }
+
+          logger.error('Uploading the file to storage failed', {
+            error: storageError,
+          });
+          throw markClientSafe(
+            new InternalServerError(serverFailureMessage('save this file')),
+          );
+        }
+      }
+
+      // STEP 2: Update the record in the database (triggers reindex event via Kafka)
+      // Blob is already uploaded at this point, so indexing service will find new content.
+      logger.info('Updating record in database via Python service', {
+        recordId,
+        hasFileUpload: hasFileBuffer,
+        updatedFields: Object.keys(updatedData),
+      });
+
+      // Call the Python service to update the record
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/record/${encodeURIComponent(recordId)}`,
+        HttpMethod.PUT,
+        req.headers as Record<string, string>,
+        {
+          updates: updatedData,
+          fileMetadata: fileMetadata,
+        },
+      );
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw handleBackendError(response, 'update record');
+      }
+
+      const updateRecordResponse = response.data as any;
+
+      if (!updateRecordResponse || !updateRecordResponse.updatedRecord) {
+        throw new InternalServerError(
+          'Python service indicated failure to update record',
+        );
+      }
+
+      const updateResult = updateRecordResponse.updatedRecord;
+
+      // Log the successful update
+      logger.info('Record updated successfully', {
+        recordId,
+        userId,
+        orgId,
+        fileUploaded,
+        newFileName: fileUploaded ? originalname : undefined,
+        updatedFields: Object.keys(updatedData),
+        version: updateResult?.version,
+        requestId: req.context?.requestId,
+      });
+
+      // Return the updated record
+      res.status(200).json({
+        message: fileUploaded
+          ? 'Record updated with new file version'
+          : 'Record updated successfully',
+        record: updateResult,
+        fileUploaded,
+        meta: {
+          requestId: req.context?.requestId,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    } catch (error: any) {
+      // Log the error for debugging
+      logger.error('Error updating folder record', {
+        recordId: req.params.recordId,
+        kbId: req.params.kbId,
+        error: error.message,
+        stack: error.stack,
+        userId: req.user?.userId,
+        orgId: req.user?.orgId,
+        requestId: req.context?.requestId,
+      });
+      const handleError = handleBackendError(error, 'update record');
+      next(handleError);
+    }
+  };
+
+export const getRecordById =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      // Call the Python service to get record
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/records/${encodeURIComponent(recordId)}`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+
+      const responseForClient: Record<string, any> = { ...response, data: { ...(response?.data || {}) } };
+
+      if (responseForClient.statusCode === 404) {
+        throw new NotFoundError(`Record ${recordId} not found`);
+      }
+
+      if (responseForClient.data?.record) {
+        responseForClient.data.record = { ...responseForClient.data.record };
+        // TODO: Move this response shaping into a typed mapper once the connector contract drops record._id.
+        delete responseForClient.data.record._id;
+        delete responseForClient.data.record._rev;
+        if (responseForClient.data.record.fileRecord) {
+          responseForClient.data.record.fileRecord = {
+            ...responseForClient.data.record.fileRecord,
+          };
+          delete responseForClient.data.record.fileRecord._rev;
+          delete responseForClient.data.record.fileRecord._key;
+          delete responseForClient.data.record.fileRecord._id;
+        }
+      }
+
+      handleConnectorResponse(
+        responseForClient,
+        res,
+        'Getting record by id',
+        'Record not found',
+      );
+
+      // Log successful retrieval
+      logger.debug('Record retrieved successfully');
+    } catch (error: any) {
+      logger.error('Error getting record by id', {
+        recordId: req.params.recordId,
+        error,
+      });
+      const handleError = handleBackendError(error, 'get record by id');
+      next(handleError);
+      return; // Added return statement
+    }
+  };
+
+export const reindexRecord =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+      const { depth = 0, force = false, statusFilters } = req.body || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      const reindexBody: { depth: number; force: boolean; statusFilters?: string[] } = {
+        depth,
+        force,
+      };
+      if (statusFilters?.length) {
+        reindexBody.statusFilters = statusFilters;
+      }
+
+      // Call the Python service to reindex record
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/records/${encodeURIComponent(recordId)}/reindex`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        reindexBody,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Record not found',
+        'Record not reindexed',
+      );
+
+      // Log successful reindex
+      logger.info('Record reindexed successfully', { force });
+    } catch (error: any) {
+      logger.error('Error reindexing record', {
+        recordId: req.params.recordId,
+        error,
+      });
+      const handleError = handleBackendError(error, 'reindex record');
+      next(handleError);
+      return;
+    }
+  };
+
+export const reindexRecordGroup =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordGroupId } = req.params as { recordGroupId: string };
+      const { userId, orgId } = req.user || {};
+      const { depth = 0, force = false, statusFilters } = req.body || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      const reindexBody: { depth: number; force: boolean; statusFilters?: string[] } = {
+        depth,
+        force,
+      };
+      if (statusFilters?.length) {
+        reindexBody.statusFilters = statusFilters;
+      }
+
+      // Call the Python service to reindex record group
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/record-groups/${encodeURIComponent(recordGroupId)}/reindex`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        reindexBody,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Record group not found',
+        'Record group not reindexed',
+      );
+
+      // Log successful reindex
+      logger.info('Record group reindexed successfully', {
+        recordGroupId,
+        depth,
+        force,
+      });
+    } catch (error: any) {
+      logger.error('Error reindexing record group', {
+        recordGroupId: req.params.recordGroupId,
+        error,
+      });
+      const handleError = handleBackendError(error, 'reindex record group');
+      next(handleError);
+      return;
+    }
+  };
+
+export const deleteRecord =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+
+      // Validate user authentication
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      // Call the Python service to get record
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/records/${encodeURIComponent(recordId)}`,
+        HttpMethod.DELETE,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Deleting record',
+        'Record not deleted',
+      );
+
+      // Log successful retrieval
+      logger.info('Record deleted successfully');
+    } catch (error: any) {
+      logger.error('Error deleting record', {
+        recordId: req.params.recordId,
+        error,
+      });
+      next(error);
+      return; // Added return statement
+    }
+  };
+
+/**
+ * Bring a deleted item back from the trash, with everything deleted along with it.
+ * The connector service checks the caller's role on the collection.
+ */
+export const restoreRecord =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/record/${encodeURIComponent(recordId)}/restore`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Restoring record',
+        'Record not restored',
+      );
+    } catch (error: any) {
+      logger.error('Error restoring record', {
+        recordId: req.params.recordId,
+        error: error.message,
+        status: error.response?.status,
+      });
+      next(handleBackendError(error, 'restore record'));
+    }
+  };
+
+/**
+ * Restore several deleted items; the answer lists the outcome for each id.
+ */
+export const restoreRecords =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { userId, orgId } = req.user || {};
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+      const { recordIds } = req.body as { recordIds: string[] };
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/records/restore`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        { recordIds },
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Restoring records',
+        'Records not restored',
+      );
+    } catch (error: any) {
+      logger.error('Error restoring records', {
+        error: error.message,
+        status: error.response?.status,
+      });
+      next(handleBackendError(error, 'restore records'));
+    }
+  };
+
+/**
+ * One page of a collection's recently deleted items: what the caller may restore.
+ * The connector service scopes it to the caller's org and role on the collection.
+ */
+export const listTrash =
+  (appConfig: AppConfig) =>
+  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+    try {
+      const { userId, orgId } = req.user || {};
+      if (!userId || !orgId) {
+        throw new UnauthorizedError(
+          'User not authenticated or missing organization ID',
+        );
+      }
+      const { kbId } = req.params as { kbId: string };
+      const { page, limit } = req.query as { page?: string; limit?: string };
+      const query = new URLSearchParams({ page: page ?? '1', limit: limit ?? '25' });
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/trash?${query.toString()}`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Listing deleted items',
+        'Deleted items not found',
+      );
+    } catch (error: any) {
+      logger.error('Error listing deleted items', {
+        kbId: req.params.kbId,
+        error: error.message,
+        status: error.response?.status,
+      });
+      next(handleBackendError(error, 'load the recently deleted items'));
+    }
+  };
+
+/**
+ * Create permissions for multiple users on a knowledge base
+ */
+export const createKBPermission =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { kbId } = req.params as { kbId: string };
+      // Both lists are optional in the request validators, so a caller may
+      // send only one of them. Treat a missing list as empty.
+      const {
+        userIds = [],
+        teamIds = [],
+        role,
+      } = req.body as {
+        userIds?: string[];
+        teamIds?: string[];
+        role?: string;
+      };
+
+      if (userIds.length === 0 && teamIds.length === 0) {
+        throw new BadRequestError('User IDs or team IDs are required');
+      }
+
+      // Role is required only if users are provided (teams don't need roles)
+      if (userIds.length > 0 && !role) {
+        throw new BadRequestError('Role is required when adding users');
+      }
+
+      // Validate role only if it's provided (for users)
+      if (role) {
+        const validRoles = [
+          'OWNER',
+          'WRITER',
+          'READER',
+        ];
+        if (!validRoles.includes(role)) {
+          throw new BadRequestError(
+            `Invalid role. Must be one of: ${validRoles.join(', ')}`,
+          );
+        }
+      }
+
+      logger.info(
+        `Creating ${role || 'team'} permissions for ${userIds.length} users and ${teamIds.length} teams on KB ${kbId}`,
+      );
+
+      const payload: { userIds: string[]; teamIds: string[]; role?: string } = {
+        userIds: userIds,
+        teamIds: teamIds,
+      };
+      // Only include role if it's provided (for users)
+      if (role) {
+        payload.role = role;
+      }
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/permissions`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        payload,
+      );
+
+      if (response.statusCode !== 200 && response.statusCode !== 201) {
+        throw handleBackendError(response, 'create permissions');
+      }
+
+      const permissionResult = response.data as any;
+      if (!permissionResult) {
+        throw new NotFoundError('Failed to create permissions');
+      }
+
+      res.status(201).json({
+        kbId: kbId,
+        permissionResult,
+      });
+    } catch (error: any) {
+      logger.error('Error creating KB permissions', {
+        error: error.message,
+        kbId: req.params.kbId,
+      });
+      const handleError = handleBackendError(error, 'create permissions');
+      next(handleError);
+    }
+  };
+
+/**
+ * Update a single user's permission on a knowledge base
+ */
+export const updateKBPermission =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { kbId } = req.params as { kbId: string };
+      // Both lists are optional in the request validators, so a caller may
+      // send only one of them. Treat a missing list as empty.
+      const {
+        userIds = [],
+        teamIds = [],
+        role,
+      } = req.body as {
+        userIds?: string[];
+        teamIds?: string[];
+        role?: string;
+      };
+
+      if (userIds.length === 0 && teamIds.length === 0) {
+        throw new BadRequestError('User IDs or team IDs are required');
+      }
+
+      if (!role) {
+        throw new BadRequestError('Role is required');
+      }
+
+      const validRoles = [
+        'OWNER',
+        'WRITER',
+        'READER',
+      ];
+      if (!validRoles.includes(role)) {
+        throw new BadRequestError(
+          `Invalid role. Must be one of: ${validRoles.join(', ')}`,
+        );
+      }
+
+      logger.info(
+        `Updating permission for ${userIds.length} users and ${teamIds.length} teams on KB ${kbId} to ${role}`,
+      );
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/permissions`,
+        HttpMethod.PUT,
+        req.headers as Record<string, string>,
+        {
+          userIds: userIds,
+          teamIds: teamIds,
+          role: role,
+        },
+      );
+
+      if (response.statusCode !== 200) {
+        throw handleBackendError(response, 'update permissions');
+      }
+
+      const updateResult = response.data as any;
+
+      res.status(200).json({
+        kbId: kbId,
+        userIds: updateResult.userIds,
+        teamIds: updateResult.teamIds,
+        newRole: updateResult.newRole,
+      });
+    } catch (error: any) {
+      logger.error('Error updating KB permission', {
+        error: error.message,
+        kbId: req.params.kbId,
+      });
+      const handleError = handleBackendError(error, 'update permissions');
+      next(handleError);
+    }
+  };
+
+/**
+ * Remove a user's permission from a knowledge base
+ */
+export const removeKBPermission =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { kbId } = req.params as { kbId: string };
+      // Both lists are optional in the request validator, so a caller may
+      // send only one of them. Treat a missing list as empty.
+      const { userIds = [], teamIds = [] } = req.body as {
+        userIds?: string[];
+        teamIds?: string[];
+      };
+
+      if (userIds.length === 0 && teamIds.length === 0) {
+        throw new BadRequestError('User IDs or team IDs are required');
+      }
+
+      logger.info(
+        `Removing permission for ${userIds.length} users and ${teamIds.length} teams from KB ${kbId}`,
+      );
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/permissions`,
+        HttpMethod.DELETE,
+        req.headers as Record<string, string>,
+        {
+          userIds: userIds,
+          teamIds: teamIds,
+        },
+      );
+
+      if (response.statusCode !== 200) {
+        throw handleBackendError(response, 'remove permissions');
+      }
+
+      const removeResult = response.data as any;
+
+      res.status(200).json({
+        kbId: kbId,
+        userIds: removeResult.userIds,
+        teamIds: removeResult.teamIds,
+      });
+    } catch (error: any) {
+      logger.error('Error removing KB permission', {
+        error: error.message,
+        kbId: req.params.kbId,
+      });
+      const handleError = handleBackendError(error, 'removing KB permissions');
+      next(handleError);
+    }
+  };
+
+/**
+ * List all permissions for a knowledge base
+ */
+export const listKBPermissions =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { kbId } = req.params as { kbId: string };
+
+      logger.info(`Listing permissions for KB ${kbId}`);
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/permissions`,
+        HttpMethod.GET,
+        req.headers as Record<string, string>,
+      );
+
+      if (response.statusCode !== 200) {
+        throw handleBackendError(response, 'list permissions');
+      }
+
+      const listResult = response.data as any;
+
+      res.status(200).json({
+        kbId: kbId,
+        permissions: listResult.permissions,
+        totalCount: listResult.totalCount,
+      });
+    } catch (error: any) {
+      logger.error('Error listing KB permissions', {
+        error: error.message,
+        kbId: req.params.kbId,
+      });
+      const handleError = handleBackendError(error, 'list permissions');
+      next(handleError);
+    }
+  };
+
+export const getRecordBuffer =
+  (connectorUrl: string) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { recordId } = req.params as { recordId: string };
+      const { userId, orgId } = req.user || {};
+      const { convertTo, version } = req.query as {
+        convertTo: string;
+        version?: string;
+      };
+      if (!userId || !orgId) {
+        throw new BadRequestError('User authentication is required');
+      }
+
+      const queryParams = new URLSearchParams();
+      if (convertTo) {
+        logger.info('Converting file to ', { convertTo });
+        queryParams.append('convertTo', convertTo);
+      }
+      if (version !== undefined) {
+        // Already validated as `^\d+$` by getRecordByIdSchema.
+        queryParams.append('version', version);
+      }
+      const headers: Record<string, string> = {
+        Authorization: req.headers.authorization as string,
+        'Content-Type': 'application/json',
+      };
+
+      // Make request to FastAPI backend
+      const response = await axios.get(
+        `${connectorUrl}/api/v1/stream/record/${encodeURIComponent(recordId)}?${queryParams.toString()}`,
+        {
+          responseType: 'stream',
+          headers,
+        },
+      );
+
+      // Set appropriate headers from the FastAPI response
+      const contentType = response.headers['content-type'];
+      if (contentType) {
+        res.set('Content-Type', String(contentType));
+      }
+      const contentDisposition = response.headers['content-disposition'];
+      if (contentDisposition) {
+        res.set('Content-Disposition', String(contentDisposition));
+      }
+
+      // Pipe the streaming response directly to the client
+      response.data.pipe(res);
+
+      // Handle any errors in the stream
+      response.data.on('error', (error: any) => {
+        logger.error('Stream error while proxying record buffer', {
+          error: error?.message,
+          recordId,
+        });
+        if (!res.headersSent) {
+          try {
+            res.status(500).end('Error streaming data');
+          } catch (e) {
+            logger.error('Failed to send stream error response to client', {
+              error: e,
+            });
+          }
+          return;
+        }
+        // Headers are already out, so the status cannot be corrected. Destroy
+        // the socket so the client sees a truncated transfer rather than
+        // silently saving a partial file as if it were complete.
+        res.destroy(error);
+      });
+    } catch (error: any) {
+      logger.error('Error fetching record buffer', {
+        error: error?.message,
+        recordId: req.params.recordId,
+      });
+      if (!res.headersSent) {
+        if (error.response) {
+          let errorMessage = 'Error from AI backend';
+          try {
+            const chunks: Buffer[] = [];
+            await new Promise<void>((resolve, reject) => {
+              error.response.data.on('data', (chunk: Buffer) =>
+                chunks.push(chunk),
+              );
+              error.response.data.on('end', resolve);
+              error.response.data.on('error', reject);
+            });
+            const body = Buffer.concat(chunks).toString('utf8');
+            const parsed = JSON.parse(body);
+            errorMessage = parsed.detail || parsed.error || body;
+          } catch (parseError) {
+            logger.error('Failed to parse error response from AI backend', {
+              error: parseError,
+            });
+          }
+          // A 429 is only actionable with the source's own backoff hint, which
+          // the connector service put on the response for us to relay.
+          const retryAfter = error.response.headers?.['retry-after'];
+          if (retryAfter) {
+            res.set('Retry-After', String(retryAfter));
+          }
+          res.status(error.response.status).json({ error: errorMessage });
+          return;
+        } else {
+          // Don't throw here to avoid uncaughtException shutdown during streams
+          res.status(500).json({ error: 'Failed to retrieve record data' });
+          return;
+        }
+      }
+      const handleError = handleBackendError(error, 'get record buffer');
+      logger.error('Error fetching record buffer', {
+        error: error.message,
+      });
+      next(handleError);
+    }
+  };
+
+/**
+ * Move a record (file or folder) to a different location within the same KB.
+ */
+export const moveRecord =
+  (appConfig: AppConfig) =>
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const { userId } = req.user || {};
+      const { kbId, recordId } = req.params as {
+        kbId: string;
+        recordId: string;
+      };
+      const { newParentId } = req.body;
+
+      if (!userId) {
+        throw new UnauthorizedError('User authentication required');
+      }
+
+      logger.info(
+        `Moving record ${recordId} to ${newParentId ? `folder ${newParentId}` : 'KB root'} in KB ${kbId}`,
+      );
+
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/kb/${encodeURIComponent(kbId)}/record/${encodeURIComponent(recordId)}/move`,
+        HttpMethod.PUT,
+        req.headers as Record<string, string>,
+        { newParentId },
+      );
+
+      handleConnectorResponse(
+        response,
+        res,
+        'Moving record',
+        'Record not found',
+      );
+    } catch (error: any) {
+      logger.error('Error moving record', {
+        error: error.message,
+        kbId: req.params.kbId,
+        recordId: req.params.recordId,
+        userId: req.user?.userId,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      const handleError = handleBackendError(error, 'move record');
+      next(handleError);
+    }
+  };

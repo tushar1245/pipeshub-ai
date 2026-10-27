@@ -1,0 +1,169 @@
+'use client';
+
+import React, { useState } from 'react';
+import { Flex, Text } from '@radix-ui/themes';
+import { useTranslation } from 'react-i18next';
+import { CitationNumberCircle } from './citation-number-circle';
+import { CitationSourceLinkRow } from './citation-source-link-row';
+import type { CitationData, CitationCallbacks } from './types';
+
+export interface InlineCitationGroupItem {
+  /** The `[N]` number from the markdown text */
+  chunkIndex: number;
+  /** Per-occurrence key when the same number appears multiple times */
+  occurrenceKey?: string;
+  /** Full citation data for this marker */
+  citation: CitationData;
+}
+
+interface InlineCitationGroupProps {
+  /** Consecutive citations pointing at the same record (length >= 2) */
+  items: InlineCitationGroupItem[];
+  /** Interaction callbacks forwarded to each circle's popover */
+  callbacks?: CitationCallbacks;
+}
+
+/** Circles shown before the rest collapse into a "+N" chip. */
+export const INLINE_CITATION_GROUP_VISIBLE = 2;
+
+/**
+ * Inline pill used when consecutive `[N]` markers all point at the same record:
+ * shows the connector icon + filename once, followed by one compact numbered
+ * circle per citation. Past two circles the rest collapse into a "+N" chip
+ * that expands the group in place.
+ */
+function InlineCitationGroupImpl({ items, callbacks }: InlineCitationGroupProps) {
+  const { t } = useTranslation();
+  const [isHovered, setIsHovered] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const first = items[0]?.citation;
+  if (!first) return null;
+
+  const connector = first.connector || '';
+  const fileNameWithoutExt = first.recordName
+    ? first.recordName.replace(/\.[^/.]+$/, '')
+    : '';
+
+  const truncatedName =
+    fileNameWithoutExt.length > 24
+      ? fileNameWithoutExt.slice(0, 24) + '…'
+      : fileNameWithoutExt;
+
+  const visibleItems = expanded ? items : items.slice(0, INLINE_CITATION_GROUP_VISIBLE);
+  const hiddenCount = items.length - visibleItems.length;
+
+  return (
+    <Flex
+      as="span"
+      align="center"
+      gap="1"
+      wrap="wrap"
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      style={{
+        display: 'inline-flex',
+        background: isHovered ? 'var(--accent-3)' : 'var(--olive-2)',
+        border: `0.667px solid ${isHovered ? 'var(--accent-8)' : 'var(--olive-3)'}`,
+        padding: '2px var(--space-1)',
+        borderRadius: 'var(--radius-1)',
+        verticalAlign: 'middle',
+        marginLeft: 'var(--space-1)',
+        marginRight: '2px',
+        transition: 'all 0.15s ease',
+        minHeight: 'var(--space-5)',
+        rowGap: '2px',
+        columnGap: 'var(--space-1)',
+      }}
+    >
+      <CitationSourceLinkRow
+        citation={first}
+        connector={connector}
+        truncatedName={truncatedName}
+      />
+
+      <Flex
+        as="span"
+        align="center"
+        gap="1"
+        wrap="wrap"
+        style={{
+          display: 'inline-flex',
+          gap: '3px',
+        }}
+      >
+        {visibleItems.map((item, idx) => (
+          <CitationNumberCircle
+            key={item.occurrenceKey ?? `cite-circle-${item.chunkIndex}-${idx}`}
+            chunkIndex={item.chunkIndex}
+            occurrenceKey={item.occurrenceKey}
+            citation={item.citation}
+            callbacks={callbacks}
+          />
+        ))}
+        {hiddenCount > 0 && (
+          <button
+            type="button"
+            className="citation-overflow-chip"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setExpanded(true);
+            }}
+            aria-label={t('chat.showMoreCitations', { count: hiddenCount })}
+            title={t('chat.showMoreCitations', { count: hiddenCount })}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              minWidth: '16px',
+              height: '16px',
+              padding: '0 4px',
+              margin: 0,
+              position: 'relative',
+              borderRadius: '999px',
+              background: 'var(--olive-3)',
+              border: '1px solid var(--olive-6)',
+              color: 'var(--olive-11)',
+              cursor: 'pointer',
+              font: 'inherit',
+              lineHeight: 1,
+              flexShrink: 0,
+            }}
+          >
+            <Text size="1" weight="bold" style={{ color: 'inherit', fontSize: '10px', lineHeight: 1 }}>
+              +{hiddenCount}
+            </Text>
+          </button>
+        )}
+      </Flex>
+    </Flex>
+  );
+}
+
+/** See `inlineCitationBadgePropsEqual` in `inline-citation-badge.tsx` for why
+ * this compares identity fields instead of relying on default reference
+ * equality — same rationale, applied per item in the group. */
+function inlineCitationGroupPropsEqual(
+  prev: InlineCitationGroupProps,
+  next: InlineCitationGroupProps,
+): boolean {
+  if (prev.callbacks !== next.callbacks) return false;
+  if (prev.items.length !== next.items.length) return false;
+  for (let i = 0; i < prev.items.length; i += 1) {
+    const a = prev.items[i];
+    const b = next.items[i];
+    if (
+      a.chunkIndex !== b.chunkIndex ||
+      a.occurrenceKey !== b.occurrenceKey ||
+      a.citation.citationId !== b.citation.citationId ||
+      a.citation.recordName !== b.citation.recordName ||
+      a.citation.webUrl !== b.citation.webUrl
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export const InlineCitationGroup = React.memo(InlineCitationGroupImpl, inlineCitationGroupPropsEqual);

@@ -1,0 +1,2309 @@
+import 'reflect-metadata'
+import { expect } from 'chai'
+import sinon from 'sinon'
+import { Response } from 'express'
+import * as connectorUtils from '../../../../src/modules/tokens_manager/utils/connector.utils'
+import { registerDesktopPresence } from '../../../../src/libs/services/desktop-presence.provider'
+import { AuthenticatedUserRequest } from '../../../../src/libs/middlewares/types'
+import { AppConfig } from '../../../../src/modules/tokens_manager/config/config'
+import { CrawlingSchedulerService } from '../../../../src/modules/crawling_manager/services/crawling_service'
+const makePresence = (online: boolean | null, connected: boolean | null = null) => ({
+  isLocalFsDeviceOnline: sinon.stub().returns(online),
+  isDesktopConnected: sinon.stub().returns(connected),
+})
+import {
+  isUserAdmin,
+  getConnectorRegistry,
+  getConnectorInstances,
+  getActiveConnectorInstances,
+  getInactiveConnectorInstances,
+  getConfiguredConnectorInstances,
+  createConnectorInstance,
+  getConnectorInstance,
+  getConnectorInstanceConfig,
+  updateConnectorInstanceConfig,
+  updateConnectorInstanceAuthConfig,
+  updateConnectorInstanceFiltersSyncConfig,
+  deleteConnectorInstance,
+  updateConnectorInstanceName,
+  getOAuthAuthorizationUrl,
+  handleOAuthCallback,
+  getConnectorInstanceFilterOptions,
+  getFilterFieldOptions,
+  saveConnectorInstanceFilterOptions,
+  toggleConnectorInstance,
+  getConnectorSchema,
+  testConnectorConnection,
+  getConnectorEgressIps,
+  getActiveAgentInstances,
+  reindexConnector,
+} from '../../../../src/modules/tokens_manager/controllers/connector.controllers'
+import { UserGroups } from '../../../../src/modules/user_management/schema/userGroup.schema'
+import { Logger } from '../../../../src/libs/services/logger.service'
+import { HttpMethod } from '../../../../src/libs/enums/http-methods.enum'
+
+describe('tokens_manager/controllers/connector.controllers', () => {
+  let mockAppConfig: any
+  let req: any
+  let res: any
+  let next: sinon.SinonStub
+
+  beforeEach(() => {
+    mockAppConfig = {
+      connectorBackend: 'http://connector-backend:8088',
+    }
+
+    req = {
+      user: {
+        userId: 'aaaaaaaaaaaaaaaaaaaaaaaa',
+        orgId: 'bbbbbbbbbbbbbbbbbbbbbbbb',
+        role: 'admin',
+      },
+      params: {},
+      query: {},
+      body: {},
+      headers: {},
+    }
+
+    res = {
+      status: sinon.stub().returnsThis(),
+      json: sinon.stub().returnsThis(),
+      send: sinon.stub().returnsThis(),
+    }
+
+    next = sinon.stub()
+  })
+
+  afterEach(() => {
+    sinon.restore()
+  })
+
+  describe('isUserAdmin', () => {
+    it('should return true when JWT role is admin', async () => {
+      req.user.role = 'admin'
+      const result = await isUserAdmin(req)
+      expect(result).to.be.true
+    })
+
+    it('should return false when JWT role is unset', async () => {
+      delete req.user.role
+      const result = await isUserAdmin(req)
+      expect(result).to.be.false
+    })
+
+    it('should return false when JWT role is member', async () => {
+      req.user.role = 'member'
+      const result = await isUserAdmin(req)
+      expect(result).to.be.false
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      req.user = {}
+      try {
+        await isUserAdmin(req)
+        expect.fail('Should have thrown')
+      } catch (error: any) {
+        expect(error.message).to.equal('User authentication required')
+      }
+    })
+  })
+
+  // =========================================================================
+  // getConnectorRegistry
+  // =========================================================================
+  describe('getConnectorRegistry', () => {
+    it('should return an async handler function', () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should call executeConnectorCommand and return data for valid request', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ connectorType: 'google_drive' }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(res.json.calledOnce).to.be.true
+    })
+
+    it('should pass query params correctly', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.query = { scope: 'org', page: '1', limit: '10', search: 'google' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('scope=org')
+      expect(calledUrl).to.include('page=1')
+      expect(calledUrl).to.include('limit=10')
+      expect(calledUrl).to.include('search=google')
+    })
+
+    it('should call next with handled error on failure', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').rejects(
+        new Error('Connection refused')
+      )
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getConnectorInstances
+  // =========================================================================
+  describe('getConnectorInstances', () => {
+    it('should return an async handler function', () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should forward query to backend when scope defaults to team via Zod middleware', async () => {
+      // The Zod schema sets scope.default('team'), so by the time the controller
+      // runs req.query.scope is always 'team' or 'personal', never undefined.
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(next.called).to.be.false
+    })
+
+    it('should return connector instances for valid request', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'org' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ id: 'c1', connectorType: 'google_drive' }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getActiveConnectorInstances
+  // =========================================================================
+  describe('getActiveConnectorInstances', () => {
+    it('should return an async handler function', () => {
+      const handler = getActiveConnectorInstances(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = getActiveConnectorInstances(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return active connector instances', async () => {
+      const handler = getActiveConnectorInstances(mockAppConfig)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ id: 'c1', isActive: true }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getInactiveConnectorInstances
+  // =========================================================================
+  describe('getInactiveConnectorInstances', () => {
+    it('should return an async handler function', () => {
+      const handler = getInactiveConnectorInstances(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = getInactiveConnectorInstances(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return inactive connector instances', async () => {
+      const handler = getInactiveConnectorInstances(mockAppConfig)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ id: 'c2', isActive: false }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getConfiguredConnectorInstances
+  // =========================================================================
+  describe('getConfiguredConnectorInstances', () => {
+    it('should return an async handler function', () => {
+      const handler = getConfiguredConnectorInstances(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = getConfiguredConnectorInstances(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return configured connector instances', async () => {
+      const handler = getConfiguredConnectorInstances(mockAppConfig)
+      req.query = { scope: 'org' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ id: 'c1', isConfigured: true }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // createConnectorInstance
+  // =========================================================================
+  describe('createConnectorInstance', () => {
+    it('should return an async handler function', () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when connectorType is missing', async () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      req.body = { instanceName: 'My Instance' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when instanceName is missing', async () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      req.body = { connectorType: 'google_drive' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should create connector instance for valid request', async () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      req.body = {
+        connectorType: 'google_drive',
+        instanceName: 'My Drive',
+        config: {},
+        scope: 'org',
+      }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 201,
+        data: { id: 'new-connector-id' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(201)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getConnectorInstance
+  // =========================================================================
+  describe('getConnectorInstance', () => {
+    it('should return an async handler function', () => {
+      const handler = getConnectorInstance(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = getConnectorInstance(mockAppConfig)
+      req.params = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return connector instance for valid request', async () => {
+      const handler = getConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { id: 'c1', connectorType: 'google_drive' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getConnectorInstanceConfig
+  // =========================================================================
+  describe('getConnectorInstanceConfig', () => {
+    it('should return an async handler function', () => {
+      const handler = getConnectorInstanceConfig(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = getConnectorInstanceConfig(mockAppConfig)
+      req.params = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return connector config for valid request', async () => {
+      const handler = getConnectorInstanceConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { auth: {}, sync: {} },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // updateConnectorInstanceConfig
+  // =========================================================================
+  describe('updateConnectorInstanceConfig', () => {
+    it('should return an async handler function', () => {
+      const handler = updateConnectorInstanceConfig(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = updateConnectorInstanceConfig(mockAppConfig)
+      req.params = {}
+      req.body = { auth: {} }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should update connector config for valid request', async () => {
+      const handler = updateConnectorInstanceConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { auth: { type: 'oauth' }, sync: { interval: 60 } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Updated' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // updateConnectorInstanceAuthConfig
+  // =========================================================================
+  describe('updateConnectorInstanceAuthConfig', () => {
+    it('should return an async handler function', () => {
+      const handler = updateConnectorInstanceAuthConfig(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = updateConnectorInstanceAuthConfig(mockAppConfig)
+      req.params = {}
+      req.body = { auth: {} }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when auth is missing in body', async () => {
+      const handler = updateConnectorInstanceAuthConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should update auth config for valid request', async () => {
+      const handler = updateConnectorInstanceAuthConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { auth: { type: 'oauth' }, baseUrl: 'http://example.com' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Auth updated' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // updateConnectorInstanceFiltersSyncConfig
+  // =========================================================================
+  describe('updateConnectorInstanceFiltersSyncConfig', () => {
+    it('should return an async handler function', () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when sync and filters are both missing', async () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should update filters-sync config when sync is provided', async () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { sync: { interval: 30 } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Updated' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should update filters-sync config when filters is provided', async () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { filters: { include: ['docs'] } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Updated' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // deleteConnectorInstance
+  // =========================================================================
+  describe('deleteConnectorInstance', () => {
+    /** Minimal scheduler mock — all methods are no-ops by default. */
+    const makeScheduler = (overrides: Partial<any> = {}) => ({
+      removeJobsForConnector: sinon.stub().resolves(),
+      ...overrides,
+    })
+
+    /**
+     * Wait for any setImmediate callbacks queued during the handler to run
+     * to completion (including their inner awaits).
+     */
+    const flushSetImmediate = () =>
+      new Promise<void>((resolve) => setImmediate(resolve))
+
+    it('should return an async handler function', () => {
+      const handler = deleteConnectorInstance(mockAppConfig, makeScheduler())
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = deleteConnectorInstance(mockAppConfig, makeScheduler())
+      req.params = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('answers with the connector service status and removes the schedule by connector id', async () => {
+      const scheduler = makeScheduler()
+      const handler = deleteConnectorInstance(mockAppConfig, scheduler)
+      req.params = { connectorId: 'conn-sched' }
+      const command = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 202,
+        data: { success: true, status: 'DELETING' },
+      })
+
+      await handler(req, res, next)
+      await flushSetImmediate()
+
+      expect(res.status.calledWith(202)).to.be.true
+      // Only the DELETE: the creator-only config read is not needed.
+      expect(command.calledOnce).to.be.true
+      expect(command.firstCall.args[1]).to.equal('DELETE')
+      expect(scheduler.removeJobsForConnector.calledOnceWithExactly(
+        'conn-sched',
+        'bbbbbbbbbbbbbbbbbbbbbbbb',
+      )).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // updateConnectorInstanceName
+  // =========================================================================
+  describe('updateConnectorInstanceName', () => {
+    it('should return an async handler function', () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      req.params = {}
+      req.body = { instanceName: 'New Name' }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when instanceName is empty', async () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { instanceName: '' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when instanceName is whitespace only', async () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { instanceName: '   ' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should update connector name for valid request', async () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { instanceName: 'New Name' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Name updated' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getOAuthAuthorizationUrl
+  // =========================================================================
+  describe('getOAuthAuthorizationUrl', () => {
+    it('should return an async handler function', () => {
+      const handler = getOAuthAuthorizationUrl(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = getOAuthAuthorizationUrl(mockAppConfig)
+      req.params = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return OAuth URL for valid request', async () => {
+      const handler = getOAuthAuthorizationUrl(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.query = { baseUrl: 'http://example.com' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { authorizationUrl: 'https://oauth.example.com/auth' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should handle baseUrl query param', async () => {
+      const handler = getOAuthAuthorizationUrl(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.query = { baseUrl: 'http://custom.com' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { authorizationUrl: 'https://oauth.example.com/auth' },
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('base_url=http')
+    })
+  })
+
+  // =========================================================================
+  // handleOAuthCallback
+  // =========================================================================
+  describe('handleOAuthCallback', () => {
+    it('should return an async handler function', () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when code is missing', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { state: 'some-state' }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when state is missing', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code' }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should handle 302 redirect response', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'some-state' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 302,
+        headers: { location: 'https://app.example.com/callback' },
+        data: null,
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(res.json.calledOnce).to.be.true
+      expect(res.json.firstCall.args[0]).to.have.property('redirectUrl')
+    })
+
+    it('should handle response with redirect_url in data', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'some-state' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { redirect_url: 'https://app.example.com/success' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(res.json.firstCall.args[0].redirectUrl).to.equal(
+        'https://app.example.com/success',
+      )
+    })
+
+    it('should handle normal response without redirect', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'some-state' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'OAuth completed' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getConnectorInstanceFilterOptions
+  // =========================================================================
+  describe('getConnectorInstanceFilterOptions', () => {
+    it('should return an async handler function', () => {
+      const handler = getConnectorInstanceFilterOptions(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = getConnectorInstanceFilterOptions(mockAppConfig)
+      req.params = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return filter options for valid request', async () => {
+      const handler = getConnectorInstanceFilterOptions(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { filters: [{ key: 'mimetype', values: ['pdf'] }] },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getFilterFieldOptions
+  // =========================================================================
+  describe('getFilterFieldOptions', () => {
+    it('should return an async handler function', () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { filterKey: 'mimetype' }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when filterKey is missing', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return filter field options for valid request', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { connectorId: 'c1', filterKey: 'mimetype' }
+      req.query = { page: '1', limit: '20', search: 'pdf', cursor: 'abc' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { options: ['application/pdf'] },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // saveConnectorInstanceFilterOptions
+  // =========================================================================
+  describe('saveConnectorInstanceFilterOptions', () => {
+    it('logs a deprecation warning when it saves', async () => {
+      const warn = sinon.stub(Logger.prototype, 'warn')
+      const handler = saveConnectorInstanceFilterOptions(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { filters: { mimetype: ['pdf'] } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Filters saved' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(warn.calledWithMatch(sinon.match('Deprecated POST /api/v1/connectors/c1/filters'))).to.be.true
+    })
+
+    it('should return an async handler function', () => {
+      const handler = saveConnectorInstanceFilterOptions(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = saveConnectorInstanceFilterOptions(mockAppConfig)
+      req.params = {}
+      req.body = { filters: {} }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when filters is missing', async () => {
+      const handler = saveConnectorInstanceFilterOptions(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should save filter options for valid request', async () => {
+      const handler = saveConnectorInstanceFilterOptions(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { filters: { mimetype: ['pdf'] } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Filters saved' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // toggleConnectorInstance
+  // =========================================================================
+  describe('toggleConnectorInstance', () => {
+    it('should return an async handler function', () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorId is missing', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = {}
+      req.body = { type: 'activate' }
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw BadRequestError when type is missing', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should toggle connector for valid request', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { type: 'activate', fullSync: true }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Toggled' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should toggle without fullSync when not boolean', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'c1' }
+      req.body = { type: 'deactivate' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { message: 'Toggled' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getConnectorSchema
+  // =========================================================================
+  describe('getConnectorSchema', () => {
+    it('should return an async handler function', () => {
+      const handler = getConnectorSchema(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw BadRequestError when connectorType is missing', async () => {
+      const handler = getConnectorSchema(mockAppConfig)
+      req.params = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return schema for valid request', async () => {
+      const handler = getConnectorSchema(mockAppConfig)
+      req.params = { connectorType: 'google_drive' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { schema: { auth: {}, sync: {} } },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  describe('testConnectorConnection', () => {
+    it('forwards only the auth values and instance id, and passes a failed check through as 200', async () => {
+      const handler = testConnectorConnection(mockAppConfig)
+      req.params = { connectorType: 'PostgreSQL' }
+      req.body = { auth: { host: 'db', password: 'pw' }, connectorId: 'c1', extra: 'dropped' }
+      const execute = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: false, message: 'Timed out' },
+      })
+
+      await handler(req, res, next)
+
+      expect(execute.firstCall.args[0]).to.equal(
+        'http://connector-backend:8088/api/v1/connectors/registry/PostgreSQL/test-connection',
+      )
+      expect(execute.firstCall.args[3]).to.deep.equal({
+        auth: { host: 'db', password: 'pw' },
+        connectorId: 'c1',
+      })
+      expect(res.status.calledWith(200)).to.be.true
+      expect(res.json.calledWith({ success: false, message: 'Timed out' })).to.be.true
+      expect(next.called).to.be.false
+    })
+
+    it('passes a backend rejection to next', async () => {
+      const handler = testConnectorConnection(mockAppConfig)
+      req.params = { connectorType: 'Jira' }
+      req.body = { auth: {} }
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 400,
+        data: { detail: 'Jira has no connection check' },
+      })
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+  })
+
+  describe('getConnectorEgressIps', () => {
+    it('returns the connector service addresses', async () => {
+      const handler = getConnectorEgressIps(mockAppConfig)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true, egressIps: ['203.0.113.10'] },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.json.calledWith({ success: true, egressIps: ['203.0.113.10'] })).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getActiveAgentInstances
+  // =========================================================================
+  describe('getActiveAgentInstances', () => {
+    it('should return an async handler function', () => {
+      const handler = getActiveAgentInstances(mockAppConfig)
+      expect(handler).to.be.a('function')
+    })
+
+    it('should throw UnauthorizedError when userId is missing', async () => {
+      const handler = getActiveAgentInstances(mockAppConfig)
+      req.user = {}
+      await handler(req, res, next)
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should return active agent instances', async () => {
+      const handler = getActiveAgentInstances(mockAppConfig)
+      req.query = { scope: 'org' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ id: 'agent-1' }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: query param branches across multiple methods
+  // =========================================================================
+  describe('getConnectorRegistry - query param branches', () => {
+    it('should pass all query params when provided', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.query = { scope: 'org', page: '1', limit: '10', search: 'google' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with no query params', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.query = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with only scope', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.query = { scope: 'user' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('does not send X-Is-Admin when user is admin', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.query = {}
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const headers = execStub.firstCall.args[2]
+      expect(headers).to.not.have.property('X-Is-Admin')
+    })
+
+    it('does not send X-Is-Admin when user is not admin', async () => {
+      const handler = getConnectorRegistry(mockAppConfig)
+      req.query = {}
+      req.user.role = 'member'
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const headers = execStub.firstCall.args[2]
+      expect(headers).to.not.have.property('X-Is-Admin')
+    })
+  })
+
+  describe('getConnectorInstances - query param branches', () => {
+    it('should pass all query params', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'org', page: '1', limit: '10', search: 'slack' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with only scope (required)', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'org' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should succeed when scope is team (set by Zod middleware default)', async () => {
+      // Zod's default('team') means scope is always present when the route middleware runs.
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  describe('getConfiguredConnectorInstances - query param branches', () => {
+    it('should pass all query params', async () => {
+      const handler = getConfiguredConnectorInstances(mockAppConfig)
+      req.query = { scope: 'org', page: '1', limit: '10', search: 'jira' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with no query params', async () => {
+      const handler = getConfiguredConnectorInstances(mockAppConfig)
+      req.query = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with only scope', async () => {
+      const handler = getConfiguredConnectorInstances(mockAppConfig)
+      req.query = { scope: 'user' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  describe('getConnectorInstances - new filter params (isAuthenticated, isActive, connectorType)', () => {
+    it('should forward isAuthenticated=true to backend', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team', isAuthenticated: 'true' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('isAuthenticated=true')
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should forward isAuthenticated=false to backend', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team', isAuthenticated: 'false' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('isAuthenticated=false')
+    })
+
+    it('should NOT append isAuthenticated when it is undefined', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.not.include('isAuthenticated')
+    })
+
+    it('should forward isActive=true to backend', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team', isActive: 'true' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('isActive=true')
+    })
+
+    it('should forward isActive=false to backend', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team', isActive: 'false' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('isActive=false')
+    })
+
+    it('should NOT append isActive when it is undefined', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.not.include('isActive')
+    })
+
+    it('should forward connectorType to backend', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team', connectorType: 'google_drive' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('connectorType=google_drive')
+    })
+
+    it('should NOT append connectorType when it is undefined', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = { scope: 'team' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.not.include('connectorType')
+    })
+
+    it('should forward all new filter params together', async () => {
+      const handler = getConnectorInstances(mockAppConfig)
+      req.query = {
+        scope: 'team',
+        isAuthenticated: 'true',
+        isActive: 'false',
+        connectorType: 'slack',
+        search: 'test',
+        page: '2',
+        limit: '50',
+      }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([{ type: 'admin' }]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      const calledUrl = execStub.firstCall.args[0] as string
+      expect(calledUrl).to.include('isAuthenticated=true')
+      expect(calledUrl).to.include('isActive=false')
+      expect(calledUrl).to.include('connectorType=slack')
+      expect(calledUrl).to.include('search=test')
+      expect(calledUrl).to.include('page=2')
+      expect(calledUrl).to.include('limit=50')
+      const headers = execStub.firstCall.args[2]
+      expect(headers).to.not.have.property('X-Is-Admin')
+    })
+  })
+
+  describe('getActiveAgentInstances - query param branches', () => {
+    it('should pass all query params', async () => {
+      const handler = getActiveAgentInstances(mockAppConfig)
+      req.query = { scope: 'org', page: '1', limit: '10', search: 'agent' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with no query params', async () => {
+      const handler = getActiveAgentInstances(mockAppConfig)
+      req.query = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: handleOAuthCallback - redirect branches
+  // =========================================================================
+  describe('handleOAuthCallback - redirect branches', () => {
+    it('should handle 302 redirect with location header', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'state-token' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 302,
+        headers: { location: 'http://redirect-url.com' },
+        data: null,
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(res.json.firstCall.args[0]).to.deep.equal({ redirectUrl: 'http://redirect-url.com' })
+    })
+
+    it('should handle JSON response with redirect_url', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'state-token' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { redirect_url: 'http://json-redirect.com' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+      expect(res.json.firstCall.args[0]).to.deep.equal({ redirectUrl: 'http://json-redirect.com' })
+    })
+
+    it('should handle normal response without redirect', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'state-token' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should pass error and baseUrl query params when provided', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'state-token', error: 'access_denied', baseUrl: 'http://base.com' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should handle 302 without location header - fall through to JSON check', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'state-token' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 302,
+        headers: {},
+        data: { redirect_url: 'http://fallback.com' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should handle data without redirect_url - fall through to handleConnectorResponse', async () => {
+      const handler = handleOAuthCallback(mockAppConfig)
+      req.query = { code: 'auth-code', state: 'state-token' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { some: 'data', redirect_url: undefined },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: getOAuthAuthorizationUrl - baseUrl branch
+  // =========================================================================
+  describe('getOAuthAuthorizationUrl - baseUrl branch', () => {
+    it('should include baseUrl when provided', async () => {
+      const handler = getOAuthAuthorizationUrl(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.query = { baseUrl: 'http://custom.base.com' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { url: 'http://oauth.com/auth' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work without baseUrl', async () => {
+      const handler = getOAuthAuthorizationUrl(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.query = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { url: 'http://oauth.com/auth' },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: toggleConnectorInstance - fullSync boolean branch
+  // =========================================================================
+  describe('toggleConnectorInstance - schedule reconcile', () => {
+    it('leaves the connector to the hourly repair when its settings cannot be read', async () => {
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout'] })
+      try {
+        const scheduler = {
+          scheduleJob: sinon.stub(),
+          removeJob: sinon.stub(),
+          getJobStatus: sinon.stub(),
+          markReconcilePending: sinon.stub().resolves(),
+          clearReconcilePending: sinon.stub().resolves(),
+        }
+        const handler = toggleConnectorInstance(mockAppConfig, scheduler as any)
+        req.params = { connectorId: 'conn-1' }
+        req.body = { type: 'sync' }
+        sinon.stub(UserGroups, 'find').returns({ select: sinon.stub().resolves([{ type: 'admin' }]) } as any)
+        const command = sinon.stub(connectorUtils, 'executeConnectorCommand')
+        // The instance summary a sync toggle reads first, then the toggle itself.
+        command.onCall(0).resolves({ statusCode: 200, data: { connector: { isActive: true } } })
+        command.onCall(1).resolves({ statusCode: 200, data: { success: true } })
+        command.rejects(new Error('connector service busy'))
+
+        await handler(req, res, next)
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        for (let i = 0; i < 4; i++) await clock.tickAsync(30_000)
+
+        const reads = command.getCalls().slice(2)
+        expect(reads).to.have.length(3)
+        // Each read is aborted on its own timeout, not left running behind a race.
+        for (const read of reads) expect(read.args[4]).to.deep.equal({ timeoutMs: 10_000 })
+        // Persisted, so a restart before the hourly repair still owes the change.
+        expect(scheduler.markReconcilePending.calledOnceWithExactly('conn-1', 'bbbbbbbbbbbbbbbbbbbbbbbb')).to.be.true
+        expect(scheduler.clearReconcilePending.called).to.be.false
+        expect(scheduler.scheduleJob.called || scheduler.removeJob.called).to.be.false
+      } finally {
+        clock.restore()
+      }
+    })
+  })
+
+  describe('toggleConnectorInstance - fullSync branch', () => {
+    it('should include fullSync when it is a boolean true', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { type: 'activate', fullSync: true }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { active: true },
+      })
+
+      await handler(req, res, next)
+
+      const body = execStub.firstCall.args[3]
+      expect(body).to.have.property('fullSync', true)
+    })
+
+    it('should include fullSync when it is a boolean false', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { type: 'activate', fullSync: false }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { active: true },
+      })
+
+      await handler(req, res, next)
+
+      const body = execStub.firstCall.args[3]
+      expect(body).to.have.property('fullSync', false)
+    })
+
+    it('should not include fullSync when it is not a boolean', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { type: 'activate', fullSync: 'yes' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { active: true },
+      })
+
+      await handler(req, res, next)
+
+      const body = execStub.firstCall.args[3]
+      expect(body).to.not.have.property('fullSync')
+    })
+
+    it('should not include fullSync when it is undefined', async () => {
+      const handler = toggleConnectorInstance(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { type: 'activate' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { active: true },
+      })
+
+      await handler(req, res, next)
+
+      const body = execStub.firstCall.args[3]
+      expect(body).to.not.have.property('fullSync')
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: updateConnectorInstanceName - empty instanceName
+  // =========================================================================
+  describe('updateConnectorInstanceName - instanceName.trim() branches', () => {
+    it('should throw when instanceName is empty string after trim', async () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { instanceName: '   ' }
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw when instanceName is missing', async () => {
+      const handler = updateConnectorInstanceName(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = {}
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: getFilterFieldOptions - query params and filterKey
+  // =========================================================================
+  describe('getFilterFieldOptions - query param and filterKey branches', () => {
+    it('should pass all query params including cursor', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { connectorId: 'conn-1', filterKey: 'department' }
+      req.query = { page: '1', limit: '10', search: 'eng', cursor: 'abc123' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [{ value: 'Engineering' }],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should work with no query params', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { connectorId: 'conn-1', filterKey: 'department' }
+      req.query = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should throw when filterKey is missing', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.query = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should work with only cursor', async () => {
+      const handler = getFilterFieldOptions(mockAppConfig)
+      req.params = { connectorId: 'conn-1', filterKey: 'type' }
+      req.query = { cursor: 'xyz' }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: [],
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: createConnectorInstance - connectorType/instanceName
+  // =========================================================================
+  describe('createConnectorInstance - validation branches', () => {
+    it('should throw when connectorType is missing', async () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      req.body = { instanceName: 'My Connector' }
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should throw when instanceName is missing', async () => {
+      const handler = createConnectorInstance(mockAppConfig)
+      req.body = { connectorType: 'google_drive' }
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Branch coverage: updateConnectorInstanceFiltersSyncConfig - validation
+  // =========================================================================
+  describe('updateConnectorInstanceFiltersSyncConfig - validation branches', () => {
+    it('should throw when both sync and filters are missing', async () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = {}
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+
+      await handler(req, res, next)
+
+      expect(next.calledOnce).to.be.true
+    })
+
+    it('should succeed when only sync is provided', async () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { sync: { interval: 60 } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('should succeed when only filters is provided', async () => {
+      const handler = updateConnectorInstanceFiltersSyncConfig(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { filters: { departments: ['eng'] } }
+      sinon.stub(UserGroups, 'find').returns({
+        select: sinon.stub().resolves([]),
+      } as any)
+      sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true },
+      })
+
+      await handler(req, res, next)
+
+      expect(res.status.calledWith(200)).to.be.true
+    })
+  })
+
+  describe('reindexConnector', () => {
+    it('forwards statusFilters and stages to the connector service', async () => {
+      const handler = reindexConnector(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { statusFilters: ['FAILED'], stages: ['classify'] }
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true },
+      })
+
+      await handler(req, res, next)
+
+      expect(execStub.firstCall.args[0]).to.equal(
+        `${mockAppConfig.connectorBackend}/api/v1/connectors/conn-1/reindex`,
+      )
+      expect(execStub.firstCall.args[1]).to.equal(HttpMethod.POST)
+      expect(execStub.firstCall.args[3]).to.deep.equal({
+        statusFilters: ['FAILED'],
+        stages: ['classify'],
+      })
+      expect(res.status.calledWith(200)).to.be.true
+    })
+
+    it('omits stages from the forwarded body when not provided', async () => {
+      const handler = reindexConnector(mockAppConfig)
+      req.params = { connectorId: 'conn-1' }
+      req.body = { statusFilters: ['FAILED'] }
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: 200,
+        data: { success: true },
+      })
+
+      await handler(req, res, next)
+
+      expect(execStub.firstCall.args[3]).to.deep.equal({ statusFilters: ['FAILED'] })
+    })
+  })
+})
+
+type StubbedResponse = Response & {
+  status: sinon.SinonStub
+  json: sinon.SinonStub
+  send: sinon.SinonStub
+}
+
+function createToggleRequest(): AuthenticatedUserRequest {
+  return {
+    user: { userId: 'caller-1', orgId: 'org-1', role: 'admin' },
+    params: { connectorId: 'conn-1' },
+    query: {},
+    body: { type: 'sync' },
+    headers: {},
+  } as unknown as AuthenticatedUserRequest
+}
+
+function createToggleResponse(): StubbedResponse {
+  return {
+    status: sinon.stub().returnsThis(),
+    json: sinon.stub().returnsThis(),
+    send: sinon.stub().returnsThis(),
+  } as unknown as StubbedResponse
+}
+
+function createToggleAppConfig(): AppConfig {
+  return {
+    jwtSecret: 'test',
+    scopedJwtSecret: 'test',
+    cookieSecret: 'test',
+    rsAvailable: 'false',
+    communicationBackend: '',
+    frontendUrl: '',
+    iamBackend: '',
+    authBackend: '',
+    cmBackend: '',
+    kbBackend: '',
+    esBackend: '',
+    storageBackend: '',
+    tokenBackend: '',
+    aiBackend: '',
+    connectorBackend: 'http://connector-backend:8088',
+    connectorPublicUrl: '',
+    indexingBackend: '',
+    kafka: { brokers: [] },
+    redis: { host: 'localhost', port: 6379 },
+    mongo: { uri: '', db: '' },
+    qdrant: { port: 0, apiKey: '', host: '', grpcPort: 0 },
+    arango: { url: '', db: '', username: '', password: '' },
+    etcd: { host: '', port: 0, dialTimeout: 0 },
+    smtp: null,
+    storage: { storageType: 'local', endpoint: '' },
+    oauthIssuer: '',
+    oauthBackendUrl: '',
+    mcpScopes: [],
+    samlIssuer: 'pipeshub',
+    skipDomainCheck: true,
+    maxRequestsPerMinute: 100,
+    maxOAuthClientRequestsPerMinute: 50,
+    deployment: {
+      dataStoreType: 'neo4j',
+      messageBrokerType: 'kafka',
+      kvStoreType: 'redis',
+      vectorDbType: 'qdrant',
+    },
+  }
+}
+
+describe('toggleConnectorInstance - Local FS desktop presence guard', () => {
+  let req: AuthenticatedUserRequest
+  let res: StubbedResponse
+  let next: sinon.SinonStub
+  let mockAppConfig: AppConfig
+  let mockScheduler: CrawlingSchedulerService
+
+  beforeEach(() => {
+    req = createToggleRequest()
+    res = createToggleResponse()
+    next = sinon.stub()
+    mockAppConfig = createToggleAppConfig()
+    mockScheduler = sinon.createStubInstance(CrawlingSchedulerService)
+  })
+
+  afterEach(() => {
+    sinon.restore()
+    registerDesktopPresence(null)
+  })
+
+  function stubInstanceThenToggle(instance: Record<string, unknown>) {
+    const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand')
+    execStub.onFirstCall().resolves({
+      statusCode: 200,
+      data: { connector: { _key: 'conn-1', ...instance } },
+    })
+    execStub.onSecondCall().resolves({ statusCode: 200, data: { active: true } })
+    return execStub
+  }
+
+  it('refuses another device when the connector already has an owner', async () => {
+    const presence = makePresence(true)
+    registerDesktopPresence(presence)
+    req.body = { type: 'sync', deviceId: 'dev-b', deviceName: 'Mac' }
+    const execStub = stubInstanceThenToggle({
+      type: 'Local FS',
+      createdBy: 'owner-1',
+      isActive: false,
+      ownerDeviceId: 'dev-a',
+      ownerDeviceName: 'Windows PC',
+    })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(next.called).to.be.false
+    expect(res.status.calledWith(409)).to.be.true
+    const body = res.json.firstCall.args[0]
+    expect(body.details.code).to.equal('DESKTOP_OWNED_BY_OTHER_DEVICE')
+    expect(body.details.ownerDeviceName).to.equal('Windows PC')
+    expect(body.message).to.include('Windows PC')
+    expect(execStub.calledOnce).to.be.true
+  })
+
+  it('answers DESKTOP_OFFLINE when the owner device is offline', async () => {
+    const presence = makePresence(false)
+    registerDesktopPresence(presence)
+    req.body = { type: 'sync', deviceId: 'dev-a' }
+    const execStub = stubInstanceThenToggle({
+      type: 'Local FS',
+      createdBy: 'owner-1',
+      isActive: false,
+      ownerDeviceId: 'dev-a',
+    })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(res.status.calledWith(409)).to.be.true
+    expect(res.json.firstCall.args[0].details.code).to.equal('DESKTOP_OFFLINE')
+    expect(execStub.calledOnce).to.be.true
+    expect(presence.isLocalFsDeviceOnline.calledOnceWithExactly('org-1', 'owner-1', 'dev-a')).to.be.true
+  })
+
+  it('answers DESKTOP_OFFLINE for an owned connector toggled from the web with the owner offline', async () => {
+    registerDesktopPresence(makePresence(false))
+    stubInstanceThenToggle({ type: 'Local FS', createdBy: 'owner-1', isActive: false, ownerDeviceId: 'dev-a' })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(res.json.firstCall.args[0].details.code).to.equal('DESKTOP_OFFLINE')
+  })
+
+  it('answers DESKTOP_UNCLAIMED when no owner exists and no device is sent', async () => {
+    const presence = makePresence(true, true)
+    registerDesktopPresence(presence)
+    const execStub = stubInstanceThenToggle({ type: 'Local FS', createdBy: 'owner-1', isActive: false })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(res.status.calledWith(409)).to.be.true
+    expect(res.json.firstCall.args[0].details.code).to.equal('DESKTOP_UNCLAIMED')
+    expect(execStub.calledOnce).to.be.true
+    expect(presence.isLocalFsDeviceOnline.called).to.be.false
+  })
+
+  it('answers DESKTOP_OFFLINE when no owner exists and the sending device is offline', async () => {
+    const presence = makePresence(false)
+    registerDesktopPresence(presence)
+    req.body = { type: 'sync', deviceId: 'dev-a' }
+    stubInstanceThenToggle({ type: 'Local FS', createdBy: 'owner-1', isActive: false })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(res.json.firstCall.args[0].details.code).to.equal('DESKTOP_OFFLINE')
+    expect(presence.isLocalFsDeviceOnline.calledOnceWithExactly('org-1', 'owner-1', 'dev-a')).to.be.true
+  })
+
+  it('forwards the device to Python when the sending device may claim the connector', async () => {
+    registerDesktopPresence(makePresence(true))
+    req.body = { type: 'sync', deviceId: 'dev-a', deviceName: 'Laptop' }
+    const execStub = stubInstanceThenToggle({ type: 'Local FS', createdBy: 'owner-1', isActive: false })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(execStub.calledTwice).to.be.true
+    expect(execStub.secondCall.args[3]).to.deep.equal({
+      type: 'sync',
+      deviceId: 'dev-a',
+      deviceName: 'Laptop',
+    })
+    expect(res.status.calledWith(200)).to.be.true
+  })
+
+  it('keeps the refusal code when Python rejects the claim with a 409', async () => {
+    registerDesktopPresence(makePresence(true))
+    req.body = { type: 'sync', deviceId: 'dev-b' }
+    const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand')
+    execStub.onFirstCall().resolves({
+      statusCode: 200,
+      data: { connector: { _key: 'conn-1', type: 'Local FS', createdBy: 'owner-1', isActive: false } },
+    })
+    execStub.onSecondCall().resolves({
+      statusCode: 409,
+      data: { detail: 'DESKTOP_OWNED_BY_OTHER_DEVICE: Connector conn-1 is owned by device \'PC\'.' },
+    })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(next.called).to.be.false
+    expect(res.status.calledWith(409)).to.be.true
+    expect(res.json.firstCall.args[0].details.code).to.equal('DESKTOP_OWNED_BY_OTHER_DEVICE')
+  })
+
+  it('proxies the toggle when the connector is already active (turning off)', async () => {
+    registerDesktopPresence(makePresence(false))
+    const execStub = stubInstanceThenToggle({ type: 'Local FS', createdBy: 'owner-1', isActive: true })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(execStub.calledTwice).to.be.true
+    expect(execStub.secondCall.args[1]).to.equal('POST')
+    expect(res.status.calledWith(200)).to.be.true
+  })
+
+  for (const [status, detail] of [
+    [404, 'This connector was removed, or you no longer have access to it.'],
+    [403, 'Only administrators can update team connectors'],
+  ] as const) {
+    it(`answers ${status}, not 500, when the caller cannot open the connector`, async () => {
+      req.body = { type: 'sync' }
+      const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+        statusCode: status,
+        data: { detail },
+      })
+
+      await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+      expect(execStub.calledOnce).to.be.true
+      expect(res.status.called).to.be.false
+      const error = next.firstCall.args[0]
+      expect(error.statusCode).to.equal(status)
+      expect(error.message).to.equal(detail)
+    })
+  }
+
+  it('still answers 500 when the connectors service returns no connector', async () => {
+    req.body = { type: 'sync' }
+    const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+      statusCode: 200,
+      data: {},
+    })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(execStub.calledOnce).to.be.true
+    expect(next.firstCall.args[0].statusCode).to.equal(500)
+  })
+
+  it('does not fetch the instance for agent toggles', async () => {
+    registerDesktopPresence(makePresence(false))
+    req.body = { type: 'agent' }
+    const execStub = sinon.stub(connectorUtils, 'executeConnectorCommand').resolves({
+      statusCode: 200,
+      data: { active: true },
+    })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(execStub.calledOnce).to.be.true
+    expect(execStub.firstCall.args[1]).to.equal('POST')
+  })
+
+  it('lets the toggle through when presence cannot tell', async () => {
+    registerDesktopPresence(makePresence(null))
+    const execStub = stubInstanceThenToggle({
+      type: 'Local FS',
+      createdBy: 'owner-1',
+      isActive: false,
+      ownerDeviceId: 'dev-a',
+    })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(execStub.calledTwice).to.be.true
+    expect(res.status.calledWith(200)).to.be.true
+  })
+
+  it('ignores presence for non-Local-FS connectors', async () => {
+    const presence = makePresence(false)
+    registerDesktopPresence(presence)
+    const execStub = stubInstanceThenToggle({ type: 'Slack', createdBy: 'owner-1', isActive: false })
+
+    await toggleConnectorInstance(mockAppConfig, mockScheduler)(req, res, next)
+
+    expect(execStub.calledTwice).to.be.true
+    expect(presence.isLocalFsDeviceOnline.called).to.be.false
+  })
+})

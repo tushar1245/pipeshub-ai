@@ -1,0 +1,323 @@
+// ========================================
+// Registry types (from Python backend)
+// ========================================
+
+export interface AIModelProviderField {
+  name: string;
+  displayName: string;
+  fieldType: 'TEXT' | 'PASSWORD' | 'SELECT' | 'NUMBER' | 'BOOLEAN' | 'URL' | 'TEXTAREA' | 'CHECKBOX' | 'FILE' | 'TAGS';
+  required: boolean;
+  defaultValue?: unknown;
+  placeholder?: string;
+  description?: string;
+  isSecret?: boolean;
+  options?: { value: string; label: string }[];
+  validation?: {
+    minLength?: number;
+    maxLength?: number;
+    pattern?: string;
+    acceptedFileTypes?: string[];
+    validationRules?: { type: string; errorMessage?: string; requiredFields?: string[]; field?: string; value?: string }[];
+  };
+  /**
+   * Labeled example values shown below the input as a compact, copyable note.
+   * Useful when a single placeholder can't convey all the variants a user
+   * might need (e.g. Azure AI endpoints differ per model family).
+   */
+  examples?: { label: string; value: string }[];
+}
+
+export interface AIModelProvider {
+  providerId: string;
+  name: string;
+  description: string;
+  /** Optional operational warning (e.g. performance); shown in configure UI when set. */
+  notice?: string;
+  /** Optional headline for {@link notice}; rendered above the notice body when set. */
+  noticeTitle?: string;
+  modelName?: string;
+  capabilities: string[];
+  iconPath: string;
+  color: string;
+  isPopular?: boolean;
+  fields: Record<string, AIModelProviderField[]>;
+  /** How this provider lists models. Absent on older registry responses. */
+  discovery?: {
+    mode: 'list' | 'search' | 'manual';
+    requiredFields: string[];
+  };
+}
+
+export interface RegistryResponse {
+  success: boolean;
+  providers: AIModelProvider[];
+  total: number;
+}
+
+export interface CapabilityInfo {
+  id: string;
+  name: string;
+  modelType: string;
+}
+
+export interface CapabilitiesResponse {
+  success: boolean;
+  capabilities: CapabilityInfo[];
+}
+
+export interface ProviderSchemaResponse {
+  success: boolean;
+  provider: { providerId: string; name: string };
+  schema: { fields: Record<string, AIModelProviderField[]> };
+}
+
+// ========================================
+// Configured model types (from CRUD API)
+// ========================================
+
+export interface ConfiguredModel {
+  modelKey: string;
+  provider: string;
+  modelType: string;
+  configuration: Record<string, unknown>;
+  isMultimodal?: boolean;
+  isReasoning?: boolean;
+  isDefault: boolean;
+  contextLength?: number | null;
+  modelFriendlyName?: string;
+  /** Stored configuration key names that have a value. Never the values. */
+  configuredFields?: string[];
+  /** Shared by models added together, so one credential write can update them all. */
+  connectionId?: string;
+}
+
+export interface DiscoveredModel {
+  id: string;
+  displayName: string;
+  capabilities: string[];
+  contextLength?: number | null;
+  isMultimodal?: boolean | null;
+  isReasoning?: boolean | null;
+  supportsTools?: boolean | null;
+  deprecated?: boolean;
+  /** Unix seconds, when the provider reports it. The server lists newest first. */
+  releasedAt?: number | null;
+}
+
+export interface DiscoveryResponse {
+  success: boolean;
+  supported: boolean;
+  models: DiscoveredModel[];
+  warnings?: string[];
+  errorCode?: string | null;
+  message?: string | null;
+}
+
+export interface PickedModel {
+  id: string;
+  modelFriendlyName?: string;
+  isMultimodal: boolean;
+  isReasoning: boolean;
+  contextLength?: number | null;
+}
+
+// ========================================
+// Model Roles types
+// ========================================
+
+/** Assignment of a specific configured model to a named role. */
+export interface ModelRoleAssignment {
+  modelType: string;
+  modelKey: string;
+}
+
+/** Well-known role names. Extensible — future roles (summarization, ner, …) are additional keys. */
+export const MODEL_ROLE_NAMES = {
+  INDEXING: 'indexing',
+} as const;
+
+export type ModelRoleName = (typeof MODEL_ROLE_NAMES)[keyof typeof MODEL_ROLE_NAMES];
+
+export interface ModelRolesResponse {
+  status: string;
+  modelRoles: Record<string, ModelRoleAssignment>;
+}
+
+export interface AllModelsResponse {
+  status: string;
+  models: {
+    ocr: ConfiguredModel[];
+    embedding: ConfiguredModel[];
+    slm: ConfiguredModel[];
+    llm: ConfiguredModel[];
+    reasoning: ConfiguredModel[];
+    multiModal: ConfiguredModel[];
+    imageGeneration?: ConfiguredModel[];
+    tts?: ConfiguredModel[];
+    stt?: ConfiguredModel[];
+    decision?: ConfiguredModel[];
+  };
+  modelRoles?: Record<string, ModelRoleAssignment>;
+  message: string;
+}
+
+export interface ModelsByTypeResponse {
+  status: string;
+  models: ConfiguredModel[];
+  message: string;
+}
+
+// ========================================
+// Capability / model type mapping
+// ========================================
+
+export const CAPABILITY_TO_MODEL_TYPE: Record<string, string> = {
+  text_generation: 'llm',
+  embedding: 'embedding',
+  ocr: 'ocr',
+  reasoning: 'reasoning',
+  image_generation: 'imageGeneration',
+  tts: 'tts',
+  stt: 'stt',
+  video: 'video',
+  decision: 'decision',
+};
+
+export const MODEL_TYPE_TO_CAPABILITY: Record<string, string> = Object.fromEntries(
+  Object.entries(CAPABILITY_TO_MODEL_TYPE).map(([k, v]) => [v, k])
+);
+
+/** Primary capability tabs on the AI Models page (registry + configured filtering). */
+export type CapabilitySection =
+  | 'text_generation'
+  | 'embedding'
+  | 'image_generation'
+  | 'tts'
+  | 'stt'
+  | 'decision';
+
+/** Order of primary capability section tabs; labels come from i18n. */
+export const CAPABILITY_SECTION_ORDER: CapabilitySection[] = [
+  'text_generation',
+  'embedding',
+  'image_generation',
+  'tts',
+  'stt',
+  // Hidden until a feature uses decision models; uncomment to show the For Decisions tab.
+  // 'decision',
+];
+
+/** Model API buckets shown under the "For LLMs" tab. */
+export const LLM_SECTION_MODEL_TYPES = ['llm', 'reasoning', 'multiModal', 'slm'] as const;
+
+/** Configured `modelType` buckets listed under a capability tab. */
+export function modelTypesForSection(section: CapabilitySection): readonly string[] {
+  if (section === 'text_generation') return LLM_SECTION_MODEL_TYPES;
+  if (section === 'image_generation') return ['imageGeneration'];
+  return [section];
+}
+
+/** Map configured `modelType` to registry capability key for schema / edit dialog. */
+export function registryCapabilityForModelType(modelType: string): string {
+  const fromMap = MODEL_TYPE_TO_CAPABILITY[modelType];
+  if (fromMap) return fromMap;
+  if (modelType === 'multiModal' || modelType === 'slm') return 'text_generation';
+  return 'text_generation';
+}
+
+/** Registry capability keys that show a badge on provider rows; badge text from i18n. */
+export const REGISTRY_BADGE_CAPABILITY_KEYS = [
+  'text_generation',
+  'reasoning',
+  'video',
+  'image_generation',
+  'embedding',
+  'tts',
+  'stt',
+  // Hidden with the For Decisions tab; uncomment together with it.
+  // 'decision',
+] as const;
+
+export type RegistryBadgeCapabilityKey = (typeof REGISTRY_BADGE_CAPABILITY_KEYS)[number];
+
+export function isRegistryBadgeCapability(cap: string): cap is RegistryBadgeCapabilityKey {
+  return (REGISTRY_BADGE_CAPABILITY_KEYS as readonly string[]).includes(cap);
+}
+
+// ========================================
+// Local embedding model download progress
+// ========================================
+
+export type EmbeddingDownloadStatus =
+  | 'not_found'
+  | 'checking'
+  | 'downloading'
+  | 'loading'
+  | 'ready'
+  | 'failed';
+
+export interface DownloadProgressPayload {
+  model: string;
+  status: EmbeddingDownloadStatus;
+  progress: number;
+  downloaded_bytes: number;
+  total_bytes: number;
+  error: string | null;
+  started_at?: number;
+  updated_at?: number;
+  timestamp?: number;
+}
+
+export const IDENTITY_FORWARDING_PROVIDERS = ['litellmProxy', 'openAICompatible', 'openRouter'] as const;
+
+export const IDENTITY_FORWARDING_FIELD_PREFIX = 'identityForwarding';
+
+export function supportsIdentityForwarding(providerId: string): boolean {
+  return (IDENTITY_FORWARDING_PROVIDERS as readonly string[]).includes(providerId);
+}
+
+export type IdentityForwardingMode = 'headers' | 'template' | 'signedJwt';
+export type IdentityForwardingPreset =
+  | 'litellm'
+  | 'portkey'
+  | 'helicone'
+  | 'cloudflare'
+  | 'apim'
+  | 'custom';
+
+export interface IdentityForwardingSettings {
+  enabled: boolean;
+  mode: IdentityForwardingMode;
+  preset: IdentityForwardingPreset;
+  headerTemplates: Record<string, string>;
+  serviceAuth: 'apiKey' | 'jwt';
+  jwtAudience?: string;
+  /** Omit to keep the saved key; an empty string removes it. */
+  serviceApiKey?: string;
+}
+
+export interface IdentityPolicy {
+  subjectSource: 'userId' | 'email' | 'idpObjectId';
+  includeEmail: boolean;
+  includeDisplayName: boolean;
+  groups: { enabled: boolean; allowList: string[]; maxForwarded: number };
+  pseudonymize: boolean;
+  onMissingIdentity: 'service' | 'block';
+  queryEmbeddingIdentity: 'user' | 'service';
+  serviceIdentityPrefix: string;
+}
+
+export interface IdentityPreview {
+  success: boolean;
+  identity: {
+    subject: string;
+    subjectKind: string;
+    email?: string | null;
+    displayName?: string | null;
+    groups: string[];
+    groupsSource: string;
+    groupsComplete: boolean;
+  };
+  headers: Record<string, string> | null;
+  notes: string[];
+}

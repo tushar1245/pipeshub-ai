@@ -1,0 +1,268 @@
+from logging import Logger
+
+from dependency_injector import containers, providers  # type: ignore
+from dotenv import find_dotenv, load_dotenv  # type: ignore
+
+from app.config.configuration_service import ConfigurationService
+from app.config.providers.encrypted_store import EncryptedKeyValueStore
+from app.connectors.services.kafka_service import KafkaService
+from app.containers.container import BaseAppContainer
+from app.containers.utils.utils import ContainerUtils
+from app.health.health import Health
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.vector_db.const.const import (
+    VECTOR_DB_ENTITIES_COLLECTION_NAME,
+)
+from app.utils.logger import create_logger
+
+load_dotenv(find_dotenv(usecwd=True), override=True)
+
+
+class IndexingAppContainer(BaseAppContainer):
+    """Dependency injection container for the indexing application."""
+
+    # Override logger with service-specific name
+    logger = providers.Singleton(create_logger, "indexing_service")
+    container_utils = ContainerUtils()
+    # Override config_service to use the service-specific logger
+    key_value_store = providers.Singleton(EncryptedKeyValueStore, logger=logger)
+    config_service = providers.Singleton(ConfigurationService, logger=logger, key_value_store=key_value_store)
+
+    # Override arango_client to use the service-specific config_service
+    arango_client = providers.Resource(
+        BaseAppContainer._create_arango_client, config_service=config_service
+    )
+    kafka_service = providers.Singleton(
+        KafkaService, logger=logger, config_service=config_service
+    )
+
+    # Graph Database Provider via Factory (HTTP mode - fully async)
+    graph_provider = providers.Resource(
+        container_utils.create_graph_provider,
+        logger=logger,
+        config_service=config_service,
+    )
+
+    vector_db_service = providers.Resource(
+        container_utils.get_vector_db_service,
+        config_service=config_service,
+    )
+
+    collection_registry = providers.Resource(
+        container_utils.create_collection_registry,
+        logger=logger,
+        config_service=config_service,
+        vector_db_service=vector_db_service,
+    )
+
+    blob_storage = providers.Resource(
+        container_utils.create_blob_storage,
+        logger=logger,
+        config_service=config_service,
+        graph_provider=graph_provider,
+    )
+
+    indexing_pipeline = providers.Resource(
+        container_utils.create_indexing_pipeline,
+        logger=logger,
+        config_service=config_service,
+        graph_provider=graph_provider,
+        vector_db_service=vector_db_service,
+        collection_registry=collection_registry,
+        blob_storage=blob_storage,
+    )
+
+    document_extractor = providers.Resource(
+        container_utils.create_document_extractor,
+        logger=logger,
+        graph_provider=graph_provider,
+        config_service=config_service,
+    )
+
+    graphdb = providers.Resource(
+        container_utils.create_graphdb,
+        graph_provider=graph_provider,
+        logger=logger,
+    )
+
+    vector_store = providers.Resource(
+        container_utils.create_vector_store,
+        logger=logger,
+        graph_provider=graph_provider,
+        config_service=config_service,
+        vector_db_service=vector_db_service,
+        collection_registry=collection_registry,
+    )
+
+    entity_vector_store = providers.Resource(
+        container_utils.create_entity_vector_store,
+        logger=logger,
+        config_service=config_service,
+        vector_db_service=vector_db_service,
+        collection_name=VECTOR_DB_ENTITIES_COLLECTION_NAME,
+        # Indexing runs the entity index rebuild, which refills a recreated
+        # collection; query and connectors keep raising until it does.
+        recreate_on_dimension_mismatch=True,
+    )
+
+    # Canonicalises extracted taxonomy names before graph/vector writes —
+    # see app.modules.entity_resolution. Always on.
+    entity_resolver = providers.Resource(
+        container_utils.create_entity_resolver,
+        logger=logger,
+        config_service=config_service,
+        graph_provider=graph_provider,
+        entity_vector_store=entity_vector_store,
+    )
+
+    sink_orchestrator = providers.Resource(
+        container_utils.create_sink_orchestrator,
+        logger=logger,
+        graphdb=graphdb,
+        blob_storage=blob_storage,
+        vector_store=vector_store,
+        graph_provider=graph_provider,
+        config_service=config_service,
+        entity_vector_store=entity_vector_store,
+        entity_resolver=entity_resolver,
+    )
+
+
+
+    # HTTP clients for the standalone Parsing and Extraction services.
+    # These are only used when USE_PARSING_SERVICE=true is set in the environment.
+    parsing_client = providers.Resource(
+        container_utils.create_parsing_client,
+        config_service=config_service,
+    )
+
+    extraction_client = providers.Resource(
+        container_utils.create_extraction_client,
+        config_service=config_service,
+    )
+
+    # Pipeline stages: classification and named entities run side by side once a record is
+    # searchable, on their own permits. Both enrich through the sink (resolver, entity points).
+    pipeline_runtime = providers.Resource(
+        container_utils.create_pipeline_runtime,
+        logger=logger,
+        config_service=config_service,
+        graph_provider=graph_provider,
+        sink_orchestrator=sink_orchestrator,
+        document_extractor=document_extractor,
+        extraction_client=extraction_client,
+    )
+
+    # Parsers
+    parsers = providers.Resource(
+        container_utils.create_parsers,
+        logger=logger,
+        config_service=config_service,
+    )
+
+    # Processor - depends on indexing_pipeline and graph_provider
+    processor = providers.Resource(
+        container_utils.create_processor,
+        logger=logger,
+        config_service=config_service,
+        indexing_pipeline=indexing_pipeline,
+        graph_provider=graph_provider,
+        parsers=parsers,
+        document_extractor=document_extractor,
+        sink_orchestrator=sink_orchestrator,
+        pipeline_runtime=pipeline_runtime,
+    )
+
+    event_processor = providers.Resource(
+        container_utils.create_event_processor,
+        logger=logger,
+        processor=processor,
+        graph_provider=graph_provider,
+        config_service=config_service,
+        collection_registry=collection_registry,
+        parsing_client=parsing_client,
+        extraction_client=extraction_client,
+        sink_orchestrator=sink_orchestrator,
+        pipeline_runtime=pipeline_runtime,
+    )
+
+    # Settles queued events of turned-off or removed connectors as the
+    # consumer reads them; None when INDEXING_CONNECTOR_STATE_REFRESH_SECONDS=0.
+    connector_off_filter = providers.Resource(
+        container_utils.create_connector_off_filter,
+        logger=logger,
+        graph_provider=graph_provider,
+    )
+
+    # Indexing-specific wiring configuration
+    wiring_config = containers.WiringConfiguration(
+        modules=[
+            "app.indexing_main"
+        ]
+    )
+
+async def _backfill_indexed_copy_flags(graph_provider: IGraphDBProvider, logger: Logger) -> None:
+    """Records indexed before ``hasIndexedCopy`` existed would otherwise leave search
+    the first time they are edited. Idempotent, so every boot may run it."""
+    try:
+        marked = await graph_provider.backfill_indexed_copy_flags()
+    except Exception:
+        logger.warning(
+            "⚠️ Could not mark existing indexed records; an edit may hide one "
+            "from search until it is indexed again",
+            exc_info=True,
+        )
+        return
+    if marked:
+        logger.info("✅ Marked %d indexed record(s) as having an indexed copy", marked)
+
+
+async def initialize_container(container: IndexingAppContainer) -> bool:
+    """Initialize container resources"""
+    logger = container.logger()
+    logger.info("🚀 Initializing application resources")
+
+    try:
+        # Ensure connector service is healthy before starting indexing service
+        logger.info("Checking Connector service health before startup")
+        await Health.health_check_connector_service(container)
+
+        # Ensure Graph Database Provider is initialized (connection is handled in the resource factory)
+        logger.info("Ensuring Graph Database Provider is initialized")
+        graph_provider = await container.graph_provider()
+        if not graph_provider:
+            raise Exception("Failed to initialize Graph Database Provider")
+
+        # Store the resolved graph_provider in the container to avoid coroutine reuse
+        container._graph_provider = graph_provider
+        logger.info("✅ Graph Database Provider initialized and connected")
+
+        # Idempotent, and not only the connector service's job: this service
+        # writes taxonomy nodes and alias nodes whose uniqueness constraints
+        # and indexes must exist before the first write, whichever service
+        # starts first after an upgrade. Not fatal: the connector service runs
+        # the same bootstrap.
+        if await graph_provider.ensure_schema():
+            logger.info("✅ Schema ensured")
+        else:
+            logger.warning(
+                "⚠️ Graph schema bootstrap failed; taxonomy and alias constraints "
+                "may be missing until a service that runs it starts successfully"
+            )
+        # Unlike a missing constraint, a records schema without this field refuses
+        # every finished-indexing write, so indexing must not start on it.
+        if not await graph_provider.records_accept_indexed_copy():
+            logger.error(
+                "❌ The graph database's records schema does not allow hasIndexedCopy yet, so "
+                "it would refuse every finished-indexing write. Check that this service or "
+                "the connector service can update collection properties, then restart."
+            )
+            raise RuntimeError("The records schema does not allow hasIndexedCopy")
+        await _backfill_indexed_copy_flags(graph_provider, logger)
+
+        await Health.system_health_check(container)
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize resources: {str(e)}")
+        raise

@@ -1,0 +1,668 @@
+import express, { Router, Request, Response, NextFunction } from 'express';
+import { Container } from 'inversify';
+import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
+import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
+import { AuthenticatedServiceRequest } from '../../../libs/middlewares/types';
+import { extensionToMimeType } from '../mimetypes/mimetypes';
+import { Logger } from '../../../libs/services/logger.service';
+import {
+  UploadNewSchema,
+  DocumentIdParams,
+  GetBufferSchema,
+  CreateDocumentSchema,
+  UploadNextVersionSchema,
+  RollBackToPreviousVersionSchema,
+  DirectUploadSchema,
+  DocumentIdParamsWithVersion,
+  PurgeConversationParams,
+  PurgeDocumentParams,
+  PurgeVirtualRecordParams,
+  MoveTreeSchema,
+  ConnectorIdParams,
+  ConnectorVirtualRecordsSchema,
+  RelocateVirtualRecordsSchema,
+  MissingDocumentsSchema,
+  FlatRecordDocumentsQuery,
+  PresignArtifactsSchema,
+  ArtifactReadUrlsSchema,
+  ArtifactFileParams,
+  PurgeArtifactSetSchema,
+  ListArtifactSetsSchema,
+} from '../validators/validators';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import { FileProcessorFactory } from '../../../libs/middlewares/file_processor/fp.factory';
+import { FileProcessorService } from '../../../libs/middlewares/file_processor/fp.service';
+import { FileProcessingType } from '../../../libs/middlewares/file_processor/fp.constant';
+import { getPlatformSettingsFromStore } from '../../configuration_manager/utils/util';
+import { KB_UPLOAD_LIMITS } from '../../knowledge_base/constants/kb.constants';
+import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
+import { StorageController } from '../controllers/storage.controller';
+import { NotFoundError } from '../../../libs/errors/http.errors';
+import { AppConfig, loadAppConfig } from '../../tokens_manager/config/config';
+import { DefaultStorageConfig } from '../../tokens_manager/services/cm.service';
+import { ARTIFACT_FILE_MAX_BYTES } from '../constants/constants';
+
+const logger = Logger.getInstance({ service: 'StorageRoutes' });
+
+// Service-token routes only. Storage scopes by org, not by record ACL, so a user
+// token must never reach these handlers; users go through /api/v1/knowledgeBase.
+export function createStorageRouter(container: Container): Router {
+  const router = Router();
+  const keyValueStoreService = container.get<KeyValueStoreService>(
+    'KeyValueStoreService',
+  );
+  let storageController = container.get<StorageController>('StorageController');
+  const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
+  storageController.watchStorageType(keyValueStoreService);
+
+  // Resolve the platform-configured per-file upload cap so internal routes
+  // honour the same limit as the user-facing KB upload route.
+  const resolveMaxUploadSize = async (): Promise<number> => {
+    try {
+      const settings = await getPlatformSettingsFromStore(keyValueStoreService);
+      return settings.fileUploadMaxSizeBytes;
+    } catch {
+      return KB_UPLOAD_LIMITS.defaultMaxFileSizeBytes;
+    }
+  };
+
+  router.post(
+    '/internal/upload',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    async (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      try {
+        const maxFileSize = await resolveMaxUploadSize();
+        const service = new FileProcessorService({
+          fieldName: 'file',
+          allowedMimeTypes: Object.values(extensionToMimeType),
+          maxFilesAllowed: 1,
+          isMultipleFilesAllowed: false,
+          processingType: FileProcessingType.BUFFER,
+          maxFileSize,
+          strictFileUpload: true,
+        });
+        const upload = service.upload();
+        upload(req, res, (err: any) => {
+          if (err) return next(err);
+          service.processFiles()(req, res, next);
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+    ValidationMiddleware.validate(UploadNewSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.uploadDocument(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Create a document placeholder and then client can upload the
+  // document to the placeholder documentPath via direct upload api
+  // provided by storage vendors
+
+  router.post(
+    '/internal/placeholder',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(CreateDocumentSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.createPlaceholderDocument(
+          req,
+          res,
+          next,
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Artifact sets: one document per content revision of a virtual record,
+  // holding many files. Registered ahead of /internal/:documentId, which would
+  // otherwise take "artifacts" for a document id.
+  router.post(
+    '/internal/artifacts/presign',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(PresignArtifactsSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.presignArtifactSet(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/artifacts',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(ListArtifactSetsSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.listArtifactSets(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/artifacts/:documentId/read-urls',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(ArtifactReadUrlsSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.getArtifactReadUrls(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.put(
+    '/internal/artifacts/:documentId/files/*',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    // The path is checked before the body is read.
+    ValidationMiddleware.validate(ArtifactFileParams),
+    express.raw({ type: () => true, limit: ARTIFACT_FILE_MAX_BYTES }),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.putArtifactFile(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/artifacts/:documentId/files/*',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(ArtifactFileParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.getArtifactFile(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.delete(
+    '/internal/artifacts/:documentId',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(PurgeArtifactSetSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.purgeArtifactSet(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/:documentId',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(DocumentIdParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.getDocumentById(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.delete(
+    '/internal/:documentId/',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(DocumentIdParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.deleteDocumentById(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.delete(
+    '/internal/:documentId/purge',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(PurgeDocumentParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.purgeDocumentById(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.delete(
+    '/internal/conversations/:conversationId/purge',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(PurgeConversationParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.purgeConversationDocuments(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.delete(
+    '/internal/records/:virtualRecordId/purge',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(PurgeVirtualRecordParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.purgeVirtualRecordDocuments(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/records/flat-documents',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(FlatRecordDocumentsQuery),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.listFlatRecordDocuments(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/records/:virtualRecordId/documents',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(PurgeVirtualRecordParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.listVirtualRecordDocuments(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/move-tree',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(MoveTreeSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.moveTree(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/records/relocate',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(RelocateVirtualRecordsSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.relocateVirtualRecords(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/connector/:connectorId/virtual-records',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(ConnectorVirtualRecordsSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.listConnectorVirtualRecords(
+          req,
+          res,
+          next,
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.delete(
+    '/internal/connector/:connectorId',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(ConnectorIdParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.deleteByConnector(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/missing',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(MissingDocumentsSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        await storageController.findMissingDocuments(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/:documentId/download',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(DocumentIdParamsWithVersion),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.downloadDocument(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Document Operations Routes
+  router.get(
+    '/internal/:documentId/buffer',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(GetBufferSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.getDocumentBuffer(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.put(
+    '/internal/:documentId/buffer',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ...FileProcessorFactory.createBufferUploadProcessor({
+      fieldName: 'file',
+      allowedMimeTypes: Object.values(extensionToMimeType),
+      maxFilesAllowed: 1,
+      isMultipleFilesAllowed: false,
+      processingType: FileProcessingType.BUFFER,
+      maxFileSize: 1024 * 1024 * 100,
+      strictFileUpload: true,
+    }).getMiddleware,
+    ValidationMiddleware.validate(DocumentIdParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.createDocumentBuffer(req, res, next);
+      } catch (error: any) {
+        logger.error(`Failed to upload buffer: ${error.message}`);
+        next(error);
+      }
+    },
+  );
+  // Version Control Routes
+  router.post(
+    '/internal/:documentId/uploadNextVersion',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    async (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      try {
+        const maxFileSize = await resolveMaxUploadSize();
+        const service = new FileProcessorService({
+          fieldName: 'file',
+          allowedMimeTypes: Object.values(extensionToMimeType),
+          maxFilesAllowed: 1,
+          isMultipleFilesAllowed: false,
+          processingType: FileProcessingType.BUFFER,
+          maxFileSize,
+          strictFileUpload: true,
+        });
+        const upload = service.upload();
+        upload(req, res, (err: any) => {
+          if (err) return next(err);
+          service.processFiles()(req, res, next);
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+    ValidationMiddleware.validate(UploadNextVersionSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.uploadNextVersionDocument(
+          req,
+          res,
+          next,
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Rollback to previous version
+  router.post(
+    '/internal/:documentId/rollBack',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(RollBackToPreviousVersionSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.rollBackToPreviousVersion(
+          req,
+          res,
+          next,
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/:documentId/abortDirectUpload',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    // Params and headers only: the caller sends no body, unlike the upload routes.
+    ValidationMiddleware.validate(DirectUploadSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.abortDirectUpload(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/:documentId/directUpload',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(DirectUploadSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.uploadDirectDocument(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.get(
+    '/internal/:documentId/isModified',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    ValidationMiddleware.validate(DocumentIdParams),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        return await storageController.documentDiffChecker(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/updateAppConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    async (
+      _req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      try {
+        const updatedConfig: AppConfig = await loadAppConfig();
+        const storageConfig = updatedConfig.storage;
+
+        container
+          .rebind<DefaultStorageConfig>('StorageConfig')
+          .toDynamicValue(() => storageConfig);
+
+        container
+          .rebind<StorageController>('StorageController')
+          .toDynamicValue(() => {
+            return new StorageController(
+              storageConfig,
+              logger,
+              keyValueStoreService,
+              updatedConfig.scopedJwtSecret,
+            );
+          });
+        res.status(200).json({
+          message: 'Storage configuration updated successfully',
+        });
+        return;
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Without this, a removed user route (e.g. GET /:documentId/download) falls
+  // through to the SPA fallback and answers 200 with the HTML shell.
+  router.use((_req: Request, _res: Response, next: NextFunction) => {
+    next(new NotFoundError('Not found'));
+  });
+
+  return router;
+}

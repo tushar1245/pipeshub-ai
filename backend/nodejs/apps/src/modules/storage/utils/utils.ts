@@ -1,0 +1,665 @@
+import { DocumentModel } from '../schema/document.schema';
+import { NextFunction, Response } from 'express';
+import {
+  BadRequestError,
+  InternalServerError,
+  NotFoundError,
+  ServiceUnavailableError,
+} from '../../../libs/errors/http.errors';
+import mongoose from 'mongoose';
+import { Logger } from '../../../libs/services/logger.service';
+import { getMimeType } from '../mimetypes/mimetypes';
+import {
+  Document,
+  FilePayload,
+  StorageServiceResponse,
+  StorageVendor,
+} from '../types/storage.service.types';
+import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
+import { ErrorMetadata } from '../../../libs/errors/base.error';
+import { createReadStream } from 'fs';
+import { STORAGE_WRITE_FAILED_MESSAGE } from '../constants/constants';
+import fs from 'fs';
+import { StorageServiceAdapter } from '../adapter/base-storage.adapter';
+import {
+  AuthenticatedServiceRequest,
+  AuthenticatedUserRequest,
+} from '../../../libs/middlewares/types';
+
+const logger = Logger.getInstance({
+  service: 'storage',
+});
+
+/**
+ * Write a file to the storage vendor, or fail with a message the uploader can act on.
+ * The vendor's own error (a path, an OS code, an S3 or Azure response) goes to the log only.
+ */
+export async function writeToStorage(
+  adapter: StorageServiceAdapter,
+  payload: FilePayload,
+  context: Record<string, unknown> = {},
+): Promise<StorageServiceResponse<string>> {
+  let response: StorageServiceResponse<string>;
+  try {
+    response = await adapter.uploadDocumentToStorageService(payload);
+  } catch (error) {
+    logger.error('Writing a file to storage failed', {
+      ...context,
+      error: error instanceof Error ? error.message : String(error),
+      metadata: (error as { metadata?: unknown }).metadata,
+    });
+    throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
+  }
+  if (response.statusCode !== HTTP_STATUS.OK || !response.data) {
+    logger.error('Writing a file to storage failed', {
+      ...context,
+      statusCode: response.statusCode,
+      error: response.msg,
+    });
+    throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
+  }
+  return response;
+}
+
+// Interface for document storage info response
+export interface DocumentInfoResponse {
+  document: mongoose.Document<unknown, {}, DocumentModel> & DocumentModel;
+}
+
+/**
+ * Read-only callers can ask for a plain object instead of a hydrated model.
+ *
+ * Mongoose hydration -- schema defaults, casting, getters, change tracking --
+ * measured ~20% of gateway CPU under load, and the download path reads a
+ * handful of fields and never saves. Opt-in rather than default because other
+ * callers of getDocumentInfo do mutate and save the document.
+ */
+// `Document` here is the plain data interface from storage.service.types.
+// NOT DocumentModel: that is declared `extends IDocument, MongooseDocument`, so
+// it carries save()/markModified()/etc and a lean object typed as it would
+// still compile against the hydrated-only API -- exactly the runtime crash the
+// lean path is meant to make impossible.
+export type LeanDocumentInfoResponse = { document: Document };
+
+export function encodeRFC5987(str: string): string {
+  return encodeURIComponent(str)
+    .replace(/'/g, '%27')
+    .replace(/\(/g, '%28')
+    .replace(/\)/g, '%29')
+    .replace(/\*/g, '%2A');
+}
+
+async function getDocumentInfoFromDb(
+  documentId: string,
+  orgId: mongoose.Types.ObjectId,
+  lean: true,
+): Promise<LeanDocumentInfoResponse | undefined>;
+async function getDocumentInfoFromDb(
+  documentId: string,
+  orgId: mongoose.Types.ObjectId,
+  lean?: false,
+): Promise<DocumentInfoResponse | undefined>;
+async function getDocumentInfoFromDb(
+  documentId: string,
+  orgId: mongoose.Types.ObjectId,
+  lean = false,
+): Promise<DocumentInfoResponse | LeanDocumentInfoResponse | undefined> {
+  try {
+    // Validate documentId is a valid ObjectId
+    if (!mongoose.isValidObjectId(documentId)) {
+      throw new NotFoundError('Invalid document ID');
+    }
+
+    // Fetch the document from MongoDB
+    const query = DocumentModel.findOne({
+      _id: documentId,
+      orgId,
+      isDeleted: false,
+    });
+    const document = lean ? await query.lean<Document>().exec() : await query;
+
+    if (!document) {
+      // Callers probe for documents that may be gone (deduplicated content
+      // removed with another connector); that is not a server fault.
+      throw new NotFoundError('Document not found', { logLevel: 'warn' });
+    }
+    return { document };
+  } catch (error) {
+    if (
+      error instanceof NotFoundError ||
+      error instanceof InternalServerError
+    ) {
+      throw error;
+    }
+
+    const logger = Logger.getInstance();
+    logger.error('Error fetching document:', {
+      documentId,
+      orgId,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+
+    throw new InternalServerError('Error fetching document information');
+  }
+}
+
+export async function getDocumentInfo(
+  req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+  next: NextFunction,
+  lean: true,
+): Promise<LeanDocumentInfoResponse | undefined>;
+export async function getDocumentInfo(
+  req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+  next: NextFunction,
+  lean?: false,
+): Promise<DocumentInfoResponse | undefined>;
+export async function getDocumentInfo(
+  req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+  next: NextFunction,
+  lean = false,
+): Promise<DocumentInfoResponse | LeanDocumentInfoResponse | undefined> {
+  try {
+    const orgId = extractOrgId(req);
+    const documentId = req.params.documentId;
+
+    const orgID = toObjectId(orgId, 'organization');
+    if (!documentId) {
+      throw new NotFoundError('Document ID is required');
+    }
+    // Branch rather than pass the boolean through: the overloads are what stop
+    // a lean object being handed to a caller expecting a hydrated document.
+    const documentInfo = lean
+      ? await getDocumentInfoFromDb(documentId, orgID, true)
+      : await getDocumentInfoFromDb(documentId, orgID, false);
+    if (!documentInfo) {
+      throw new NotFoundError('Document not found');
+    }
+    return documentInfo;
+  } catch (error) {
+    next(error);
+    return Promise.reject(error);
+  }
+}
+
+export function parseBoolean(
+  value: string | boolean | undefined | null,
+): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    return value.toLowerCase() === 'true';
+  }
+  return false;
+}
+
+export function isValidStorageVendor(vendor: string): vendor is StorageVendor {
+  const validStorageTypes = [
+    StorageVendor.S3,
+    StorageVendor.AzureBlob,
+    StorageVendor.Local,
+  ];
+  return validStorageTypes.includes(vendor as StorageVendor);
+}
+
+export function getExtension(documentName: string): string {
+  // Handle edge cases where documentName is undefined, null or empty
+  if (!documentName) {
+    return '';
+  }
+
+  // Split by dot and get the last element
+  const parts = documentName.split('.');
+
+  // If there's no extension (no dots or ends with a dot), return empty string
+  if (parts.length <= 1) {
+    return '';
+  }
+
+  // Return the last element which is the extension
+  return parts[parts.length - 1] || '';
+}
+
+/**
+ * Normalises a file extension so it always starts with a dot.
+ * Examples:
+ *   normalizeExtension('pdf')   -> '.pdf'
+ *   normalizeExtension('.pdf')  -> '.pdf'
+ *   normalizeExtension('')      -> ''
+ */
+export function normalizeExtension(ext: string): string {
+  if (!ext) return '';
+  return ext.startsWith('.') ? ext : `.${ext}`;
+}
+
+/**
+ * Returns the org-scoped folder path (without documentId).
+ * e.g. 'org1/PipesHub/Finance'  or  'org1/PipesHub'
+ */
+export function getFullDocumentPath(
+  orgId: string,
+  documentPath?: string,
+): string {
+  return documentPath
+    ? `${orgId}/PipesHub/${documentPath}`
+    : `${orgId}/PipesHub`;
+}
+
+/**
+ * The folder holding a virtual record's content revisions.
+ * e.g. 'org1/PipesHub/record-revisions/vr-1'
+ *
+ * Not under `records/`: older records are filed flat at `records/{id}`, and a
+ * move of one of them into its folder path (move-tree) would carry or collide
+ * with revisions stored beneath the same folder.
+ */
+export function getArtifactSetFolder(
+  orgId: string,
+  virtualRecordId: string,
+): string {
+  return getFullDocumentPath(orgId, `record-revisions/${virtualRecordId}`);
+}
+
+/**
+ * Where one content revision of a virtual record keeps its files.
+ * e.g. 'org1/PipesHub/record-revisions/vr-1/0123abcd'
+ */
+export function getArtifactSetRoot(
+  orgId: string,
+  virtualRecordId: string,
+  rev: string,
+): string {
+  return `${getArtifactSetFolder(orgId, virtualRecordId)}/${rev}`;
+}
+
+/**
+ * Returns the versioned snapshot path for a specific version number.
+ * e.g. 'org1/PipesHub/Finance/doc1/versions/v3.pdf'
+ */
+export function getVersionFilePath(
+  rootPath: string,
+  version: number,
+  extension: string,
+): string {
+  return `${rootPath}/versions/v${version}${normalizeExtension(extension)}`;
+}
+
+/**
+ * Returns the "live" (current) file path.
+ * versioned:     'org1/.../doc1/current/report.pdf'
+ * non-versioned: 'org1/.../doc1/report.pdf'
+ */
+export function getCurrentFilePath(
+  rootPath: string,
+  documentName: string,
+  extension: string,
+  isVersioned: boolean,
+): string {
+  const ext = normalizeExtension(extension);
+  return isVersioned
+    ? `${rootPath}/current/${documentName}${ext}`
+    : `${rootPath}/${documentName}${ext}`;
+}
+
+/**
+ * Every file a document keeps in storage: the current one and one per version,
+ * each as a document-shaped value a storage adapter can delete. Versions that
+ * point at the same place as another copy are listed once.
+ */
+export function storedCopies(document: Document): Document[] {
+  const base: Document =
+    typeof (document as { toObject?: () => Document }).toObject === 'function'
+      ? (document as unknown as { toObject: () => Document }).toObject()
+      : document;
+  const locations = [
+    { s3: base.s3, azureBlob: base.azureBlob, local: base.local },
+    ...(base.versionHistory ?? []).map((version) => ({
+      s3: version.s3,
+      azureBlob: version.azureBlob,
+      local: version.local,
+    })),
+  ];
+  const seen = new Set<string>();
+  const copies: Document[] = [];
+  for (const location of locations) {
+    const key =
+      location.s3?.url ??
+      location.azureBlob?.url ??
+      location.local?.localPath ??
+      location.local?.url;
+    if (key === undefined || key === '' || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    copies.push({ ...base, ...location });
+  }
+  return copies;
+}
+
+/**
+ * Returns the root folder path for a document (org + optional sub-path + documentId).
+ * e.g. 'org1/PipesHub/Finance/doc1'
+ */
+export function getDocumentRootPath(
+  orgId: string,
+  documentId: string,
+  documentPath?: string,
+  fullDocumentPath?: string,
+): string {
+  if (fullDocumentPath) {
+    return `${fullDocumentPath}/${documentId}`;
+  }
+  return `${getFullDocumentPath(orgId, documentPath)}/${documentId}`;
+}
+
+/**
+ * Detects whether a document name still carries a file extension that would be
+ * duplicated when `${documentName}${extension}` is reconstructed.
+ *
+ * The extension of a file is ALWAYS the segment after the LAST dot. A name may
+ * legitimately contain earlier dots (e.g. a file literally named
+ * `report.docx.png` is stored as documentName `report.docx` + extension `png`),
+ * so we must NOT reject a name just because some interior dot-segment looks like
+ * a known type. When the real `extension` is known, only flag the genuine
+ * double-extension case — the name already ending in `.<extension>`.
+ *
+ * When `extension` is not provided we fall back to the historical heuristic
+ * (last dot-segment maps to a known MIME type) for backward compatibility.
+ */
+export function hasExtension(
+  documentName: string | undefined,
+  extension?: string,
+): boolean {
+  if (!documentName) {
+    return false;
+  }
+
+  if (extension) {
+    const ext = (
+      extension.startsWith('.') ? extension.slice(1) : extension
+    ).toLowerCase();
+    return ext !== '' && documentName.toLowerCase().endsWith(`.${ext}`);
+  }
+
+  const lastSegment = documentName.split('.').pop() || '';
+  return getMimeType(lastSegment) !== '';
+}
+
+/**
+ * Validates file extension, MIME type, and document name constraints
+ * @param extension - File extension (without leading dot)
+ * @param documentName - Document name to validate (should not contain extension or forward slash)
+ * @param fileNameForError - File name to use in error messages
+ * @throws BadRequestError if validation fails
+ */
+export function validateFileAndDocumentName(
+  extension: string,
+  documentName: string | undefined,
+  fileNameForError: string,
+): void {
+  // Validate MIME type support FIRST - most important check
+  const mimeType = getMimeType(extension);
+  if (mimeType === '') {
+    throw new BadRequestError(
+      `File "${fileNameForError}" has an unsupported file extension "${extension}". Supported file types include: .pdf, .docx, .xlsx, .csv, .md, .txt, .pptx, .html, .tsv, and images (.png, .jpg, .svg, .webp).`,
+    );
+  }
+
+
+  if (documentName?.includes('/')) {
+    throw new BadRequestError(
+      `File "${fileNameForError}": The document name cannot contain a forward slash.`,
+    );
+  }
+}
+
+export async function createPlaceholderDocument(
+  req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+  next: NextFunction,
+  size: number,
+  extension: string,
+  originalname?: string,
+  storageVendor?: StorageVendor,
+): Promise<DocumentInfoResponse | undefined> {
+  try {
+    const {
+      documentName,
+      alternateDocumentName,
+      documentPath,
+      permissions,
+      customMetadata,
+      isVersionedFile,
+    } = req.body as Partial<Document>;
+    const orgId = extractOrgId(req);
+    const userId = extractUserId(req);
+
+    // Use originalname or documentName for error messages
+    const fileNameForError = originalname || documentName || 'the file';
+
+    // Validate file extension, MIME type, and document name constraints
+    validateFileAndDocumentName(extension, documentName, fileNameForError);
+
+    const fullDocumentPath = getFullDocumentPath(orgId, documentPath);
+    const documentInfo: Partial<Document> = {
+      documentName,
+      documentPath: fullDocumentPath,
+      alternateDocumentName,
+      orgId: toObjectId(orgId, 'organization'),
+      isVersionedFile: isVersionedFile,
+      permissions: permissions,
+      initiatorUserId: userId ? toObjectId(userId, 'user') : null,
+      customMetadata,
+      sizeInBytes: size,
+      storageVendor: storageVendor ?? StorageVendor.S3,
+      extension: normalizeExtension(extension),
+    };
+
+    const savedDocument = await DocumentModel.create(documentInfo);
+    return { document: savedDocument };
+  } catch (error) {
+    next(error);
+    return Promise.reject(error);
+  }
+}
+
+export async function generatePresignedUrlForDirectUpload(
+  adapter: StorageServiceAdapter,
+  documentPath: string | undefined,
+): Promise<string | undefined> {
+  try {
+    if (!documentPath) {
+      throw new BadRequestError('Document path is required');
+    }
+    const presignedUrlResponse =
+      await adapter.generatePresignedUrlForDirectUpload(documentPath);
+
+    if (presignedUrlResponse.statusCode !== 200) {
+      logger.error(
+        'Error generating presigned URL:',
+        presignedUrlResponse.data?.url,
+      );
+      const errorMetadata: ErrorMetadata = {
+        statusCode: presignedUrlResponse.statusCode,
+        requestedUrl: presignedUrlResponse.data?.url,
+        errorMessage: presignedUrlResponse.msg,
+        timestamp: new Date().toISOString(),
+      };
+      throw new InternalServerError(
+        'Error generating presigned URL:',
+        errorMetadata,
+      );
+    }
+    return presignedUrlResponse.data?.url;
+  } catch (error) {
+    throw error;
+  }
+}
+
+export function getBaseUrl(url: string): string | undefined {
+  const baseUrl = url.split('?')[0];
+  return baseUrl;
+}
+
+export function getStorageVendor(storageType: string): StorageVendor {
+  switch (storageType) {
+    case 's3':
+      return StorageVendor.S3;
+    case 'azureBlob':
+      return StorageVendor.AzureBlob;
+    case 'local':
+      return StorageVendor.Local;
+    default:
+      throw new Error(`Invalid storage type: ${storageType}`);
+  }
+}
+
+export function serveFileFromLocalStorage(document: Document, res: Response, version?: number) {
+  try {
+    const localFilePath = version !== undefined
+      ? (document.versionHistory?.[version]?.local?.localPath ||
+         document.versionHistory?.[version]?.local?.url)
+      : (document.local?.localPath);
+
+    if (!localFilePath) {
+      throw new NotFoundError('Local file path not found for requested version');
+    }
+
+    // DON'T use new URL() - it treats # as a fragment identifier!
+    // Instead, manually parse the file:// URL
+
+    let filePath: string;
+
+    if (localFilePath.startsWith('file://')) {
+      // Remove the file:// protocol
+      let pathPart = localFilePath.substring(7); // Remove 'file://'
+
+      if (process.platform === 'win32') {
+        // Windows: file:///C:/path/to/file
+        // Remove leading / if present (file:/// becomes /C:/...)
+        if (pathPart.startsWith('/')) {
+          pathPart = pathPart.substring(1);
+        }
+        // Decode URI components and convert forward slashes to backslashes
+        filePath = decodeURIComponent(pathPart).replace(/\//g, '\\');
+      } else {
+        // Unix: file:///path/to/file or file://path/to/file
+        // Remove leading / if we have // (file:// case)
+        if (pathPart.startsWith('//')) {
+          pathPart = pathPart.substring(1);
+        }
+        filePath = decodeURIComponent(pathPart);
+      }
+    } else {
+      // If it's not a file:// URL, treat it as a direct path
+      filePath = localFilePath;
+    }
+
+    // Check if file exists using synchronous access
+    try {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    } catch (err) {
+      logger.error('File not accessible:', {
+        filePath,
+        originalPath: localFilePath,
+        documentName: document.documentName,
+        extension: document.extension,
+        error: err,
+      });
+      throw new NotFoundError(
+        `File not found or not accessible: ${document.documentName}${document.extension}`,
+      );
+    }
+
+    // Get mime type from extension
+    const mimeType = getMimeType(document.extension);
+
+    // Encode filename for Content-Disposition header
+    const fullName = `${document.documentName}${document.extension}`;
+    const filenameStar = encodeRFC5987(fullName);
+
+    // Set headers
+    res.setHeader('Content-Type', mimeType || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${filenameStar}`,
+    );
+
+    // Stream the file
+    const fileStream = createReadStream(filePath);
+    fileStream.pipe(res);
+
+    // Handle streaming errors
+    fileStream.on('error', (error) => {
+      logger.error('Error streaming file:', {
+        filePath,
+        documentName: document.documentName,
+        error,
+      });
+      if (!res.headersSent) {
+        res
+          .status(HTTP_STATUS.INTERNAL_SERVER)
+          .json({ error: 'Error streaming file' });
+      }
+    });
+  } catch (error) {
+    logger.error('Error serving local file:', error);
+    throw error;
+  }
+}
+
+/**
+ * The org and user ids come from the caller's token. A malformed one makes
+ * `new ObjectId` throw a BSONError, which reaches the client as a 500.
+ * isValidObjectId is not enough: it passes a number, which ObjectId turns into
+ * a made-up timestamp id that matches nothing.
+ */
+export function toObjectId(
+  id: unknown,
+  kind: 'organization' | 'user',
+): mongoose.Types.ObjectId {
+  if (typeof id !== 'string' || !mongoose.isObjectIdOrHexString(id)) {
+    throw new BadRequestError(
+      `The ${kind} id in the storage token isn't valid. Issue the token with the 24-character id of an existing ${kind}, then try again.`,
+    );
+  }
+  return new mongoose.Types.ObjectId(id);
+}
+
+export function extractOrgId(
+  req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+): string {
+  // Check user request first
+  if ('user' in req && req.user && 'orgId' in req.user) {
+    return req.user.orgId;
+  }
+
+  // Check service request
+  if (
+    'tokenPayload' in req &&
+    req.tokenPayload &&
+    'orgId' in req.tokenPayload
+  ) {
+    return req.tokenPayload.orgId;
+  }
+
+  throw new BadRequestError('Organization ID not found in request');
+}
+
+export function extractUserId(
+  req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+): string | null {
+  // Check user request first
+  if ('user' in req && req.user && 'userId' in req.user) {
+    return req.user.userId;
+  }
+
+  // Service token that carries a userId (e.g. the storage service token minted
+  // for internal KB uploads) — preserve initiator attribution.
+  if (
+    'tokenPayload' in req &&
+    req.tokenPayload &&
+    typeof req.tokenPayload.userId === 'string'
+  ) {
+    return req.tokenPayload.userId;
+  }
+
+  return null;
+}

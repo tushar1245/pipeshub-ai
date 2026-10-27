@@ -1,0 +1,348 @@
+import asyncio
+import logging
+from typing import Any, Tuple, cast
+
+from langchain_core.language_models.chat_models import BaseChatModel
+
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.service import config_node_constants
+from app.exceptions.indexing_exceptions import DocumentProcessingError
+from app.services.ai_models.decision import DecisionModel, get_decision_model
+from app.utils.aimodels import (
+    STTAdapter,
+    TTSAdapter,
+    get_generator_model,
+    get_stt_model,
+    get_tts_model,
+    is_local_cpu_embedding_provider,
+)
+
+# Users read these as a file's failure reason or a chat error, so each says what to do next.
+LLM_MISSING_FOR_FILE = (
+    "No AI model is set up for this workspace yet, so this file couldn't be processed. "
+    "An admin can add one in Workspace → AI Models, then reindex the file."
+)
+LLM_MISSING_FOR_CHAT = (
+    "No AI model is set up for this workspace yet. "
+    "An admin can add one in Workspace → AI Models, then you can send your message again."
+)
+
+
+class LLMNotConfiguredError(DocumentProcessingError, ValueError):
+    """No language model is configured for the org; permanent until an admin adds one, so never retried.
+
+    A DocumentProcessingError so indexing passes the message through as the
+    record's failure reason instead of prefixing it with "Failed to process document".
+    """
+
+    code = "LLM_NOT_CONFIGURED"
+
+    def __init__(self, message: str = LLM_MISSING_FOR_FILE) -> None:
+        super().__init__(message)
+
+
+class LLMUnavailableError(Exception):
+    """The model provider could not serve the call (unreachable, timing out, overloaded or rate
+    limiting). Transient: the caller waits and tries again without counting a failure."""
+
+    code = "LLM_UNAVAILABLE"
+
+    def __init__(self, message: str = "", *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        # Seconds until the provider may serve again, when known (its open circuit's cooldown).
+        self.retry_after = retry_after
+
+
+# Provider SDKs name the same failures differently (openai, anthropic, httpx, google, botocore).
+_UNAVAILABLE_NAME_PARTS = ("Connect", "Timeout", "RateLimit", "Unavailable", "Overloaded", "Throttl", "InternalServer", "Disconnect")
+_TOO_MANY_REQUESTS = 429
+_SERVER_ERROR = 500
+
+
+def is_provider_unavailable(exc: BaseException) -> bool:
+    """Whether an LLM call failed because the provider could not serve it, not because of the request.
+
+    Reads status codes and exception names, following the cause chain (LangChain re-raises SDK
+    errors). A 4xx other than 429 is the request's fault.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, ConnectionError)):
+            return True
+        status = getattr(current, "status_code", None)
+        if isinstance(status, int):
+            return status == _TOO_MANY_REQUESTS or status >= _SERVER_ERROR
+        if any(part in type(current).__name__ for part in _UNAVAILABLE_NAME_PARTS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def load_ai_models(config_service: ConfigurationService) -> dict[str, Any]:
+    """Load the AI models config blob (OSS: org-scoped get_config); ``{}`` until AI settings are saved."""
+    config = cast(object, await config_service.get_config(
+        config_node_constants.AI_MODELS.value, use_cache=False
+    ))
+    return cast(dict[str, Any], config) if isinstance(config, dict) else {}
+
+
+def indexing_model_identity(ai_models: dict[str, Any], role: str = "indexing") -> str:
+    """Which model serves ``role``, without instantiating it (for stage fingerprints).
+
+    Mirrors ``get_llm_for_role``'s choice: the role's assigned model, else the default LLM,
+    else the first; an assignment that does not resolve counts as none, as it does there.
+    ``"none"`` when no LLM is configured.
+    """
+    roles = ai_models.get("modelRoles")
+    assignment = cast(dict[str, Any], roles).get(role) if isinstance(roles, dict) else None
+    if isinstance(assignment, dict):
+        chosen = cast(dict[str, Any], assignment)
+        model_type = chosen.get("modelType")
+        bucket = ai_models.get(model_type) if isinstance(model_type, str) else None
+        if chosen.get("modelKey") and isinstance(bucket, list):
+            for candidate in cast(list[Any], bucket):
+                entry = cast(dict[str, Any], candidate) if isinstance(candidate, dict) else None
+                if entry is not None and entry.get("modelKey") == chosen["modelKey"]:
+                    return _model_entry_identity(str(model_type), entry)
+    configs = ai_models.get("llm")
+    if not isinstance(configs, list) or not configs:
+        return "none"
+    entries = [cast(dict[str, Any], c) for c in cast(list[Any], configs) if isinstance(c, dict)]
+    if not entries:
+        return "none"
+    default = next((c for c in entries if c.get("isDefault")), entries[0])
+    return _model_entry_identity("llm", default)
+
+
+def _model_entry_identity(model_type: str, entry: dict[str, Any]) -> str:
+    configuration = entry.get("configuration")
+    model = cast(dict[str, Any], configuration).get("model", "") if isinstance(configuration, dict) else ""
+    return f"{model_type}:{entry.get('modelKey') or entry.get('provider', '')}:{model}"
+
+
+def _select_default_config(configs: list) -> dict | None:
+    """Prefer isDefault entry; else first entry; else None."""
+    if not configs:
+        return None
+    return next((c for c in configs if c.get("isDefault")), configs[0])
+
+
+async def _instantiate_llm_from_configs(
+    llm_configs: list | None,
+    *,
+    reasoning_effort: str | None = None,
+) -> Tuple[BaseChatModel, dict[str, Any]]:
+    """Pick and instantiate an LLM from a config list (default first, then any)."""
+    if not llm_configs:
+        raise LLMNotConfiguredError()
+
+    for config in llm_configs:
+        if config.get("isDefault", False):
+            llm = await asyncio.to_thread(
+                get_generator_model, config["provider"], config, None, reasoning_effort,
+            )
+            if llm:
+                return llm, config
+
+    for config in llm_configs:
+        llm = await asyncio.to_thread(
+            get_generator_model, config["provider"], config, None, reasoning_effort,
+        )
+        if llm:
+            return llm, config
+
+    raise ValueError("No LLM found")
+
+
+async def _try_resolve_role_llm(
+    ai_models: dict | None,
+    role: str,
+    *,
+    reasoning_effort: str | None = None,
+) -> Tuple[BaseChatModel, dict[str, Any]] | None:
+    """Resolve modelRoles assignment to an instantiated LLM, or None."""
+    model_roles: dict = (ai_models or {}).get("modelRoles") or {}
+    assignment = model_roles.get(role)
+    if not assignment:
+        return None
+
+    model_type: str = assignment.get("modelType", "")
+    model_key: str = assignment.get("modelKey", "")
+    bucket: list = (ai_models or {}).get(model_type, []) or []
+    matched = next(
+        (cfg for cfg in bucket if cfg.get("modelKey") == model_key), None
+    )
+    if not matched:
+        return None
+
+    llm = await asyncio.to_thread(
+        get_generator_model, matched["provider"], matched, None, reasoning_effort,
+    )
+    if llm:
+        return llm, matched
+    return None
+
+
+async def get_llm(
+    config_service: ConfigurationService,
+    llm_configs: Any = None,
+    *,
+    reasoning_effort: str | None = None,
+) -> Tuple[BaseChatModel, dict[str, Any]]:
+    if not llm_configs:
+        ai_models = await load_ai_models(config_service)
+        llm_configs = ai_models.get("llm")
+    return await _instantiate_llm_from_configs(llm_configs, reasoning_effort=reasoning_effort)
+
+
+async def get_llm_for_role(
+    config_service: ConfigurationService,
+    role: str,
+    *,
+    reasoning_effort: str | None = None,
+) -> Tuple[BaseChatModel, dict[str, Any]]:
+    """Return the LLM assigned to *role*, falling back to the default LLM.
+
+    Reads ``modelRoles`` from the AI models config blob. If the role is
+    assigned to a specific model (identified by ``modelKey`` within a
+    ``modelType`` bucket), that model is instantiated and returned.
+
+    Falls back to :func:`get_llm` when:
+    - the role is not assigned, or
+    - the assigned ``modelKey`` / ``modelType`` cannot be resolved.
+
+    This ensures full backward compatibility: existing deployments without
+    ``modelRoles`` in their config are unaffected.
+    """
+    try:
+        ai_models = await load_ai_models(config_service)
+        resolved = await _try_resolve_role_llm(
+            ai_models, role, reasoning_effort=reasoning_effort
+        )
+        if resolved:
+            return resolved
+    except Exception:
+        pass
+
+    return await get_llm(config_service, reasoning_effort=reasoning_effort or "low")
+
+
+async def get_embedding_model_config(config_service: ConfigurationService) -> dict | None:
+    try:
+        ai_models = await load_ai_models(config_service)
+        embedding_configs = ai_models.get("embedding")
+        if not embedding_configs:
+            return None
+        return embedding_configs[0]
+    except Exception as e:
+        raise e
+
+
+async def is_local_cpu_embedding_configured(
+    config_service: ConfigurationService,
+    logger: logging.Logger,
+) -> bool:
+    """Whether records will be embedded on local CPU rather than a hosted API.
+
+    Read once at startup by the services that hold CPU back from their
+    heavy-parse ceiling for the embedding server (see
+    ``resource_governor.policy.EMBEDDING_CPU_RESERVATION``). Mirrors the
+    config selection ``VectorStore._get_embedding_model`` makes, so both
+    reach the same verdict for a given deployment, and treats an
+    unconfigured deployment as local because that path falls back to
+    ``get_default_embedding_model()``.
+
+    An unreadable config also resolves to ``True``: over-reserving two cores
+    costs some parse throughput, while under-reserving them starves the
+    embedding step that every record has to pass through.
+    """
+    try:
+        ai_models = await config_service.get_config(
+            config_node_constants.AI_MODELS.value, use_cache=False
+        )
+        embedding_configs = (ai_models or {}).get("embedding") or []
+        if not embedding_configs:
+            return True
+        config = next(
+            (c for c in embedding_configs if c.get("isDefault")), embedding_configs[0]
+        )
+        configuration = config.get("configuration") or {}
+        return is_local_cpu_embedding_provider(
+            config.get("provider"), configuration.get("endpoint")
+        )
+    except Exception:
+        logger.warning(
+            "Could not resolve the embedding provider; assuming a local CPU model",
+            exc_info=True,
+        )
+        return True
+
+
+async def get_image_generation_config(config_service: ConfigurationService) -> dict | None:
+    """Return the active image-generation model config, or ``None`` if unset.
+
+    Prefers the config marked ``isDefault``; falls back to the first entry.
+    Mirrors the shape returned for other model types under the ``aiModels``
+    namespace.
+    """
+    ai_models = await load_ai_models(config_service)
+    return _select_default_config(ai_models.get("imageGeneration") or [])
+
+
+async def _get_default_config(
+    config_service: ConfigurationService,
+    bucket: str,
+) -> dict | None:
+    """Shared helper: return the default entry under ``ai_models[bucket]``.
+
+    Gracefully returns ``None`` when the whole ``aiModels`` blob is missing
+    (e.g. on a brand-new install) so callers — and the chat UI fallback —
+    can treat TTS/STT as simply unconfigured instead of erroring.
+    """
+    ai_models = await load_ai_models(config_service)
+    if not ai_models:
+        return None
+    return _select_default_config(ai_models.get(bucket) or [])
+
+
+async def get_tts_config(config_service: ConfigurationService) -> dict | None:
+    """Return the active TTS model config, or ``None`` if unset."""
+    return await _get_default_config(config_service, "tts")
+
+
+async def get_stt_config(config_service: ConfigurationService) -> dict | None:
+    """Return the active STT model config, or ``None`` if unset."""
+    return await _get_default_config(config_service, "stt")
+
+
+async def get_decision_config(config_service: ConfigurationService) -> dict | None:
+    return await _get_default_config(config_service, "decision")
+
+
+async def get_decision_model_instance(
+    config_service: ConfigurationService,
+) -> tuple[DecisionModel, dict] | None:
+    config = await get_decision_config(config_service)
+    if not config:
+        return None
+    return get_decision_model(config["provider"], config), config
+
+
+async def get_tts_model_instance(
+    config_service: ConfigurationService,
+) -> Tuple[TTSAdapter, dict] | None:
+    config = await get_tts_config(config_service)
+    if not config:
+        return None
+    return get_tts_model(config["provider"], config), config
+
+
+async def get_stt_model_instance(
+    config_service: ConfigurationService,
+) -> Tuple[STTAdapter, dict] | None:
+    config = await get_stt_config(config_service)
+    if not config:
+        return None
+    return get_stt_model(config["provider"], config), config

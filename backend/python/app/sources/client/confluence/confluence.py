@@ -1,0 +1,544 @@
+import base64
+import logging
+from dataclasses import asdict, dataclass
+from typing import Any, Optional
+
+from app.config.configuration_service import ConfigurationService
+from app.connectors.core.constants import OAuthConfigKeys
+from app.sources.client.http.exception.exception import HttpStatusCode
+from app.sources.client.http.http_client import HTTPClient
+from app.sources.client.http.http_request import HTTPRequest
+from app.sources.client.iclient import IClient
+from app.sources.client.resilience import ResiliencePolicy
+from app.sources.external.common.atlassian import (
+    AtlassianCloudResource,
+    match_atlassian_cloud_resource,
+    resolve_preferred_site_with_fallback,
+)
+from app.utils.oauth_config import fetch_toolset_oauth_config_by_id
+
+
+class ConfluenceRESTClientViaUsernamePassword(HTTPClient):
+    """Confluence REST client via username and password
+    Args:
+        username: The username to use for authentication
+        password: The password to use for authentication
+        token_type: The type of token to use for authentication
+    """
+
+    def __init__(
+        self, base_url: str, username: str, password: str, token_type: str = "Basic",
+        resilience: Optional[ResiliencePolicy] = None,
+    ) -> None:
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        super().__init__(credentials, token_type, resilience=resilience)
+        self.base_url = base_url
+        self.username = username
+
+    def get_base_url(self) -> str:
+        """Get the base URL"""
+        return self.base_url
+
+class ConfluenceRESTClientViaApiKey(HTTPClient):
+    """Confluence REST client via API key (Basic auth with email:apiToken)
+
+    Atlassian Cloud uses Basic authentication with email:apiToken format.
+    The credentials are base64 encoded and sent as 'Basic <encoded>' header.
+
+    Args:
+        base_url: The base URL of the Confluence instance
+        email: The email to use for authentication
+        api_key: The API key/token to use for authentication
+    """
+
+    def __init__(
+        self, base_url: str, email: str, api_key: str, resilience: Optional[ResiliencePolicy] = None,
+    ) -> None:
+        credentials = base64.b64encode(f"{email}:{api_key}".encode()).decode()
+        super().__init__(credentials, "Basic", resilience=resilience)
+        self.base_url = base_url
+        self.email = email
+
+    def get_base_url(self) -> str:
+        """Get the base URL"""
+        return self.base_url
+
+
+class ConfluenceRESTClientViaToken(HTTPClient):
+    def __init__(
+        self, base_url: str, token: str, token_type: str = "Bearer",
+        resilience: Optional[ResiliencePolicy] = None,
+    ) -> None:
+        super().__init__(token, token_type, resilience=resilience)
+        self.base_url = base_url
+        self.token = token
+
+    def get_base_url(self) -> str:
+        """Get the base URL"""
+        return self.base_url
+
+    def get_token(self) -> str:
+        """Get the token"""
+        return self.token
+
+    def set_token(self, token: str) -> None:
+        """Set the token"""
+        self.token = token
+        self.headers["Authorization"] = f"Bearer {token}"
+
+@dataclass
+class ConfluenceUsernamePasswordConfig:
+    """Configuration for Confluence REST client via username and password
+    Args:
+        base_url: The base URL of the Confluence instance
+        username: The username to use for authentication
+        password: The password to use for authentication
+        ssl: Whether to use SSL
+    """
+
+    base_url: str
+    username: str
+    password: str
+    ssl: bool = False
+
+    def create_client(self) -> ConfluenceRESTClientViaUsernamePassword:
+        return ConfluenceRESTClientViaUsernamePassword(self.base_url, self.username, self.password, "Basic")
+
+    def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary"""
+        return asdict(self)
+
+
+@dataclass
+class ConfluenceTokenConfig:
+    """Configuration for Confluence REST client via token
+    Args:
+        base_url: The base URL of the Confluence instance
+        token: The token to use for authentication
+        ssl: Whether to use SSL
+    """
+
+    base_url: str
+    token: str
+    ssl: bool = False
+
+    def create_client(self) -> ConfluenceRESTClientViaToken:
+        return ConfluenceRESTClientViaToken(self.base_url, self.token)
+
+    def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary"""
+        return asdict(self)
+
+
+@dataclass
+class ConfluenceApiKeyConfig:
+    """Configuration for Confluence REST client via API key
+    Args:
+        base_url: The base URL of the Confluence instance
+        email: The email to use for authentication
+        api_key: The API key to use for authentication
+        ssl: Whether to use SSL
+    """
+
+    base_url: str
+    email: str
+    api_key: str
+    ssl: bool = False
+
+    def create_client(self) -> ConfluenceRESTClientViaApiKey:
+        return ConfluenceRESTClientViaApiKey(self.base_url, self.email, self.api_key)
+
+    def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary"""
+        return asdict(self)
+
+
+class ConfluenceClient(IClient):
+    """Builder class for Confluence clients with different construction methods"""
+
+    def __init__(
+        self,
+        client: ConfluenceRESTClientViaUsernamePassword | ConfluenceRESTClientViaApiKey | ConfluenceRESTClientViaToken,
+    ) -> None:
+        """Initialize with a Confluence client object"""
+        self.client = client
+
+    def get_client(self) -> ConfluenceRESTClientViaUsernamePassword | ConfluenceRESTClientViaApiKey | ConfluenceRESTClientViaToken:
+        """Return the Confluence client object"""
+        return self.client
+
+    @staticmethod
+    async def get_accessible_resources(token: str) -> list[AtlassianCloudResource]:
+        """Get list of Atlassian sites (Confluence/Jira instances) accessible to the user
+        Args:
+            token: The authentication token
+        Returns:
+            List of accessible Atlassian Cloud resources
+        """
+        RESOURCE_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
+
+        if not token:
+            raise ValueError("No token provided for resource fetching")
+
+        http_client = HTTPClient(token, "Bearer")
+        request = HTTPRequest(
+            url=RESOURCE_URL,
+            method="GET",
+            headers={"Content-Type": "application/json"}
+        )
+
+        try:
+            response = await http_client.execute(request)
+
+            # Check if the response is successful
+            if response.status != HttpStatusCode.SUCCESS.value:
+                raise Exception(f"API request failed with status {response.status}: {response.text()}")
+
+            # Try to parse JSON response
+            try:
+                response_data = response.json()
+            except Exception as json_error:
+                raise Exception(f"Failed to parse JSON response: {json_error}. Response: {response.text()}")
+
+            # Check if response_data is a list
+            if not isinstance(response_data, list):
+                raise Exception(f"Expected list of resources, got {type(response_data)}: {response_data}")
+
+            return [
+                AtlassianCloudResource(
+                    id=resource["id"],
+                    name=resource.get("name", ""),
+                    url=resource["url"],
+                    scopes=resource.get("scopes", []),
+                    avatar_url=resource.get("avatarUrl"),
+                )
+                for resource in response_data
+            ]
+        except Exception as e:
+            raise Exception(f"Failed to fetch accessible resources: {str(e)}") from e
+
+    @staticmethod
+    async def get_cloud_id(token: str, site_url: str) -> str:
+        """Resolve cloud ID from accessible resources using ``site_url`` (``auth.baseUrl``)."""
+        resources = await ConfluenceClient.get_accessible_resources(token)
+        return match_atlassian_cloud_resource(resources, site_url, product="Confluence").id
+
+    @staticmethod
+    async def get_confluence_base_url(token: str, site_url: str) -> str:
+        """Get the Confluence proxy API base URL for the site matching ``site_url``."""
+        cloud_id = await ConfluenceClient.get_cloud_id(token, site_url)
+        # Confluence Cloud v2 endpoints live under /wiki/api/v2
+        return f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2"
+
+    @classmethod
+    def build_with_config(
+        cls,
+        config: ConfluenceUsernamePasswordConfig | ConfluenceTokenConfig | ConfluenceApiKeyConfig,
+    ) -> "ConfluenceClient":
+        """Build ConfluenceClient with configuration (placeholder for future OAuth2/enterprise support)
+
+        Args:
+            config: ConfluenceConfigBase instance
+        Returns:
+            ConfluenceClient instance with placeholder implementation
+
+        """
+        return cls(config.create_client())
+
+    @classmethod
+    async def build_from_services(
+        cls,
+        logger: logging.Logger,
+        config_service: ConfigurationService,
+        connector_instance_id: Optional[str] = None,
+        resilience: Optional[ResiliencePolicy] = None,
+    ) -> "ConfluenceClient":
+        """Build ConfluenceClient using configuration service
+        Args:
+            logger: Logger instance
+            config_service: Configuration service instance
+            resilience: The connector's rate limit and retry policy, applied to every request
+        Returns:
+            ConfluenceClient instance
+        """
+        try:
+            # Get Confluence configuration from the configuration service
+            config = await cls._get_connector_config(logger, config_service, connector_instance_id)
+            if not config:
+                raise ValueError("Failed to get Confluence connector configuration")
+            auth_config = config.get("auth",{}) or {}
+            if not auth_config:
+                raise ValueError("Auth configuration not found in Confluence connector configuration")
+
+            # Extract configuration values
+            auth_type = auth_config.get("authType", "BEARER_TOKEN")
+
+            # Create appropriate client based on auth type
+            if auth_type == "API_TOKEN":
+                # API Token authentication
+                # Cloud: uses Basic auth with email:apiToken + /wiki/api/v2
+                # DC PAT: uses Bearer token + plain base URL (no /wiki/api/v2)
+                base_url = auth_config.get("baseUrl", "").strip()
+                email = auth_config.get("email", "").strip()
+                api_token = auth_config.get("apiToken", "").strip()
+
+                if not base_url:
+                    raise ValueError("Base URL is required for API_TOKEN auth")
+                if not api_token:
+                    raise ValueError("API token is required for API_TOKEN auth")
+
+                # Normalize base URL; a site URL typed with its /wiki path must not become /wiki/wiki
+                base_url = base_url.rstrip('/')
+                if email and base_url.endswith('/wiki'):
+                    base_url = base_url[: -len('/wiki')]
+
+                if email:
+                    # Cloud: Basic auth with email:token + /wiki/api/v2
+                    if not base_url.endswith('/wiki/api/v2'):
+                        base_url = f"{base_url}/wiki/api/v2"
+                    client = ConfluenceRESTClientViaApiKey(base_url, email, api_token, resilience=resilience)
+                else:
+                    # DC PAT: Bearer token, plain base URL (no /wiki/api/v2)
+                    client = ConfluenceRESTClientViaToken(base_url, api_token, resilience=resilience)
+
+            elif auth_type == "BASIC_AUTH":
+                # Basic authentication with username:password (DC/Server)
+                base_url = auth_config.get("baseUrl", "").strip()
+                username = auth_config.get("username", "").strip()
+                password = auth_config.get("password", "").strip()
+
+                if not base_url:
+                    raise ValueError("Base URL is required for BASIC_AUTH")
+                if not username or not password:
+                    raise ValueError("Username and password are required for BASIC_AUTH")
+
+                # DC plain base URL (no /wiki/api/v2)
+                base_url = base_url.rstrip('/')
+                client = ConfluenceRESTClientViaUsernamePassword(base_url, username, password, resilience=resilience)
+
+            elif auth_type == "BEARER_TOKEN":  # Default to token auth
+                token = auth_config.get("bearerToken", "")
+                if not token:
+                    raise ValueError("Token required for token auth type")
+
+                preferred_site = (auth_config.get("baseUrl") or "").strip()
+                if not preferred_site:
+                    raise ValueError("Atlassian site URL (baseUrl) is required for BEARER_TOKEN auth")
+                base_url = await cls.get_confluence_base_url(token, preferred_site)
+
+                if not base_url:
+                    raise ValueError("Confluence base_url not found in configuration")
+
+                client = ConfluenceRESTClientViaToken(base_url, token, resilience=resilience)
+            elif auth_type == "OAUTH":
+                credentials_config = config.get("credentials", {}) or {}
+                if not credentials_config:
+                    raise ValueError("Credentials configuration not found for OAuth auth type")
+                access_token = credentials_config.get("access_token", "")
+                if not access_token:
+                    raise ValueError("Access token required for OAuth auth type")
+
+                preferred_site = (auth_config.get("baseUrl") or "").strip()
+                if not preferred_site:
+                    oauth_config_id = auth_config.get(OAuthConfigKeys.OAUTH_CONFIG_ID)
+                    if oauth_config_id:
+                        from app.edition_config import fetch_oauth_config_by_id
+                        shared = await fetch_oauth_config_by_id(
+                            oauth_config_id=oauth_config_id,
+                            connector_type="Confluence",
+                            config_service=config_service,
+                            logger=logger,
+                            org_id=auth_config.get("inheritedFromOrgId"),
+                        )
+                        if shared:
+                            preferred_site = (shared.get(OAuthConfigKeys.CONFIG, {}).get("baseUrl") or "").strip()
+                preferred_site = await resolve_preferred_site_with_fallback(
+                    preferred_site, access_token, cls.get_accessible_resources, logger, "Confluence",
+                )
+                base_url = await cls.get_confluence_base_url(access_token, preferred_site)
+
+                if not base_url:
+                    raise ValueError("Confluence base_url not found in configuration")
+
+                client = ConfluenceRESTClientViaToken(base_url, access_token, resilience=resilience)
+            else:
+                raise ValueError(f"Invalid auth type: {auth_type}")
+
+            return cls(client)
+
+        except Exception as e:
+            logger.error(f"Failed to build Confluence client from services: {str(e)}")
+            raise
+
+    @classmethod
+    async def build_from_toolset(
+        cls,
+        toolset_config: dict[str, Any],
+        logger: logging.Logger,
+        config_service: Optional[ConfigurationService] = None,
+    ) -> "ConfluenceClient":
+        """
+        Build ConfluenceClient using toolset configuration from etcd.
+
+        NEW ARCHITECTURE: This method uses toolset configs directly instead of
+        connector instance configs. Toolset configs are stored per-user at:
+        /services/toolsets/{user_id}/{toolset_type}
+
+        Args:
+            toolset_config: Toolset configuration dictionary from etcd
+            logger: Logger instance
+            config_service: Configuration service for fetching instance config
+
+        Returns:
+            ConfluenceClient instance
+        """
+        try:
+            if not toolset_config:
+                raise ValueError("Toolset config is required for Confluence client")
+
+            # Extract auth configuration from toolset config
+            credentials_config = toolset_config.get("credentials", {}) or {}
+            auth_type = toolset_config.get("authType", "BEARER_TOKEN")
+            confluence_instance: Optional[dict[str, Any]] = None
+
+            # Create appropriate client based on auth type
+            if auth_type == "BEARER_TOKEN":
+                token = toolset_config.get("bearerToken", "")
+                if not token:
+                    raise ValueError("Token required for bearer token auth type")
+
+                user_auth = toolset_config.get("auth", {}) or {}
+                preferred_site = (user_auth.get("baseUrl") or toolset_config.get("baseUrl") or "").strip()
+                if not preferred_site:
+                    raise ValueError("Atlassian site URL (baseUrl) is required for BEARER_TOKEN toolsets")
+                base_url = await cls.get_confluence_base_url(token, preferred_site)
+                if not base_url:
+                    raise ValueError("Confluence base_url not found in configuration")
+
+                client = ConfluenceRESTClientViaToken(base_url, token)
+
+            elif auth_type == "OAUTH":
+                access_token = credentials_config.get("access_token", "")
+                if not access_token:
+                    raise ValueError("Access token required for OAuth auth type")
+
+                user_auth = toolset_config.get("auth", {}) or {}
+                preferred_site = (user_auth.get("baseUrl") or toolset_config.get("baseUrl") or "").strip()
+                if not preferred_site and config_service is not None:
+                    oauth_config_id = (
+                        user_auth.get(OAuthConfigKeys.OAUTH_CONFIG_ID)
+                        or toolset_config.get(OAuthConfigKeys.OAUTH_CONFIG_ID)
+                    )
+                    if oauth_config_id:
+                        shared = await fetch_toolset_oauth_config_by_id(
+                            oauth_config_id=oauth_config_id,
+                            toolset_type="Confluence",
+                            config_service=config_service,
+                            logger=logger,
+                        )
+                        if shared:
+                            preferred_site = (shared.get(OAuthConfigKeys.CONFIG, {}).get("baseUrl") or "").strip()
+                preferred_site = await resolve_preferred_site_with_fallback(
+                    preferred_site, access_token, cls.get_accessible_resources, logger, "Confluence",
+                )
+                base_url = await cls.get_confluence_base_url(access_token, preferred_site)
+                if not base_url:
+                    raise ValueError("Confluence base_url not found in configuration")
+
+                client = ConfluenceRESTClientViaToken(base_url, access_token)
+
+            elif auth_type == "API_TOKEN":
+                # API Token authentication - fetch instance config for CONFIGURE fields,
+                # use toolset_config for AUTHENTICATE fields (like MariaDB pattern)
+                instance_id = toolset_config.get("instanceId")
+                if not instance_id:
+                    raise ValueError("instanceId is required for API_TOKEN auth")
+
+                if not config_service:
+                    raise ValueError("config_service is required for API_TOKEN auth")
+
+                # Fetch instance config to get CONFIGURE-level fields (baseUrl)
+                from app.edition_config import get_toolset_by_id
+                confluence_instance = await get_toolset_by_id(instance_id, config_service, org_id=toolset_config.get("orgId"))
+                if not confluence_instance:
+                    raise ValueError(f"Confluence instance '{instance_id}' not found")
+
+                # Get baseUrl from instance config (CONFIGURE field)
+                instance_auth = confluence_instance.get("auth", {})
+                base_url = instance_auth.get("baseUrl", "").strip()
+
+                # Get email and apiToken from user config (AUTHENTICATE fields)
+                user_auth = toolset_config.get("auth", {})
+                email = user_auth.get("email", "").strip()
+                api_token = user_auth.get("apiToken", "").strip()
+
+                if not base_url:
+                    raise ValueError("Base URL is required. Admin must configure the Atlassian instance URL.")
+                if not api_token:
+                    raise ValueError("API token is required for API_TOKEN auth")
+
+                # Normalize base URL — Cloud (email + token) vs DC PAT (token only, no /wiki/api/v2)
+                base_url = base_url.rstrip('/')
+                if email:
+                    # A site URL ending in /wiki would otherwise call /wiki/wiki/api/v2.
+                    if base_url.endswith('/wiki'):
+                        base_url = base_url[: -len('/wiki')]
+                    if not base_url.endswith('/wiki/api/v2'):
+                        base_url = f"{base_url}/wiki/api/v2"
+                    client = ConfluenceRESTClientViaApiKey(base_url, email, api_token)
+                else:
+                    client = ConfluenceRESTClientViaToken(base_url, api_token)
+
+            elif auth_type == "BASIC_AUTH":
+                user_auth = toolset_config.get("auth", {}) or {}
+                instance_id = toolset_config.get("instanceId")
+                if not instance_id:
+                    raise ValueError("instanceId is required for BASIC_AUTH toolsets")
+
+                if not config_service:
+                    raise ValueError("config_service is required for BASIC_AUTH auth")
+
+                from app.edition_config import get_toolset_by_id
+                confluence_instance = await get_toolset_by_id(instance_id, config_service, org_id=toolset_config.get("orgId"))
+                if not confluence_instance:
+                    raise ValueError(f"Confluence instance '{instance_id}' not found")
+
+                instance_auth = confluence_instance.get("auth", {})
+                base_url = instance_auth.get("baseUrl", "").strip()
+                username = user_auth.get("username", "").strip()
+                password = user_auth.get("password", "").strip()
+
+                if not base_url:
+                    raise ValueError("Base URL is required. Admin must configure the Atlassian instance URL.")
+                if not username or not password:
+                    raise ValueError("Username and password are required for BASIC_AUTH")
+
+                base_url = base_url.rstrip('/')
+                client = ConfluenceRESTClientViaUsernamePassword(base_url, username, password)
+
+            else:
+                raise ValueError(f"Invalid auth type: {auth_type}. Supported: OAUTH, API_TOKEN, BEARER_TOKEN, BASIC_AUTH")
+
+            # A personal action's address is its owner's: connect only to the public one checked.
+            from app.agents.toolset_store import is_personal
+
+            if confluence_instance is not None and is_personal(confluence_instance):
+                client.require_public_addresses()
+            logger.info(f"Built Confluence client from toolset config with auth type: {auth_type}")
+            return cls(client)
+
+        except Exception as e:
+            logger.error(f"Failed to build Confluence client from toolset config: {str(e)}")
+            raise
+
+    @staticmethod
+    async def _get_connector_config(logger: logging.Logger, config_service: ConfigurationService, connector_instance_id: Optional[str] = None) -> dict[str, Any]:
+        """Fetch connector config from etcd for Confluence."""
+        try:
+            config = await config_service.get_config(f"/services/connectors/{connector_instance_id}/config")
+            if not config:
+                raise ValueError(f"Failed to get Confluence connector configuration for instance {connector_instance_id}")
+            return config
+        except Exception as e:
+            logger.error(f"Failed to get Confluence connector config: {e}")
+            raise ValueError(f"Failed to get Confluence connector configuration for instance {connector_instance_id}")

@@ -1,0 +1,1668 @@
+import json
+from collections.abc import Awaitable, Callable
+from enum import Enum
+from inspect import isawaitable, isclass
+from typing import Any, cast
+from uuid import uuid4
+
+from app.config.constants.arangodb import (
+    CollectionNames,
+    Connectors,
+    PermissionModel,
+    ProgressStatus,
+)
+from app.telemetry.event_buffer import record_event
+from app.telemetry.identity import domain_from_email
+from app.connectors.core.constants import ConnectorStateKeys
+from app.connectors.core.registry.connector_builder import ConnectorScope
+from app.containers.connector import ConnectorAppContainer
+from app.models.entities import RecordType
+from app.services.graph_db.common.utils import (
+    ROOT_SCOPED_CONNECTOR_TYPES,
+    org_id_from_app_edge,
+)
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.messaging.lanes.lifecycle import assign_lane_to_new_connector
+from app.utils.time_conversion import get_epoch_timestamp_in_ms
+
+
+# KB app documents store type == Connectors.KNOWLEDGE_BASE.value ("KB"), but the
+# connector class is registered under its display name (see
+# app/connectors/sources/localKB/connector.py, KB_CONNECTOR_NAME) — so registry
+# lookups keyed directly on doc "type" miss KB instances entirely.
+_KB_REGISTRY_KEY = "Collections"
+
+
+
+def _parsed_summary(raw: object) -> dict[str, Any] | None:
+    """The last run's summary, stored as JSON text on the app doc."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+def _parsed_action_items(raw: object) -> list[dict[str, Any]]:
+    """What the admin has to do, stored as JSON text on the app doc; [] when nothing or unreadable."""
+    if not isinstance(raw, str) or not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [cast(dict[str, Any], item) for item in cast(list[object], value) if isinstance(item, dict)]
+
+
+class Origin(str, Enum):
+    """Data origin types."""
+    UPLOAD = "UPLOAD"
+    CONNECTOR = "CONNECTOR"
+
+
+class Permissions(str, Enum):
+    """Permission levels for resources."""
+    READER = "READER"
+    WRITER = "WRITER"
+    OWNER = "OWNER"
+    COMMENTER = "COMMENTER"
+
+
+def Connector(
+    name: str,
+    app_group: str,
+    supported_auth_types: str | list[str],  # Supported auth types (user selects one during creation)
+    app_description: str = "",
+    app_categories: list[str] | None = None,
+    config: dict[str, Any] | None = None,
+    connector_scopes: list[ConnectorScope] | None = None,
+    connector_info: str | None = None,
+    resilience_config: dict[str, Any] | None = None
+) -> Callable[[type], type]:
+    """
+    Decorator to register a connector with metadata and configuration schema.
+
+    Args:
+        name: Name of the application (e.g., "Google Drive", "Gmail")
+        app_group: Group the app belongs to (e.g., "Google Workspace")
+        supported_auth_types: Supported authentication types (e.g., ["OAUTH", "API_TOKEN"])
+                             User will select one during connector creation
+        app_description: Description of the application
+        app_categories: List of categories the app belongs to
+        config: Complete configuration schema for the connector
+        connector_scopes: List of scopes the connector supports ("personal", "team")
+        connector_info: Optional info text to display on the frontend connector page
+        resilience_config: Rate limit and retry budget, from ConnectorBuilder.with_resilience_config
+    Returns:
+        Decorator function that marks a class as a connector
+
+    Example:
+        @Connector(
+            name="Gmail",
+            app_group="Google Workspace",
+            supported_auth_types=["OAUTH"],
+            app_description="Email client",
+            app_categories=["email", "productivity"],
+            connector_scopes=["personal", "team"],
+            connector_info="This connector syncs emails from your Gmail account."
+        )
+        class GmailConnector:
+            pass
+    """
+    def decorator(cls: type) -> type:
+        # Normalize supported auth types
+        if isinstance(supported_auth_types, str):
+            supported_auth_types_list = [supported_auth_types]
+        elif isinstance(supported_auth_types, list):
+            if not supported_auth_types:
+                raise ValueError("supported_auth_types list cannot be empty")
+            supported_auth_types_list = supported_auth_types
+        else:
+            raise ValueError(f"supported_auth_types must be str or List[str], got {type(supported_auth_types)}")
+
+        # Store metadata in the class (no authType - it comes from etcd/database when connector is created)
+        cls._connector_metadata = {
+            "name": name,
+            "appGroup": app_group,
+            "supportedAuthTypes": supported_auth_types_list,  # Supported types (user selects one during creation)
+            "appDescription": app_description,
+            "appCategories": app_categories or [],
+            "config": config or {},
+            "connectorScopes": connector_scopes or [ConnectorScope.PERSONAL],  # Default to personal only
+            "connectorInfo": connector_info,
+            "resilienceConfig": resilience_config or {}
+        }
+
+        # Mark class as a connector
+        cls._is_connector = True
+
+        return cls
+    return decorator
+
+
+class ConnectorRegistry:
+    """
+    Registry for managing connector metadata and database synchronization with scope support.
+
+    This class handles:
+    - Registration of connector classes from code
+    - Synchronization with database (deactivating orphaned apps)
+    - Providing connector information with current database status
+    - Creating and updating connector instances with scope-based access control
+    - Pagination for large connector lists
+    """
+
+    def __init__(self, container: ConnectorAppContainer) -> None:
+        """
+        Initialize the connector registry.
+
+        Args:
+            container: Dependency injection container
+        """
+        self.container = container
+        self.logger = container.logger()
+        self._graph_provider: IGraphDBProvider | None = None
+        self._collection_name = CollectionNames.APPS.value
+
+        # In-memory storage for connector metadata
+        self._connectors: dict[str, dict[str, Any]] = {}
+
+    async def _get_graph_provider(self) -> IGraphDBProvider:
+        """
+        Get the graph DB provider, initializing it lazily if needed.
+
+        Returns:
+            Initialized graph DB provider instance
+        """
+        if self._graph_provider is None:
+            data_store = await self.container.data_store()
+            self._graph_provider = data_store.graph_provider
+        return self._graph_provider
+
+    def register_connector(self, connector_class: type) -> bool:
+        """
+        Register a connector class with the registry.
+
+        Args:
+            connector_class: The connector class to register (must be decorated with @Connector)
+
+        Returns:
+            True if registered successfully, False otherwise
+        """
+        try:
+            if not hasattr(connector_class, '_connector_metadata'):
+                self.logger.warning(
+                    f"Class {connector_class.__name__} is not decorated with @Connector"
+                )
+                return False
+
+            metadata = connector_class._connector_metadata
+            connector_name = metadata['name']
+
+            # Store in memory
+            self._connectors[connector_name] = metadata.copy()
+
+            self.logger.info(f"Registered connector: {connector_name}")
+            return True
+
+        except Exception as e:
+            self.logger.error(
+                f"Error registering connector {connector_class.__name__}: {e}"
+            )
+            return False
+
+    def discover_connectors(self, module_paths: list[str]) -> None:
+        """
+        Discover and register all connector classes from specified modules.
+
+        This method scans the provided modules for classes decorated with @Connector
+        and automatically registers them.
+
+        Args:
+            module_paths: List of module names to search for connectors
+        """
+        try:
+            for module_path in module_paths:
+                try:
+                    module = __import__(module_path, fromlist=['*'])
+
+                    for attribute_name in dir(module):
+                        attribute = getattr(module, attribute_name)
+
+                        if (isclass(attribute) and
+                            hasattr(attribute, '_connector_metadata') and
+                            hasattr(attribute, '_is_connector')):
+
+                            self.register_connector(attribute)
+
+                except ImportError as e:
+                    self.logger.warning(
+                        f"Could not import module {module_path}: {e}"
+                    )
+                    continue
+
+            self.logger.info(f"Discovered {len(self._connectors)} connectors")
+
+        except Exception as e:
+            self.logger.error(f"Error discovering connectors: {e}")
+
+    @staticmethod
+    def _permission_model_for(metadata: dict[str, Any]) -> str:
+        """The connector's declared permission model, defaulting to RECORD_LEVEL.
+
+        RECORD_LEVEL is the safe default: it resolves visibility per user, so a
+        connector that forgets to declare can only under-share.
+        """
+        config = metadata.get('config') or {}
+        return config.get('permissionModel') or PermissionModel.RECORD_LEVEL.value
+
+    def _normalize_connector_name(self, name: str) -> str:
+        """
+        Normalize connector name for matching (case-insensitive, ignore spaces).
+
+        This matches the logic used in ConnectorFactory for beta connector identification.
+
+        Args:
+            name: Connector name to normalize
+
+        Returns:
+            Normalized connector name
+        """
+        return name.replace(' ', '').lower()
+
+    def _get_beta_connector_names(self) -> list[str]:
+        """
+        Get list of normalized beta connector names from ConnectorFactory.
+
+        Returns:
+            List of normalized beta connector names
+        """
+        try:
+            from app.connectors.core.factory.connector_factory import (
+                ConnectorFactory,
+            )
+            beta_connectors = ConnectorFactory.list_beta_connectors()
+            # Extract connector names from metadata and normalize them
+            beta_names = []
+            for connector_class in beta_connectors.values():
+                if hasattr(connector_class, '_connector_metadata'):
+                    metadata = connector_class._connector_metadata
+                    connector_name = metadata.get('name', '')
+                    if connector_name:
+                        beta_names.append(self._normalize_connector_name(connector_name))
+            return beta_names
+        except Exception as e:
+            self.logger.debug(f"Could not get beta connector names: {e}")
+            return []
+
+    async def belongs_to_org(self, connector_instance: dict[str, Any], org_id: str) -> bool:
+        """Tenant check, applied before any role logic.
+
+        Instances are fetched by id alone, so without this a TEAM connector's
+        gate reduces to `is_admin` — and an administrator of one organization
+        who learns an id belonging to another would pass it. Instances created
+        before August 2026 carry no ``orgId``, so for those the org edge decides.
+        """
+        instance_org_id = connector_instance.get("orgId") or await self._org_id_from_edge(
+            connector_instance
+        )
+        if instance_org_id != org_id:
+            self.logger.warning(
+                "Connector %s belongs to org %s; caller is in org %s",
+                connector_instance.get("_key") or connector_instance.get("id"),
+                instance_org_id,
+                org_id,
+            )
+            return False
+        return True
+
+    async def _org_id_from_edge(self, connector_instance: dict[str, Any]) -> str | None:
+        connector_id = connector_instance.get("_key") or connector_instance.get("id")
+        if not connector_id:
+            return None
+        return await org_id_from_app_edge(await self._get_graph_provider(), connector_id)
+
+    async def _can_delete_connector(
+        self,
+        connector_instance: dict[str, Any],
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+    ) -> bool:
+        """Whether this caller may *delete* the connector: an administrator, or
+        its creator, in the same organization.
+
+        Deliberately not `_can_access_connector`. Deletion is uniform across
+        scopes where access is not: reading or altering someone's personal
+        connector exposes their data, while removing one that should no longer
+        exist does not, and an admin who can remove the member entirely was
+        otherwise unable to clean up the connector they left behind.
+        Broadening `_can_access_connector` instead would hand admins read and
+        update rights over personal connectors, which is not the intent.
+        """
+        if not await self.belongs_to_org(connector_instance, org_id):
+            return False
+        return is_admin or connector_instance.get("createdBy") == user_id
+
+    async def _can_access_connector(
+        self,
+        connector_instance: dict[str, Any],
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+    ) -> bool:
+        """
+        Check if user can access a connector instance.
+
+        Args:
+            connector_instance: Connector instance document
+            user_id: User ID
+            org_id: Organization the caller belongs to
+            is_admin: Whether the user is an admin
+
+        Returns:
+            True if user can access the connector
+        """
+        try:
+            if not await self.belongs_to_org(connector_instance, org_id):
+                return False
+
+            connector_scope = connector_instance.get("scope", ConnectorScope.PERSONAL.value)
+            created_by = connector_instance.get("createdBy")
+
+            # Team scope: accessible by admins and the creator
+            if connector_scope == ConnectorScope.TEAM.value:
+                return is_admin or created_by == user_id
+
+            # Personal scope: only accessible by creator
+            if connector_scope == ConnectorScope.PERSONAL.value:
+                return created_by == user_id
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Error checking connector access: {e}")
+            return False
+
+    async def can_user_view_connector(
+        self,
+        connector_id: str,
+        connector_instance: dict[str, Any],
+        user_id: str,
+        *,
+        is_admin: bool,
+    ) -> bool:
+        """Gate stats visibility to the connector creator or an org admin.
+
+        Only admins and the user who created the connector may view its stats.
+        The connector *listing* has broader visibility (team-scoped connectors
+        are visible to all org members via graph edges), but stats are
+        restricted to prevent leaking usage data to non-privileged users.
+        """
+        try:
+            scope = connector_instance.get("scope", ConnectorScope.PERSONAL.value)
+            created_by = connector_instance.get("createdBy")
+
+            if scope == ConnectorScope.PERSONAL.value:
+                return created_by == user_id
+
+            if scope == ConnectorScope.TEAM.value:
+                return is_admin or created_by == user_id
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Error checking connector view access: {e}")
+            return False
+
+    async def _check_name_uniqueness(
+        self,
+        instance_name: str,
+        scope: str,
+        org_id: str,
+        user_id: str,
+        exclude_connector_id: str | None = None,
+    ) -> bool:
+        """
+        Check if connector instance name is unique based on scope.
+
+        Args:
+            instance_name: Name to check
+            scope: Connector scope (personal/team)
+            org_id: Organization ID
+            user_id: User ID (for personal scope)
+            exclude_connector_id: Connector being renamed, which never clashes with itself
+
+        Returns:
+            True if name is unique, False if already exists
+        """
+        try:
+            graph_provider = await self._get_graph_provider()
+
+            # Use graph provider method to check name existence
+            name_exists = await graph_provider.check_connector_name_exists(
+                collection=self._collection_name,
+                instance_name=instance_name,
+                scope=scope,
+                org_id=org_id,
+                user_id=user_id,
+                exclude_connector_id=exclude_connector_id,
+            )
+
+            # Return True if name is unique (does NOT exist)
+            return not name_exists
+
+        except Exception as e:
+            self.logger.error(f"Error checking name uniqueness: {e}")
+            # On error, allow the operation (fail-open to avoid blocking)
+            return True
+
+    async def _get_connector_instance_from_db(
+        self,
+        connector_id: str
+    ) -> dict[str, Any] | None:
+        """
+        Get connector instance document from database.
+
+        Args:
+            connector_id: Unique key of the connector instance
+
+        Returns:
+            Connector instance document or None if not found
+        """
+        try:
+            graph_provider = await self._get_graph_provider()
+            return await graph_provider.get_document(
+                connector_id,
+                self._collection_name
+            )
+
+        except Exception as e:
+            self.logger.debug(
+                f"Could not get connector instance {connector_id} from database: {e}"
+            )
+            return None
+
+    async def _create_connector_instance(
+        self,
+        connector_type: str,
+        instance_name: str,
+        metadata: dict[str, Any],
+        scope: str,
+        created_by: str,
+        org_id: str,
+        selected_auth_type: str | None = None
+    ) -> dict[str, Any] | None:
+        """
+        Create a new connector instance in the database.
+
+        Args:
+            connector_type: Type of the connector (from registry)
+            instance_name: Name for this specific instance
+            metadata: Connector metadata from decorator
+            scope: Connector scope (personal/team)
+            created_by: User ID who created the connector
+            org_id: Organization ID
+
+        Returns:
+            Created connector instance document or None if failed
+        """
+        try:
+            graph_provider = await self._get_graph_provider()
+
+            # Verify organization exists
+            organization = await graph_provider.get_document(
+                org_id,
+                CollectionNames.ORGS.value
+            )
+
+            if not organization:
+                self.logger.warning(
+                    f"Organization {org_id} not found; skipping instance creation"
+                )
+                return None
+
+            # Check name uniqueness before creating
+            is_unique = await self._check_name_uniqueness(
+                instance_name=instance_name,
+                scope=scope,
+                org_id=org_id,
+                user_id=created_by
+            )
+
+            if not is_unique:
+                self.logger.warning(
+                    f"Connector instance name '{instance_name}' already exists for scope {scope}"
+                )
+                raise ValueError(
+                    f"Connector instance name '{instance_name}' already exists. "
+                    f"Please choose a different name."
+                )
+
+            # Create connector instance document
+            instance_key = str(uuid4())
+            current_timestamp = get_epoch_timestamp_in_ms()
+
+            # Require selected auth type - it must be provided by the user during connector creation
+            # selected_auth_type is the auth type chosen by the user and stored in the database
+            # This cannot be changed after creation
+            if not selected_auth_type:
+                raise ValueError(
+                    f"selected_auth_type is required when creating connector '{connector_type}'. "
+                    f"User must select one of the supported auth types: {metadata.get('supportedAuthTypes', [])}"
+                )
+
+            # Validate that selected auth type is supported by the connector
+            supported_auth_types = metadata.get('supportedAuthTypes', [])
+            if supported_auth_types and selected_auth_type not in supported_auth_types:
+                raise ValueError(
+                    f"Selected auth type '{selected_auth_type}' is not supported for connector '{connector_type}'. "
+                    f"Supported types: {supported_auth_types}"
+                )
+
+            auth_type_to_store = selected_auth_type
+
+            instance_document = {
+                '_key': instance_key,
+                'name': instance_name,
+                'type': connector_type,
+                'appGroup': metadata['appGroup'],
+                'authType': auth_type_to_store,  # Store selected auth type (user's choice, not metadata)
+                'scope': scope,
+                'orgId': org_id,
+                # Denormalized off the decorator so the query service can route
+                # permission resolution without importing connector code.
+                'permissionModel': self._permission_model_for(metadata),
+                'isActive': False,
+                'isAgentActive': False,
+                'isConfigured': True,
+                'isAuthenticated': False,
+                'vectorMembershipBackfilled': True,
+                **(
+                    {ConnectorStateKeys.ROOT_MEMBERSHIP_REQUESTED: True}
+                    if str(connector_type).upper() in ROOT_SCOPED_CONNECTOR_TYPES
+                    else {}
+                ),
+                'createdBy': created_by,
+                'updatedBy': created_by,
+                # Whoever supplies the credentials; restamped when someone else re-authenticates
+                'authenticatedBy': created_by,
+                'createdAtTimestamp': current_timestamp,
+                'updatedAtTimestamp': current_timestamp
+            }
+
+            # Create instance in database
+            created_instance = await graph_provider.batch_upsert_nodes(
+                [instance_document],
+                self._collection_name
+            )
+
+            if not created_instance:
+                raise Exception(
+                    f"Failed to create connector instance for {connector_type}"
+                )
+
+            # Create relationship edge between organization and instance
+            edge_document = {
+                "from_id": org_id,
+                "from_collection": CollectionNames.ORGS.value,
+                "to_id": instance_key,
+                "to_collection": CollectionNames.APPS.value,
+                "createdAtTimestamp": current_timestamp,
+            }
+
+            created_edge = await graph_provider.batch_create_edges(
+                [edge_document],
+                CollectionNames.ORG_APP_RELATION.value,
+            )
+
+            if not created_edge:
+                raise Exception(
+                    f"Failed to create organization relationship for {connector_type}"
+                )
+
+            self.logger.info(
+                f"Created connector instance '{instance_name}' of type {connector_type} "
+                f"with scope {scope} for user {created_by}"
+            )
+            await assign_lane_to_new_connector(
+                self.logger,
+                instance_key,
+                connector_type=connector_type,
+                scope=scope,
+                org_id=org_id,
+            )
+            return instance_document
+
+        except ValueError:
+            # Re-raise ValueError (name uniqueness) as-is
+            raise
+        except Exception as e:
+            self.logger.error(
+                f"Error creating connector instance for {connector_type}: {e}"
+            )
+            return None
+
+    async def _deactivate_connector_instance(self, connector_id: str) -> bool:
+        """
+        Deactivate a connector instance in the database.
+
+        Args:
+            connector_id: Unique key of the connector instance
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            graph_provider = await self._get_graph_provider()
+
+            existing_document = await graph_provider.get_document(
+                connector_id,
+                self._collection_name
+            )
+
+            if not existing_document:
+                self.logger.warning(
+                    f"Connector instance {connector_id} not found in database"
+                )
+                return False
+
+            updates = {
+                'isActive': False,
+                'isAgentActive': False,
+                'updatedAtTimestamp': get_epoch_timestamp_in_ms()
+            }
+
+            await graph_provider.update_node(
+                connector_id,
+                self._collection_name,
+                updates
+            )
+
+            self.logger.info(f"Deactivated connector instance {connector_id}")
+            return True
+
+        except Exception as e:
+            self.logger.error(
+                f"Error deactivating connector instance {connector_id}: {e}"
+            )
+            return False
+
+    async def sync_with_database(self) -> bool:
+        """
+        Synchronize registry with database.
+
+        This method deactivates connector instances in the database that are no longer
+        registered in the code. It does NOT create new instances during startup.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            graph_provider = await self._get_graph_provider()
+
+            # Get all connector instances from database
+            all_documents = await graph_provider.get_all_documents(
+                self._collection_name
+            )
+
+            # Collect keys of instances that need to be deactivated
+            keys_to_deactivate = []
+            stale_permission_models: list[tuple[str, str]] = []
+            needs_root_membership: list[str] = []
+            for document in all_documents:
+                connector_type = document.get('type')
+                is_active = document.get('isActive', False)
+                doc_key = document.get('_key') or document.get('id')
+                is_kb = connector_type == Connectors.KNOWLEDGE_BASE.value
+
+                # KB instances are registered under their display name, so a
+                # lookup keyed on the doc's own type misses them — which is why
+                # they are exempt from deactivation rather than being treated as
+                # an unknown type. They still need their permissionModel
+                # written: search reads it off the app doc to decide whether a
+                # Collection's records can skip per-record adjudication, and
+                # skipping the whole document here left that permanently unset.
+                if not is_kb and connector_type not in self._connectors and is_active:
+                    keys_to_deactivate.append(doc_key)
+
+                registered = self._connectors.get(
+                    _KB_REGISTRY_KEY if is_kb else connector_type
+                )
+                if registered and doc_key:
+                    expected = self._permission_model_for(registered)
+                    if document.get('permissionModel') != expected:
+                        stale_permission_models.append((doc_key, expected))
+
+                    # Instances synced before rootRecordGroupId existed have no
+                    # roots on their vector points, and search scopes these
+                    # connectors by root — so ask the membership backfill to
+                    # rewrite them once. Until it finishes the instance counts as
+                    # un-backfilled and search falls back to record ids.
+                    if (
+                        not is_kb
+                        and str(connector_type).upper() in ROOT_SCOPED_CONNECTOR_TYPES
+                        and not document.get(
+                            ConnectorStateKeys.ROOT_MEMBERSHIP_REQUESTED
+                        )
+                    ):
+                        needs_root_membership.append(doc_key)
+
+            # Batch deactivate all instances using graph provider
+            if keys_to_deactivate:
+                updated_count = await graph_provider.batch_update_connector_status(
+                    collection=self._collection_name,
+                    connector_keys=keys_to_deactivate,
+                    is_active=False,
+                    is_agent_active=False,
+                )
+                self.logger.info(f"Batch deactivated {updated_count} connector instances")
+
+            # Backfill instances created before the flag existed, and pick up
+            # reclassifications. Best-effort: a failure here only costs the
+            # query service some cache sharing, never correctness.
+            for doc_key, expected in stale_permission_models:
+                try:
+                    await graph_provider.update_node(
+                        doc_key, self._collection_name, {'permissionModel': expected}
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not set permissionModel on connector instance {doc_key}: {e}"
+                    )
+            for doc_key in needs_root_membership:
+                try:
+                    await graph_provider.update_node(
+                        doc_key,
+                        self._collection_name,
+                        {
+                            ConnectorStateKeys.VECTOR_MEMBERSHIP_BACKFILLED: False,
+                            ConnectorStateKeys.ROOT_MEMBERSHIP_REQUESTED: True,
+                        },
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not request root membership backfill for {doc_key}: {e}"
+                    )
+            if needs_root_membership:
+                self.logger.info(
+                    f"Requested root membership backfill for {len(needs_root_membership)} "
+                    "connector instances"
+                )
+
+            if stale_permission_models:
+                self.logger.info(
+                    f"Backfilled permissionModel on {len(stale_permission_models)} connector instances"
+                )
+
+            self.logger.info("Successfully synced registry with database")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error syncing registry with database: {e}")
+            return False
+
+    def _build_connector_info(
+        self,
+        connector_type: str,
+        metadata: dict[str, Any],
+        instance_data: dict[str, Any] | None = None,
+        scope: str | None = None,
+        include_config: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Build connector information dictionary from metadata and instance data.
+
+        Args:
+            connector_type: Type of the connector
+            metadata: Connector metadata from registry
+            instance_data: Optional instance-specific data from database
+            scope: Optional scope override
+            include_config: When False, omits the full ``config`` blob and promotes
+                ``documentationLinks``, ``isAdminAccessRequired``, and
+                ``personalConnectorType`` to top-level fields.  Use False for list
+                endpoints to keep payloads lean; use True (default) only for the
+                single-item / schema endpoints that genuinely need the full config.
+
+        Returns:
+            Complete connector information dictionary
+        """
+        connector_config = metadata.get('config', {})
+
+        connector_info: dict[str, Any] = {
+            'name': connector_type,
+            'type': connector_type,
+            'appGroup': metadata['appGroup'],
+            'supportedAuthTypes': metadata.get('supportedAuthTypes', []),
+            'appDescription': metadata.get('appDescription', ''),
+            'appCategories': metadata.get('appCategories', []),
+            'iconPath': connector_config.get('iconPath', '/icons/connectors/default.svg'),
+            'supportsRealtime': connector_config.get('supportsRealtime', False),
+            'supportsSync': connector_config.get('supportsSync', False),
+            'supportsAgent': connector_config.get('supportsAgent', False),
+            'documentationLinks': connector_config.get('documentationLinks', []),
+            'isAdminAccessRequired': connector_config.get('isAdminAccessRequired', False),
+            'personalConnectorType': connector_config.get('personalConnectorType'),
+            'scope': scope if scope else metadata.get('connectorScopes', [ConnectorScope.PERSONAL.value]),
+            'connectorInfo': metadata.get('connectorInfo'),
+        }
+
+        _promoted_config_keys = frozenset({
+            'documentationLinks',
+            'isAdminAccessRequired',
+            'personalConnectorType',
+        })
+
+        if include_config:
+            # Exclude promoted keys from the config blob to avoid duplication.
+            connector_info['config'] = {
+                k: v for k, v in connector_config.items() if k not in _promoted_config_keys
+            }
+
+        # Add instance-specific data if provided
+        if instance_data:
+            # authType comes from instance_data (stored in database when connector was created)
+            connector_info.update({
+                'authType': instance_data.get('authType'),  # Selected auth type (from database)
+                'isActive': instance_data.get('isActive', False),
+                'isAgentActive': instance_data.get('isAgentActive', False),
+                'isConfigured': instance_data.get('isConfigured', False),
+                'isAuthenticated': instance_data.get('isAuthenticated', False),
+                'status': instance_data.get('status'),
+                'createdAtTimestamp': instance_data.get('createdAtTimestamp'),
+                'updatedAtTimestamp': instance_data.get('updatedAtTimestamp'),
+                'lastSyncStartedAtTimestamp': instance_data.get('lastSyncStartedAtTimestamp'),
+                'lastSyncFinishedAtTimestamp': instance_data.get('lastSyncFinishedAtTimestamp'),
+                'lastSyncOutcome': instance_data.get('lastSyncOutcome'),
+                'lastSyncSummary': _parsed_summary(instance_data.get('lastSyncSummary')),
+                'actionItems': _parsed_action_items(instance_data.get('actionItems')),
+                '_key': instance_data.get('_key') or instance_data.get('id'),
+                'name': instance_data.get('name'),
+                'scope': instance_data.get('scope', ConnectorScope.PERSONAL.value),
+                'createdBy': instance_data.get('createdBy'),
+                'updatedBy': instance_data.get('updatedBy'),
+                'isLocked': instance_data.get('isLocked', False),
+                'ownerDeviceId': instance_data.get('ownerDeviceId'),
+                'ownerDeviceName': instance_data.get('ownerDeviceName'),
+            })
+
+        return connector_info
+
+    async def _get_all_connector_instances(self, user_id: str, org_id: str) -> list[dict[str, Any]]:
+        """
+        Get all connector instances from the database.
+
+        Returns:
+            - All personal connectors created by the user
+            - All team connectors in the organization (regardless of creator)
+        """
+        connectors = []
+        graph_provider = await self._get_graph_provider()
+
+        # Use graph provider method to get user's connector instances
+        documents = await graph_provider.get_user_connector_instances(
+            collection=self._collection_name,
+            user_id=user_id,
+            org_id=org_id,
+            team_scope=ConnectorScope.TEAM.value,
+            personal_scope=ConnectorScope.PERSONAL.value,
+        )
+
+        for document in documents:
+            doc_type = document.get('type')
+            registry_key = (
+                _KB_REGISTRY_KEY if doc_type == Connectors.KNOWLEDGE_BASE.value else doc_type
+            )
+            if registry_key in self._connectors:
+                connectors.append(
+                    self._build_connector_info(
+                        doc_type,
+                        self._connectors[registry_key],
+                        document,
+                        include_config=False,
+                    )
+                )
+        return connectors
+
+    async def get_all_registered_connectors(
+        self,
+        *,
+        is_admin: bool,
+        scope: str | None = None,
+        page: int = 1,
+        limit: int = 20,
+        search: str | None = None,
+        account_type: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Get all registered connectors from the registry (without instance status).
+
+        This returns the connector types available for configuration, optionally filtered by scope.
+        Beta connectors are filtered based on the ENABLE_BETA_CONNECTORS feature flag.
+        Beta connectors are excluded for enterprise accounts to prevent instability.
+
+        Args:
+            scope: Optional scope filter (personal/team)
+            is_admin: Whether the user is an admin
+            page: Page number (1-indexed)
+            limit: Number of items per page
+            search: Optional search query
+            account_type: Account type ('individual' or 'enterprise'/'business') - used to filter beta connectors
+        Returns:
+            Dictionary with connectors list and pagination info
+        """
+        connectors = []
+
+        # Prepare search tokens (case-insensitive, AND across tokens)
+        tokens: list[str] = []
+        if search:
+            tokens = [t.strip().lower() for t in str(search).split() if t.strip()]
+
+        def matches_search(info: dict[str, Any]) -> bool:
+            if not tokens:
+                return True
+            haystacks: list[str] = []
+            haystacks.append(str(info.get('name', '')).lower())
+            haystacks.append(str(info.get('type', '')).lower())
+            haystacks.append(str(info.get('appGroup', '')).lower())
+            haystacks.append(str(info.get('appDescription', '')).lower())
+            # Search in supported auth types
+            haystacks.extend(str(auth_type).lower() for auth_type in (info.get('supportedAuthTypes', []) or []))
+            haystacks.extend(str(cat).lower() for cat in (info.get('appCategories', []) or []))
+            combined = ' '.join(haystacks)
+            return all(tok in combined for tok in tokens)
+
+        # Check feature flag once and get beta connector names
+        # This is done once before the loop for efficiency
+        # We always need beta_names to filter them for enterprise accounts
+        try:
+            feature_flag_service = await self.container.feature_flag_service()
+            try:
+                await feature_flag_service.refresh()
+            except Exception as e:
+                self.logger.debug(f"Feature flag refresh failed: {e}")
+
+            from app.services.featureflag.config.config import CONFIG
+            beta_enabled = feature_flag_service.is_feature_enabled(CONFIG.ENABLE_BETA_CONNECTORS)
+            # Always get beta names - needed for enterprise account filtering even when feature flag is enabled
+            beta_names = self._get_beta_connector_names()
+        except Exception as e:
+            # On any failure, include all connectors (fail-open)
+            self.logger.debug(f"Feature flag check failed, including all connectors: {e}")
+            beta_enabled = True
+            beta_names = []
+
+        for connector_type, metadata in self._connectors.items():
+            # Filter by scope if specified
+            connector_scopes = metadata.get('connectorScopes', [])
+            if scope and scope not in connector_scopes:
+                continue
+
+            # Check if this is a beta connector
+            normalized_name = self._normalize_connector_name(connector_type)
+            is_beta_connector = normalized_name in beta_names
+
+            # Filter by feature flag (beta connectors)
+            if not beta_enabled and is_beta_connector:
+                continue
+
+            # Filter out beta connectors for enterprise accounts ONLY when scope is "team"
+            # Beta connectors are allowed for:
+            # - personal scope in enterprise accounts
+            # - team scope in individual accounts
+            # Beta connectors are NOT allowed for:
+            # - team scope in enterprise accounts (to prevent instability)
+            if is_beta_connector and account_type and account_type.lower() in ['enterprise', 'business'] and scope == ConnectorScope.TEAM.value:
+                continue
+            # Skip hidden connectors
+            if metadata.get('config', {}).get('hideConnector', False):
+                continue
+            connector_info = self._build_connector_info(connector_type, metadata, scope=scope, include_config=False)
+            if matches_search(connector_info):
+                connectors.append(connector_info)
+
+        # Calculate pagination
+        total_count = len(connectors)
+        total_pages = (total_count + limit - 1) // limit
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        has_prev = page > 1
+        has_next = end_idx < total_count
+
+        paginated_connectors = connectors[start_idx:end_idx]
+
+        # Calculate registry counts by scope (all connectors after beta filtering, before search filtering)
+        # This represents the total available connector types per scope
+        registry_counts_by_scope = {"personal": 0, "team": 0}
+
+        for connector_type, metadata in self._connectors.items():
+            # Filter by feature flag (beta connectors)
+            if not beta_enabled:
+                normalized_name = self._normalize_connector_name(connector_type)
+                if normalized_name in beta_names:
+                    continue
+
+            # Skip hidden connectors
+            if metadata.get('config', {}).get('hideConnector', False):
+                continue
+            connector_scopes = metadata.get('connectorScopes', [])
+            if ConnectorScope.PERSONAL.value in connector_scopes:
+                registry_counts_by_scope["personal"] += 1
+            if ConnectorScope.TEAM.value in connector_scopes:
+                registry_counts_by_scope["team"] += 1
+
+        return {
+            "connectors": paginated_connectors,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "search": search,
+                "totalCount": total_count,
+                "totalPages": total_pages,
+                "hasPrev": has_prev,
+                "hasNext": has_next,
+                "prevPage": page - 1 if has_prev else None,
+                "nextPage": page + 1 if has_next else None,
+            },
+            "registryCountsByScope": registry_counts_by_scope
+        }
+
+    async def get_all_connector_instances(
+        self,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+        scope: str | None = None,
+        page: int = 1,
+        limit: int = 20,
+        search: str | None = None,
+        is_authenticated: bool | None = None,
+        is_active: bool | None = None,
+        connector_type: str | None = None,
+        is_configured: bool | None = None,
+        is_agent_active: bool | None = None,
+    ) -> dict[str, Any]:
+        """
+        Get all configured connector instances with scope-based filtering.
+
+        Args:
+            user_id: User ID requesting the instances
+            org_id: Organization ID
+            is_admin: Whether the user is an admin
+            scope: Optional scope filter (personal/team)
+            page: Page number (1-indexed)
+            limit: Number of items per page
+            search: Optional search query
+            is_authenticated: Optional filter — True returns only authenticated instances,
+                False returns only unauthenticated (configured-but-not-authenticated) ones.
+            is_active: Optional filter — True returns only active instances,
+                False returns only inactive ones.
+            connector_type: Optional exact connector type filter (e.g. "Confluence").
+            is_configured: Optional filter on whether the instance's settings are saved.
+            is_agent_active: Optional filter on whether agents may use the instance.
+        Returns:
+            Dictionary with connector instances and pagination info
+        """
+        graph_provider = await self._get_graph_provider()
+
+        # Use graph provider method for filtered query with pagination
+        documents, total_count = await graph_provider.get_filtered_connector_instances(
+            collection=self._collection_name,
+            edge_collection=CollectionNames.ORG_APP_RELATION.value,
+            org_id=org_id,
+            user_id=user_id,
+            scope=scope,
+            search=search,
+            skip=(page - 1) * limit,
+            limit=limit,
+            exclude_kb=True,
+            kb_connector_type=Connectors.KNOWLEDGE_BASE.value,
+            is_admin=is_admin,
+            is_authenticated=is_authenticated,
+            is_active=is_active,
+            connector_type_filter=connector_type,
+            is_configured=is_configured,
+            is_agent_active=is_agent_active,
+            allowed_connector_types=list(self._connectors),
+        )
+
+        connector_instances = []
+
+        for document in documents:
+            doc_type = document['type']
+
+            if doc_type not in self._connectors:
+                self.logger.warning(
+                    f"Connector type {doc_type} not found in registry"
+                )
+                continue
+
+            metadata = self._connectors[doc_type]
+            connector_info = self._build_connector_info(
+                doc_type,
+                metadata,
+                document,
+                include_config=False,
+            )
+            connector_instances.append(connector_info)
+
+        total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
+        has_prev = page > 1
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        has_next = end_idx < total_count
+        return {
+            "connectors": connector_instances,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "totalCount": total_count,
+                "totalPages": total_pages,
+                "hasPrev": has_prev,
+                "hasNext": has_next,
+                "prevPage": page - 1 if has_prev else None,
+                "nextPage": page + 1 if has_next else None,
+            },
+        }
+
+    async def get_active_connector_instances(
+        self,
+        user_id: str,
+        org_id: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get all active connector instances (isActive = true) with scope-based filtering.
+
+        Args:
+            user_id: User ID requesting the instances
+            org_id: Organization ID
+        Returns:
+            List of active connector instances
+        """
+        result = await self._get_all_connector_instances(user_id, org_id)
+
+        return [
+            instance for instance in result
+            if instance.get('isActive', False)
+        ]
+
+    async def get_active_agent_connector_instances(
+        self,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+        scope: str | None = None,
+        page: int = 1,
+        limit: int = 20,
+        search: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Get all active agent connector instances (isAgentActive = true) with scope-based filtering.
+
+        Args:
+            user_id: User ID requesting the instances
+            org_id: Organization ID
+            is_admin: Whether the user is an admin
+            scope: Optional scope filter (personal/team)
+            page: Page number (1-indexed)
+            limit: Number of items per page
+            search: Optional search query
+        Returns:
+            Dictionary with active agent connector instances and pagination info
+        """
+        # Filtered in the query, so the page and the total count cover only these instances.
+        result = await self.get_all_connector_instances(
+            user_id, org_id, is_admin=is_admin, scope=scope, page=page, limit=limit, search=search,
+            is_configured=True, is_agent_active=True,
+        )
+        result["pagination"]["search"] = search
+        return result
+
+
+    async def get_inactive_connector_instances(
+        self,
+        user_id: str,
+        org_id: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Get all inactive connector instances (isActive = false) with scope-based filtering.
+
+        Args:
+            user_id: User ID requesting the instances
+            org_id: Organization ID
+        Returns:
+            List of inactive connector instances
+        """
+        result = await self._get_all_connector_instances(user_id, org_id)
+
+        return [
+            instance for instance in result
+            if not instance.get('isActive', False)
+        ]
+
+    async def get_configured_connector_instances(
+        self,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+        scope: str | None = None,
+        page: int = 1,
+        limit: int = 20,
+        search: str | None = None
+    ) -> dict[str, Any]:
+        """
+        Get all configured connector instances (isConfigured = true) with scope-based filtering.
+
+        Args:
+            user_id: User ID requesting the instances
+            org_id: Organization ID
+            is_admin: Whether the user is an admin
+            scope: Optional scope filter (personal/team)
+            page: Page number (1-indexed)
+            limit: Number of items per page
+            search: Optional search query
+        Returns:
+            Dictionary with configured connector instances and pagination info
+        """
+        # Filtered in the query, so the page and the total count cover only configured instances.
+        result = await self.get_all_connector_instances(
+            user_id, org_id, is_admin=is_admin, scope=scope, page=page, limit=limit, search=search,
+            is_configured=True,
+        )
+        result["pagination"]["search"] = search
+        return result
+
+    async def get_connector_metadata(self, connector_type: str, instance_data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """
+        Get connector metadata by type from the registry.
+
+        Args:
+            connector_type: Type of the connector
+
+        Returns:
+            Connector metadata or None if not found
+        """
+        if connector_type not in self._connectors:
+            return None
+
+        metadata = self._connectors[connector_type]
+        return self._build_connector_info(connector_type, metadata, instance_data)
+
+    async def get_connector_instance(
+        self,
+        connector_id: str,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+    ) -> dict[str, Any] | None:
+        """
+        Get a specific connector instance by its key with access control.
+
+        Args:
+            connector_id: Unique key of the connector instance
+            user_id: User ID requesting the instance
+            org_id: Organization ID
+            is_admin: Whether the user is an admin
+        Returns:
+            Connector instance with full metadata and status or None if not found/no access
+        """
+        return await self._load_authorized_instance(
+            connector_id,
+            lambda document: self._can_access_connector(
+                document, user_id, org_id, is_admin=is_admin
+            ),
+            user_id=user_id,
+        )
+
+    async def get_connector_instance_for_view(
+        self,
+        connector_id: str,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+    ) -> dict[str, Any] | None:
+        """The read a connector's detail page makes. An edition may let more
+        users view a connector than manage it; every route that acts on the
+        connector loads it with `get_connector_instance` instead."""
+        return await self.get_connector_instance(
+            connector_id, user_id, org_id, is_admin=is_admin
+        )
+
+    async def get_connector_instance_for_deletion(
+        self,
+        connector_id: str,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+    ) -> dict[str, Any] | None:
+        """Fetch an instance for the delete route, under the deletion gate.
+
+        The read gate would 404 an administrator on another user's personal
+        connector, so routing deletion through it made the admin allowance in
+        `_validate_connector_deletion_permissions` unreachable for exactly the
+        orphaned instances it exists to clean up.
+        """
+        return await self._load_authorized_instance(
+            connector_id,
+            lambda document: self._can_delete_connector(
+                document, user_id, org_id, is_admin=is_admin
+            ),
+            user_id=user_id,
+        )
+
+    async def _load_authorized_instance(
+        self,
+        connector_id: str,
+        authorize: Callable[[dict[str, Any]], Awaitable[bool] | bool],
+        *,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        """Fetch, authorize, then enrich — shared so a second gate cannot drift
+        from the first on anything but the authorization step."""
+        try:
+            document = await self._get_connector_instance_from_db(connector_id)
+
+            if not document:
+                self.logger.error(
+                    f"Connector instance {connector_id} not found in database"
+                )
+                return None
+
+            decision = authorize(document)
+            if isawaitable(decision):
+                decision = await decision
+
+            if not decision:
+                self.logger.warning(
+                    f"User {user_id} does not have access to connector {connector_id}"
+                )
+                return None
+
+            connector_type = document['type']
+            registry_key = (
+                _KB_REGISTRY_KEY if connector_type == Connectors.KNOWLEDGE_BASE.value else connector_type
+            )
+
+            if registry_key not in self._connectors:
+                self.logger.error(
+                    f"Connector type {connector_type} not found in registry"
+                )
+                return None
+
+            metadata = self._connectors[registry_key]
+            return self._build_connector_info(connector_type, metadata, document)
+
+        except Exception as e:
+            self.logger.error(
+                f"Error getting connector instance {connector_id}: {e}"
+            )
+            return None
+
+    async def get_connector_instances_by_group(
+        self,
+        app_group: str,
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+        scope: str | None = None,
+        page: int = 1,
+        limit: int = 20
+    ) -> dict[str, Any]:
+        """
+        Get all connector instances in a specific group with scope-based filtering.
+
+        Args:
+            app_group: Group name to filter by
+            user_id: User ID requesting the instances
+            org_id: Organization ID
+            is_admin: Whether the caller is an org admin (affects team connector visibility)
+            scope: Optional scope filter (personal/team)
+            page: Page number (1-indexed)
+            limit: Number of items per page
+
+        Returns:
+            Dictionary with connector instances and pagination info
+        """
+        result = await self.get_all_connector_instances(
+            user_id, org_id, is_admin=is_admin, scope=scope, page=page, limit=limit * 2
+        )
+
+        group_instances = [
+            instance for instance in result["connectors"]
+            if instance['appGroup'] == app_group
+        ]
+
+        # Re-paginate the filtered results
+        total_count = len(group_instances)
+        total_pages = (total_count + limit - 1) // limit
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+
+        return {
+            "connectors": group_instances[start_idx:end_idx],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "totalCount": total_count,
+                "totalPages": total_pages
+            }
+        }
+
+    async def get_filter_options(self) -> dict[str, list[str]]:
+        """
+        Get available filter options for connectors.
+
+        Returns:
+            Dictionary containing lists of available filter values
+        """
+        app_groups = list({
+            metadata['appGroup']
+            for metadata in self._connectors.values()
+        })
+
+        # Collect all supported auth types from all connectors
+        all_auth_types = set()
+        for metadata in self._connectors.values():
+            supported_types = metadata.get('supportedAuthTypes', [])
+            all_auth_types.update(supported_types)
+        auth_types = sorted(all_auth_types)
+
+        connector_names = list(self._connectors.keys())
+
+        return {
+            'appGroups': sorted(app_groups),
+            'authTypes': sorted(auth_types),
+            'connectorNames': sorted(connector_names),
+            'indexingStatus': ProgressStatus.values(),
+            'recordType': RecordType.values(),
+            'origin': Origin.values(),
+            'permissions': Permissions.values(),
+            'scopes': [scope.value for scope in ConnectorScope]
+        }
+
+    async def create_connector_instance_on_configuration(
+        self,
+        connector_type: str,
+        instance_name: str,
+        scope: str,
+        created_by: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+        selected_auth_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Create a connector instance when it's being configured.
+
+        This method should be called during the configuration process.
+
+        Args:
+            connector_type: Type of the connector (from registry)
+            instance_name: Name for this specific instance
+            scope: Connector scope (personal/team)
+            created_by: User ID creating the connector
+            org_id: Organization ID
+            is_admin: Whether the user is an admin
+            selected_auth_type: Auth type selected by the user (cannot be changed after creation)
+        Returns:
+            Created connector instance document or None if failed
+        Raises:
+            ValueError: If instance name is not unique
+        """
+        if connector_type not in self._connectors:
+            self.logger.error(
+                f"Connector type {connector_type} not found in registry"
+            )
+            return None
+        instance = await self._create_connector_instance(
+            connector_type,
+            instance_name,
+            self._connectors[connector_type],
+            scope,
+            created_by,
+            org_id,
+            selected_auth_type=selected_auth_type
+        )
+        if instance is not None:
+            email = None
+            try:
+                graph_provider = await self._get_graph_provider()
+                user_doc = await graph_provider.get_document(created_by, CollectionNames.USERS.value)
+                email = (user_doc or {}).get("email")
+            except Exception as e:
+                self.logger.debug(f"telemetry: could not resolve connector creator email: {e}")
+            record_event("connector_added", {
+                "orgId": org_id,
+                "userId": created_by,
+                "email": email,
+                "domain": domain_from_email(email),
+                "connector": connector_type,
+                "scope": scope,
+            })
+        return instance
+
+    async def update_connector_instance(
+        self,
+        connector_id: str,
+        updates: dict[str, Any],
+        user_id: str,
+        org_id: str,
+        *,
+        is_admin: bool,
+    ) -> dict[str, Any] | None:
+        """
+        Update a connector instance in the database with access control.
+
+        Args:
+            connector_id: Unique key of the connector instance
+            updates: Dictionary of fields to update
+            user_id: User ID performing the update
+            org_id: Organization ID
+            is_admin: Whether the user is an admin
+        Returns:
+            Updated connector instance document or None if failed
+        Raises:
+            ValueError: If instance name is not unique
+        """
+        try:
+            graph_provider = await self._get_graph_provider()
+
+            existing_document = await graph_provider.get_document(
+                connector_id,
+                self._collection_name
+            )
+
+            if not existing_document:
+                self.logger.error(
+                    f"Connector instance {connector_id} not found. "
+                    "Please configure the connector first."
+                )
+                return None
+
+            # Check access
+            has_access = await self._can_access_connector(
+                existing_document,
+                user_id,
+                org_id,
+                is_admin=is_admin,
+            )
+
+            if not has_access:
+                self.logger.error(
+                    f"User {user_id} does not have permission to update connector {connector_id}"
+                )
+                return None
+
+            # If name is being updated, check uniqueness
+            if 'name' in updates:
+                new_name = updates['name']
+                scope = existing_document.get('scope', ConnectorScope.PERSONAL.value)
+                created_by = existing_document.get('createdBy', user_id)
+
+                # Check if name is unique (excluding current connector)
+                is_unique = await self._check_name_uniqueness(
+                    instance_name=new_name,
+                    scope=scope,
+                    org_id=org_id,
+                    user_id=created_by,
+                    exclude_connector_id=connector_id,
+                )
+
+                if not is_unique:
+                    self.logger.warning(
+                        f"Connector instance name '{new_name}' already exists for scope {scope}"
+                    )
+                    raise ValueError(
+                        f"Connector instance name '{new_name}' already exists. "
+                        f"Please choose a different name."
+                    )
+
+            # Merge updates with existing document
+            updated_document = {
+                **existing_document,
+                **updates,
+                'updatedAtTimestamp': get_epoch_timestamp_in_ms()
+            }
+
+            # Execute update via update_node (only the changed fields)
+            node_updates = {
+                k: v for k, v in updated_document.items()
+                if k not in ('_key', '_id', '_rev', 'id')
+            }
+
+            await graph_provider.update_node(
+                connector_id,
+                self._collection_name,
+                node_updates
+            )
+
+            result = [updated_document]
+            if not result:
+                self.logger.warning(
+                    f"Failed to update connector instance {connector_id}: not found"
+                )
+                return None
+
+            self.logger.debug(f"Updated connector instance {connector_id}")
+            return updated_document
+
+        except ValueError:
+            # Re-raise ValueError (name uniqueness) as-is
+            raise
+        except Exception as e:
+            self.logger.error(
+                f"Error updating connector instance {connector_id}: {e}"
+            )
+            return None

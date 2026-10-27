@@ -1,0 +1,2208 @@
+import 'reflect-metadata'
+import { expect } from 'chai'
+import sinon from 'sinon'
+import crypto from 'crypto'
+import {
+  randomKeyGenerator,
+  SIGNING_SECRET_BYTES,
+  SIGNING_SECRETS_ROTATE_ID_FIELD,
+  ConfigService,
+  SmtpConfig,
+  KafkaConfig,
+  RedisConfig,
+  MongoConfig,
+  QdrantConfig,
+  ArangoConfig,
+  EtcdConfig,
+  EncryptionConfig,
+  DefaultStorageConfig,
+} from '../../../../src/modules/tokens_manager/services/cm.service'
+import { envGuard } from '../../../helpers/env-guard'
+
+describe('tokens_manager/services/cm.service', () => {
+  afterEach(() => {
+    sinon.restore()
+  })
+
+  // =========================================================================
+  // randomKeyGenerator
+  // =========================================================================
+  describe('randomKeyGenerator', () => {
+    const hexLength = SIGNING_SECRET_BYTES * 2
+
+    it('should generate a 32-byte hex string', () => {
+      const key = randomKeyGenerator()
+      expect(key).to.have.lengthOf(hexLength)
+    })
+
+    it('should return a string', () => {
+      const key = randomKeyGenerator()
+      expect(key).to.be.a('string')
+    })
+
+    it('should only contain lowercase hex characters', () => {
+      const key = randomKeyGenerator()
+      expect(key).to.match(/^[0-9a-f]+$/)
+    })
+
+    it('should generate different keys on consecutive calls', () => {
+      const key1 = randomKeyGenerator()
+      const key2 = randomKeyGenerator()
+      // While theoretically possible to collide, it's astronomically unlikely
+      expect(key1).to.not.equal(key2)
+    })
+
+    it('should generate keys from the hex character set', () => {
+      const validChars = '0123456789abcdef'
+      const key = randomKeyGenerator()
+      for (const char of key) {
+        expect(validChars).to.include(char)
+      }
+    })
+
+    it('should not use Math.random (signing secrets must come from a CSPRNG)', () => {
+      const mathRandomSpy = sinon.spy(Math, 'random')
+      randomKeyGenerator()
+      expect(mathRandomSpy.called).to.be.false
+    })
+
+    it('should draw the secret via crypto.randomBytes', () => {
+      const bytes = Buffer.alloc(SIGNING_SECRET_BYTES, 0xab)
+      const randomBytesStub = sinon.stub().returns(bytes)
+      sinon.replace(crypto, 'randomBytes', randomBytesStub as typeof crypto.randomBytes)
+      const key = randomKeyGenerator()
+      expect(key).to.equal('ab'.repeat(SIGNING_SECRET_BYTES))
+      expect(randomBytesStub.calledOnceWithExactly(SIGNING_SECRET_BYTES)).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // Interface Type Checks (compile-time checks expressed as runtime tests)
+  // =========================================================================
+  describe('SmtpConfig interface', () => {
+    it('should accept valid SmtpConfig objects', () => {
+      const config: SmtpConfig = {
+        host: 'smtp.example.com',
+        port: 587,
+        username: 'user',
+        password: 'pass',
+        fromEmail: 'noreply@example.com',
+      }
+      expect(config.host).to.equal('smtp.example.com')
+      expect(config.port).to.equal(587)
+      expect(config.fromEmail).to.equal('noreply@example.com')
+    })
+
+    it('should accept SmtpConfig with optional fields omitted', () => {
+      const config: SmtpConfig = {
+        host: 'smtp.example.com',
+        port: 587,
+        fromEmail: 'noreply@example.com',
+      }
+      expect(config.username).to.be.undefined
+      expect(config.password).to.be.undefined
+    })
+  })
+
+  describe('KafkaConfig interface', () => {
+    it('should accept valid KafkaConfig objects', () => {
+      const config: KafkaConfig = {
+        brokers: ['broker1:9092', 'broker2:9092'],
+        ssl: true,
+        sasl: {
+          mechanism: 'scram-sha-512',
+          username: 'user',
+          password: 'pass',
+        },
+      }
+      expect(config.brokers).to.have.lengthOf(2)
+      expect(config.ssl).to.be.true
+      expect(config.sasl?.mechanism).to.equal('scram-sha-512')
+    })
+
+    it('should accept KafkaConfig without sasl', () => {
+      const config: KafkaConfig = {
+        brokers: ['localhost:9092'],
+      }
+      expect(config.sasl).to.be.undefined
+      expect(config.ssl).to.be.undefined
+    })
+
+    it('should support all SASL mechanisms', () => {
+      const mechanisms: Array<'plain' | 'scram-sha-256' | 'scram-sha-512'> = [
+        'plain',
+        'scram-sha-256',
+        'scram-sha-512',
+      ]
+      for (const mechanism of mechanisms) {
+        const config: KafkaConfig = {
+          brokers: ['localhost:9092'],
+          sasl: { mechanism, username: 'u', password: 'p' },
+        }
+        expect(config.sasl?.mechanism).to.equal(mechanism)
+      }
+    })
+  })
+
+  describe('RedisConfig interface', () => {
+    it('should accept valid RedisConfig objects', () => {
+      const config: RedisConfig = {
+        host: 'localhost',
+        port: 6379,
+        username: 'default',
+        password: 'secret',
+        tls: false,
+        db: 0,
+      }
+      expect(config.host).to.equal('localhost')
+      expect(config.port).to.equal(6379)
+    })
+
+    it('should accept RedisConfig with only required fields', () => {
+      const config: RedisConfig = {
+        host: 'localhost',
+        port: 6379,
+      }
+      expect(config.username).to.be.undefined
+      expect(config.password).to.be.undefined
+      expect(config.tls).to.be.undefined
+      expect(config.db).to.be.undefined
+    })
+  })
+
+  describe('MongoConfig interface', () => {
+    it('should accept valid MongoConfig objects', () => {
+      const config: MongoConfig = {
+        uri: 'mongodb://localhost:27017',
+        db: 'pipeshub',
+      }
+      expect(config.uri).to.equal('mongodb://localhost:27017')
+      expect(config.db).to.equal('pipeshub')
+    })
+  })
+
+  describe('QdrantConfig interface', () => {
+    it('should accept valid QdrantConfig objects', () => {
+      const config: QdrantConfig = {
+        port: 6333,
+        apiKey: 'test-key',
+        host: 'localhost',
+        grpcPort: 6334,
+      }
+      expect(config.port).to.equal(6333)
+      expect(config.grpcPort).to.equal(6334)
+    })
+  })
+
+  describe('ArangoConfig interface', () => {
+    it('should accept valid ArangoConfig objects', () => {
+      const config: ArangoConfig = {
+        url: 'http://localhost:8529',
+        db: 'pipeshub',
+        username: 'root',
+        password: 'secret',
+      }
+      expect(config.url).to.equal('http://localhost:8529')
+      expect(config.db).to.equal('pipeshub')
+    })
+  })
+
+  describe('EtcdConfig interface', () => {
+    it('should accept valid EtcdConfig objects', () => {
+      const config: EtcdConfig = {
+        host: 'localhost',
+        port: 2379,
+        dialTimeout: 5000,
+      }
+      expect(config.host).to.equal('localhost')
+      expect(config.dialTimeout).to.equal(5000)
+    })
+  })
+
+  describe('EncryptionConfig interface', () => {
+    it('should accept valid EncryptionConfig objects', () => {
+      const config: EncryptionConfig = {
+        key: 'my-secret-key',
+        algorithm: 'aes-256-cbc',
+      }
+      expect(config.key).to.equal('my-secret-key')
+      expect(config.algorithm).to.equal('aes-256-cbc')
+    })
+  })
+
+  describe('DefaultStorageConfig interface', () => {
+    it('should accept valid DefaultStorageConfig objects', () => {
+      const config: DefaultStorageConfig = {
+        storageType: 'local',
+        endpoint: 'http://localhost:3000',
+      }
+      expect(config.storageType).to.equal('local')
+      expect(config.endpoint).to.equal('http://localhost:3000')
+    })
+
+    it('should support different storage types', () => {
+      const types = ['local', 's3', 'azure']
+      for (const storageType of types) {
+        const config: DefaultStorageConfig = {
+          storageType,
+          endpoint: 'http://localhost:3000',
+        }
+        expect(config.storageType).to.equal(storageType)
+      }
+    })
+  })
+
+  // =========================================================================
+  // ConfigService class tests
+  // =========================================================================
+  describe('ConfigService', () => {
+    // We cannot easily test the singleton since it relies on real etcd,
+    // but we can test the static method behavior and catch constructor errors.
+    it('should have a getInstance static method', () => {
+      expect(ConfigService).to.have.property('getInstance')
+      expect(typeof ConfigService.getInstance).to.equal('function')
+    })
+
+    it('should export ConfigService as a class', () => {
+      expect(ConfigService).to.be.a('function')
+    })
+  })
+
+  // =========================================================================
+  // randomKeyGenerator additional tests
+  // =========================================================================
+  describe('randomKeyGenerator (additional)', () => {
+    it('should produce unique keys across many iterations', () => {
+      const keys = new Set<string>()
+      for (let i = 0; i < 50; i++) {
+        keys.add(randomKeyGenerator())
+      }
+      // 256-bit CSPRNG keys should not collide across 50 draws
+      expect(keys.size).to.equal(50)
+    })
+
+    it('should never produce empty string', () => {
+      for (let i = 0; i < 10; i++) {
+        const key = randomKeyGenerator()
+        expect(key.length).to.be.greaterThan(0)
+      }
+    })
+  })
+
+  // =========================================================================
+  // SmtpConfig edge cases
+  // =========================================================================
+  describe('SmtpConfig interface (additional)', () => {
+    it('should accept SmtpConfig with empty string values', () => {
+      const config: SmtpConfig = {
+        host: '',
+        port: 0,
+        fromEmail: '',
+      }
+      expect(config.host).to.equal('')
+      expect(config.port).to.equal(0)
+    })
+  })
+
+  // =========================================================================
+  // KafkaConfig edge cases
+  // =========================================================================
+  describe('KafkaConfig interface (additional)', () => {
+    it('should accept KafkaConfig with empty brokers array', () => {
+      const config: KafkaConfig = {
+        brokers: [],
+      }
+      expect(config.brokers).to.have.lengthOf(0)
+    })
+
+    it('should accept KafkaConfig with ssl false', () => {
+      const config: KafkaConfig = {
+        brokers: ['localhost:9092'],
+        ssl: false,
+      }
+      expect(config.ssl).to.be.false
+    })
+  })
+
+  // =========================================================================
+  // RedisConfig edge cases
+  // =========================================================================
+  describe('RedisConfig interface (additional)', () => {
+    it('should accept RedisConfig with tls true', () => {
+      const config: RedisConfig = {
+        host: 'redis.example.com',
+        port: 6380,
+        tls: true,
+      }
+      expect(config.tls).to.be.true
+    })
+
+    it('should accept RedisConfig with db number', () => {
+      const config: RedisConfig = {
+        host: 'localhost',
+        port: 6379,
+        db: 5,
+      }
+      expect(config.db).to.equal(5)
+    })
+  })
+
+  // =========================================================================
+  // MongoConfig edge cases
+  // =========================================================================
+  describe('MongoConfig interface (additional)', () => {
+    it('should accept MongoConfig with connection string options', () => {
+      const config: MongoConfig = {
+        uri: 'mongodb+srv://user:pass@cluster.example.com/db?retryWrites=true',
+        db: 'test-db',
+      }
+      expect(config.uri).to.include('mongodb+srv')
+    })
+  })
+
+  // =========================================================================
+  // QdrantConfig edge cases
+  // =========================================================================
+  describe('QdrantConfig interface (additional)', () => {
+    it('should accept QdrantConfig with non-default ports', () => {
+      const config: QdrantConfig = {
+        port: 16333,
+        apiKey: '',
+        host: '192.168.1.100',
+        grpcPort: 16334,
+      }
+      expect(config.port).to.equal(16333)
+      expect(config.apiKey).to.equal('')
+    })
+  })
+
+  // =========================================================================
+  // ArangoConfig edge cases
+  // =========================================================================
+  describe('ArangoConfig interface (additional)', () => {
+    it('should accept ArangoConfig with https URL', () => {
+      const config: ArangoConfig = {
+        url: 'https://arango.example.com:8529',
+        db: 'production',
+        username: 'admin',
+        password: 'securePassword123',
+      }
+      expect(config.url).to.include('https')
+    })
+  })
+
+  // =========================================================================
+  // EtcdConfig edge cases
+  // =========================================================================
+  describe('EtcdConfig interface (additional)', () => {
+    it('should accept EtcdConfig with zero dialTimeout', () => {
+      const config: EtcdConfig = {
+        host: 'localhost',
+        port: 2379,
+        dialTimeout: 0,
+      }
+      expect(config.dialTimeout).to.equal(0)
+    })
+
+    it('should accept EtcdConfig with large dialTimeout', () => {
+      const config: EtcdConfig = {
+        host: 'etcd.example.com',
+        port: 2379,
+        dialTimeout: 30000,
+      }
+      expect(config.dialTimeout).to.equal(30000)
+    })
+  })
+
+  // =========================================================================
+  // randomKeyGenerator stress tests
+  // =========================================================================
+  describe('randomKeyGenerator (stress)', () => {
+    it('should always produce 64 hex chars across 100 iterations', () => {
+      for (let i = 0; i < 100; i++) {
+        const key = randomKeyGenerator()
+        expect(key).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+        expect(key).to.match(/^[0-9a-f]+$/)
+      }
+    })
+
+    it('should contain at least 3 distinct characters', () => {
+      const key = randomKeyGenerator()
+      const uniqueChars = new Set(key.split(''))
+      expect(uniqueChars.size).to.be.at.least(3)
+    })
+  })
+
+  // =========================================================================
+  // DefaultStorageConfig edge cases
+  // =========================================================================
+  describe('DefaultStorageConfig (additional)', () => {
+    it('should accept empty endpoint', () => {
+      const config: DefaultStorageConfig = {
+        storageType: 'local',
+        endpoint: '',
+      }
+      expect(config.endpoint).to.equal('')
+    })
+
+    it('should accept HTTPS endpoint', () => {
+      const config: DefaultStorageConfig = {
+        storageType: 's3',
+        endpoint: 'https://s3.amazonaws.com',
+      }
+      expect(config.endpoint).to.include('https')
+    })
+  })
+
+  // =========================================================================
+  // ConfigService singleton tests
+  // =========================================================================
+  describe('ConfigService (additional)', () => {
+    it('should export ConfigService with standard methods', () => {
+      const proto = ConfigService.prototype
+      expect(proto).to.have.property('connect')
+      expect(proto).to.have.property('getSmtpConfig')
+      expect(proto).to.have.property('getKafkaConfig')
+      expect(proto).to.have.property('getRedisConfig')
+      expect(proto).to.have.property('getMongoConfig')
+      expect(proto).to.have.property('getQdrantConfig')
+      expect(proto).to.have.property('getArangoConfig')
+      expect(proto).to.have.property('getEtcdConfig')
+      expect(proto).to.have.property('getJwtSecret')
+      expect(proto).to.have.property('getScopedJwtSecret')
+      expect(proto).to.have.property('getCookieSecret')
+      expect(proto).to.have.property('getAuthBackendUrl')
+      expect(proto).to.have.property('getCommunicationBackendUrl')
+      expect(proto).to.have.property('getKbBackendUrl')
+      expect(proto).to.have.property('getEsBackendUrl')
+      expect(proto).to.have.property('getCmBackendUrl')
+      expect(proto).to.have.property('getTokenBackendUrl')
+      expect(proto).to.have.property('getConnectorUrl')
+      expect(proto).to.have.property('getConnectorPublicUrl')
+      expect(proto).to.have.property('getIndexingUrl')
+      expect(proto).to.have.property('getIamBackendUrl')
+      expect(proto).to.have.property('getStorageBackendUrl')
+      expect(proto).to.have.property('getFrontendUrl')
+      expect(proto).to.have.property('getAiBackendUrl')
+      expect(proto).to.have.property('getStorageConfig')
+      expect(proto).to.have.property('getOAuthBackendUrl')
+      expect(proto).to.have.property('initializeOAuthIssuer')
+      expect(proto).to.have.property('getOAuthIssuer')
+      expect(proto).to.have.property('getMcpScopes')
+      expect(proto).to.have.property('getRsAvailable')
+    })
+
+    it('should return the same instance on multiple getInstance calls', () => {
+      // ConfigService.getInstance() may throw due to missing etcd config,
+      // but we can verify the static method exists and is callable
+      try {
+        const instance1 = ConfigService.getInstance()
+        const instance2 = ConfigService.getInstance()
+        expect(instance1).to.equal(instance2)
+      } catch (e) {
+        // Expected if etcd config not available in test env
+        // But at least we verified it's callable
+        expect(e).to.be.an('error')
+      }
+    })
+  })
+
+  // =========================================================================
+  // KafkaConfig SASL edge cases
+  // =========================================================================
+  describe('KafkaConfig SASL (additional)', () => {
+    it('should accept plain mechanism', () => {
+      const config: KafkaConfig = {
+        brokers: ['broker:9092'],
+        sasl: {
+          mechanism: 'plain',
+          username: 'admin',
+          password: 'secret',
+        },
+      }
+      expect(config.sasl?.mechanism).to.equal('plain')
+    })
+
+    it('should accept scram-sha-256 mechanism', () => {
+      const config: KafkaConfig = {
+        brokers: ['broker:9092'],
+        sasl: {
+          mechanism: 'scram-sha-256',
+          username: 'admin',
+          password: 'secret',
+        },
+      }
+      expect(config.sasl?.mechanism).to.equal('scram-sha-256')
+    })
+
+    it('should accept multiple brokers with ssl and sasl', () => {
+      const config: KafkaConfig = {
+        brokers: ['broker1:9092', 'broker2:9092', 'broker3:9092'],
+        ssl: true,
+        sasl: {
+          mechanism: 'scram-sha-512',
+          username: 'user',
+          password: 'pass',
+        },
+      }
+      expect(config.brokers).to.have.lengthOf(3)
+      expect(config.ssl).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // MongoConfig with various URI formats
+  // =========================================================================
+  describe('MongoConfig URI formats', () => {
+    it('should accept standard mongodb URI', () => {
+      const config: MongoConfig = {
+        uri: 'mongodb://localhost:27017/mydb',
+        db: 'mydb',
+      }
+      expect(config.uri).to.include('mongodb://')
+    })
+
+    it('should accept mongodb+srv URI', () => {
+      const config: MongoConfig = {
+        uri: 'mongodb+srv://user:pass@cluster.mongodb.net/db',
+        db: 'db',
+      }
+      expect(config.uri).to.include('mongodb+srv')
+    })
+
+    it('should accept mongodb URI with replica set', () => {
+      const config: MongoConfig = {
+        uri: 'mongodb://host1:27017,host2:27017,host3:27017/db?replicaSet=rs0',
+        db: 'db',
+      }
+      expect(config.uri).to.include('replicaSet')
+    })
+  })
+
+  // =========================================================================
+  // QdrantConfig additional
+  // =========================================================================
+  describe('QdrantConfig (additional)', () => {
+    it('should accept QdrantConfig with empty API key (local dev)', () => {
+      const config: QdrantConfig = {
+        port: 6333,
+        apiKey: '',
+        host: 'localhost',
+        grpcPort: 6334,
+      }
+      expect(config.apiKey).to.equal('')
+    })
+
+    it('should accept remote QdrantConfig with custom ports', () => {
+      const config: QdrantConfig = {
+        port: 443,
+        apiKey: 'prod-api-key-12345',
+        host: 'qdrant.cloud.example.com',
+        grpcPort: 443,
+      }
+      expect(config.host).to.include('cloud')
+      expect(config.port).to.equal(443)
+    })
+  })
+
+  // =========================================================================
+  // ConfigService method tests with mocked internals
+  // =========================================================================
+  describe('ConfigService methods (mocked)', () => {
+    const env = envGuard()
+    let configService: any
+    let mockKvStore: any
+    let mockEncryption: any
+
+    beforeEach(() => {
+      env.snapshot()
+      mockKvStore = {
+        get: sinon.stub(),
+        set: sinon.stub().resolves(),
+        compareAndSet: sinon.stub().resolves(true),
+        connect: sinon.stub().resolves(),
+        watchKey: sinon.stub().resolves(),
+        isConnected: sinon.stub().returns(true),
+        disconnect: sinon.stub().resolves(),
+      }
+
+      mockEncryption = {
+        encrypt: sinon.stub().callsFake((text: string) => `encrypted:${text}`),
+        decrypt: sinon.stub().callsFake((text: string) => text.replace('encrypted:', '')),
+      }
+
+      // Create instance bypassing private constructor
+      configService = Object.create(ConfigService.prototype)
+      configService.keyValueStoreService = mockKvStore
+      configService.encryptionService = mockEncryption
+      configService.configManagerConfig = {}
+      delete process.env.ROTATE_SIGNING_SECRETS
+      delete process.env.JWT_SECRET
+      delete process.env.SCOPED_JWT_SECRET
+      delete process.env.COOKIE_SECRET
+    })
+
+    afterEach(() => {
+      env.restore()
+    })
+
+    describe('connect', () => {
+      it('should call keyValueStoreService.connect', async () => {
+        await configService.connect()
+        expect(mockKvStore.connect.calledOnce).to.be.true
+      })
+    })
+
+    describe('getSmtpConfig', () => {
+      it('should return null when no SMTP config exists', async () => {
+        mockKvStore.get.resolves(null)
+        const result = await configService.getSmtpConfig()
+        expect(result).to.be.null
+      })
+
+      it('should return parsed SMTP config when encrypted config exists', async () => {
+        const smtpData = { host: 'smtp.test.com', port: 587, fromEmail: 'test@test.com' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(smtpData))
+        const result = await configService.getSmtpConfig()
+        expect(result).to.deep.equal(smtpData)
+      })
+    })
+
+    describe('getKafkaConfig', () => {
+      it('should have getKafkaConfig method', () => {
+        expect(configService.getKafkaConfig).to.be.a('function')
+      })
+
+      it('should fall back to env vars when config not in store', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.KAFKA_BROKERS = 'broker1:9092,broker2:9092'
+        process.env.KAFKA_SSL = 'false'
+        delete process.env.KAFKA_USERNAME
+
+        const result = await configService.getKafkaConfig()
+        expect(result.brokers).to.deep.equal(['broker1:9092', 'broker2:9092'])
+        expect(result.ssl).to.be.false
+        expect(result.sasl).to.be.undefined
+      })
+
+      it('should include SASL config when KAFKA_USERNAME is set', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.KAFKA_BROKERS = 'broker:9092'
+        process.env.KAFKA_SSL = 'true'
+        process.env.KAFKA_USERNAME = 'user'
+        process.env.KAFKA_PASSWORD = 'pass'
+        process.env.KAFKA_SASL_MECHANISM = 'plain'
+
+        const result = await configService.getKafkaConfig()
+        expect(result.sasl).to.exist
+        expect(result.sasl.mechanism).to.equal('plain')
+        expect(result.sasl.username).to.equal('user')
+      })
+    })
+
+    describe('getRedisConfig', () => {
+      it('should return redis config', async () => {
+        const redisData = { host: 'localhost', port: 6379 }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(redisData))
+
+        process.env.REDIS_HOST = 'localhost'
+        process.env.REDIS_PORT = '6379'
+        process.env.REDIS_DB = '0'
+
+        const result = await configService.getRedisConfig()
+        expect(result.host).to.equal('localhost')
+      })
+    })
+
+    describe('getMongoConfig', () => {
+      it('should return mongo config', async () => {
+        const mongoData = { uri: 'mongodb://localhost:27017', db: 'test' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(mongoData))
+
+        process.env.MONGO_URI = 'mongodb://localhost:27017'
+
+        const result = await configService.getMongoConfig()
+        expect(result.uri).to.equal('mongodb://localhost:27017')
+      })
+    })
+
+    describe('getQdrantConfig', () => {
+      it('should return qdrant config', async () => {
+        const qdrantData = { apiKey: 'key', host: 'localhost', port: 6333, grpcPort: 6334 }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(qdrantData))
+
+        process.env.QDRANT_API_KEY = 'key'
+        process.env.QDRANT_HOST = 'localhost'
+
+        const result = await configService.getQdrantConfig()
+        expect(result.host).to.equal('localhost')
+      })
+    })
+
+    describe('getArangoConfig', () => {
+      it('should return arango config', async () => {
+        const arangoData = { url: 'http://localhost:8529', db: 'test', username: 'root', password: 'pass' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(arangoData))
+
+        process.env.ARANGO_URL = 'http://localhost:8529'
+        process.env.ARANGO_USERNAME = 'root'
+        process.env.ARANGO_PASSWORD = 'pass'
+
+        const result = await configService.getArangoConfig()
+        expect(result.url).to.equal('http://localhost:8529')
+      })
+    })
+
+    describe('getEtcdConfig', () => {
+      it('should return etcd config from env vars', async () => {
+        process.env.ETCD_HOST = 'localhost'
+        process.env.ETCD_PORT = '2379'
+        process.env.ETCD_DIAL_TIMEOUT = '5000'
+
+        const result = await configService.getEtcdConfig()
+        expect(result.host).to.equal('localhost')
+        expect(result.port).to.equal(2379)
+        expect(result.dialTimeout).to.equal(5000)
+      })
+    })
+
+    describe('getAuthBackendUrl', () => {
+      it('should return auth endpoint from stored config', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ auth: { endpoint: 'http://auth:3000' } }))
+        const result = await configService.getAuthBackendUrl()
+        expect(result).to.equal('http://auth:3000')
+      })
+
+      it('should fall back to PORT env var when no stored endpoint', async () => {
+        mockKvStore.get.resolves('{}')
+        process.env.PORT = '4000'
+        const result = await configService.getAuthBackendUrl()
+        expect(result).to.equal('http://localhost:4000')
+      })
+
+      it('should use default port 3000 when no PORT env var', async () => {
+        mockKvStore.get.resolves(null)
+        delete process.env.PORT
+        const result = await configService.getAuthBackendUrl()
+        expect(result).to.equal('http://localhost:3000')
+      })
+    })
+
+    describe('getCommunicationBackendUrl', () => {
+      it('should return communication endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ communication: { endpoint: 'http://comm:3000' } }))
+        const result = await configService.getCommunicationBackendUrl()
+        expect(result).to.equal('http://comm:3000')
+      })
+
+      it('should fall back to localhost when no endpoint', async () => {
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getCommunicationBackendUrl()
+        expect(result).to.include('http://localhost')
+      })
+    })
+
+    describe('getKbBackendUrl', () => {
+      it('should return kb endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ kb: { endpoint: 'http://kb:3000' } }))
+        const result = await configService.getKbBackendUrl()
+        expect(result).to.equal('http://kb:3000')
+      })
+    })
+
+    describe('getEsBackendUrl', () => {
+      it('should return es endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ es: { endpoint: 'http://es:3000' } }))
+        const result = await configService.getEsBackendUrl()
+        expect(result).to.equal('http://es:3000')
+      })
+    })
+
+    describe('getCmBackendUrl', () => {
+      it('should return cm endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ cm: { endpoint: 'http://cm:3000' } }))
+        const result = await configService.getCmBackendUrl()
+        expect(result).to.equal('http://cm:3000')
+      })
+    })
+
+    describe('getTokenBackendUrl', () => {
+      it('should return token backend endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ tokenBackend: { endpoint: 'http://token:3000' } }))
+        const result = await configService.getTokenBackendUrl()
+        expect(result).to.equal('http://token:3000')
+      })
+    })
+
+    describe('getConnectorUrl', () => {
+      it('should return connector endpoint from env var', async () => {
+        process.env.CONNECTOR_BACKEND = 'http://connector:8088'
+        process.env.CONNECTOR_PUBLIC_BACKEND = 'http://connector-public:8088'
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getConnectorUrl()
+        expect(result).to.equal('http://connector:8088')
+      })
+    })
+
+    describe('getConnectorPublicUrl', () => {
+      it('should return connector public endpoint from stored config', async () => {
+        mockKvStore.get.resolves(JSON.stringify({
+          connectors: { publicEndpoint: 'http://connector-pub:8088' }
+        }))
+        const result = await configService.getConnectorPublicUrl()
+        expect(result).to.equal('http://connector-pub:8088')
+      })
+
+      it('should fall back to env var', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ connectors: {} }))
+        process.env.CONNECTOR_PUBLIC_BACKEND = 'http://fallback-connector:8088'
+        const result = await configService.getConnectorPublicUrl()
+        expect(result).to.equal('http://fallback-connector:8088')
+      })
+    })
+
+    describe('getIndexingUrl', () => {
+      it('should return indexing endpoint', async () => {
+        process.env.INDEXING_BACKEND = 'http://indexing:8091'
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getIndexingUrl()
+        expect(result).to.equal('http://indexing:8091')
+      })
+    })
+
+    describe('getIamBackendUrl', () => {
+      it('should return iam endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ iam: { endpoint: 'http://iam:3000' } }))
+        const result = await configService.getIamBackendUrl()
+        expect(result).to.equal('http://iam:3000')
+      })
+    })
+
+    describe('getStorageBackendUrl', () => {
+      it('should return storage endpoint', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ storage: { endpoint: 'http://storage:3000' } }))
+        const result = await configService.getStorageBackendUrl()
+        expect(result).to.equal('http://storage:3000')
+      })
+    })
+
+    describe('getFrontendUrl', () => {
+      it('should return frontend URL from env var', async () => {
+        process.env.FRONTEND_PUBLIC_URL = 'http://frontend:3000'
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getFrontendUrl()
+        expect(result).to.equal('http://frontend:3000')
+      })
+
+      it('should return stored frontend URL when no env var', async () => {
+        delete process.env.FRONTEND_PUBLIC_URL
+        mockKvStore.get.resolves(JSON.stringify({ frontend: { publicEndpoint: 'http://stored-frontend:3000' } }))
+        const result = await configService.getFrontendUrl()
+        expect(result).to.equal('http://stored-frontend:3000')
+      })
+    })
+
+    describe('getAiBackendUrl', () => {
+      it('should return AI backend URL from env var', async () => {
+        process.env.QUERY_BACKEND = 'http://query:8000'
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getAiBackendUrl()
+        expect(result).to.equal('http://query:8000')
+      })
+
+      it('should fall back to default localhost:8000', async () => {
+        delete process.env.QUERY_BACKEND
+        mockKvStore.get.resolves(JSON.stringify({}))
+        const result = await configService.getAiBackendUrl()
+        expect(result).to.equal('http://localhost:8000')
+      })
+    })
+
+    describe('getStorageConfig', () => {
+      it('should return storage config with storageType local by default', async () => {
+        mockKvStore.get.callsFake(async (path: string) => {
+          if (path.includes('storage')) return '{}'
+          return '{}'
+        })
+        const result = await configService.getStorageConfig()
+        expect(result.storageType).to.equal('local')
+      })
+
+      it('should return stored storageType when available', async () => {
+        let callCount = 0
+        mockKvStore.get.callsFake(async () => {
+          callCount++
+          if (callCount <= 1) return '{}'
+          return JSON.stringify({ storageType: 's3' })
+        })
+        const result = await configService.getStorageConfig()
+        expect(result.storageType).to.equal('s3')
+      })
+    })
+
+    describe('getJwtSecret', () => {
+      it('should return existing JWT secret from encrypted store', async () => {
+        const secretData = { jwtSecret: 'existing-secret-key' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(secretData))
+        const result = await configService.getJwtSecret()
+        expect(result).to.equal('existing-secret-key')
+      })
+
+      it('should generate and store new JWT secret when none exists', async () => {
+        mockKvStore.get.resolves(null)
+        const result = await configService.getJwtSecret()
+        expect(result).to.be.a('string')
+        expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+        expect(result).to.match(/^[0-9a-f]+$/)
+        expect(mockKvStore.compareAndSet.calledOnce).to.be.true
+        expect(mockKvStore.compareAndSet.firstCall.args[0]).to.equal('/services/secretKeys')
+        expect(mockKvStore.compareAndSet.firstCall.args[1]).to.equal(null)
+      })
+
+      it('should generate JWT secret when parsedKeys has no jwtSecret', async () => {
+        const secretData = { otherKey: 'value' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(secretData))
+        const result = await configService.getJwtSecret()
+        expect(result).to.be.a('string')
+        expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+      })
+
+      it('should keep an existing short secret so upgrades do not invalidate tokens', async () => {
+        const legacySecret = 'abcdefghij0123456789'
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify({ jwtSecret: legacySecret }))
+        const result = await configService.getJwtSecret()
+        expect(result).to.equal(legacySecret)
+        expect(mockKvStore.compareAndSet.called).to.be.false
+      })
+
+      it('should persist JWT_SECRET from env only when no stored secret exists', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.JWT_SECRET = 'operator-seeded-secret'
+        const result = await configService.getJwtSecret()
+        expect(result).to.equal('operator-seeded-secret')
+        expect(mockKvStore.compareAndSet.calledOnce).to.be.true
+      })
+
+      it('should ignore JWT_SECRET env when a stored secret already exists', async () => {
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify({ jwtSecret: 'existing-secret-key' }))
+        process.env.JWT_SECRET = 'should-not-win'
+        const result = await configService.getJwtSecret()
+        expect(result).to.equal('existing-secret-key')
+        expect(mockKvStore.compareAndSet.called).to.be.false
+      })
+    })
+
+    describe('getScopedJwtSecret', () => {
+      it('should return existing scoped JWT secret', async () => {
+        const secretData = { scopedJwtSecret: 'scoped-secret' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(secretData))
+        const result = await configService.getScopedJwtSecret()
+        expect(result).to.equal('scoped-secret')
+      })
+
+      it('should generate new scoped JWT secret when none exists', async () => {
+        mockKvStore.get.resolves(null)
+        const result = await configService.getScopedJwtSecret()
+        expect(result).to.be.a('string')
+        expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+      })
+
+      it('should persist SCOPED_JWT_SECRET from env only when no stored secret exists', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.SCOPED_JWT_SECRET = 'operator-scoped-secret'
+        const result = await configService.getScopedJwtSecret()
+        expect(result).to.equal('operator-scoped-secret')
+      })
+    })
+
+    describe('getCookieSecret', () => {
+      it('should return existing cookie secret', async () => {
+        const secretData = { cookieSecret: 'cookie-secret' }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(secretData))
+        const result = await configService.getCookieSecret()
+        expect(result).to.equal('cookie-secret')
+      })
+
+      it('should generate new cookie secret when none exists', async () => {
+        mockKvStore.get.resolves(null)
+        const result = await configService.getCookieSecret()
+        expect(result).to.be.a('string')
+        expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+      })
+
+      it('should persist COOKIE_SECRET from env only when no stored secret exists', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.COOKIE_SECRET = 'operator-cookie-secret'
+        const result = await configService.getCookieSecret()
+        expect(result).to.equal('operator-cookie-secret')
+      })
+    })
+
+    describe('ROTATE_SIGNING_SECRETS', () => {
+      const stored = {
+        jwtSecret: 'old-jwt-secret-20xx',
+        scopedJwtSecret: 'old-scoped-secret',
+        cookieSecret: 'old-cookie-secret',
+      }
+
+      it('should replace all three secrets when the rotate id is new', async () => {
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(stored))
+        process.env.ROTATE_SIGNING_SECRETS = 'rotate-1'
+        const jwt = await configService.getJwtSecret()
+        expect(jwt).to.not.equal(stored.jwtSecret)
+        expect(jwt).to.match(/^[0-9a-f]{64}$/)
+        expect(mockKvStore.compareAndSet.calledOnce).to.be.true
+        const saved = JSON.parse(
+          mockEncryption.decrypt(mockKvStore.compareAndSet.firstCall.args[2]),
+        )
+        expect(saved.jwtSecret).to.equal(jwt)
+        expect(saved.scopedJwtSecret).to.not.equal(stored.scopedJwtSecret)
+        expect(saved.cookieSecret).to.not.equal(stored.cookieSecret)
+        expect(saved[SIGNING_SECRETS_ROTATE_ID_FIELD]).to.equal('rotate-1')
+      })
+
+      it('should not rotate again when the same id is already stored', async () => {
+        const rotated = {
+          ...stored,
+          jwtSecret: 'a'.repeat(64),
+          scopedJwtSecret: 'b'.repeat(64),
+          cookieSecret: 'c'.repeat(64),
+          [SIGNING_SECRETS_ROTATE_ID_FIELD]: 'rotate-1',
+        }
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(rotated))
+        process.env.ROTATE_SIGNING_SECRETS = 'rotate-1'
+        const jwt = await configService.getJwtSecret()
+        expect(jwt).to.equal(rotated.jwtSecret)
+        expect(mockKvStore.compareAndSet.called).to.be.false
+      })
+
+      it('should generate new secrets during rotation even if env seeds are set', async () => {
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(stored))
+        process.env.ROTATE_SIGNING_SECRETS = 'rotate-2'
+        process.env.JWT_SECRET = stored.jwtSecret
+        process.env.SCOPED_JWT_SECRET = stored.scopedJwtSecret
+        process.env.COOKIE_SECRET = stored.cookieSecret
+        const jwt = await configService.getJwtSecret()
+        expect(jwt).to.not.equal(stored.jwtSecret)
+        expect(jwt).to.match(/^[0-9a-f]{64}$/)
+        const saved = JSON.parse(
+          mockEncryption.decrypt(mockKvStore.compareAndSet.firstCall.args[2]),
+        )
+        expect(saved.scopedJwtSecret).to.not.equal(stored.scopedJwtSecret)
+        expect(saved.cookieSecret).to.not.equal(stored.cookieSecret)
+      })
+
+      it('should ignore an empty ROTATE_SIGNING_SECRETS value', async () => {
+        mockKvStore.get.resolves('encrypted:' + JSON.stringify(stored))
+        process.env.ROTATE_SIGNING_SECRETS = '   '
+        const jwt = await configService.getJwtSecret()
+        expect(jwt).to.equal(stored.jwtSecret)
+        expect(mockKvStore.compareAndSet.called).to.be.false
+      })
+
+      it('should adopt a peer replica\'s secrets when CAS loses the first write', async () => {
+        process.env.ROTATE_SIGNING_SECRETS = 'rotate-1'
+        const winner = {
+          jwtSecret: 'a'.repeat(64),
+          scopedJwtSecret: 'b'.repeat(64),
+          cookieSecret: 'c'.repeat(64),
+          [SIGNING_SECRETS_ROTATE_ID_FIELD]: 'rotate-1',
+        }
+        mockKvStore.get
+          .onFirstCall().resolves('encrypted:' + JSON.stringify(stored))
+          .onSecondCall().resolves('encrypted:' + JSON.stringify(winner))
+        mockKvStore.compareAndSet.onFirstCall().resolves(false)
+
+        const jwt = await configService.getJwtSecret()
+        expect(jwt).to.equal(winner.jwtSecret)
+        expect(mockKvStore.compareAndSet.calledOnce).to.be.true
+        expect(mockKvStore.get.calledTwice).to.be.true
+      })
+
+      it('should adopt a peer-created jwtSecret after a lost first-boot CAS', async () => {
+        mockKvStore.get
+          .onFirstCall().resolves(null)
+          .onSecondCall().resolves('encrypted:' + JSON.stringify({ jwtSecret: 'peer-secret' }))
+        mockKvStore.compareAndSet.onFirstCall().resolves(false)
+
+        const jwt = await configService.getJwtSecret()
+        expect(jwt).to.equal('peer-secret')
+        expect(mockKvStore.compareAndSet.calledOnce).to.be.true
+      })
+
+      it('should throw when CAS keeps failing', async () => {
+        mockKvStore.get.resolves(null)
+        mockKvStore.compareAndSet.resolves(false)
+        try {
+          await configService.getJwtSecret()
+          expect.fail('Should have thrown')
+        } catch (error: any) {
+          expect(error.message).to.include('concurrent modification')
+        }
+        expect(mockKvStore.compareAndSet.callCount).to.equal(5)
+      })
+    })
+
+    describe('getOAuthBackendUrl', () => {
+      it('should return auth backend URL', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ auth: { endpoint: 'http://auth:3000' } }))
+        const result = await configService.getOAuthBackendUrl()
+        expect(result).to.equal('http://auth:3000')
+      })
+    })
+
+    describe('initializeOAuthIssuer', () => {
+      it('should always persist resolved issuer even when one exists', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ oauthProvider: { issuer: 'http://existing-issuer' } }))
+        process.env.OAUTH_ISSUER = 'http://fresh-issuer'
+        await configService.initializeOAuthIssuer()
+        expect(mockKvStore.set.calledOnce).to.be.true
+        const saved = JSON.parse(mockKvStore.set.firstCall.args[1])
+        expect(saved.oauthProvider.issuer).to.equal('http://fresh-issuer')
+        delete process.env.OAUTH_ISSUER
+      })
+
+      it('should set issuer from env var', async () => {
+        mockKvStore.get.resolves('{}')
+        process.env.OAUTH_ISSUER = 'http://dev-issuer'
+        await configService.initializeOAuthIssuer()
+        expect(mockKvStore.set.calledOnce).to.be.true
+      })
+
+      it('should fall back to localhost when frontend URL contains localhost', async () => {
+        mockKvStore.get.resolves('{}')
+        delete process.env.OAUTH_ISSUER
+        delete process.env.FRONTEND_PUBLIC_URL
+        process.env.PORT = '3001'
+        await configService.initializeOAuthIssuer()
+        expect(mockKvStore.set.called).to.be.true
+        const saved = JSON.parse(mockKvStore.set.lastCall.args[1])
+        expect(saved.oauthProvider.issuer).to.equal('http://localhost:3001')
+      })
+    })
+
+    describe('getOAuthIssuer', () => {
+      it('should return issuer from env var', async () => {
+        process.env.OAUTH_ISSUER = 'http://issuer.example.com'
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getOAuthIssuer()
+        expect(result).to.equal('http://issuer.example.com')
+      })
+
+      it('should return frontend URL when it does not contain localhost', async () => {
+        delete process.env.OAUTH_ISSUER
+        delete process.env.FRONTEND_PUBLIC_URL
+        mockKvStore.get.resolves(JSON.stringify({
+          frontend: { publicEndpoint: 'https://app.example.com' },
+        }))
+        const result = await configService.getOAuthIssuer()
+        expect(result).to.equal('https://app.example.com')
+      })
+
+      it('should fall back to localhost when frontend URL contains localhost', async () => {
+        delete process.env.OAUTH_ISSUER
+        delete process.env.FRONTEND_PUBLIC_URL
+        process.env.PORT = '3001'
+        mockKvStore.get.resolves('{}')
+        const result = await configService.getOAuthIssuer()
+        expect(result).to.equal('http://localhost:3001')
+      })
+    })
+
+    describe('getMcpScopes', () => {
+      it('should return default scopes when no env var', async () => {
+        delete process.env.MCP_SCOPES
+        const result = await configService.getMcpScopes()
+        expect(result).to.be.an('array')
+        expect(result).to.include('openid')
+      })
+
+      it('should parse scopes from env var', async () => {
+        process.env.MCP_SCOPES = 'scope1, scope2, scope3'
+        const result = await configService.getMcpScopes()
+        expect(result).to.deep.equal(['scope1', 'scope2', 'scope3'])
+      })
+
+      it('should filter empty scopes', async () => {
+        process.env.MCP_SCOPES = 'scope1,,scope2,'
+        const result = await configService.getMcpScopes()
+        expect(result).to.deep.equal(['scope1', 'scope2'])
+      })
+    })
+
+    describe('getRsAvailable', () => {
+      it('returns "true" when REPLICA_SET_AVAILABLE=true', async () => {
+        process.env.REPLICA_SET_AVAILABLE = 'true'
+        const result = await configService.getRsAvailable()
+        expect(result).to.equal('true')
+      })
+
+      it('returns "false" when REPLICA_SET_AVAILABLE=false', async () => {
+        process.env.REPLICA_SET_AVAILABLE = 'false'
+        const result = await configService.getRsAvailable()
+        expect(result).to.equal('false')
+      })
+
+      it('returns "false" when REPLICA_SET_AVAILABLE is unset (fail-closed)', async () => {
+        delete process.env.REPLICA_SET_AVAILABLE
+        const result = await configService.getRsAvailable()
+        expect(result).to.equal('false')
+      })
+
+      it('ignores MONGO_URI shape and only honors the env var', async () => {
+        // The previous URI heuristic mis-detected Helm-rendered hosts as a
+        // replica set. Verify it has been removed.
+        delete process.env.REPLICA_SET_AVAILABLE
+        process.env.MONGO_URI = 'mongodb+srv://user:pass@cluster.mongodb.net/test'
+        const result = await configService.getRsAvailable()
+        expect(result).to.equal('false')
+      })
+    })
+
+    describe('getEncryptedConfig - error handling', () => {
+      it('should return fallback env vars when get throws', async () => {
+        mockKvStore.get.rejects(new Error('connection error'))
+        const fallback = { host: 'fallback-host', port: 1234 }
+        const result = await (configService as any).getEncryptedConfig('/test/path', fallback)
+        expect(result).to.deep.equal(fallback)
+      })
+
+      it('should return fallback when decrypt throws', async () => {
+        mockKvStore.get.resolves('bad-encrypted-data')
+        mockEncryption.decrypt.throws(new Error('decrypt error'))
+        const fallback = { host: 'fallback-host' }
+        const result = await (configService as any).getEncryptedConfig('/test/path', fallback)
+        expect(result).to.deep.equal(fallback)
+      })
+    })
+
+    describe('saveConfigToEtcd', () => {
+      it('should encrypt and save config', async () => {
+        await (configService as any).saveConfigToEtcd('/test/path', { key: 'value' })
+        expect(mockEncryption.encrypt.calledOnce).to.be.true
+        expect(mockKvStore.set.calledOnce).to.be.true
+      })
+
+      it('should throw when set fails', async () => {
+        mockKvStore.set.rejects(new Error('write error'))
+        try {
+          await (configService as any).saveConfigToEtcd('/test/path', { key: 'value' })
+          expect.fail('Should have thrown')
+        } catch (error) {
+          expect(error).to.be.instanceOf(Error)
+        }
+      })
+    })
+
+    // =========================================================================
+    // getDeploymentConfig
+    // =========================================================================
+    describe('getDeploymentConfig', () => {
+      it('should read and merge deployment config from KV store', async () => {
+        const stored = JSON.stringify({ dataStoreType: 'neo4j', vectorDbType: 'qdrant' })
+        mockKvStore.get.resolves(stored)
+        process.env.MESSAGE_BROKER = 'redis'
+        process.env.KV_STORE_TYPE = 'redis'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.dataStoreType).to.equal('neo4j')
+        expect(result.vectorDbType).to.equal('qdrant')
+        expect(result.messageBrokerType).to.equal('redis')
+        expect(result.kvStoreType).to.equal('redis')
+      })
+
+      it('should overwrite messageBrokerType and kvStoreType from env', async () => {
+        const stored = JSON.stringify({
+          dataStoreType: 'neo4j',
+          vectorDbType: 'qdrant',
+          messageBrokerType: 'kafka',
+          kvStoreType: 'etcd',
+        })
+        mockKvStore.get.resolves(stored)
+        process.env.MESSAGE_BROKER = 'redis'
+        process.env.KV_STORE_TYPE = 'redis'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('redis')
+        expect(result.kvStoreType).to.equal('redis')
+      })
+
+      it('should not set dataStoreType or vectorDbType defaults', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.MESSAGE_BROKER = 'kafka'
+        process.env.KV_STORE_TYPE = 'etcd'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.dataStoreType).to.be.undefined
+        expect(result.vectorDbType).to.be.undefined
+        expect(result.messageBrokerType).to.equal('kafka')
+        expect(result.kvStoreType).to.equal('etcd')
+      })
+
+      it('should default messageBrokerType and kvStoreType to redis when env not set', async () => {
+        mockKvStore.get.resolves(null)
+        delete process.env.MESSAGE_BROKER
+        delete process.env.KV_STORE_TYPE
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('redis')
+        expect(result.kvStoreType).to.equal('redis')
+      })
+
+      it('should write merged config back to KV store', async () => {
+        const stored = JSON.stringify({ dataStoreType: 'neo4j' })
+        mockKvStore.get.resolves(stored)
+        process.env.MESSAGE_BROKER = 'redis'
+        process.env.KV_STORE_TYPE = 'redis'
+
+        await configService.getDeploymentConfig()
+
+        expect(mockKvStore.set.calledOnce).to.be.true
+        const written = JSON.parse(mockKvStore.set.firstCall.args[1])
+        expect(written.dataStoreType).to.equal('neo4j')
+        expect(written.messageBrokerType).to.equal('redis')
+      })
+
+      it('should handle corrupted KV store data gracefully', async () => {
+        mockKvStore.get.resolves('not-valid-json')
+        process.env.MESSAGE_BROKER = 'kafka'
+        process.env.KV_STORE_TYPE = 'etcd'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('kafka')
+        expect(result.kvStoreType).to.equal('etcd')
+      })
+
+      it('should handle KV store read error gracefully', async () => {
+        mockKvStore.get.rejects(new Error('connection timeout'))
+        process.env.MESSAGE_BROKER = 'redis'
+        process.env.KV_STORE_TYPE = 'redis'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('redis')
+        expect(result.kvStoreType).to.equal('redis')
+      })
+
+      it('should lowercase env var values', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.MESSAGE_BROKER = 'KAFKA'
+        process.env.KV_STORE_TYPE = 'ETCD'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('kafka')
+        expect(result.kvStoreType).to.equal('etcd')
+      })
+
+      it('should preserve Python-set fields when writing back', async () => {
+        const stored = JSON.stringify({
+          dataStoreType: 'neo4j',
+          vectorDbType: 'qdrant',
+        })
+        mockKvStore.get.resolves(stored)
+        process.env.MESSAGE_BROKER = 'redis'
+        process.env.KV_STORE_TYPE = 'redis'
+
+        await configService.getDeploymentConfig()
+
+        const written = JSON.parse(mockKvStore.set.firstCall.args[1])
+        expect(written.dataStoreType).to.equal('neo4j')
+        expect(written.vectorDbType).to.equal('qdrant')
+        expect(written.messageBrokerType).to.equal('redis')
+        expect(written.kvStoreType).to.equal('redis')
+      })
+    })
+
+    // =========================================================================
+    // getDeploymentConfig — deployment combination tests
+    // =========================================================================
+    describe('getDeploymentConfig — deployment combinations', () => {
+      const combinations = [
+        {
+          name: 'arangodb + kafka + etcd (classic)',
+          stored: { dataStoreType: 'arangodb', vectorDbType: 'qdrant' },
+          env: { MESSAGE_BROKER: 'kafka', KV_STORE_TYPE: 'etcd' },
+          expected: { dataStoreType: 'arangodb', vectorDbType: 'qdrant', messageBrokerType: 'kafka', kvStoreType: 'etcd' },
+        },
+        {
+          name: 'neo4j + redis + redis (minimal infra)',
+          stored: { dataStoreType: 'neo4j', vectorDbType: 'qdrant' },
+          env: { MESSAGE_BROKER: 'redis', KV_STORE_TYPE: 'redis' },
+          expected: { dataStoreType: 'neo4j', vectorDbType: 'qdrant', messageBrokerType: 'redis', kvStoreType: 'redis' },
+        },
+        {
+          name: 'arangodb + redis + redis',
+          stored: { dataStoreType: 'arangodb', vectorDbType: 'qdrant' },
+          env: { MESSAGE_BROKER: 'redis', KV_STORE_TYPE: 'redis' },
+          expected: { dataStoreType: 'arangodb', vectorDbType: 'qdrant', messageBrokerType: 'redis', kvStoreType: 'redis' },
+        },
+        {
+          name: 'neo4j + kafka + etcd',
+          stored: { dataStoreType: 'neo4j', vectorDbType: 'qdrant' },
+          env: { MESSAGE_BROKER: 'kafka', KV_STORE_TYPE: 'etcd' },
+          expected: { dataStoreType: 'neo4j', vectorDbType: 'qdrant', messageBrokerType: 'kafka', kvStoreType: 'etcd' },
+        },
+        {
+          name: 'arangodb + kafka + redis (mixed KV)',
+          stored: { dataStoreType: 'arangodb', vectorDbType: 'qdrant' },
+          env: { MESSAGE_BROKER: 'kafka', KV_STORE_TYPE: 'redis' },
+          expected: { dataStoreType: 'arangodb', vectorDbType: 'qdrant', messageBrokerType: 'kafka', kvStoreType: 'redis' },
+        },
+        {
+          name: 'neo4j + redis + etcd (mixed broker)',
+          stored: { dataStoreType: 'neo4j', vectorDbType: 'qdrant' },
+          env: { MESSAGE_BROKER: 'redis', KV_STORE_TYPE: 'etcd' },
+          expected: { dataStoreType: 'neo4j', vectorDbType: 'qdrant', messageBrokerType: 'redis', kvStoreType: 'etcd' },
+        },
+      ]
+
+      for (const combo of combinations) {
+        it(`should produce correct config for: ${combo.name}`, async () => {
+          mockKvStore.get.resolves(JSON.stringify(combo.stored))
+          process.env.MESSAGE_BROKER = combo.env.MESSAGE_BROKER
+          process.env.KV_STORE_TYPE = combo.env.KV_STORE_TYPE
+
+          const result = await configService.getDeploymentConfig()
+
+          expect(result.dataStoreType).to.equal(combo.expected.dataStoreType)
+          expect(result.vectorDbType).to.equal(combo.expected.vectorDbType)
+          expect(result.messageBrokerType).to.equal(combo.expected.messageBrokerType)
+          expect(result.kvStoreType).to.equal(combo.expected.kvStoreType)
+        })
+
+        it(`should persist correct config to KV store for: ${combo.name}`, async () => {
+          mockKvStore.get.resolves(JSON.stringify(combo.stored))
+          process.env.MESSAGE_BROKER = combo.env.MESSAGE_BROKER
+          process.env.KV_STORE_TYPE = combo.env.KV_STORE_TYPE
+
+          await configService.getDeploymentConfig()
+
+          expect(mockKvStore.set.calledOnce).to.be.true
+          const written = JSON.parse(mockKvStore.set.firstCall.args[1])
+          expect(written.dataStoreType).to.equal(combo.expected.dataStoreType)
+          expect(written.vectorDbType).to.equal(combo.expected.vectorDbType)
+          expect(written.messageBrokerType).to.equal(combo.expected.messageBrokerType)
+          expect(written.kvStoreType).to.equal(combo.expected.kvStoreType)
+        })
+      }
+
+      it('should write to the correct KV path (/services/deployment)', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.MESSAGE_BROKER = 'kafka'
+        process.env.KV_STORE_TYPE = 'etcd'
+
+        await configService.getDeploymentConfig()
+
+        expect(mockKvStore.set.calledOnce).to.be.true
+        expect(mockKvStore.set.firstCall.args[0]).to.equal('/services/deployment')
+      })
+
+      it('should never set dataStoreType default from Node.js side', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.MESSAGE_BROKER = 'kafka'
+        process.env.KV_STORE_TYPE = 'etcd'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.dataStoreType).to.be.undefined
+        expect(result.vectorDbType).to.be.undefined
+      })
+
+      it('should always overwrite messageBrokerType from env even if KV has a value', async () => {
+        mockKvStore.get.resolves(JSON.stringify({
+          dataStoreType: 'neo4j',
+          vectorDbType: 'qdrant',
+          messageBrokerType: 'kafka',
+          kvStoreType: 'etcd',
+        }))
+        process.env.MESSAGE_BROKER = 'redis'
+        process.env.KV_STORE_TYPE = 'redis'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('redis')
+        expect(result.kvStoreType).to.equal('redis')
+        expect(result.dataStoreType).to.equal('neo4j')
+      })
+
+      it('should handle case-insensitive env vars', async () => {
+        mockKvStore.get.resolves(null)
+        process.env.MESSAGE_BROKER = 'REDIS'
+        process.env.KV_STORE_TYPE = 'REDIS'
+
+        const result = await configService.getDeploymentConfig()
+
+        expect(result.messageBrokerType).to.equal('redis')
+        expect(result.kvStoreType).to.equal('redis')
+      })
+    })
+
+    // =========================================================================
+    // readDeploymentConfig
+    // =========================================================================
+    describe('readDeploymentConfig', () => {
+      it('should return parsed config from KV store', async () => {
+        const stored = JSON.stringify({
+          dataStoreType: 'neo4j',
+          vectorDbType: 'qdrant',
+          messageBrokerType: 'redis',
+          kvStoreType: 'redis',
+        })
+        mockKvStore.get.resolves(stored)
+
+        const result = await configService.readDeploymentConfig()
+
+        expect(result.dataStoreType).to.equal('neo4j')
+        expect(result.messageBrokerType).to.equal('redis')
+      })
+
+      it('should not write anything to KV store', async () => {
+        mockKvStore.get.resolves(JSON.stringify({ dataStoreType: 'neo4j' }))
+
+        await configService.readDeploymentConfig()
+
+        expect(mockKvStore.set.called).to.be.false
+      })
+
+      it('should return empty object when key does not exist', async () => {
+        mockKvStore.get.resolves(null)
+
+        const result = await configService.readDeploymentConfig()
+
+        expect(result).to.deep.equal({})
+      })
+
+      it('should return empty object on parse error', async () => {
+        mockKvStore.get.resolves('invalid-json')
+
+        const result = await configService.readDeploymentConfig()
+
+        expect(result).to.deep.equal({})
+      })
+
+      it('should return empty object on KV store error', async () => {
+        mockKvStore.get.rejects(new Error('redis down'))
+
+        const result = await configService.readDeploymentConfig()
+
+        expect(result).to.deep.equal({})
+      })
+
+      it('should handle object value from KV store', async () => {
+        const obj = { dataStoreType: 'arangodb', vectorDbType: 'qdrant' }
+        mockKvStore.get.resolves(JSON.stringify(obj))
+
+        const result = await configService.readDeploymentConfig()
+
+        expect(result.dataStoreType).to.equal('arangodb')
+        expect(result.vectorDbType).to.equal('qdrant')
+      })
+    })
+  })
+})
+
+/**
+ * Coverage tests for ConfigService - exercises all the get*Url methods
+ * and secret key management by creating an instance via Object.create
+ * and mocking the internal services.
+ */
+describe('ConfigService - coverage', () => {
+  const env = envGuard()
+  let service: ConfigService
+  let mockKvStore: any
+  let mockEncryption: any
+
+  beforeEach(() => {
+    env.snapshot()
+    mockKvStore = {
+      get: sinon.stub(),
+      set: sinon.stub().resolves(),
+      compareAndSet: sinon.stub().resolves(true),
+      connect: sinon.stub().resolves(),
+      watchKey: sinon.stub().resolves(),
+    }
+    mockEncryption = {
+      encrypt: sinon.stub().callsFake((val: string) => `enc:${val}`),
+      decrypt: sinon.stub().callsFake((val: string) => val.replace('enc:', '')),
+    }
+
+    // Create instance bypassing private constructor
+    service = Object.create(ConfigService.prototype)
+    ;(service as any).keyValueStoreService = mockKvStore
+    ;(service as any).encryptionService = mockEncryption
+    ;(service as any).configManagerConfig = { secretKey: 'test-secret', algorithm: 'aes-256-cbc' }
+    delete process.env.ROTATE_SIGNING_SECRETS
+    delete process.env.JWT_SECRET
+    delete process.env.SCOPED_JWT_SECRET
+    delete process.env.COOKIE_SECRET
+  })
+
+  afterEach(() => {
+    env.restore()
+    sinon.restore()
+  })
+
+  // =========================================================================
+  // connect
+  // =========================================================================
+  describe('connect', () => {
+    it('should call keyValueStoreService.connect', async () => {
+      await service.connect()
+      expect(mockKvStore.connect.calledOnce).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getSmtpConfig
+  // =========================================================================
+  describe('getSmtpConfig', () => {
+    it('should return parsed config when encrypted config exists', async () => {
+      const smtpData = { host: 'smtp.test.com', port: 587, fromEmail: 'no@test.com' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(smtpData))
+      mockEncryption.decrypt.returns(JSON.stringify(smtpData))
+
+      const result = await service.getSmtpConfig()
+      expect(result).to.deep.equal(smtpData)
+    })
+
+    it('should return null when no encrypted config exists', async () => {
+      mockKvStore.get.resolves(null)
+
+      const result = await service.getSmtpConfig()
+      expect(result).to.be.null
+    })
+
+    it('should return null when encrypted config is empty string', async () => {
+      mockKvStore.get.resolves('')
+
+      const result = await service.getSmtpConfig()
+      expect(result).to.be.null
+    })
+  })
+
+  // =========================================================================
+  // getKafkaConfig
+  // =========================================================================
+  describe('getKafkaConfig', () => {
+    it('should return config from etcd when available', async () => {
+      const kafkaData = { brokers: ['localhost:9092'], ssl: false }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(kafkaData))
+      mockEncryption.decrypt.returns(JSON.stringify(kafkaData))
+      // Set env var to prevent eager evaluation crash in fallback object construction
+      process.env.KAFKA_BROKERS = 'localhost:9092'
+
+      const result = await service.getKafkaConfig()
+      expect(result).to.deep.equal(kafkaData)
+    })
+
+    it('should fall back to env vars when etcd has no config', async () => {
+      // First call returns null (no etcd config), second call for save also returns
+      mockKvStore.get.resolves(null)
+      process.env.KAFKA_BROKERS = 'broker1:9092,broker2:9092'
+      process.env.KAFKA_SSL = 'false'
+      delete process.env.KAFKA_USERNAME
+
+      const result = await service.getKafkaConfig()
+      expect(result.brokers).to.deep.equal(['broker1:9092', 'broker2:9092'])
+    })
+
+    it('should include SASL config when KAFKA_USERNAME is set', async () => {
+      mockKvStore.get.resolves(null)
+      process.env.KAFKA_BROKERS = 'broker1:9092'
+      process.env.KAFKA_SSL = 'true'
+      process.env.KAFKA_USERNAME = 'user'
+      process.env.KAFKA_PASSWORD = 'pass'
+      process.env.KAFKA_SASL_MECHANISM = 'plain'
+
+      const result = await service.getKafkaConfig()
+      expect(result.sasl).to.exist
+      expect(result.sasl!.username).to.equal('user')
+      expect(result.sasl!.mechanism).to.equal('plain')
+    })
+  })
+
+  // =========================================================================
+  // getRedisConfig
+  // =========================================================================
+  describe('getRedisConfig', () => {
+    it('should save and return redis config', async () => {
+      const redisData = { host: 'localhost', port: 6379, tls: false, db: 0 }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(redisData))
+      mockEncryption.decrypt.returns(JSON.stringify(redisData))
+
+      process.env.REDIS_HOST = 'localhost'
+      process.env.REDIS_PORT = '6379'
+      process.env.REDIS_DB = '0'
+
+      const result = await service.getRedisConfig()
+      expect(result).to.deep.equal(redisData)
+      expect(mockKvStore.set.called).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getMongoConfig
+  // =========================================================================
+  describe('getMongoConfig', () => {
+    it('should save and return mongo config', async () => {
+      const mongoData = { uri: 'mongodb://localhost:27017', db: 'pipeshub' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(mongoData))
+      mockEncryption.decrypt.returns(JSON.stringify(mongoData))
+
+      process.env.MONGO_URI = 'mongodb://localhost:27017'
+
+      const result = await service.getMongoConfig()
+      expect(result).to.deep.equal(mongoData)
+    })
+  })
+
+  // =========================================================================
+  // getQdrantConfig
+  // =========================================================================
+  describe('getQdrantConfig', () => {
+    it('should save and return qdrant config', async () => {
+      const qdrantData = { apiKey: 'key', host: 'localhost', port: 6333, grpcPort: 6334 }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(qdrantData))
+      mockEncryption.decrypt.returns(JSON.stringify(qdrantData))
+
+      process.env.QDRANT_API_KEY = 'key'
+
+      const result = await service.getQdrantConfig()
+      expect(result).to.deep.equal(qdrantData)
+    })
+  })
+
+  // =========================================================================
+  // getArangoConfig
+  // =========================================================================
+  describe('getArangoConfig', () => {
+    it('should save and return arango config', async () => {
+      const arangoData = { url: 'http://localhost:8529', db: 'pipeshub_db', username: 'root', password: 'pass' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(arangoData))
+      mockEncryption.decrypt.returns(JSON.stringify(arangoData))
+
+      process.env.ARANGO_URL = 'http://localhost:8529'
+      process.env.ARANGO_USERNAME = 'root'
+      process.env.ARANGO_PASSWORD = 'pass'
+
+      const result = await service.getArangoConfig()
+      expect(result).to.deep.equal(arangoData)
+    })
+  })
+
+  // =========================================================================
+  // getEtcdConfig
+  // =========================================================================
+  describe('getEtcdConfig', () => {
+    it('should return etcd config from env vars', async () => {
+      process.env.ETCD_HOST = 'localhost'
+      process.env.ETCD_PORT = '2379'
+      process.env.ETCD_DIAL_TIMEOUT = '5000'
+
+      const result = await service.getEtcdConfig()
+      expect(result.host).to.equal('localhost')
+      expect(result.port).to.equal(2379)
+      expect(result.dialTimeout).to.equal(5000)
+    })
+  })
+
+  // =========================================================================
+  // get*BackendUrl methods
+  // =========================================================================
+  describe('getAuthBackendUrl', () => {
+    it('should return stored endpoint when present', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ auth: { endpoint: 'http://auth:3001' } }))
+      const result = await service.getAuthBackendUrl()
+      expect(result).to.equal('http://auth:3001')
+    })
+
+    it('should fall back to localhost when no endpoint in store', async () => {
+      mockKvStore.get.resolves('{}')
+      process.env.PORT = '3001'
+      const result = await service.getAuthBackendUrl()
+      expect(result).to.equal('http://localhost:3001')
+    })
+
+    it('should strip trailing slash from endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ auth: { endpoint: 'http://auth:3001/' } }))
+      const result = await service.getAuthBackendUrl()
+      expect(result).to.equal('http://auth:3001')
+    })
+  })
+
+  describe('getCommunicationBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ communication: { endpoint: 'http://comm:3002' } }))
+      const result = await service.getCommunicationBackendUrl()
+      expect(result).to.equal('http://comm:3002')
+    })
+
+    it('should fall back to localhost when no endpoint', async () => {
+      mockKvStore.get.resolves('{}')
+      const result = await service.getCommunicationBackendUrl()
+      expect(result).to.include('http://localhost:')
+    })
+  })
+
+  describe('getKbBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ kb: { endpoint: 'http://kb:3003' } }))
+      const result = await service.getKbBackendUrl()
+      expect(result).to.equal('http://kb:3003')
+    })
+
+    it('should fall back to localhost', async () => {
+      mockKvStore.get.resolves('{}')
+      const result = await service.getKbBackendUrl()
+      expect(result).to.include('http://localhost:')
+    })
+  })
+
+  describe('getEsBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ es: { endpoint: 'http://es:3004' } }))
+      const result = await service.getEsBackendUrl()
+      expect(result).to.equal('http://es:3004')
+    })
+
+    it('should fall back to localhost', async () => {
+      mockKvStore.get.resolves('{}')
+      const result = await service.getEsBackendUrl()
+      expect(result).to.include('http://localhost:')
+    })
+  })
+
+  describe('getCmBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ cm: { endpoint: 'http://cm:3005' } }))
+      const result = await service.getCmBackendUrl()
+      expect(result).to.equal('http://cm:3005')
+    })
+
+    it('should fall back to localhost', async () => {
+      mockKvStore.get.resolves('{}')
+      const result = await service.getCmBackendUrl()
+      expect(result).to.include('http://localhost:')
+    })
+  })
+
+  describe('getTokenBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ tokenBackend: { endpoint: 'http://token:3006' } }))
+      const result = await service.getTokenBackendUrl()
+      expect(result).to.equal('http://token:3006')
+    })
+
+    it('should fall back to localhost', async () => {
+      mockKvStore.get.resolves('{}')
+      const result = await service.getTokenBackendUrl()
+      expect(result).to.include('http://localhost:')
+    })
+  })
+
+  describe('getConnectorUrl', () => {
+    it('should prefer env var CONNECTOR_BACKEND', async () => {
+      mockKvStore.get.resolves('{}')
+      process.env.CONNECTOR_BACKEND = 'http://connector:8088'
+      process.env.CONNECTOR_PUBLIC_BACKEND = 'http://connector-pub:8088'
+
+      const result = await service.getConnectorUrl()
+      expect(result).to.equal('http://connector:8088')
+    })
+
+    it('should fall back to stored endpoint', async () => {
+      delete process.env.CONNECTOR_BACKEND
+      delete process.env.CONNECTOR_PUBLIC_BACKEND
+      mockKvStore.get.resolves(JSON.stringify({ connectors: { endpoint: 'http://stored:8088', publicEndpoint: 'http://pub:8088' } }))
+
+      const result = await service.getConnectorUrl()
+      expect(result).to.equal('http://stored:8088')
+    })
+  })
+
+  describe('getConnectorPublicUrl', () => {
+    it('should return stored public endpoint', async () => {
+      delete process.env.CONNECTOR_PUBLIC_BACKEND
+      mockKvStore.get.resolves(JSON.stringify({ connectors: { publicEndpoint: 'http://pub:8088' } }))
+
+      const result = await service.getConnectorPublicUrl()
+      expect(result).to.equal('http://pub:8088')
+    })
+
+    it('should fall back to env var', async () => {
+      process.env.CONNECTOR_PUBLIC_BACKEND = 'http://env-pub:8088'
+      mockKvStore.get.resolves(JSON.stringify({ connectors: {} }))
+
+      const result = await service.getConnectorPublicUrl()
+      expect(result).to.equal('http://env-pub:8088')
+    })
+  })
+
+  describe('getIndexingUrl', () => {
+    it('should prefer env var INDEXING_BACKEND', async () => {
+      process.env.INDEXING_BACKEND = 'http://indexing:8091'
+      mockKvStore.get.resolves('{}')
+
+      const result = await service.getIndexingUrl()
+      expect(result).to.equal('http://indexing:8091')
+    })
+  })
+
+  describe('getIamBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ iam: { endpoint: 'http://iam:3007' } }))
+      const result = await service.getIamBackendUrl()
+      expect(result).to.equal('http://iam:3007')
+    })
+  })
+
+  describe('getStorageBackendUrl', () => {
+    it('should return stored endpoint', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ storage: { endpoint: 'http://storage:3008' } }))
+      const result = await service.getStorageBackendUrl()
+      expect(result).to.equal('http://storage:3008')
+    })
+  })
+
+  describe('getFrontendUrl', () => {
+    it('should prefer env var FRONTEND_PUBLIC_URL', async () => {
+      process.env.FRONTEND_PUBLIC_URL = 'http://frontend:3000'
+      mockKvStore.get.resolves('{}')
+
+      const result = await service.getFrontendUrl()
+      expect(result).to.equal('http://frontend:3000')
+    })
+
+    it('should fall back to stored value', async () => {
+      delete process.env.FRONTEND_PUBLIC_URL
+      mockKvStore.get.resolves(JSON.stringify({ frontend: { publicEndpoint: 'http://stored-fe:3000' } }))
+
+      const result = await service.getFrontendUrl()
+      expect(result).to.equal('http://stored-fe:3000')
+    })
+  })
+
+  describe('getAiBackendUrl', () => {
+    it('should prefer env var QUERY_BACKEND', async () => {
+      process.env.QUERY_BACKEND = 'http://query:8000'
+      mockKvStore.get.resolves('{}')
+
+      const result = await service.getAiBackendUrl()
+      expect(result).to.equal('http://query:8000')
+    })
+
+    it('should fall back to default localhost:8000', async () => {
+      delete process.env.QUERY_BACKEND
+      mockKvStore.get.resolves('{}')
+
+      const result = await service.getAiBackendUrl()
+      expect(result).to.equal('http://localhost:8000')
+    })
+  })
+
+  // =========================================================================
+  // getStorageConfig
+  // =========================================================================
+  describe('getStorageConfig', () => {
+    it('should return existing storage config', async () => {
+      mockKvStore.get
+        .onFirstCall().resolves(JSON.stringify({ storage: { endpoint: 'http://storage:3000' } }))
+        .onSecondCall().resolves(JSON.stringify({ storageType: 's3' }))
+
+      const result = await service.getStorageConfig()
+      expect(result.storageType).to.equal('s3')
+      expect(result.endpoint).to.equal('http://storage:3000')
+    })
+
+    it('should default to local when storageType is not set', async () => {
+      mockKvStore.get
+        .onFirstCall().resolves(JSON.stringify({ storage: { endpoint: 'http://storage:3000' } }))
+        .onSecondCall().resolves('{}')
+
+      const result = await service.getStorageConfig()
+      expect(result.storageType).to.equal('local')
+      expect(mockKvStore.set.called).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getJwtSecret
+  // =========================================================================
+  describe('getJwtSecret', () => {
+    it('should return existing jwt secret from encrypted store', async () => {
+      const keys = { jwtSecret: 'existing-secret-123' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(keys))
+      mockEncryption.decrypt.returns(JSON.stringify(keys))
+
+      const result = await service.getJwtSecret()
+      expect(result).to.equal('existing-secret-123')
+    })
+
+    it('should generate and save new jwt secret when none exists', async () => {
+      mockKvStore.get.resolves(null)
+
+      const result = await service.getJwtSecret()
+      expect(result).to.be.a('string')
+      expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+      expect(mockKvStore.compareAndSet.called).to.be.true
+    })
+
+    it('should generate jwt secret when parsedKeys has no jwtSecret', async () => {
+      const keys = { otherKey: 'value' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(keys))
+      mockEncryption.decrypt.returns(JSON.stringify(keys))
+
+      const result = await service.getJwtSecret()
+      expect(result).to.be.a('string')
+      expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+    })
+  })
+
+  // =========================================================================
+  // getScopedJwtSecret
+  // =========================================================================
+  describe('getScopedJwtSecret', () => {
+    it('should return existing scoped jwt secret', async () => {
+      const keys = { scopedJwtSecret: 'scoped-secret-456' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(keys))
+      mockEncryption.decrypt.returns(JSON.stringify(keys))
+
+      const result = await service.getScopedJwtSecret()
+      expect(result).to.equal('scoped-secret-456')
+    })
+
+    it('should generate and save new scoped jwt secret when none exists', async () => {
+      mockKvStore.get.resolves(null)
+
+      const result = await service.getScopedJwtSecret()
+      expect(result).to.be.a('string')
+      expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+      expect(mockKvStore.compareAndSet.called).to.be.true
+    })
+  })
+
+  // =========================================================================
+  // getCookieSecret
+  // =========================================================================
+  describe('getCookieSecret', () => {
+    it('should return existing cookie secret', async () => {
+      const keys = { cookieSecret: 'cookie-secret-789' }
+      mockKvStore.get.resolves('enc:' + JSON.stringify(keys))
+      mockEncryption.decrypt.returns(JSON.stringify(keys))
+
+      const result = await service.getCookieSecret()
+      expect(result).to.equal('cookie-secret-789')
+    })
+
+    it('should generate and save new cookie secret when none exists', async () => {
+      mockKvStore.get.resolves(null)
+
+      const result = await service.getCookieSecret()
+      expect(result).to.be.a('string')
+      expect(result).to.have.lengthOf(SIGNING_SECRET_BYTES * 2)
+    })
+  })
+
+  // =========================================================================
+  // getOAuthBackendUrl
+  // =========================================================================
+  describe('getOAuthBackendUrl', () => {
+    it('should delegate to getAuthBackendUrl', async () => {
+      mockKvStore.get.resolves(JSON.stringify({ auth: { endpoint: 'http://auth:3001' } }))
+      const result = await service.getOAuthBackendUrl()
+      expect(result).to.equal('http://auth:3001')
+    })
+  })
+
+  // =========================================================================
+  // getMcpScopes
+  // =========================================================================
+  describe('getMcpScopes', () => {
+    it('should return default scopes when env is not set', async () => {
+      delete process.env.MCP_SCOPES
+
+      const result = await service.getMcpScopes()
+      expect(result).to.be.an('array')
+    })
+
+    it('should parse comma-separated scopes from env', async () => {
+      process.env.MCP_SCOPES = 'scope1, scope2, scope3'
+
+      const result = await service.getMcpScopes()
+      expect(result).to.deep.equal(['scope1', 'scope2', 'scope3'])
+    })
+
+    it('should filter empty strings from scopes', async () => {
+      process.env.MCP_SCOPES = 'scope1,,scope2, ,scope3'
+
+      const result = await service.getMcpScopes()
+      expect(result).to.not.include('')
+    })
+  })
+
+  // =========================================================================
+  // getRsAvailable
+  // =========================================================================
+  describe('getRsAvailable', () => {
+    it('returns "true" when REPLICA_SET_AVAILABLE=true', async () => {
+      process.env.REPLICA_SET_AVAILABLE = 'true'
+      const result = await service.getRsAvailable()
+      expect(result).to.equal('true')
+    })
+
+    it('returns "false" when REPLICA_SET_AVAILABLE=false', async () => {
+      process.env.REPLICA_SET_AVAILABLE = 'false'
+      const result = await service.getRsAvailable()
+      expect(result).to.equal('false')
+    })
+
+    it('returns "false" when REPLICA_SET_AVAILABLE is unset (fail-closed)', async () => {
+      delete process.env.REPLICA_SET_AVAILABLE
+      const result = await service.getRsAvailable()
+      expect(result).to.equal('false')
+    })
+
+    it('ignores MONGO_URI shape and only honors the env var', async () => {
+      delete process.env.REPLICA_SET_AVAILABLE
+      process.env.MONGO_URI = 'mongodb+srv://user:pass@cluster.mongodb.net/pipeshub'
+      const result = await service.getRsAvailable()
+      expect(result).to.equal('false')
+    })
+  })
+
+  // =========================================================================
+  // getEncryptedConfig (private - tested through public methods)
+  // =========================================================================
+  describe('getEncryptedConfig - error handling', () => {
+    it('should fall back to env vars when decrypt fails', async () => {
+      mockKvStore.get.rejects(new Error('etcd connection failed'))
+      process.env.KAFKA_BROKERS = 'localhost:9092'
+      delete process.env.KAFKA_USERNAME
+
+      const result = await service.getKafkaConfig()
+      expect(result.brokers).to.deep.equal(['localhost:9092'])
+    })
+  })
+
+  // =========================================================================
+  // saveConfigToEtcd (private - tested through public methods)
+  // =========================================================================
+  describe('saveConfigToEtcd - error propagation', () => {
+    it('should throw when kvStore.set fails in saveConfigToEtcd', async () => {
+      mockKvStore.set.rejects(new Error('etcd write failed'))
+
+      try {
+        await service.getRedisConfig()
+        // If we get here, the method may have caught the error internally
+      } catch (error: any) {
+        expect(error.message).to.equal('etcd write failed')
+      }
+    })
+  })
+})

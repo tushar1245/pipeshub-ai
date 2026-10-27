@@ -1,0 +1,144 @@
+import { InternalServerError } from "../errors/http.errors";
+import {
+  injectRequestHeaders,
+  HEADER_REQUEST_ID,
+} from "../context/request-context";
+
+export interface ICommand<T> {
+  execute(): Promise<T>;
+}
+
+export abstract class BaseCommand<T> implements ICommand<T> {
+  protected uri: string;
+  protected queryParams?: Record<string, string | number | boolean>;
+  protected headers: Record<string, string>;
+
+  constructor(
+    uri: string,
+    queryParams?: Record<string, string | number | boolean>,
+    headers?: Record<string, string>,
+  ) {
+    this.uri = uri;
+    this.queryParams = queryParams;
+    this.headers = headers || {};
+  }
+
+  /**
+   * Build the full URL including query parameters, with SSRF validation.
+   *
+   * User-controlled path segments (e.g. `agentKey`, `conversationId`) are
+   * interpolated into the URI string by callers.  This method validates the
+   * result before it reaches `fetch()`:
+   *
+   *  - Must be a valid, absolute URL (`new URL()` will throw otherwise).
+   *  - Protocol must be `http:` or `https:`.
+   *  - Must not contain embedded credentials (blocks `http://x@evil.com/` tricks).
+   */
+  protected buildUrl(): string {
+    let raw = this.uri;
+    if (this.queryParams) {
+      const queryString = new URLSearchParams(
+        Object.entries(this.queryParams).reduce<Record<string, string>>(
+          (acc, [key, value]) => {
+            acc[key] = String(value);
+            return acc;
+          },
+          {},
+        ),
+      ).toString();
+      raw = `${this.uri}?${queryString}`;
+    }
+
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new InternalServerError(
+        `Blocked request with disallowed protocol: ${parsed.protocol}`,
+      );
+    }
+    if (parsed.username || parsed.password) {
+      throw new InternalServerError(
+        'Blocked request: URL must not contain embedded credentials',
+      );
+    }
+    return parsed.href;
+  }
+
+  protected sanitizeBody(body: any): any {
+    // Check if it's a FormData object by looking for typical FormData properties
+    if (
+      body &&
+      typeof body === 'object' &&
+      body._boundary
+    ) {
+      return body;
+    }
+    return typeof body === 'string' ? body : JSON.stringify(body);
+  }
+
+  protected sanitizeHeaders(
+    headers: Record<string, string>,
+  ): Record<string, string> {
+    // Propagate the trace id onto every outbound service call.
+    headers = injectRequestHeaders(headers);
+    // Define allowed headers in lowercase.
+    const allowedHeaders = new Set([
+      'content-type',
+      'authorization',
+      HEADER_REQUEST_ID,
+      'client-name'
+    ]);
+    // Normalize to lowercase keys so case-variants (e.g. content-type from
+    // Express + Content-Type from the caller) collapse to one entry. fetch
+    // otherwise emits "application/json, application/json", which FastAPI
+    // does not treat as JSON and then fails Pydantic body parsing with
+    // model_attributes_type.
+    const normalized: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      const lower = key.toLowerCase();
+      if (allowedHeaders.has(lower) && value !== undefined && value !== null) {
+        normalized[lower] = String(value);
+      }
+    }
+    if (!normalized['content-type']) {
+      normalized['content-type'] = 'application/json';
+    }
+    return normalized;
+  }
+
+  /**
+   * Retry helper method using exponential backoff.
+   * @param fn - A function returning a promise to retry.
+   * @param retries - Number of retries (default is 3).
+   * @param backoff - Initial backoff delay in milliseconds (default is 300ms).
+   */
+  protected async fetchWithRetry<T>(
+    fn: () => Promise<T>,
+    retries: number = 3,
+    backoff: number = 300,
+    shouldRetry: (error: unknown) => boolean = () => true,
+  ): Promise<T> {
+    let attempt = 0;
+    while (attempt < retries) {
+      try {
+        const response = await fn();
+        return response;
+      } catch (error) {
+        // A caller that aborted a request is not waiting for another try.
+        if ((error as { name?: string } | null)?.name === 'AbortError') {
+          throw error;
+        }
+        attempt++;
+        if (attempt >= retries || !shouldRetry(error)) {
+          throw error;
+        }
+        // Calculate exponential backoff delay.
+        const delay = backoff * Math.pow(2, attempt);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    // Should never reach here.
+    throw new InternalServerError('Unexpected error in retry logic.');
+  }
+
+  public abstract execute(): Promise<T>;
+}

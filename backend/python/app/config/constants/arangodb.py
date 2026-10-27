@@ -1,0 +1,861 @@
+from enum import Enum
+
+
+class DepartmentNames(Enum):
+    LEGAL = "Legal"
+    COMPLIANCE_RISK = "Compliance/Risk Management"
+    IT_SECURITY = "IT & Security"
+    PRODUCT_MANAGEMENT = "Product Management"
+    SALES = "Sales"
+    ENGINEERING = "Engineering/Technology"
+    HR = "Human Resources"
+    PROCUREMENT = "Procurement"
+    FINANCE = "Finance"
+    OPERATIONS = "Operations"
+    RND = "Research and Development"
+    EXECUTIVE = "Executive Leadership"
+    QA = "Quality Assurance"
+    DEVOPS = "Devops/Site Reliability Engineering"
+    LEGAL_PATENT = "Legal/Patent Management"
+    FACILITIES_ADMIN = "Facilities / Administration"
+    DATA_ANALYTICS = "Data Analytics / Insights"
+    BUSINESS_DEV = "Business Development / Partnerships"
+    ESG = "Environmental, Social, and Governance"
+    TRAINING = "Training and Enablement"
+    MARKETING = "Marketing"
+    INVESTOR_RELATIONS = "Investor Relations"
+    CUSTOMER_SUCCESS = "Customer Success"
+    OTHERS = "Others"
+
+
+class Connectors(Enum):
+    GOOGLE_DRIVE = "DRIVE"
+    GOOGLE_DRIVE_WORKSPACE = "DRIVE WORKSPACE"
+    GOOGLE_MAIL = "GMAIL"
+    GOOGLE_MAIL_WORKSPACE = "GMAIL WORKSPACE"
+    GOOGLE_CALENDAR = "CALENDAR"
+
+    ONEDRIVE = "ONEDRIVE"
+    SHAREPOINT_ONLINE = "SHAREPOINT ONLINE"
+    OUTLOOK = "OUTLOOK"
+    OUTLOOK_INDIVIDUAL = "OUTLOOK PERSONAL"
+    OUTLOOK_CALENDAR = "OUTLOOK CALENDAR"
+    MICROSOFT_TEAMS = "MICROSOFT TEAMS"
+
+    NOTION = "NOTION"
+    NOTION_PERSONAL = "NOTION PERSONAL"
+    SLACK = "SLACK"
+    SLACK_WORKSPACE = "SLACK WORKSPACE"
+
+    KNOWLEDGE_BASE = "KB"
+
+    CONFLUENCE = "CONFLUENCE"
+    CONFLUENCE_DATA_CENTER = "CONFLUENCE DATA CENTER"
+    CONFLUENCE_DATA_CENTER_PERSONAL = "CONFLUENCE DATA CENTER PERSONAL"
+    JIRA = "JIRA"
+    JIRA_PERSONAL = "JIRA PERSONAL"
+    JIRA_CLOUD_PERSONAL = "JIRA CLOUD PERSONAL"
+    JIRA_DATA_CENTER = "JIRA DATA CENTER"
+    JIRA_DATA_CENTER_PERSONAL = "JIRA DATA CENTER PERSONAL"
+    BOX = "BOX"
+    NEXTCLOUD = "NEXTCLOUD"
+    DROPBOX = "DROPBOX"
+    DROPBOX_PERSONAL = "DROPBOX PERSONAL"
+    WEB = "WEB"
+    BOOKSTACK = "BOOKSTACK"
+    DRUPAL_WIKI = "DRUPAL WIKI"
+    GITHUB = "GITHUB"
+    GITHUB_TEAMS = "GITHUB TEAMS"
+    SERVICENOW = "SERVICENOW"
+    SALESFORCE = "SALESFORCE"
+    S3 = "S3"
+    MINIO = "MINIO"
+    GCS = "GCS"
+    AZURE_BLOB = "AZURE BLOB"
+    AZURE_FILES = "AZURE FILES"
+    LINEAR = "LINEAR"
+    ZAMMAD = "ZAMMAD"
+    ZENDESK = "ZENDESK"
+    ZOOM = "ZOOM"
+
+    GITLAB = "GITLAB"
+    GITLAB_PERSONAL = "GITLAB PERSONAL"
+    SNOWFLAKE = "SNOWFLAKE"
+    POSTGRESQL = "POSTGRESQL"
+    MARIADB = "MARIADB"
+
+    UNKNOWN = "UNKNOWN"
+
+    RSS = "RSS"
+    LOCAL_FS = "LOCAL_FS"
+    DEMO = "DEMO"
+    SMB = "SMB"
+    CIFS = "CIFS"
+
+    CODING_SANDBOX = "CODING_SANDBOX"
+    DATABASE_SANDBOX = "DATABASE_SANDBOX"
+    IMAGE_GENERATION = "IMAGE_GENERATION"
+    ATTACHMENTS = "ATTACHMENTS"
+
+
+class PermissionModel(Enum):
+    """How a record derives its per-user visibility, declared on its container.
+
+    ``APP_LEVEL``: reaching the app implies reaching every record it syncs.
+    ``RECORD_LEVEL``: the source has real per-record ACLs. Both are declared per
+    connector; ``RECORD_LEVEL`` is the default, since assuming per-record ACLs
+    can only under-share.
+
+    ``RECORD_GROUP_LEVEL`` is set on a RecordGroup, not a connector, and lets
+    search skip the per-record check for records in that group. Only safe when
+    every record under the group really inherits from it: ``recordGroupIds`` is
+    built from ``belongsTo`` (always written) while inheritance follows
+    ``INHERIT_PERMISSIONS`` (conditional), so one ``inherit_permissions=False``
+    record in the group makes it over-share. Leave unset to verify each record.
+    """
+
+    APP_LEVEL = "APP_LEVEL"
+    RECORD_LEVEL = "RECORD_LEVEL"
+    RECORD_GROUP_LEVEL = "RECORD_GROUP_LEVEL"
+
+
+class AccessRule(Enum):
+    """How a node's own permissions combine with its ancestors'.
+
+    ``OPEN``: inheritance from an accessible parent, or a direct grant, is
+    enough — nothing above the parent is consulted.
+    ``STRICT``: every ancestor up to the App must be accessible as well.
+    ``RESTRICTED``: implies strict, and inheritance alone is not sufficient —
+    the node's own grant is required on top of it.
+
+    A missing value reads as ``OPEN`` (a connector that declares nothing gets
+    the permissive reading), but an *unrecognised* value reads as
+    ``RESTRICTED``, so corruption or a foreign writer fails closed rather than
+    exposing a node.
+    """
+
+    OPEN = "OPEN"
+    STRICT = "STRICT"
+    RESTRICTED = "RESTRICTED"
+
+
+class AppGroups(Enum):
+    GOOGLE_WORKSPACE = "Google Workspace"
+    NOTION = "Notion"
+    ATLASSIAN = "Atlassian"
+    MICROSOFT = "Microsoft"
+    DROPBOX = "Dropbox"
+    BOX = "Box"
+    SERVICENOW = "Servicenow"
+    SALESFORCE = "Salesforce"
+    NEXTCLOUD = "Nextcloud"
+    WEB = "Web"
+    BOOKSTACK = "BookStack"
+    DRUPAL_WIKI = "Drupal Wiki"
+    GITHUB = "Github"
+    S3 = "S3"
+    MINIO = "MinIO"
+    GOOGLE_CLOUD = "Google Cloud"
+    AZURE = "Azure"
+    LINEAR = "Linear"
+    SLACK = "Slack"
+    ZAMMAD = "Zammad"
+    ZENDESK = "Zendesk"
+    ZOOM = "Zoom"
+    LOCAL_STORAGE = "Local Storage"
+    DEMO = "Demo"
+    RSS = "RSS"
+    GITLAB = "GitLab"
+
+    SNOWFLAKE = "Snowflake"
+    POSTGRESQL = "PostgreSQL"
+    MARIADB = "MariaDB"
+    SMB = "SMB"
+    CIFS = "CIFS"
+
+class OriginTypes(Enum):
+    CONNECTOR = "CONNECTOR"
+    UPLOAD = "UPLOAD"
+
+
+class LegacyCollectionNames(Enum):
+    KNOWLEDGE_BASE = "knowledgeBase"
+    PERMISSIONS_TO_KNOWLEDGE_BASE = "permissionsToKnowledgeBase"
+    BELONGS_TO_KNOWLEDGE_BASE = "belongsToKnowledgeBase"
+    BELONGS_TO_KB = "belongsToKB"
+    PERMISSIONS = "permissions"
+    PERMISSIONS_TO_KB = "permissionsToKB"
+
+
+class LegacyGraphNames(Enum):
+    FILE_ACCESS_GRAPH = "fileAccessGraph"
+
+
+class GraphNames(Enum):
+    KNOWLEDGE_GRAPH = "knowledgeGraph"
+
+
+class CollectionNames(Enum):
+    # Records and Record relations
+    RECORDS = "records"
+    NODE_RELATIONS = "nodeRelations"
+    # Links between records (BLOCKS, FOREIGN_KEY, SIBLING, ...), apart from the
+    # hierarchy. Shared code addresses them through NODE_RELATIONS.
+    RECORD_LINKS = "recordLinks"
+    RECORD_GROUPS = "recordGroups"
+    SYNC_POINTS = "syncPoints"
+    INHERIT_PERMISSIONS = "inheritPermissions"
+
+    # Knowledge base
+    IS_OF_TYPE = "isOfType"
+    PERMISSION = "permission"
+
+    # Drive related
+    DRIVES = "drives"
+    USER_DRIVE_RELATION = "userDriveRelation"
+
+    # Record types
+    FILES = "files"
+    LINKS = "links"
+    MAILS = "mails"
+    MESSAGES = "messages"
+    WEBPAGES = "webpages"
+    COMMENTS = "comments"
+    TICKETS = "tickets"
+    ENTITY_RELATIONS = "entityRelations"
+    PROJECTS = "projects"
+    PULLREQUESTS = "prs"
+    MEETINGS = "meetings"
+    PRODUCTS = "products"
+    DEALS = "deals"
+    ARTIFACTS = "artifacts"
+    CODE_FILES = "codeFiles"
+    SQL_TABLES = "sqlTables"
+    SQL_VIEWS = "sqlViews"
+
+    # Users and groups
+    PEOPLE = "person"
+    USERS = "users"
+    GROUPS = "groups"
+    ROLES = "roles"
+    ORGS = "organizations"
+    # No grant type writes these nodes; kept for the queries that still read them.
+    ANYONE = "anyone"
+    BELONGS_TO = "belongsTo"
+    TEAMS = "teams"
+
+    # Departments
+    DEPARTMENTS = "departments"
+    BELONGS_TO_DEPARTMENT = "belongsToDepartment"
+    CATEGORIES = "categories"
+    BELONGS_TO_CATEGORY = "belongsToCategory"
+    LANGUAGES = "languages"
+    BELONGS_TO_LANGUAGE = "belongsToLanguage"
+    TOPICS = "topics"
+    BELONGS_TO_TOPIC = "belongsToTopic"
+    NAMED_ENTITIES = "namedEntities"
+    MENTIONS_ENTITY = "mentionsEntity"
+    VALUE_MENTIONS = "valueMentions"
+    NAMED_ENTITY_PERSIST_RETRIES = "namedEntityPersistRetries"
+    SUBCATEGORIES1 = "subcategories1"
+    SUBCATEGORIES2 = "subcategories2"
+    SUBCATEGORIES3 = "subcategories3"
+    INTER_CATEGORY_RELATIONS = "interCategoryRelations"
+
+    # Other
+    CHANNEL_HISTORY = "channelHistory"
+    PAGE_TOKENS = "pageTokens"
+
+    APPS = "apps"
+    ORG_APP_RELATION = "orgAppRelation"
+    USER_APP_RELATION = "userAppRelation"
+    AUTHENTICATED_AS = "authenticatedAs"  # User -> User: connector creator -> source account it authenticated as, per connectorId
+    ORG_DEPARTMENT_RELATION = "orgDepartmentRelation"
+    PROSPECT = "prospect"  # Org -> Org: prospect/account relationship
+    CUSTOMER = "customer"  # Org -> Org: customer relationship
+    LEAD = "lead"  # Org -> Person: lead (until converted to contact)
+    CONTACT = "contact"  # Org -> Person: contact relationship
+    DEAL_INFO = "dealInfo"  # Org -> Deal: opportunity/deal relationship
+    DEAL_OF = "dealOf"  # Deal -> Org: deal belongs to organization
+    SOLD_IN = "soldIn"  # Product -> Deal: lineItems [{quantity, unitPrice}, ...] per product–deal
+    MEMBER_OF = "memberOf"  # Person -> Org: membership with Title, Department
+
+    BLOCKS = "blocks"
+
+    # WEBPAGE_RECORD="webpageRecord"
+    # WEBPAGE_COMMENT_RECORD="webpageCommentRecord"
+
+    # NOTION_DATABASE_RECORD="notionDatabaseRecord"
+    BELONGS_TO_RECORD_GROUP = "belongsToRecordGroup"
+
+    # Storage mappings
+    VIRTUAL_RECORD_TO_DOC_ID_MAPPING = "virtualRecordToDocIdMapping"
+    STAGE_STATES = "stageStates"
+    # Agent Builder collections
+    AGENT_TEMPLATES = "agentTemplates"
+    AGENT_INSTANCES = "agentInstances"
+
+    # Agent Builder Graph collections
+    AGENT_KNOWLEDGE = "agentKnowledge"
+    AGENT_TOOLSETS = "agentToolsets"
+    AGENT_TOOLS = "agentTools"
+    AGENT_MCP_SERVERS = "agentMcpServers"
+
+    # Agent Builder Graph edges
+    AGENT_HAS_KNOWLEDGE = "agentHasKnowledge"
+    AGENT_HAS_TOOLSET = "agentHasToolset"
+    TOOLSET_HAS_TOOL = "toolsetHasTool"
+    AGENT_HAS_MCP_SERVER = "agentHasMcpServer"
+    MCP_SERVER_HAS_TOOL = "mcpServerHasTool"
+
+    # Agent Skills collections (agent_loop_lib SkillManager — GraphSkillStore)
+    AGENT_SKILLS = "agentSkills"
+    AGENT_SKILL_VERSIONS = "agentSkillVersions"
+    AGENT_SKILL_CANDIDATES = "agentSkillCandidates"
+
+    # Agent Skills Graph edge — skill-to-skill connectedness (related/requires/replaced_by)
+    AGENT_SKILL_RELATION = "agentSkillRelation"
+
+    # Agent -> Skill assignment edge (Agent Builder), mirrors AGENT_HAS_TOOLSET
+    AGENT_HAS_SKILL = "agentHasSkill"
+
+
+class QdrantCollectionNames(Enum):
+    RECORDS = "records"
+    ENTITIES = "entities"
+
+
+class ExtensionTypes(Enum):
+    PDF = "pdf"
+    DOCX = "docx"
+    DOC = "doc"
+    PPTX = "pptx"
+    PPT = "ppt"
+    XLSX = "xlsx"
+    XLS = "xls"
+    CSV = "csv"
+    TSV = "tsv"
+    TXT = "txt"
+    MD = "md"
+    MDX = "mdx"
+    HTML = "html"
+    PNG = "png"
+    JPG = "jpg"
+    JPEG = "jpeg"
+    WEBP = "webp"
+    SVG = "svg"
+    HEIC = "heic"
+    HEIF = "heif"
+    EPUB = "epub"
+    SQL_TABLE = "sql_table"
+    SQL_VIEW = "sql_view"
+    # Registry key for the tree-sitter code parser; not a file extension.
+    CODE = "code"
+    PY = "py"
+    JS = "js"
+    JSX = "jsx"
+    MJS = "mjs"
+    CJS = "cjs"
+    TS = "ts"
+    TSX = "tsx"
+    JAVA = "java"
+    C = "c"
+    H = "h"
+    CPP = "cpp"
+    CC = "cc"
+    CXX = "cxx"
+    HPP = "hpp"
+    HXX = "hxx"
+    CS = "cs"
+    GO = "go"
+    RS = "rs"
+    RB = "rb"
+    PHP = "php"
+    SWIFT = "swift"
+    KT = "kt"
+    KTS = "kts"
+    DART = "dart"
+    SH = "sh"
+    BASH = "bash"
+    PYI = "pyi"
+    MTS = "mts"
+    CTS = "cts"
+    SCALA = "scala"
+    GROOVY = "groovy"
+    GRADLE = "gradle"
+    LUA = "lua"
+    HTM = "htm"
+    BLOCKS = "blocks"
+    JSON = "json"
+    YAML = "yaml"
+    YML = "yml"
+
+# Common file types PipesHub cannot index. Sync filters offer them so a user can
+# exclude them (Not in); they are kept out of ExtensionTypes because that enum
+# lists the types that can be indexed.
+EXCLUDABLE_FILE_EXTENSIONS: tuple[str, ...] = (
+    # archives
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz",
+    # databases
+    "db", "sqlite", "sqlite3", "mdb", "accdb",
+    # executables and installers
+    "exe", "dll", "msi", "bin", "iso", "dmg", "apk", "jar",
+    # temporary and backup files
+    "tmp", "bak", "swp", "lock",
+    # logs
+    "log",
+    # video and audio
+    "mp4", "mov", "avi", "mkv", "webm", "wmv",
+    "mp3", "wav", "flac", "m4a", "aac", "ogg",
+)
+
+class MimeTypes(Enum):
+    PDF = "application/pdf"
+    GMAIL = "text/gmail_content"
+    GOOGLE_SLIDES = "application/vnd.google-apps.presentation"
+    GOOGLE_DOCS = "application/vnd.google-apps.document"
+    GOOGLE_SHEETS = "application/vnd.google-apps.spreadsheet"
+    GOOGLE_DRIVE_FOLDER = "application/vnd.google-apps.folder"
+    FOLDER = "text/directory"
+    DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    DOC = "application/msword"
+    PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    PPT = "application/vnd.ms-powerpoint"
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    XLS = "application/vnd.ms-excel"
+    CSV = "text/csv"
+    TSV = "text/tab-separated-values"
+    BIN = "application/octet-stream"
+    NOTION_TEXT = "notion/text"
+    NOTION_PAGE_COMMENT_TEXT = "notion/pageCommentText"
+    HTML = "text/html"
+    PLAIN_TEXT = "text/plain"
+    MARKDOWN = "text/markdown"
+    MDX = "text/mdx"
+    GENESIS_32X_ROM = "application/x-genesis-32x-rom"
+    JSON = "application/json"
+    BLOCKS = "application/blocks"
+    XML = "application/xml"
+    YAML = "application/yaml"
+    UNKNOWN = "application/unknown"
+    PNG = "image/png"
+    JPG = "image/jpg"
+    JPEG = "image/jpeg"
+    WEBP = "image/webp"
+    SVG = "image/svg+xml"
+    HEIC = "image/heic"
+    HEIF = "image/heif"
+    ZIP = "application/zip"
+    GIF = "image/gif"
+    EPUB = "application/epub+zip"
+    PYTHON = "text/x-python"
+    PYTHON_SCRIPT = "text/x-python-script"
+    PYTHON_SCRIPT_X = "text/x-script.python"
+    JAVA_SOURCE = "text/x-java-source"
+    C_SOURCE = "text/x-c"
+    CPP = "text/x-c++"
+    PHP = "text/x-php"
+    JAVASCRIPT = "application/javascript"
+    JAVASCRIPT_TEXT = "text/javascript"
+    TYPESCRIPT = "application/typescript"
+    CSHARP = "text/x-csharp"
+    GO = "text/x-go"
+    RUST = "text/x-rust"
+    RUBY = "text/x-ruby"
+    SWIFT = "text/x-swift"
+    KOTLIN = "text/x-kotlin"
+    DART = "application/dart"
+    SHELL = "application/x-sh"
+    SHELL_TEXT = "text/x-sh"
+    SHELLSCRIPT = "text/x-shellscript"
+    SQL_TABLE = "application/vnd.sql.table"  
+    SQL_VIEW = "application/vnd.sql.view"  
+
+# Every mimeType a folder record has been written with. Folders are written as
+# MimeTypes.FOLDER only; readers accept the older values too, so a folder the
+# startup migration has not rewritten yet still reads as a folder.
+FOLDER_MIME_TYPES = [
+    MimeTypes.FOLDER.value,
+    "application/vnd.folder",  # older collection folders
+    MimeTypes.GOOGLE_DRIVE_FOLDER.value,  # older Google Drive folders
+]
+
+CODE_FILE_MIME_TYPE_VALUES = frozenset({
+    MimeTypes.PYTHON.value,
+    MimeTypes.PYTHON_SCRIPT.value,
+    MimeTypes.PYTHON_SCRIPT_X.value,
+    MimeTypes.JAVA_SOURCE.value,
+    MimeTypes.C_SOURCE.value,
+    MimeTypes.CPP.value,
+    MimeTypes.PHP.value,
+    MimeTypes.JAVASCRIPT.value,
+    MimeTypes.JAVASCRIPT_TEXT.value,
+    MimeTypes.TYPESCRIPT.value,
+    MimeTypes.CSHARP.value,
+    MimeTypes.GO.value,
+    MimeTypes.RUST.value,
+    MimeTypes.RUBY.value,
+    MimeTypes.SWIFT.value,
+    MimeTypes.KOTLIN.value,
+    MimeTypes.DART.value,
+    MimeTypes.SHELL.value,
+    MimeTypes.SHELL_TEXT.value,
+    MimeTypes.SHELLSCRIPT.value,
+})
+
+CODE_FILE_EXTENSION_VALUES = frozenset({
+    ExtensionTypes.PY.value,
+    ExtensionTypes.JS.value,
+    ExtensionTypes.JSX.value,
+    ExtensionTypes.MJS.value,
+    ExtensionTypes.CJS.value,
+    ExtensionTypes.TS.value,
+    ExtensionTypes.TSX.value,
+    ExtensionTypes.JAVA.value,
+    ExtensionTypes.C.value,
+    ExtensionTypes.H.value,
+    ExtensionTypes.CPP.value,
+    ExtensionTypes.CC.value,
+    ExtensionTypes.CXX.value,
+    ExtensionTypes.HPP.value,
+    ExtensionTypes.HXX.value,
+    ExtensionTypes.CS.value,
+    ExtensionTypes.GO.value,
+    ExtensionTypes.RS.value,
+    ExtensionTypes.RB.value,
+    ExtensionTypes.PHP.value,
+    ExtensionTypes.SWIFT.value,
+    ExtensionTypes.KT.value,
+    ExtensionTypes.KTS.value,
+    ExtensionTypes.DART.value,
+    ExtensionTypes.SH.value,
+    ExtensionTypes.BASH.value,
+    # Parsed by the code parser too; test_code_file_extensions keeps this list
+    # a superset of lang_config's, which it had drifted from (P-3).
+    ExtensionTypes.PYI.value,
+    ExtensionTypes.MTS.value,
+    ExtensionTypes.CTS.value,
+    ExtensionTypes.SCALA.value,
+    ExtensionTypes.GROOVY.value,
+    ExtensionTypes.GRADLE.value,
+    ExtensionTypes.LUA.value,
+})
+
+# MIME type mapping for common file extensions
+FILE_MIME_TYPES = {
+    '.pdf': MimeTypes.PDF,
+    '.doc': MimeTypes.DOC,
+    '.docx': MimeTypes.DOCX,
+    '.xls': MimeTypes.XLS,
+    '.xlsx': MimeTypes.XLSX,
+    '.ppt': MimeTypes.PPT,
+    '.pptx': MimeTypes.PPTX,
+    '.txt': MimeTypes.PLAIN_TEXT,
+    '.csv': MimeTypes.CSV,
+    '.tsv': MimeTypes.TSV,
+    '.json': MimeTypes.JSON,
+    '.yaml': MimeTypes.YAML,
+    '.yml': MimeTypes.YAML,
+    '.xml': MimeTypes.XML,
+    '.zip': MimeTypes.ZIP,
+    '.jpg': MimeTypes.JPEG,
+    '.jpeg': MimeTypes.JPEG,
+    '.png': MimeTypes.PNG,
+    '.gif': MimeTypes.GIF,
+    '.svg': MimeTypes.SVG,
+    '.webp': MimeTypes.WEBP,
+    '.heic': MimeTypes.HEIC,
+    '.heif': MimeTypes.HEIF,
+    '.html': MimeTypes.HTML,
+    '.htm': MimeTypes.HTML,
+    '.md': MimeTypes.MARKDOWN,
+    '.mdx': MimeTypes.MDX,
+    '.epub': MimeTypes.EPUB,
+}
+
+
+def normalize_file_extension(extension: str | None) -> str:
+    """Lower-case extension without a leading dot."""
+    if not extension:
+        return ""
+    return extension.lower().lstrip(".")
+
+
+def get_mime_type_for_extension(
+    extension: str | None,
+    *,
+    fallback: str | None = None,
+) -> str | None:
+    """Resolve a MIME type string from a file extension using ``FILE_MIME_TYPES``."""
+    normalized = normalize_file_extension(extension)
+    if not normalized:
+        return fallback
+    mapped = FILE_MIME_TYPES.get(f".{normalized}")
+    if mapped is None:
+        return fallback
+    return mapped.value
+
+
+RECONCILIATION_ENABLED_MIME_TYPES = {
+    MimeTypes.SQL_TABLE.value,
+    MimeTypes.SQL_VIEW.value,
+    MimeTypes.GOOGLE_DOCS.value,
+    MimeTypes.GOOGLE_SHEETS.value,
+    MimeTypes.GOOGLE_SLIDES.value,
+    MimeTypes.PDF.value,
+    MimeTypes.DOCX.value,
+    MimeTypes.DOC.value,
+    MimeTypes.PLAIN_TEXT.value,
+    MimeTypes.HTML.value,
+    MimeTypes.BLOCKS.value,
+}
+
+RECONCILIATION_ENABLED_EXTENSIONS = {
+    ExtensionTypes.SQL_TABLE.value,
+    ExtensionTypes.SQL_VIEW.value,
+    ExtensionTypes.PDF.value,
+    ExtensionTypes.DOCX.value,
+    ExtensionTypes.DOC.value,
+    ExtensionTypes.TXT.value,
+    ExtensionTypes.MD.value,
+    ExtensionTypes.MDX.value,
+    ExtensionTypes.HTML.value
+}
+
+# Extensions that make a repository blob a CODE_FILE record. Connectors that walk
+# a git tree (GitLab, GitHub) classify each blob against this set; anything outside
+# it is an ordinary FILE record and is gated by the generic mime/extension allowlist
+# instead. Text-based only — a binary listed here would be fed to the code parser.
+SUPPORTED_CODE_FILE_EXTENSIONS = {
+    # C / C++
+    "c", "h", "cpp", "cc", "cxx", "hpp", "hxx",
+    # C#
+    "cs",
+    # Java / JVM
+    "java", "kt", "kts", "scala", "groovy", "gradle",
+    # Python
+    "py", "pyi",
+    # JavaScript / TypeScript
+    "js", "jsx", "mjs", "cjs", "ts", "tsx", "vue", "svelte",
+    # Go / Rust / Ruby / PHP / Swift / Dart
+    "go", "rs", "rb", "php", "swift", "dart",
+    # Other languages
+    "lua", "pl", "pm", "r", "ex", "exs", "erl", "hs", "clj", "cljs",
+    # Shell
+    "sh", "bash", "zsh", "fish", "ps1",
+    # Markup / stylesheets
+    "html", "htm", "css", "scss", "sass", "less", "md",
+    # Schema / IDL / infra-as-code
+    "sql", "proto", "graphql", "gql", "tf", "tfvars",
+}
+
+
+class ProgressStatus(Enum):
+    NOT_STARTED = "NOT_STARTED"
+    PAUSED = "PAUSED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    FILE_TYPE_NOT_SUPPORTED = "FILE_TYPE_NOT_SUPPORTED"
+    AUTO_INDEX_OFF = "AUTO_INDEX_OFF"
+    EMPTY = "EMPTY"
+    ENABLE_MULTIMODAL_MODELS = "ENABLE_MULTIMODAL_MODELS"
+    QUEUED = "QUEUED"
+    # A stage that does not apply to this record (policy off, nothing to process).
+    SKIPPED = "SKIPPED"
+    # The file needs a password to open. Terminal: only a new version of the
+    # file (or, later, a password) changes the outcome, so nothing retries it.
+    PASSWORD_PROTECTED = "PASSWORD_PROTECTED"
+
+
+class DeleteSource(str, Enum):
+    """Who moved a record to the trash. Decides whether a sync may restore it."""
+
+    USER = "USER"
+    CONNECTOR = "CONNECTOR"
+    SYSTEM = "SYSTEM"
+
+
+class RecordTypes(Enum):
+    FILE = "FILE"
+    ATTACHMENT = "ATTACHMENT"
+    LINK = "LINK"
+    MAIL = "MAIL"
+    GROUP_MAIL = "GROUP_MAIL"
+    DRIVE = "DRIVE"
+    WEBPAGE = "WEBPAGE"
+    DATABASE = "DATABASE"
+    DATASOURCE = "DATASOURCE"
+    COMMENT = "COMMENT"
+    TICKET = "TICKET"
+    PRODUCT = "PRODUCT"
+    DEAL = "DEAL"
+    MESSAGE = "MESSAGE"
+    WEBPAGE_COMMENT = "WEBPAGE_COMMENT"
+    SHAREPOINT_LIST = "SHAREPOINT_LIST"
+    SHAREPOINT_PAGE = "SHAREPOINT_PAGE"
+    PULL_REQUEST = "PULL_REQUEST"
+    MEETING = "MEETING"
+    CASE = "CASE"
+    TASK = "TASK"
+    ARTIFACT = "ARTIFACT"
+    CODE_FILE = "CODE_FILE"
+
+
+class RecordRelations(Enum):
+    PARENT_CHILD = "PARENT_CHILD"
+    SIBLING = "SIBLING"
+    ATTACHMENT = "ATTACHMENT"
+    OTHERS = "OTHERS"
+    LINKED_TO = "LINKED_TO"
+    BLOCKS = "BLOCKS"
+    DUPLICATES = "DUPLICATES"
+    DEPENDS_ON = "DEPENDS_ON"
+    CLONES = "CLONES"
+    IMPLEMENTS = "IMPLEMENTS"
+    # A concrete method and the interface/abstract method it satisfies. Written
+    # by the code-graph edge pass, never by the parser: at parse time a base is
+    # only a name, and whether it is an interface is known once it resolves.
+    OVERRIDES = "OVERRIDES"
+    REVIEWS = "REVIEWS"
+    CAUSES = "CAUSES"
+    # Inverse of CAUSES. A link edge always runs from the record being synced, so a
+    # source that names the cause on the effect (Zendesk's problem_id) needs this.
+    CAUSED_BY = "CAUSED_BY"
+    RELATED = "RELATED"
+    FOREIGN_KEY = "FOREIGN_KEY"
+    # An output artifact (chart, PDF, spreadsheet, ...) was produced by
+    # running a specific version of a CODE artifact. Auto-captured by the
+    # harness (`sandbox_bridge.py`'s POST_TOOL_USE hook) — never asserted
+    # by the model — carrying `sourceVersion`/`derivedVersion` custom
+    # properties (see `record_links_schema`, which allows additional
+    # properties). A link like any other type outside the hierarchy: stored on
+    # RECORD_LINK in Neo4j and in recordLinks in Arango.
+    DERIVED_FROM = "DERIVED_FROM"
+
+    # --- code knowledge graph ---
+    # Structural, written at parse time because both endpoints are in one file.
+    CONTAINS = "CONTAINS"      # record -> block, or block group -> block
+    DEFINES = "DEFINES"        # class -> field
+    METHOD = "METHOD"          # class -> method
+    # Cross-file, written by the edge-resolution pass once a repo is indexed.
+    CALLS = "CALLS"
+    IMPORTS = "IMPORTS"            # file -> imported symbol
+    IMPORTS_FROM = "IMPORTS_FROM"  # file -> imported module file
+    RE_EXPORTS = "RE_EXPORTS"
+    EXPORTS = "EXPORTS"
+    INHERITS = "INHERITS"
+
+
+#: The relation types that are hierarchy. Every other type is a link, stored
+#: apart from the hierarchy.
+HIERARCHY_RELATION_TYPES = frozenset({RecordRelations.PARENT_CHILD.value, RecordRelations.ATTACHMENT.value})
+
+
+class EntityRelations(Enum):
+    """Standard edge types for entity relationships"""
+
+    ASSIGNED_TO = "ASSIGNED_TO"
+    REPORTED_BY = "REPORTED_BY"
+    CREATED_BY = "CREATED_BY"
+    LEAD_BY = "LEAD_BY"
+    RELATED_TO_PERSON = "RELATED_TO_PERSON"
+    MENTIONED_IN = "MENTIONED_IN"  # User mentioned in a message/record
+    INVOLVED_IN = "INVOLVED_IN"
+
+
+class EventTypes(Enum):
+    NEW_RECORD = "newRecord"
+    UPDATE_RECORD = "updateRecord"
+    DELETE_RECORD = "deleteRecord"
+    REINDEX_RECORD = "reindexRecord"
+    REINDEX_FAILED = "reindexFailed"
+    BULK_DELETE_RECORDS = "bulkDeleteRecords"
+    DELETE_CONNECTOR_EMBEDDINGS = "deleteConnectorEmbeddings"
+    DELETE_CONNECTOR_ENTITIES = "deleteConnectorEntities"
+    SYNC_VECTOR_MEMBERSHIP = "syncVectorMembership"
+    DELETE_VECTOR_COLLECTION = "deleteVectorCollection"
+    # Vectors-only cleanup for records moved to the trash; never touches blob or Mongo.
+    SOFT_DELETE_RECORDS = "softDeleteRecords"
+    DELETE_STORED_DOCUMENTS = "deleteStoredDocuments"
+    BUILD_CODE_EDGES = "buildCodeEdges"
+
+
+class AccountType(Enum):
+    INDIVIDUAL = "individual"
+    ENTERPRISE = "enterprise"
+    BUSINESS = "business"
+    ADMIN = "admin"
+
+
+class ConnectorScopes(Enum):
+    PERSONAL = "personal"
+    TEAM = "team"
+
+
+class AppStatus(Enum):
+    IDLE = "IDLE"
+    FULL_SYNCING = "FULL_SYNCING"
+    SYNCING = "SYNCING"
+    QUEUED = "QUEUED"
+
+
+RECORD_TYPE_COLLECTION_MAPPING = {
+    "FILE": CollectionNames.FILES.value,
+    "MAIL": CollectionNames.MAILS.value,
+    "GROUP_MAIL": CollectionNames.MAILS.value,
+    "MESSAGE": CollectionNames.MESSAGES.value,
+    "WEBPAGE": CollectionNames.WEBPAGES.value,
+    "SHAREPOINT_PAGE": CollectionNames.WEBPAGES.value,
+    "CONFLUENCE_PAGE": CollectionNames.WEBPAGES.value,
+    "CONFLUENCE_BLOGPOST": CollectionNames.WEBPAGES.value,
+    "TICKET": CollectionNames.TICKETS.value,
+    "CASE": CollectionNames.TICKETS.value,
+    "TASK": CollectionNames.TICKETS.value,
+    "COMMENT": CollectionNames.COMMENTS.value,
+    "INLINE_COMMENT": CollectionNames.COMMENTS.value,
+    "LINK": CollectionNames.LINKS.value,
+    "PROJECT": CollectionNames.PROJECTS.value,
+    "PRODUCT": CollectionNames.PRODUCTS.value,
+    "DEAL": CollectionNames.DEALS.value,
+    "DATABASE": CollectionNames.WEBPAGES.value,
+    "DATASOURCE": CollectionNames.WEBPAGES.value,
+    "MEETING": CollectionNames.MEETINGS.value,
+    "ARTIFACT": CollectionNames.ARTIFACTS.value,
+    "CODE_FILE": CollectionNames.CODE_FILES.value,
+    "PULL_REQUEST":CollectionNames.PULLREQUESTS.value,
+    "SQL_TABLE": CollectionNames.SQL_TABLES.value,
+    "SQL_VIEW": CollectionNames.SQL_VIEWS.value,
+    # Note: MESSAGE, DRIVE, SHAREPOINT_*, and other types are stored only in records collection
+}
+
+
+# Person -> User promotion (see docs/external-user-support-plan.md, D4).
+#
+# One definition for both graph backends so they cannot drift: a Person that carries any
+# CRM edge is a Salesforce contact as well as a collaborator, so the two identities split
+# rather than merge - the collaborator edges move to the User and the Person survives
+# holding only its CRM edges. A Person with no CRM edge migrates outright and is deleted.
+#
+# Direction matters and differs: the transferable edges always have the Person as _from,
+# while `lead`/`contact` point AT the Person and only `memberOf` points away from it - so
+# the CRM check has to look both ways.
+PERSON_TRANSFERABLE_EDGES = (
+    CollectionNames.PERMISSION.value,
+    CollectionNames.USER_APP_RELATION.value,
+)
+
+PERSON_CRM_EDGES_OUTBOUND = (CollectionNames.MEMBER_OF.value,)
+PERSON_CRM_EDGES_INBOUND = (
+    CollectionNames.LEAD.value,
+    CollectionNames.CONTACT.value,
+)
+PERSON_CRM_EDGES = PERSON_CRM_EDGES_OUTBOUND + PERSON_CRM_EDGES_INBOUND
+
+
+class PersonMigrationMode:
+    """Outcome of migrate_person_to_user. Distinguished so callers can log which of the
+    two very different things happened."""
+
+    MIGRATED = "migrated"  # no CRM edges: everything moved, Person node deleted
+    SPLIT = "split"  # CRM edges present: collaborator edges moved, Person kept

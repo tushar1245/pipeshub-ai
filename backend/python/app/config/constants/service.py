@@ -1,0 +1,245 @@
+from enum import Enum
+
+
+class config_node_constants(Enum):
+    """Constants for ETCD configuration paths"""
+
+    # Service paths
+    ARANGODB = "/services/arangodb"
+    NEO4J = "/services/neo4j"
+    QDRANT = "/services/qdrant"
+    REDIS = "/services/redis"
+    REDIS_VECTOR = "/services/redis-vector"
+    OPENSEARCH = "/services/opensearch"
+    AI_MODELS = "/services/aiModels"
+    AI_MODELS_EMBEDDING = "/services/aiModels/embedding"
+    SYSTEM_PROMPTS = "/services/systemPrompts"
+    # Learned per-model LLM API-mode facts (Responses vs. Chat Completions,
+    # see `app/utils/llm_api_mode_store.py`). Deliberately a *separate* key
+    # from AI_MODELS: that blob is owned by the Node.js admin API and has no
+    # compare-and-set, and it holds provider API keys, so nothing else may
+    # write to it from Python.
+    AI_MODEL_API_MODES = "/services/aiModelApiModes"
+    WEB_SEARCH = "/services/webSearch"
+    KAFKA = "/services/kafka"
+    REDIS_STREAMS = "/services/redis-streams"
+    MESSAGE_BROKER = "/services/message-broker"
+    ENDPOINTS = "/services/endpoints"
+    SECRET_KEYS = "/services/secretKeys"
+    STORAGE = "/services/storage"
+    MIGRATIONS = "/services/migrations"
+    DEPLOYMENT = "/services/deployment"
+    INHERITANCE = "/services/inheritance"
+    NAMED_ENTITIES = "/services/namedEntities"
+    # Org-wide rules for which identity fields may be sent to a model gateway.
+    # Written by the Node admin API; read-only from Python.
+    AI_GATEWAY_IDENTITY_POLICY = "/services/aiGateway/identityPolicy"
+
+
+    # Non-service paths
+    # LOG_LEVEL = "/logLevel"
+
+class TokenScopes(Enum):
+    """Constants for internal scoped token scopes"""
+
+    SEND_MAIL = "mail:send"
+    FETCH_CONFIG = "fetch:config"
+    PASSWORD_RESET = "password:reset"
+    USER_LOOKUP = "user:lookup"
+    TOKEN_REFRESH = "token:refresh"
+    STORAGE_TOKEN = "storage:token"
+    # Grants the connectors service's ACL-enforcing content endpoint.
+    # Deliberately separate from STORAGE_TOKEN so a leaked storage token
+    # cannot also grant connector record reads.
+    RECORD_CONTENT = "record:content"
+    # Indexing's admin-level read of record bytes from the connectors service
+    # (the name predates the route; it is not tied to signed URLs).
+    CONNECTOR_SIGNED_URL = "connector:signedUrl"
+    CONVERSATION_CREATE = "conversation:create"
+    # Node -> query: grant/revoke permission edges on a conversation's attachments
+    # and artifacts, after Node has checked ownership/sharing in Mongo.
+    CONVERSATION_PERMISSIONS = "conversation:permissions"
+    # Python -> Node caller-role lookups, so Node's rate limiter can tell them from
+    # client traffic. Never accepted by the Python services.
+    CALLER_ROLE = "caller:role"
+    DOCUMENT_PARSE = "document:parse"
+    DOCUMENT_CLASSIFY = "document:classify"
+    # Node -> connectors: write verified profile email onto the graph user.
+    ENTITY_USER_WRITE = "entity:user:write"
+
+
+class OAuthScopes(str, Enum):
+    """OAuth scopes for external API access control"""
+
+    # Semantic Search
+    SEMANTIC_WRITE = "semantic:write"
+    SEMANTIC_READ = "semantic:read"
+    SEMANTIC_DELETE = "semantic:delete"
+
+    # Conversations
+    CONVERSATION_READ = "conversation:read"
+    CONVERSATION_WRITE = "conversation:write"
+    CONVERSATION_CHAT = "conversation:chat"
+
+    # Agents
+    AGENT_READ = "agent:read"
+    AGENT_WRITE = "agent:write"
+    AGENT_EXECUTE = "agent:execute"
+
+    # Agent Skills
+    SKILL_READ = "skill:read"
+    SKILL_WRITE = "skill:write"
+
+    # MCP Servers
+    MCP_READ = "mcp:read"
+    MCP_WRITE = "mcp:write"
+    MCP_DELETE = "mcp:delete"
+
+    # Knowledge Base
+    KB_READ = "kb:read"
+    KB_WRITE = "kb:write"
+    KB_DELETE = "kb:delete"
+    KB_UPLOAD = "kb:upload"
+
+    # Connectors
+    CONNECTOR_READ = "connector:read"
+    CONNECTOR_WRITE = "connector:write"
+    CONNECTOR_SYNC = "connector:sync"
+    CONNECTOR_DELETE = "connector:delete"
+
+    # Code graph
+    CODE_READ = "code:read"
+
+    # Teams
+    TEAM_READ = "team:read"
+    TEAM_WRITE = "team:write"
+
+class DefaultEndpoints(Enum):
+    """Constants for default endpoints"""
+
+    CONNECTOR_ENDPOINT = "http://localhost:8088"
+    INDEXING_ENDPOINT = "http://localhost:8091"
+    QUERY_ENDPOINT = "http://localhost:8000"
+    NODEJS_ENDPOINT = "http://localhost:3000"
+    FRONTEND_ENDPOINT = "http://localhost:3001"
+    STORAGE_ENDPOINT = "http://localhost:3000"  # noqa: PIE796
+
+class Routes(Enum):
+    """Constants for routes"""
+
+    # Token paths
+    INDIVIDUAL_CREDENTIALS = "/api/v1/configurationManager/internal/connectors/individual/googleWorkspaceCredentials"
+    INDIVIDUAL_REFRESH_TOKEN = (
+        "/api/v1/connectors/internal/refreshIndividualConnectorToken"
+    )
+    BUSINESS_CREDENTIALS = "/api/v1/configurationManager/internal/connectors/business/googleWorkspaceCredentials"
+
+    # AI Model paths
+    AI_MODEL_CONFIG = "/api/v1/configurationManager/internal/aiModelsConfig"
+
+    # Storage paths
+    STORAGE_PLACEHOLDER = "/api/v1/document/internal/placeholder"
+    STORAGE_DIRECT_UPLOAD = "/api/v1/document/internal/{documentId}/directUpload"
+    STORAGE_UPLOAD = "/api/v1/document/internal/upload"
+    STORAGE_UPLOAD_NEXT_VERSION = "/api/v1/document/internal/{documentId}/uploadNextVersion"
+    STORAGE_DOWNLOAD = "/api/v1/document/internal/{documentId}/download"
+    STORAGE_BUFFER = "/api/v1/document/internal/{documentId}/buffer"
+    STORAGE_DOCUMENT = "/api/v1/document/internal/{documentId}"
+    STORAGE_PURGE_DOCUMENT = "/api/v1/document/internal/{documentId}/purge"
+    STORAGE_PURGE_VIRTUAL_RECORD = "/api/v1/document/internal/records/{virtualRecordId}/purge"
+    STORAGE_VIRTUAL_RECORD_DOCUMENTS = "/api/v1/document/internal/records/{virtualRecordId}/documents"
+    STORAGE_FLAT_RECORD_DOCUMENTS = "/api/v1/document/internal/records/flat-documents"
+    STORAGE_MOVE_TREE = "/api/v1/document/internal/move-tree"
+    STORAGE_DELETE_CONNECTOR = "/api/v1/document/internal/connector/{connector_id}"
+    STORAGE_CONNECTOR_VIRTUAL_RECORDS = "/api/v1/document/internal/connector/{connector_id}/virtual-records"
+    STORAGE_RELOCATE_RECORDS = "/api/v1/document/internal/records/relocate"
+    STORAGE_MISSING_DOCUMENTS = "/api/v1/document/internal/missing"
+    # Artifact sets: one storage document per content revision of a virtual record.
+    STORAGE_ARTIFACTS = "/api/v1/document/internal/artifacts"
+    STORAGE_ARTIFACTS_PRESIGN = "/api/v1/document/internal/artifacts/presign"
+    STORAGE_ARTIFACT_SET = "/api/v1/document/internal/artifacts/{documentId}"
+    STORAGE_ARTIFACT_READ_URLS = "/api/v1/document/internal/artifacts/{documentId}/read-urls"
+
+    # User-facing, permission-checked record bytes
+    KB_STREAM_RECORD = "/api/v1/knowledgeBase/stream/record/{recordId}"
+
+
+class WebhookConfig(Enum):
+    """Constants for webhook configuration"""
+
+    EXPIRATION_DAYS = 6
+    EXPIRATION_HOURS = 23
+    EXPIRATION_MINUTES = 59
+    COALESCEDELAY = 60
+
+
+class KafkaConfig(Enum):
+    """Constants for kafka configuration"""
+
+    # Producer client IDs
+    CLIENT_ID_RECORDS = "record-processor"
+    CLIENT_ID_MAIN = "enterprise-search"
+    CLIENT_ID_LLM = "llm-configuration"
+    CLIENT_ID_ENTITY = "entity-producer"
+    CLIENT_ID_MESSAGING_PRODUCER = "messaging_producer_client"
+
+    # Consumer client IDs
+    CLIENT_ID_ENTITY_CONSUMER = "entity_consumer_client"
+    CLIENT_ID_SYNC_CONSUMER = "sync_consumer_client"
+    CLIENT_ID_RECORDS_CONSUMER = "records_consumer_client"
+    CLIENT_ID_AICONFIG_CONSUMER = "aiconfig_consumer_client"
+
+    # Consumer group IDs
+    GROUP_ID_ENTITY = "entity_consumer_group"
+    GROUP_ID_SYNC = "sync_consumer_group"
+    GROUP_ID_RECORDS = "records_consumer_group"
+    GROUP_ID_AICONFIG = "aiconfig_consumer_group"
+
+
+class CeleryConfig(Enum):
+    """Constants for celery configuration"""
+
+    TASK_SERIALIZER = "json"
+    RESULT_SERIALIZER = "json"  # noqa: PIE796
+    ACCEPT_CONTENT = ["json"]
+    TIMEZONE = "UTC"
+    ENABLE_UTC = True
+    SCHEDULE = {"syncStartTime": "23:00", "syncPauseTime": "05:00"}
+
+
+class KVStoreType(str, Enum):
+    """Supported key-value store backends."""
+
+    REDIS = "redis"
+    ETCD = "etcd"
+
+
+class RedisEnv(str, Enum):
+    """Environment variable names for Redis configuration."""
+
+    KV_STORE_TYPE = "KV_STORE_TYPE"
+    HOST = "REDIS_HOST"
+    PORT = "REDIS_PORT"
+    PASSWORD = "REDIS_PASSWORD"
+    DB = "REDIS_DB"
+
+
+class RedisDefaults(str, Enum):
+    """Default values for Redis configuration."""
+
+    HOST = "localhost"
+    PORT = "6379"
+    DB = "0"
+
+
+class RedisConfig(Enum):
+    """Constants for redis configuration"""
+
+    REDIS_DB = 0
+
+
+class HealthCheckConfig(Enum):
+    """Constants for health check configuration"""
+
+    CONNECTOR_HEALTH_CHECK_MAX_RETRIES = 120
+    CONNECTOR_HEALTH_CHECK_RETRY_INTERVAL_SECONDS = 1

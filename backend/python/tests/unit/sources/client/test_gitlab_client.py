@@ -1,0 +1,1018 @@
+"""Unit tests for GitLab client module."""
+
+import http.server
+import logging
+import socket
+import threading
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import gitlab
+import pytest
+import requests
+
+from app.sources.client.gitlab.gitlab import (
+    GitLabClient,
+    GitLabClientViaToken,
+    GitLabConfig,
+    GitLabReadTimeout,
+    GitLabResponse,
+    _TokenSafeSession,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def logger():
+    return logging.getLogger("test_gitlab_client")
+
+
+@pytest.fixture
+def mock_config_service():
+    return AsyncMock()
+
+
+# ---------------------------------------------------------------------------
+# GitLabResponse
+# ---------------------------------------------------------------------------
+
+
+class TestGitLabResponse:
+    def test_success_response(self):
+        resp = GitLabResponse(success=True, data={"projects": []})
+        assert resp.success is True
+        assert resp.data == {"projects": []}
+
+    def test_error_response(self):
+        resp = GitLabResponse(success=False, error="not found")
+        assert resp.error == "not found"
+
+    def test_default_nones(self):
+        resp = GitLabResponse(success=True)
+        assert resp.data is None
+        assert resp.error is None
+        assert resp.message is None
+
+    def test_to_dict(self):
+        resp = GitLabResponse(success=True, data={"k": "v"}, message="ok")
+        d = resp.to_dict()
+        assert d["success"] is True
+        assert d["data"] == {"k": "v"}
+        assert d["message"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# GitLabClientViaToken
+# ---------------------------------------------------------------------------
+
+
+class TestGitLabClientViaToken:
+    def test_init_defaults(self):
+        client = GitLabClientViaToken("tok")
+        assert client.token == "tok"
+        assert client.url == "https://gitlab.com"
+        assert client.timeout is None
+        assert client.api_version == "4"
+        assert client.retry_transient_errors is None
+        assert client.max_retries is None
+        assert client.obey_rate_limit is None
+        assert client._sdk is None
+
+    def test_init_with_custom_url(self):
+        client = GitLabClientViaToken("tok", url="https://gitlab.example.com")
+        assert client.url == "https://gitlab.example.com"
+
+    def test_init_with_all_options(self):
+        client = GitLabClientViaToken(
+            "tok",
+            url="https://gl.local",
+            timeout=60.0,
+            api_version="4",
+            retry_transient_errors=True,
+            max_retries=5,
+            obey_rate_limit=True,
+        )
+        assert client.url == "https://gl.local"
+        assert client.timeout == 60.0
+        assert client.retry_transient_errors is True
+        assert client.max_retries == 5
+        assert client.obey_rate_limit is True
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_minimal_kwargs(self, mock_gitlab_module):
+        client = GitLabClientViaToken("tok")
+        sdk = client.create_client()
+        mock_gitlab_module.Gitlab.assert_called_once()
+        call_kwargs = mock_gitlab_module.Gitlab.call_args[1]
+        assert call_kwargs["url"] == "https://gitlab.com"
+        assert call_kwargs["oauth_token"] == "tok"
+        assert call_kwargs["api_version"] == "4"
+        # Optional kwargs should NOT be in call_kwargs when unset
+        assert "timeout" not in call_kwargs
+        assert "retry_transient_errors" not in call_kwargs
+        assert "max_retries" not in call_kwargs
+        assert "obey_rate_limit" not in call_kwargs
+        assert sdk is mock_gitlab_module.Gitlab.return_value
+        assert client._sdk is mock_gitlab_module.Gitlab.return_value
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_all_kwargs(self, mock_gitlab_module):
+        client = GitLabClientViaToken(
+            "tok",
+            url="https://gl.local",
+            timeout=60.0,
+            api_version="4",
+            retry_transient_errors=True,
+            max_retries=5,
+            obey_rate_limit=True,
+        )
+        client.create_client()
+        call_kwargs = mock_gitlab_module.Gitlab.call_args[1]
+        assert call_kwargs["url"] == "https://gl.local"
+        assert call_kwargs["oauth_token"] == "tok"
+        assert call_kwargs["timeout"] == 60.0
+        assert call_kwargs["api_version"] == "4"
+        assert call_kwargs["retry_transient_errors"] is True
+        # ``max_retries`` and ``obey_rate_limit`` are per-request kwargs in
+        # python-gitlab (see ``Gitlab.http_request``); they are intentionally
+        # NOT forwarded to ``gitlab.Gitlab()`` because older versions reject
+        # unknown constructor kwargs via the HTTP backend
+        # (``RequestsBackend.__init__() got an unexpected keyword argument``).
+        assert "max_retries" not in call_kwargs
+        assert "obey_rate_limit" not in call_kwargs
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_skips_api_version_when_none(self, mock_gitlab_module):
+        client = GitLabClientViaToken("tok", api_version=None)
+        client.create_client()
+        call_kwargs = mock_gitlab_module.Gitlab.call_args[1]
+        assert "api_version" not in call_kwargs
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_get_sdk_lazy_init(self, mock_gitlab_module):
+        client = GitLabClientViaToken("tok")
+        assert client._sdk is None
+        sdk = client.get_sdk()
+        assert sdk is mock_gitlab_module.Gitlab.return_value
+        # A second call should return the cached SDK (no additional Gitlab() call)
+        sdk2 = client.get_sdk()
+        assert sdk2 is sdk
+        assert mock_gitlab_module.Gitlab.call_count == 1
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_get_sdk_returns_cached(self, mock_gitlab_module):
+        client = GitLabClientViaToken("tok")
+        client.create_client()
+        assert mock_gitlab_module.Gitlab.call_count == 1
+        # Subsequent get_sdk should not call Gitlab() again
+        client.get_sdk()
+        assert mock_gitlab_module.Gitlab.call_count == 1
+
+    def test_get_base_url(self):
+        client = GitLabClientViaToken("tok", url="https://gl.local")
+        assert client.get_base_url() == "https://gl.local"
+
+    def test_get_base_url_default(self):
+        client = GitLabClientViaToken("tok")
+        assert client.get_base_url() == "https://gitlab.com"
+
+    def test_get_token(self):
+        client = GitLabClientViaToken("my-token")
+        assert client.get_token() == "my-token"
+
+    # auth_type handling -------------------------------------------------------
+
+    def test_default_auth_type_is_oauth(self):
+        client = GitLabClientViaToken("tok")
+        assert client.auth_type == "OAUTH"
+
+    def test_auth_type_api_token(self):
+        client = GitLabClientViaToken("tok", auth_type="API_TOKEN")
+        assert client.auth_type == "API_TOKEN"
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_uses_oauth_token_for_oauth(self, mock_gitlab_module):
+        client = GitLabClientViaToken("tok", auth_type="OAUTH")
+        client.create_client()
+        call_kwargs = mock_gitlab_module.Gitlab.call_args[1]
+        assert "oauth_token" in call_kwargs
+        assert call_kwargs["oauth_token"] == "tok"
+        assert "private_token" not in call_kwargs
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://gitlab.com",
+            "https://gitlab.self-managed.example",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ],
+    )
+    @pytest.mark.parametrize("auth_type", ["API_TOKEN", "OAUTH"])
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_allows_tls_and_loopback(
+        self, mock_gitlab_module, auth_type, url
+    ) -> None:
+        GitLabClientViaToken("tok", url=url, auth_type=auth_type).create_client()
+        assert mock_gitlab_module.Gitlab.call_args[1]["url"] == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://gitlab.internal.example",
+            "http://10.0.0.5",
+            "ftp://gitlab.example",
+            # Not pinned to loopback by every resolver, so not trusted by name.
+            "http://localhost.localdomain",
+        ],
+    )
+    @pytest.mark.parametrize("auth_type", ["API_TOKEN", "OAUTH"])
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_refuses_to_send_a_token_in_cleartext(
+        self, mock_gitlab_module, auth_type, url, monkeypatch
+    ) -> None:
+        # Either kind of token travels as a header on every request, so a
+        # plaintext host would expose it to anything on the path.
+        monkeypatch.delenv("PIPESHUB_GITLAB_ALLOW_INSECURE_HTTP", raising=False)
+        client = GitLabClientViaToken("tok", url=url, auth_type=auth_type)
+        with pytest.raises(ValueError, match="must use https"):
+            client.create_client()
+        mock_gitlab_module.Gitlab.assert_not_called()
+
+    @pytest.mark.parametrize("auth_type", ["API_TOKEN", "OAUTH"])
+    @pytest.mark.parametrize(
+        "url", ["http://gitlab.internal.example", "http://10.0.0.5"]
+    )
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_plain_http_is_allowed_when_the_server_opts_in(
+        self, mock_gitlab_module, url, auth_type, monkeypatch, caplog
+    ) -> None:
+        # Self-managed GitLab on a trusted private network can still be used
+        # over http, but only after an explicit, server-wide choice.
+        monkeypatch.setenv("PIPESHUB_GITLAB_ALLOW_INSECURE_HTTP", "true")
+        with caplog.at_level("WARNING"):
+            GitLabClientViaToken("tok", url=url, auth_type=auth_type).create_client()
+        assert mock_gitlab_module.Gitlab.call_args[1]["url"] == url
+        assert "plain http" in caplog.text
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_neither_the_warning_nor_the_error_repeats_credentials_in_the_url(
+        self, mock_gitlab_module, monkeypatch, caplog
+    ) -> None:
+        url = "http://alice:s3cret@gitlab.internal.example"
+        monkeypatch.delenv("PIPESHUB_GITLAB_ALLOW_INSECURE_HTTP", raising=False)
+        with pytest.raises(ValueError) as refused:
+            GitLabClientViaToken("tok", url=url, auth_type="OAUTH").create_client()
+        assert "s3cret" not in str(refused.value)
+        monkeypatch.setenv("PIPESHUB_GITLAB_ALLOW_INSECURE_HTTP", "true")
+        with caplog.at_level("WARNING"):
+            GitLabClientViaToken("tok", url=url, auth_type="OAUTH").create_client()
+        assert "plain http" in caplog.text
+        assert "s3cret" not in caplog.text
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_the_client_uses_a_session_that_checks_redirects(self, mock_gitlab_module) -> None:
+        GitLabClientViaToken("tok", url="https://gitlab.example", auth_type="API_TOKEN").create_client()
+        session = mock_gitlab_module.Gitlab.call_args[1]["session"]
+        assert session.hooks["response"], "the session must inspect each response for redirects"
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_the_opt_in_does_not_allow_other_schemes(self, mock_gitlab_module, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_GITLAB_ALLOW_INSECURE_HTTP", "true")
+        with pytest.raises(ValueError, match="must use https"):
+            GitLabClientViaToken("tok", url="ftp://gitlab.example", auth_type="OAUTH").create_client()
+        mock_gitlab_module.Gitlab.assert_not_called()
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_create_client_uses_private_token_for_api_token(self, mock_gitlab_module):
+        client = GitLabClientViaToken("pat-tok", auth_type="API_TOKEN")
+        client.create_client()
+        call_kwargs = mock_gitlab_module.Gitlab.call_args[1]
+        assert "private_token" in call_kwargs
+        assert call_kwargs["private_token"] == "pat-tok"
+        assert "oauth_token" not in call_kwargs
+
+    # set_token ----------------------------------------------------------------
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_set_token_updates_token_before_sdk_init(self, _mock_gitlab_module):
+        client = GitLabClientViaToken("old-tok")
+        client.set_token("new-tok")
+        assert client.token == "new-tok"
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_set_token_updates_sdk_oauth_token_in_place(self, mock_gitlab_module):
+        mock_sdk = MagicMock()
+        mock_gitlab_module.Gitlab.return_value = mock_sdk
+
+        client = GitLabClientViaToken("old-tok", auth_type="OAUTH")
+        client.create_client()
+        client.set_token("refreshed-tok")
+
+        assert client.token == "refreshed-tok"
+        assert mock_sdk.oauth_token == "refreshed-tok"
+        mock_sdk._set_auth_info.assert_called()
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_set_token_updates_sdk_private_token_in_place(self, mock_gitlab_module):
+        mock_sdk = MagicMock()
+        mock_gitlab_module.Gitlab.return_value = mock_sdk
+
+        client = GitLabClientViaToken("old-pat", auth_type="API_TOKEN")
+        client.create_client()
+        client.set_token("new-pat")
+
+        assert client.token == "new-pat"
+        assert mock_sdk.private_token == "new-pat"
+        mock_sdk._set_auth_info.assert_called()
+
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_set_token_without_sdk_only_updates_field(self, _mock_gitlab_module):
+        client = GitLabClientViaToken("tok")
+        assert client._sdk is None
+        client.set_token("new-tok")
+        assert client.token == "new-tok"
+        assert client._sdk is None  # still not initialized
+
+    # Retry-After cap ----------------------------------------------------------
+
+    def test_retry_after_cap_rewrites_oversized_header_on_429(self):
+        """The wrapper around ``session.send`` must rewrite a long
+        ``Retry-After`` header on a 429 down to ``max_retry_after_seconds``
+        before python-gitlab sleeps on it. Without this cap a misbehaving
+        self-managed EE deployment can park a sync inside ``time.sleep``
+        for minutes per request and look hung.
+        """
+        from requests import Response, Session
+
+        session = Session()
+        original_send = MagicMock()
+        # Build a 429 with a Retry-After far above the cap.
+        resp = Response()
+        resp.status_code = 429
+        resp.headers["Retry-After"] = "600"
+        original_send.return_value = resp
+        session.send = original_send
+
+        sdk = MagicMock()
+        sdk.session = session
+
+        client = GitLabClientViaToken("tok", max_retry_after_seconds=30)
+        client._install_retry_after_cap(sdk)
+
+        out = sdk.session.send(MagicMock(method="GET", url="https://gl/api"))
+        assert out is resp
+        # Header must be rewritten to the cap so python-gitlab sleeps for
+        # ``cap`` seconds, not the original 600.
+        assert resp.headers["Retry-After"] == "30"
+
+    def test_retry_after_cap_passes_short_waits_through(self):
+        from requests import Response, Session
+
+        session = Session()
+        original_send = MagicMock()
+        resp = Response()
+        resp.status_code = 429
+        resp.headers["Retry-After"] = "5"
+        original_send.return_value = resp
+        session.send = original_send
+
+        sdk = MagicMock()
+        sdk.session = session
+
+        client = GitLabClientViaToken("tok", max_retry_after_seconds=30)
+        client._install_retry_after_cap(sdk)
+
+        sdk.session.send(MagicMock(method="GET", url="https://gl/api"))
+        # Below-cap waits are honoured unchanged.
+        assert resp.headers["Retry-After"] == "5"
+
+    def test_retry_after_cap_ignores_non_429(self):
+        from requests import Response, Session
+
+        session = Session()
+        original_send = MagicMock()
+        resp = Response()
+        resp.status_code = 200
+        resp.headers["Retry-After"] = "999"  # bogus, but not on a 429
+        original_send.return_value = resp
+        session.send = original_send
+
+        sdk = MagicMock()
+        sdk.session = session
+
+        client = GitLabClientViaToken("tok", max_retry_after_seconds=30)
+        client._install_retry_after_cap(sdk)
+
+        sdk.session.send(MagicMock(method="GET", url="https://gl/api"))
+        # Only 429s are subject to the cap.
+        assert resp.headers["Retry-After"] == "999"
+
+    def test_retry_after_cap_is_idempotent(self):
+        """Re-installing the cap on the same SDK must not double-wrap and
+        must keep the original behaviour for normal requests.
+        """
+        from requests import Response, Session
+
+        session = Session()
+        original_send = MagicMock()
+        resp = Response()
+        resp.status_code = 429
+        resp.headers["Retry-After"] = "120"
+        original_send.return_value = resp
+        session.send = original_send
+
+        sdk = MagicMock()
+        sdk.session = session
+
+        client = GitLabClientViaToken("tok", max_retry_after_seconds=30)
+        client._install_retry_after_cap(sdk)
+        wrapped_once = sdk.session.send
+        client._install_retry_after_cap(sdk)
+        # Second call must be a no-op (still the same wrapper, not a wrapper
+        # of a wrapper) — verify by identity.
+        assert sdk.session.send is wrapped_once
+
+        sdk.session.send(MagicMock(method="GET", url="https://gl/api"))
+        assert resp.headers["Retry-After"] == "30"
+
+
+# ---------------------------------------------------------------------------
+# GitLabConfig
+# ---------------------------------------------------------------------------
+
+
+class TestGitLabConfig:
+    def test_defaults(self):
+        cfg = GitLabConfig(token="tok")
+        assert cfg.token == "tok"
+        assert cfg.url == "https://gitlab.com"
+        assert cfg.timeout is None
+        assert cfg.api_version == "4"
+        assert cfg.retry_transient_errors is None
+        assert cfg.max_retries is None
+        assert cfg.obey_rate_limit is None
+
+    def test_create_client(self):
+        cfg = GitLabConfig(
+            token="tok",
+            url="https://gl.local",
+            timeout=30.0,
+            api_version="4",
+            retry_transient_errors=True,
+            max_retries=3,
+            obey_rate_limit=False,
+        )
+        client = cfg.create_client()
+        assert isinstance(client, GitLabClientViaToken)
+        assert client.token == "tok"
+        assert client.url == "https://gl.local"
+        assert client.timeout == 30.0
+        assert client.api_version == "4"
+        assert client.retry_transient_errors is True
+        assert client.max_retries == 3
+        assert client.obey_rate_limit is False
+
+
+# ---------------------------------------------------------------------------
+# GitLabClient init / get_client / get_sdk / get_token
+# ---------------------------------------------------------------------------
+
+
+class TestGitLabClientInit:
+    def test_init(self):
+        inner = MagicMock(spec=GitLabClientViaToken)
+        gc = GitLabClient(inner)
+        assert gc.get_client() is inner
+
+    def test_get_sdk_delegates(self):
+        inner = MagicMock(spec=GitLabClientViaToken)
+        inner.get_sdk.return_value = MagicMock()
+        gc = GitLabClient(inner)
+        assert gc.get_sdk() is inner.get_sdk.return_value
+        inner.get_sdk.assert_called_once()
+
+    def test_get_token_delegates(self):
+        inner = MagicMock(spec=GitLabClientViaToken)
+        inner.get_token.return_value = "tok"
+        gc = GitLabClient(inner)
+        assert gc.get_token() == "tok"
+        inner.get_token.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# build_with_config
+# ---------------------------------------------------------------------------
+
+
+class TestBuildWithConfig:
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    def test_build(self, _mock_gitlab_module):
+        cfg = GitLabConfig(token="tok")
+        gc = GitLabClient.build_with_config(cfg)
+        assert isinstance(gc, GitLabClient)
+        assert gc.get_token() == "tok"
+
+
+# ---------------------------------------------------------------------------
+# build_from_services
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFromServices:
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_api_token(self, _mock_gitlab, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {
+                    "authType": "API_TOKEN",
+                    "token": "tok",
+                    "instanceUrl": "https://gl.local",
+                },
+                "credentials": {"something": "x"},
+            }
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert isinstance(gc, GitLabClient)
+        assert gc.get_token() == "tok"
+        # instanceUrl should be passed through to the underlying client
+        assert gc.get_client().url == "https://gl.local"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_oauth_is_default_when_authtype_missing(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        # authType absent → defaults to OAUTH (primary auth flow for this connector).
+        # auth must be non-empty to pass the "Auth configuration missing" guard,
+        # but it need not contain authType.
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {"clientId": "app-id"},
+                "credentials": {"access_token": "oauth-tok"},
+            }
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert isinstance(gc, GitLabClient)
+        assert gc.get_token() == "oauth-tok"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_oauth(self, _mock_gitlab, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {"authType": "OAUTH"},
+                "credentials": {"access_token": "oauth-tok"},
+            }
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert isinstance(gc, GitLabClient)
+        assert gc.get_token() == "oauth-tok"
+
+    @pytest.mark.asyncio
+    async def test_empty_config_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(return_value=None)
+        with pytest.raises(ValueError, match="Failed to get GitLab connector configuration"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={"auth": {}, "credentials": {"x": "y"}}
+        )
+        with pytest.raises(ValueError, match="Auth configuration missing"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    async def test_oauth_missing_credentials_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={"auth": {"authType": "OAUTH"}, "credentials": {}}
+        )
+        with pytest.raises(ValueError, match="Credentials configuration not found"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_api_token_without_credentials_builds(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        # A token-only connector has no OAuth credentials and must still build.
+        mock_config_service.get_config = AsyncMock(
+            return_value={"auth": {"authType": "API_TOKEN", "token": "tok"}}
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_token() == "tok"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_api_token_refused_for_plaintext_instance(
+        self, mock_gitlab_module, logger, mock_config_service
+    ) -> None:
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {
+                    "authType": "API_TOKEN",
+                    "token": "tok",
+                    "instanceUrl": "http://gitlab.internal.example",
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="must use https"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        mock_gitlab_module.Gitlab.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_api_token_missing_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {"authType": "API_TOKEN"},
+                "credentials": {"something": "x"},
+            }
+        )
+        with pytest.raises(ValueError, match="Token required"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    async def test_oauth_missing_access_token_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {"authType": "OAUTH"},
+                "credentials": {"other": "value"},
+            }
+        )
+        with pytest.raises(ValueError, match="Access token required"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    async def test_invalid_auth_type_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {"authType": "UNSUPPORTED"},
+                "credentials": {"something": "x"},
+            }
+        )
+        with pytest.raises(ValueError, match="Invalid auth type"):
+            await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_instance_url_used_for_ee(self, _mock_gitlab, logger, mock_config_service):
+        """instanceUrl is passed to the underlying client for GitLab EE support."""
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {
+                    "authType": "OAUTH",
+                    "instanceUrl": "https://gitlab.mycompany.com",
+                },
+                "credentials": {"access_token": "tok"},
+            }
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_client().url == "https://gitlab.mycompany.com"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_instance_url_trailing_slash_stripped(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        """Trailing slash in instanceUrl is stripped."""
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {
+                    "authType": "OAUTH",
+                    "instanceUrl": "https://gitlab.mycompany.com/",
+                },
+                "credentials": {"access_token": "tok"},
+            }
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_client().url == "https://gitlab.mycompany.com"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_instance_url_defaults_to_gitlab_com(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        """When instanceUrl is absent the client uses https://gitlab.com."""
+        mock_config_service.get_config = AsyncMock(
+            return_value={
+                "auth": {"authType": "OAUTH"},
+                "credentials": {"access_token": "tok"},
+            }
+        )
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_client().url == "https://gitlab.com"
+
+    # --- Cloud vs EE: legacy-install fallback to shared OAuth config ----------
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_ee_legacy_install_resolves_instance_url_via_shared_oauth_config(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        """Legacy GitLab EE connector: instanceUrl was stripped from the
+        connector-instance auth config (old bug), but is still on the shared
+        OAuth-app config. ``build_from_services`` must fall back to that so
+        the client talks to the EE host, not gitlab.com."""
+
+        async def _get_config(path, *_args, **_kwargs):
+            if path == "/services/connectors/inst-1/config":
+                return {
+                    "auth": {
+                        "authType": "OAUTH",
+                        "oauthConfigId": "oauth-1",
+                        "connectorType": "GITLAB",
+                        # instanceUrl deliberately missing (legacy strip)
+                    },
+                    "credentials": {"access_token": "tok"},
+                }
+            # Shared OAuth-app config path: /services/oauth/gitlab
+            if path == "/services/oauth/gitlab":
+                return [
+                    {
+                        "_id": "oauth-1",
+                        "config": {
+                            "clientId": "cid",
+                            "clientSecret": "csecret",
+                            "instanceUrl": "https://git.ringcentral.com",
+                        },
+                    }
+                ]
+            return None
+
+        mock_config_service.get_config = AsyncMock(side_effect=_get_config)
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_client().url == "https://git.ringcentral.com"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_cloud_legacy_install_falls_back_to_gitlab_com(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        """Legacy GitLab Cloud connector: instanceUrl missing everywhere (it's
+        the SaaS default). Client must default to https://gitlab.com."""
+
+        async def _get_config(path, *_args, **_kwargs):
+            if path == "/services/connectors/inst-1/config":
+                return {
+                    "auth": {
+                        "authType": "OAUTH",
+                        "oauthConfigId": "oauth-1",
+                        "connectorType": "GITLAB",
+                    },
+                    "credentials": {"access_token": "tok"},
+                }
+            if path == "/services/oauth/gitlab":
+                return [
+                    {
+                        "_id": "oauth-1",
+                        "config": {"clientId": "cid", "clientSecret": "csecret"},
+                    }
+                ]
+            return None
+
+        mock_config_service.get_config = AsyncMock(side_effect=_get_config)
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_client().url == "https://gitlab.com"
+
+    @pytest.mark.asyncio
+    @patch("app.sources.client.gitlab.gitlab.gitlab")
+    async def test_instance_url_on_auth_wins_over_shared_oauth_config(
+        self, _mock_gitlab, logger, mock_config_service
+    ):
+        """Per-instance value is the source of truth; shared OAuth-config is a fallback only."""
+
+        async def _get_config(path, *_args, **_kwargs):
+            if path == "/services/connectors/inst-1/config":
+                return {
+                    "auth": {
+                        "authType": "OAUTH",
+                        "oauthConfigId": "oauth-1",
+                        "connectorType": "GITLAB",
+                        "instanceUrl": "https://gitlab.team-a.example",
+                    },
+                    "credentials": {"access_token": "tok"},
+                }
+            if path == "/services/oauth/gitlab":
+                return [
+                    {
+                        "_id": "oauth-1",
+                        "config": {"instanceUrl": "https://gitlab.team-b.example"},
+                    }
+                ]
+            return None
+
+        mock_config_service.get_config = AsyncMock(side_effect=_get_config)
+        gc = await GitLabClient.build_from_services(logger, mock_config_service, "inst-1")
+        assert gc.get_client().url == "https://gitlab.team-a.example"
+
+
+# ---------------------------------------------------------------------------
+# _get_connector_config
+# ---------------------------------------------------------------------------
+
+
+class TestGetConnectorConfig:
+    @pytest.mark.asyncio
+    async def test_returns_config(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(
+            return_value={"auth": {"authType": "API_TOKEN"}}
+        )
+        result = await GitLabClient._get_connector_config(
+            logger, mock_config_service, "inst-1"
+        )
+        assert result == {"auth": {"authType": "API_TOKEN"}}
+
+    @pytest.mark.asyncio
+    async def test_empty_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(return_value=None)
+        with pytest.raises(ValueError, match="Failed to get GitLab connector configuration"):
+            await GitLabClient._get_connector_config(logger, mock_config_service, "inst-1")
+
+    @pytest.mark.asyncio
+    async def test_exception_raises(self, logger, mock_config_service):
+        mock_config_service.get_config = AsyncMock(side_effect=RuntimeError("boom"))
+        with pytest.raises(ValueError, match="Failed to get GitLab connector configuration"):
+            await GitLabClient._get_connector_config(logger, mock_config_service, "inst-1")
+
+
+class _RedirectingAdapter(requests.adapters.BaseAdapter):
+    """Answers the first request with a redirect and records every request sent."""
+
+    def __init__(self, location: str) -> None:
+        super().__init__()
+        self.location = location
+        self.sent: list[requests.PreparedRequest] = []
+
+    def send(self, request, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.sent.append(request)
+        response = requests.Response()
+        response.request = request
+        response.url = request.url
+        if len(self.sent) == 1:
+            response.status_code = 302
+            response.headers["location"] = self.location
+        else:
+            response.status_code = 200
+        return response
+
+    def close(self) -> None:
+        pass
+
+
+class TestRedirectsKeepTheTokenOffPlainHttp:
+    @pytest.mark.parametrize(
+        "headers", [{"PRIVATE-TOKEN": "pat-tok"}, {"Authorization": "Bearer oauth-tok"}]
+    )
+    def test_a_redirect_to_plain_http_is_refused_before_it_is_followed(self, headers, monkeypatch) -> None:
+        # requests strips Authorization on a downgrade but keeps PRIVATE-TOKEN,
+        # so the redirect itself must not be followed.
+        from app.sources.client.gitlab.gitlab import _secure_session
+
+        monkeypatch.delenv("PIPESHUB_GITLAB_ALLOW_INSECURE_HTTP", raising=False)
+        session = _secure_session()
+        adapter = _RedirectingAdapter("http://gitlab.example/api/v4/projects")
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        with pytest.raises(ValueError, match="must use https"):
+            session.get("https://gitlab.example/api/v4/projects", headers=headers)
+        assert len(adapter.sent) == 1, "no request may follow the downgrade"
+
+    def test_a_redirect_that_stays_on_https_is_followed(self) -> None:
+        from app.sources.client.gitlab.gitlab import _secure_session
+
+        session = _secure_session()
+        adapter = _RedirectingAdapter("https://gitlab.example/api/v4/projects?page=2")
+        session.mount("https://", adapter)
+
+        response = session.get("https://gitlab.example/api/v4/projects", headers={"PRIVATE-TOKEN": "pat-tok"})
+        assert response.status_code == 200
+        assert len(adapter.sent) == 2
+
+    @pytest.mark.parametrize(
+        "headers,header", [({"PRIVATE-TOKEN": "pat-tok"}, "PRIVATE-TOKEN"), ({"Authorization": "Bearer oauth-tok"}, "Authorization")]
+    )
+    def test_a_redirect_to_another_server_does_not_carry_the_token(self, headers, header) -> None:
+        from app.sources.client.gitlab.gitlab import _secure_session
+
+        session = _secure_session()
+        adapter = _RedirectingAdapter("https://attacker.example/steal")
+        session.mount("https://", adapter)
+
+        session.get("https://gitlab.example/api/v4/projects", headers=headers)
+        assert len(adapter.sent) == 2
+        assert header not in adapter.sent[1].headers, "the token must not follow a redirect to another server"
+
+    def test_a_redirect_on_the_same_server_keeps_the_token(self) -> None:
+        from app.sources.client.gitlab.gitlab import _secure_session
+
+        session = _secure_session()
+        adapter = _RedirectingAdapter("https://gitlab.example/api/v4/projects?page=2")
+        session.mount("https://", adapter)
+
+        session.get("https://gitlab.example/api/v4/projects", headers={"PRIVATE-TOKEN": "pat-tok"})
+        assert adapter.sent[1].headers.get("PRIVATE-TOKEN") == "pat-tok"
+
+
+# ---------------------------------------------------------------------------
+# Read timeouts are not retried inside python-gitlab
+# ---------------------------------------------------------------------------
+
+
+class TestReadTimeoutIsNotRetriedBySdk:
+    """python-gitlab 8 retries a read timeout when retry_transient_errors is on.
+
+    A stalled call would then hold its worker thread for up to ten per-request
+    timeouts, which asyncio.wait_for cannot interrupt.
+    """
+
+    @staticmethod
+    def _stalled_server() -> tuple[http.server.ThreadingHTTPServer, list[str]]:
+        hits: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                hits.append(self.path)
+                time.sleep(1.0)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, hits
+
+    def test_first_read_timeout_is_raised_after_one_request(self) -> None:
+        server, hits = self._stalled_server()
+        try:
+            gl = gitlab.Gitlab(
+                f"http://127.0.0.1:{server.server_port}",
+                private_token="t",
+                timeout=0.2,
+                retry_transient_errors=True,
+                session=_TokenSafeSession(),
+            )
+            with pytest.raises(GitLabReadTimeout):
+                gl.http_get("/projects/1/issues")
+        finally:
+            server.shutdown()
+        assert len(hits) == 1
+
+    def test_a_stall_while_reading_the_body_is_raised_after_one_request(self) -> None:
+        hits: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b"{")
+                self.wfile.flush()
+                time.sleep(1.0)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            gl = gitlab.Gitlab(
+                f"http://127.0.0.1:{server.server_port}",
+                private_token="t",
+                timeout=0.2,
+                retry_transient_errors=True,
+                session=_TokenSafeSession(),
+            )
+            with pytest.raises(GitLabReadTimeout):
+                gl.http_get("/projects/1/issues")
+        finally:
+            server.shutdown()
+        assert len(hits) == 1
+
+    def test_connect_failures_are_still_retried_by_the_sdk(self) -> None:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        session = _TokenSafeSession()
+        calls: list[int] = []
+        real = requests.Session.send
+
+        def counting(self_: requests.Session, request: requests.PreparedRequest, **kw: object) -> requests.Response:
+            calls.append(1)
+            return real(self_, request, **kw)
+
+        gl = gitlab.Gitlab(f"http://127.0.0.1:{port}", private_token="t", timeout=0.2,
+                           retry_transient_errors=True, session=session)
+        with patch.object(requests.Session, "send", counting), patch("time.sleep"):
+            with pytest.raises(requests.exceptions.ConnectionError):
+                gl.http_get("/projects/1/issues", max_retries=2)
+        assert len(calls) == 3

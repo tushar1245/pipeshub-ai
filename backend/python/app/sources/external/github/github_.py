@@ -1,0 +1,1844 @@
+from __future__ import annotations
+
+import base64
+import difflib
+import itertools
+import re
+from collections.abc import AsyncGenerator, Sequence
+from typing import TYPE_CHECKING
+
+import httpx
+from github import (
+    Github,  # type: ignore
+)
+from github.AuthenticatedUser import AuthenticatedUser  # type: ignore
+from github.Branch import Branch  # type: ignore
+from github.Commit import Commit  # type: ignore
+from github.ContentFile import ContentFile  # type: ignore
+from github.Deployment import Deployment  # type: ignore
+from github.DeploymentStatus import DeploymentStatus  # type: ignore
+from github.File import File  # type: ignore
+from github.Comparison import Comparison  # type: ignore
+from github.GitBlob import GitBlob  # type: ignore
+from github.GitRef import GitRef  # type: ignore
+from github.GitRelease import GitRelease  # type: ignore
+from github.GitTag import GitTag  # type: ignore
+from github.GitTree import GitTree  # type: ignore
+from github.Hook import Hook  # type: ignore
+from github.Invitation import Invitation  # type: ignore
+from github.Issue import Issue  # type: ignore
+from github.IssueComment import IssueComment  # type: ignore
+from github.Label import Label  # type: ignore
+from github.Membership import Membership  # type: ignore
+from github.NamedUser import NamedUser  # type: ignore
+from github.Organization import Organization  # type: ignore
+from github.PullRequest import PullRequest  # type: ignore
+from github.PullRequestComment import PullRequestComment  # type: ignore
+from github.PullRequestReview import PullRequestReview  # type: ignore
+from github.RateLimit import RateLimit  # type: ignore
+from github.Repository import Repository  # type: ignore
+from github.Tag import Tag  # type: ignore
+from github.Team import Team  # type: ignore
+from github.Workflow import Workflow  # type: ignore
+from github.WorkflowRun import WorkflowRun  # type: ignore
+
+from app.sources.client.github.github import GitHubResponse, github_retry_after_seconds
+
+if TYPE_CHECKING:
+    import datetime
+    from collections.abc import Iterable
+
+# GitHub caps both REST and Search page sizes at 100. Requesting the maximum
+# cuts round trips for the many call sites that materialise a whole PaginatedList.
+_SERVER_PAGE_SIZE = 100
+_MAX_PAGE_SIZE = 100
+_DEFAULT_PAGE_SIZE = 10
+
+
+
+_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+# Most items one call reads into the model's context from a nested list (comments,
+# reviews, changed files). shortcut: the cut is silent; return a truncated flag if
+# answers on very long threads turn out wrong.
+_MAX_NESTED_ITEMS = 300
+
+
+def _capped[T](items: Iterable[T]) -> tuple[list[T], bool]:
+    """The first ``_MAX_NESTED_ITEMS`` items, and whether more exist."""
+    out = list(itertools.islice(items, _MAX_NESTED_ITEMS + 1))
+    return out[:_MAX_NESTED_ITEMS], len(out) > _MAX_NESTED_ITEMS
+
+
+class GitHubDataSource:
+    """Strict, typed wrapper over PyGithub for common GitHub business operations.
+
+    Accepts either a PyGithub `Github` instance *or* any object with `.get_sdk() -> Github`.
+    """
+
+    def __init__(self, client: object) -> None:
+        if isinstance(client, Github):
+            self._sdk: Github = client
+            # NOTE : when can this be a case
+            self._pin_page_size()
+        else:
+            self._bind_from_wrapper(client)
+
+    def _pin_page_size(self) -> None:
+        """Make the SDK's page size match what ``_slice_paginated`` assumes.
+
+        Set once, not per call: the executor runs several workers against this
+        same SDK, so mutating ``per_page`` inside a method would race. It must
+        be pinned on every construction path — ``_slice_paginated`` treats a
+        server page shorter than ``_SERVER_PAGE_SIZE`` as the end of the
+        listing, so an SDK left on PyGithub's default of 30 would silently
+        truncate every paged sweep after its first page.
+        """
+        try:
+            self._sdk.per_page = _SERVER_PAGE_SIZE
+        except Exception:  # pragma: no cover - older/patched SDKs
+            pass
+
+    def _bind_from_wrapper(self, client: object) -> None:
+        get_sdk = getattr(client, "get_sdk", None)
+        if get_sdk is None or not callable(get_sdk):
+            raise TypeError("client must be a github.GithubClient or expose get_sdk() -> Github")
+        sdk = get_sdk()
+        if not isinstance(sdk, Github):
+            raise TypeError("get_sdk() must return a github.Github instance")
+        self._sdk = sdk
+        get_token = getattr(client, "get_token", None)
+        if get_token is None or not callable(get_token):
+            raise TypeError("client must be a github.GitHubClient or expose get_token() -> str")
+        token = get_token()
+        if not isinstance(token, str):
+            raise TypeError("get_token() must return a string")
+        self.token = token
+        self._pin_page_size()
+
+    def rebind_client(self, client: object) -> None:
+        """Re-point this data source at a freshly rebuilt SDK/token pair.
+
+        PyGithub binds ``Auth.Token`` at construction time, so rotating the
+        access token (``GitHubClientViaToken.set_token``) builds a brand new
+        ``Github`` instance rather than mutating one in place. Without this
+        call, every request made through this data source after a token
+        refresh -- SDK-backed calls via the stale ``self._sdk``, and the
+        direct-httpx image/attachment paths via the stale ``self.token`` --
+        would keep using the expired credential.
+        """
+        self._bind_from_wrapper(client)
+
+    # -----------------------
+    # Internal helpers
+    # -----------------------
+    def _repo(self, owner: str, repo: str, *, lazy: bool = False) -> Repository:
+        """``lazy`` skips the ``GET /repos/{owner}/{repo}`` a method that only
+        reads a sub-resource does not need: a missing repository still fails,
+        as a 404 from that sub-resource. It halves the cost of a content fetch
+        or tree walk against the hourly rate limit."""
+        # owner/repo come from the model. A "." or ".." segment (or a "/") would be
+        # resolved by the HTTP layer into another repository's path, so a write
+        # approved for acme/widgets could land elsewhere.
+        for part in (owner, repo):
+            if not _REPO_SEGMENT.fullmatch(part or "") or part in (".", ".."):
+                raise ValueError(f"Invalid GitHub owner or repository name: {part!r}")
+        return self._sdk.get_repo(f"{owner}/{repo}", lazy=lazy)
+
+    @staticmethod
+    def _err(e: Exception) -> GitHubResponse:
+        """Failure response preserving the HTTP status and exception class.
+
+        ``GithubException.status`` is the only way to tell 401 (re-auth) from
+        403 (rate/abuse limit) from 5xx (retry) once the exception is stringified.
+        """
+        return GitHubResponse(
+            success=False,
+            error=str(e),
+            status_code=getattr(e, "status", None),
+            exception_type=type(e).__name__,
+            api_message=GitHubDataSource._api_message(getattr(e, "data", None)),
+            retry_after_seconds=GitHubDataSource._retry_after_seconds(getattr(e, "headers", None)),
+        )
+
+    @staticmethod
+    def _api_message(data: object) -> str | None:
+        """GitHub's ``message`` plus the text of any field ``errors`` it listed."""
+        if not isinstance(data, dict):
+            return None
+        parts = [str(data["message"]).rstrip(".")] if data.get("message") else []
+        for item in data.get("errors") or []:
+            text = item.get("message") if isinstance(item, dict) else item
+            if isinstance(text, str) and text and text not in parts:
+                parts.append(text.rstrip("."))
+        return "; ".join(parts) or None
+
+    @staticmethod
+    def _retry_after_seconds(headers: object) -> int | None:
+        """Seconds GitHub asked us to wait: ``Retry-After``, else until ``X-RateLimit-Reset``."""
+        return github_retry_after_seconds(headers)
+
+    @staticmethod
+    def _not_none(**params: object) -> dict[str, object]:
+        return {k: v for k, v in params.items() if v is not None}
+
+    @staticmethod
+    def _clamp_page_args(per_page: int | None, page: int | None) -> tuple[int, int]:
+        return (
+            _DEFAULT_PAGE_SIZE if per_page is None else min(_MAX_PAGE_SIZE, max(1, per_page)),
+            1 if page is None else max(1, page),
+        )
+
+    @staticmethod
+    def _slice_paginated(paginated: object, per_page: int, page: int) -> list:
+        """Return the caller's ``page`` of ``per_page`` items from a ``PaginatedList``.
+
+        ``get_page(n)`` returns *GitHub's* page of ``_SERVER_PAGE_SIZE`` items,
+        which is not the caller's page size. Slicing a single ``get_page`` result
+        therefore skips every item between ``per_page`` and the server page
+        boundary — they are unreachable at any page index. Walk server pages and
+        cut the requested window out of the absolute item sequence instead.
+        """
+        start = (page - 1) * per_page
+        end = start + per_page
+        if not hasattr(paginated, "get_page"):
+            return list(paginated)[start:end]
+
+        collected: list = []
+        server_page = start // _SERVER_PAGE_SIZE
+        offset_in_page = start % _SERVER_PAGE_SIZE
+        while len(collected) < per_page:
+            items = paginated.get_page(server_page)
+            if not items:
+                break
+            collected.extend(items[offset_in_page:])
+            if len(items) < _SERVER_PAGE_SIZE:
+                break
+            offset_in_page = 0
+            server_page += 1
+        return collected[:per_page]
+
+    @staticmethod
+    def _is_pull_request(item: object) -> bool:
+        """True when an ``/issues`` item is really a pull request.
+
+        Uses ``html_url`` rather than ``.pull_request``: on a partial ``Issue``
+        from a listing, ``_pull_request`` is unset, so touching it triggers
+        PyGithub's lazy ``GET /issues/{n}`` — one blocking request per issue.
+        ``html_url`` is always present on the list payload.
+        """
+        return "/pull/" in (getattr(item, "html_url", "") or "")
+
+    def _reload_edited_issue(self, r: Repository, issue: Issue) -> GitHubResponse:
+        """Return the issue as GitHub now has it after a successful edit().
+
+        edit() updates the typed attributes from the PATCH reply but not raw_data, which is what
+        callers serialize, so read it again. If that read fails the change is still saved: say so
+        from the attributes edit() did update, rather than report the write as failed.
+        """
+        try:
+            return GitHubResponse(success=True, data=r.get_issue(issue.number))
+        except Exception as e:
+            return GitHubResponse(success=True, data={
+                "number": issue.number,
+                "title": issue.title,
+                "state": issue.state,
+                "html_url": issue.html_url,
+                "note": (
+                    "The change was saved, but the updated issue could not be reloaded "
+                    f"({e}). Call get_issue to see it in full."
+                ),
+            })
+
+    @classmethod
+    def _issues_only(cls, items: list) -> list:
+        """Filter to items that are issues, excluding PRs."""
+        return [i for i in items if not cls._is_pull_request(i)]
+
+
+    def get_authenticated(self) -> GitHubResponse[AuthenticatedUser]:
+        """Return the authenticated user."""
+        try:
+            user = self._sdk.get_user()
+            # get_user() is lazy — no request until an attribute is read. Force
+            # the GET /user HERE, inside the caller's executor thread; otherwise
+            # the first attribute access fires it on the event loop, and a
+            # rate-limited response blocks the whole service for PyGithub's
+            # backoff (observed: 30 min frozen, health checks dead).
+            user.id
+            return GitHubResponse(success=True, data=user)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_user(self, login: str) -> GitHubResponse[NamedUser]:
+        """Get a user by login."""
+        try:
+            user = self._sdk.get_user(login)
+            return GitHubResponse(success=True, data=user)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_organization(self, org: str) -> GitHubResponse[Organization]:
+        """Get an organization by login."""
+        try:
+            org_obj = self._sdk.get_organization(org)
+            return GitHubResponse(success=True, data=org_obj)
+        except Exception as e:
+            return self._err(e)
+
+    def get_owner(self, login: str, kind: str = "user") -> GitHubResponse[NamedUser | Organization]:
+        """Get a user or organization by login (the 'owner' of repos). Use login='me' for the authenticated user."""
+        try:
+            if kind == "organization":
+                obj = self._sdk.get_organization(login)
+            else:
+                obj = self._sdk.get_user() if (login or "").strip().lower() == "me" else self._sdk.get_user(login)
+            # A lazy object would make its GET on whichever thread first reads it; as in get_authenticated, read it here.
+            _ = obj.id
+            return GitHubResponse(success=True, data=obj)
+        except Exception as e:
+            return self._err(e)
+
+    def list_user_repos(
+        self,
+        user: str | None=None,
+        type: str = "owner",
+        per_page: int | None = None,
+        page: int | None = None,
+    ) -> GitHubResponse[list[Repository]]:
+        """List repositories for a given user. When both per_page and page are omitted, returns all repos. When either is passed, returns one page (default 10 per page, max 100). Pass the login from get_owner(owner='me') result; do not pass 'me' here."""
+        try:
+            # /users/{login}/repos lists public repos only, even for the caller's own login;
+            # the caller's own repos (private ones too) come from /user/repos.
+            me = self._sdk.get_user()
+            u = me if not user or user.lower() in ("me", me.login.lower()) else self._sdk.get_user(user)
+            paginated = u.get_repos(type=type)
+            if per_page is None and page is None:
+                return GitHubResponse(success=True, data=list(paginated))
+            _per_page, _page = self._clamp_page_args(per_page, page)
+            return GitHubResponse(success=True, data=self._slice_paginated(paginated, _per_page, _page))
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_repo(self, owner: str, repo: str) -> GitHubResponse[Repository]:
+        """Get a repository."""
+        try:
+            r = self._repo(owner, repo)
+            return GitHubResponse(success=True, data=r)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_org_repos(
+        self,
+        org: str,
+        type: str = "all",
+        per_page: int | None = None,
+        page: int | None = None,
+    ) -> GitHubResponse[list[Repository]]:
+        """List repositories for an organization. When both per_page and page are omitted, returns all repos."""
+        try:
+            o = self._sdk.get_organization(org)
+            paginated = o.get_repos(type=type)
+            if per_page is None and page is None:
+                return GitHubResponse(success=True, data=list(paginated))
+            _per_page, _page = self._clamp_page_args(per_page, page)
+            return GitHubResponse(success=True, data=self._slice_paginated(paginated, _per_page, _page))
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_repo(self, name: str, private: bool = True, description: str | None = None, auto_init: bool = True) -> GitHubResponse[Repository]:
+        """Create a repository under the authenticated user."""
+        try:
+            params = self._not_none(description=description)
+            repo = self._sdk.get_user().create_repo(name=name, private=private, auto_init=auto_init, **params)
+            return GitHubResponse(success=True, data=repo)
+        except Exception as e:
+            return self._err(e)
+
+
+    # Issue-dependency endpoints shipped in a newer API version than the one
+    # PyGithub pins, so both go through the raw requester with an explicit
+    # version header. Responses are raw issue dicts (no typed wrapper exists).
+    _ISSUE_DEPENDENCIES_API_VERSION = "2026-03-10"
+
+    def _list_issue_dependencies(
+        self, owner: str, repo: str, number: int, direction: str
+    ) -> GitHubResponse[list[dict]]:
+        try:
+            _, data = self._sdk.requester.requestJsonAndCheck(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{number}/dependencies/{direction}",
+                headers={"X-GitHub-Api-Version": self._ISSUE_DEPENDENCIES_API_VERSION},
+            )
+            return GitHubResponse(success=True, data=data or [])
+        except Exception as e:
+            return self._err(e)
+
+    def list_issue_blocked_by(self, owner: str, repo: str, number: int) -> GitHubResponse[list[dict]]:
+        """Issues that block the given issue (it depends on them)."""
+        return self._list_issue_dependencies(owner, repo, number, "blocked_by")
+
+    def list_issue_blocking(self, owner: str, repo: str, number: int) -> GitHubResponse[list[dict]]:
+        """Issues the given issue blocks."""
+        return self._list_issue_dependencies(owner, repo, number, "blocking")
+
+    def list_issues(
+        self,
+        owner: str,
+        repo: str,
+        state: str = "open",
+        labels: Sequence[str] | None = None,
+        assignee: str | None = None,
+        since: datetime.datetime | None = None,
+        per_page: int | None = None,
+        page: int | None = None,
+        sort:str|None=None,
+        direction:str|None=None,
+    ) -> GitHubResponse[list[Issue]]:
+        """List issues with filters. When both per_page and page are None (e.g. from connector), returns all issues. Otherwise returns one page (default 10 per page, max 100)."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(labels=labels, assignee=assignee, since=since,direction=direction,sort=sort)
+            paginated = r.get_issues(state=state, **params)
+            if per_page is None and page is None:
+                issues = list(paginated)
+                return GitHubResponse(success=True, data=issues)
+            _per_page, _page = self._clamp_page_args(per_page, page)
+            return GitHubResponse(success=True, data=self._slice_paginated(paginated, _per_page, _page))
+        except Exception as e:
+            return self._err(e)
+
+    def list_issues_only(
+        self,
+        owner: str,
+        repo: str,
+        state: str = "open",
+        labels: Sequence[str] | None = None,
+        assignee: str | None = None,
+        since: str | None = None,
+        per_page: int = 10,
+        page: int = 1,
+    ) -> GitHubResponse[list[Issue]]:
+        """List only issues (exclude PRs). Always returns one page (default 10 per page, max 50) by over-fetching API pages and filtering out PRs."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(labels=labels, assignee=assignee, since=since)
+            paginated = r.get_issues(state=state, **params)
+
+            _per_page = min(50, max(1, per_page))
+            _page = max(1, page)
+            skip = (_page - 1) * _per_page
+            needed = skip + _per_page
+            accumulator: list = []
+            api_page_index = 0
+            api_page_size = 30
+            while len(accumulator) < needed:
+                if hasattr(paginated, "get_page"):
+                    raw = paginated.get_page(api_page_index)
+                else:
+                    all_items = list(paginated)
+                    filtered_all = self._issues_only(all_items)
+                    result = filtered_all[skip : skip + _per_page]
+                    return GitHubResponse(success=True, data=result)
+                if not raw:
+                    break
+                batch = raw if isinstance(raw, list) else list(raw)
+                accumulator.extend(self._issues_only(batch))
+                if len(batch) < api_page_size:
+                    break
+                api_page_index += 1
+            result = accumulator[skip : skip + _per_page]
+            return GitHubResponse(success=True, data=result)
+        except Exception as e:
+            return self._err(e)
+
+    def get_issue(self, owner: str, repo: str, number: int) -> GitHubResponse[Issue]:
+        """Get a single issue."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            return GitHubResponse(success=True, data=issue)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_issue(self, owner: str, repo: str, title: str, body: str | None = None, assignees: Sequence[str] | None = None, labels: Sequence[str] | None = None) -> GitHubResponse[Issue]:
+        """Create an issue."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(body=body, assignees=assignees, labels=labels)
+            issue = r.create_issue(title=title, **params)
+            return GitHubResponse(success=True, data=issue)
+        except Exception as e:
+            return self._err(e)
+
+
+    def update_issue(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        title: str | None = None,
+        body: str | None = None,
+        state: str | None = None,
+        assignees: Sequence[str] | None = None,
+        labels: Sequence[str] | None = None,
+    ) -> GitHubResponse[Issue]:
+        """Update an existing issue. Only pass fields to change (title, body, state, assignees, labels)."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            params = self._not_none(title=title, body=body, state=state, assignees=assignees, labels=labels)
+            if not params:
+                return GitHubResponse(success=True, data=issue)
+            issue.edit(**params)
+            return self._reload_edited_issue(r, issue)
+        except Exception as e:
+            return self._err(e)
+
+
+    def close_issue(self, owner: str, repo: str, number: int) -> GitHubResponse[Issue]:
+        """Close an issue."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            issue.edit(state="closed")
+            return self._reload_edited_issue(r, issue)
+        except Exception as e:
+            return self._err(e)
+
+
+    def add_labels_to_issue(self, owner: str, repo: str, number: int, labels: Sequence[str]) -> GitHubResponse[list[Label]]:
+        """Add labels to an issue."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            out = list(issue.add_to_labels(*labels))
+            return GitHubResponse(success=True, data=out)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_issue_comments(self, owner: str, repo: str, number: int,since:datetime.datetime|None=None) -> GitHubResponse[list[IssueComment]]:
+        """List comments on an issue."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            if since is None:
+                comments, truncated = _capped(issue.get_comments())
+            else:
+                comments, truncated = list(issue.get_comments(since=since)), False
+            return GitHubResponse(success=True, data=comments, truncated=truncated)
+        except Exception as e:
+            return self._err(e)
+
+    def get_issue_comment(self, owner: str, repo: str, number: int, comment_id: int) -> GitHubResponse[IssueComment]:
+        """Get a single issue comment by ID."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number=number)
+            comment = issue.get_comment(id=comment_id)
+            return GitHubResponse(success=True, data=comment)
+        except Exception as e:
+            return self._err(e)
+
+    def create_issue_comment(self, owner: str, repo: str, number: int, body: str) -> GitHubResponse[IssueComment]:
+        """Create a comment on an issue."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            comment = issue.create_comment(body)
+            return GitHubResponse(success=True, data=comment)
+        except Exception as e:
+            return self._err(e)
+
+    def edit_issue_comment(self, owner: str, repo: str, number: int, comment_id: int, body: str) -> GitHubResponse[IssueComment]:
+        """Edit an existing issue comment."""
+        try:
+            r = self._repo(owner, repo)
+            issue = r.get_issue(number)
+            comment = issue.get_comment(id=comment_id)
+            comment.edit(body)
+            return GitHubResponse(success=True, data=comment)
+        except Exception as e:
+            return self._err(e)
+
+    def list_pulls(
+        self,
+        owner: str,
+        repo: str,
+        state: str = "open",
+        head: str | None = None,
+        base: str | None = None,
+        sort: str | None = None,
+        direction: str | None = None,
+        per_page: int | None = None,
+        page: int | None = None,
+    ) -> GitHubResponse[list[PullRequest]]:
+        """List PRs. When both per_page and page are None (e.g. from connector), returns all PRs. Otherwise returns one page (default 10 per page, max 100).
+
+        ``sort``/``direction`` matter for incremental sync: this endpoint has no
+        ``since`` parameter, so ``sort='updated', direction='desc'`` is the only
+        way to page newest-first and stop at the checkpoint.
+
+        Objects returned here carry the LIST payload, which omits ``mergeable``,
+        ``mergeable_state`` and ``merged_by``. Reading those properties would
+        make PyGithub silently issue a per-PR GET, so callers must go through
+        ``raw_data`` instead of the typed attributes.
+        """
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(head=head, base=base, sort=sort, direction=direction)
+            paginated = r.get_pulls(state=state, **params)
+            if per_page is None and page is None:
+                pulls = list(paginated)
+                return GitHubResponse(success=True, data=pulls)
+            _per_page, _page = self._clamp_page_args(per_page, page)
+            return GitHubResponse(success=True, data=self._slice_paginated(paginated, _per_page, _page))
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_pull(self, owner: str, repo: str, number: int) -> GitHubResponse[PullRequest]:
+        """Get a PR."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            return GitHubResponse(success=True, data=pr)
+        except Exception as e:
+            return self._err(e)
+
+    def get_pull_commits(self, owner: str, repo: str, number: int) -> GitHubResponse[list[Commit]]:
+        """Get commits of a PR."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            commits = list(pr.get_commits())
+            return GitHubResponse(success=True, data=commits)
+        except Exception as e:
+            return self._err(e)
+
+    def get_pull_file_changes(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        fetch_full_content: bool = True,
+        max_changes_per_file: int = 10000,  # NEW: Skip files with excessive changes
+        max_diff_lines: int = 10000,        # NEW: Truncate very long diffs
+        context_lines: int = 2,            # NEW: Configurable context (GitHub default)
+    ) -> GitHubResponse[list[File]]:
+        """
+        Get file changes of a PR with complete diffs and safety limits.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            number: Pull request number
+            fetch_full_content: If True, fetches complete diffs for truncated files
+            max_changes_per_file: Skip files with more than this many total changes
+                                (default 3000). These are likely full rewrites or
+                                generated files that would overflow context.
+            max_diff_lines: Truncate diffs longer than this many lines (default 5000)
+                        to prevent context overflow on massive refactors.
+            context_lines: Number of context lines around each change (default 3,
+                        standard GitHub format).
+
+        Returns:
+            GitHubResponse containing list of File objects with complete diffs,
+            respecting safety limits to prevent context overflow.
+
+        Safety Features:
+            - Skips files with >max_changes_per_file total changes
+            - Truncates diffs longer than max_diff_lines
+            - Uses minimal context to reduce token usage
+            - Logs warnings for skipped/truncated files
+        """
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            files, truncated = _capped(pr.get_files())
+
+            # Fast path: return as-is if full content fetching disabled
+            if not fetch_full_content:
+                return GitHubResponse(success=True, data=files, truncated=truncated)
+
+            # Process each file with safety checks
+            enhanced_files = []
+            skipped_count = 0
+            truncated_count = 0
+
+            for file_obj in files:
+                raw_data = file_obj.raw_data if hasattr(file_obj, 'raw_data') else {}
+
+                filename = raw_data.get("filename", "")
+                status = raw_data.get("status", "")
+                patch = raw_data.get("patch", "")
+                additions = raw_data.get("additions", 0)
+                deletions = raw_data.get("deletions", 0)
+                total_changes = additions + deletions
+
+                # SAFETY CHECK 1: Skip files with excessive changes
+                if total_changes > max_changes_per_file:
+                    import logging
+                    logging.warning(
+                        f"SKIP: {filename} has {total_changes} changes "
+                        f"(exceeds limit of {max_changes_per_file}). "
+                        f"Likely a full rewrite or generated file."
+                    )
+
+                    # Add explanatory note in the patch
+                    enhanced_raw_data = dict(raw_data)
+                    enhanced_raw_data["patch"] = (
+                        f"[SKIPPED: File has {total_changes:,} total changes "
+                        f"(+{additions:,} -{deletions:,}), exceeding safety limit of "
+                        f"{max_changes_per_file:,}. This is likely a complete rewrite, "
+                        f"generated file, or vendor dependency. Manual review recommended.]"
+                    )
+                    enhanced_raw_data["_skipped_large_file"] = True
+                    enhanced_raw_data["_skip_reason"] = "excessive_changes"
+
+                    if hasattr(file_obj, '_rawData'):
+                        file_obj._rawData = enhanced_raw_data
+                    elif hasattr(file_obj, 'raw_data'):
+                        object.__setattr__(file_obj, '_raw_data', enhanced_raw_data)
+
+                    enhanced_files.append(file_obj)
+                    skipped_count += 1
+                    continue
+
+                # Detect truncated patches
+                is_truncated = False
+
+                if total_changes > 0 and not patch:
+                    is_truncated = True
+                elif patch and any(marker in patch.lower() for marker in [
+                    "diff too large", "binary file", "file is too large", "large diffs"
+                ]):
+                    is_truncated = True
+                elif total_changes > 1000 and len(patch) < 500:
+                    is_truncated = True
+
+                # Skip fetching for removed/renamed files
+                if not is_truncated or status in ("removed", "renamed"):
+                    enhanced_files.append(file_obj)
+                    continue
+
+                # Fetch full diff with safety limits
+                try:
+                    full_diff = self._generate_full_diff_for_file(
+                        owner=owner,
+                        repo=repo,
+                        pr=pr,
+                        filename=filename,
+                        status=status,
+                        max_diff_lines=max_diff_lines,
+                        context_lines=context_lines,
+                    )
+
+                    if full_diff:
+                        # Check if diff was truncated
+                        was_truncated = "[TRUNCATED]" in full_diff
+                        if was_truncated:
+                            truncated_count += 1
+
+                        # Replace the truncated patch
+                        enhanced_raw_data = dict(raw_data)
+                        enhanced_raw_data["patch"] = full_diff
+                        enhanced_raw_data["_full_content_fetched"] = True
+                        if was_truncated:
+                            enhanced_raw_data["_diff_truncated"] = True
+
+                        if hasattr(file_obj, '_rawData'):
+                            file_obj._rawData = enhanced_raw_data
+                        elif hasattr(file_obj, 'raw_data'):
+                            object.__setattr__(file_obj, '_raw_data', enhanced_raw_data)
+
+                    enhanced_files.append(file_obj)
+
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Failed to fetch full content for {filename}: {e}")
+                    enhanced_files.append(file_obj)
+
+            # Log summary
+            if skipped_count > 0 or truncated_count > 0:
+                import logging
+                logging.info(
+                    f"PR #{number} file processing: "
+                    f"{len(enhanced_files)} total files, "
+                    f"{skipped_count} skipped (excessive changes), "
+                    f"{truncated_count} truncated (exceeded max_diff_lines)"
+                )
+
+            return GitHubResponse(success=True, data=enhanced_files, truncated=truncated)
+
+        except Exception as e:
+            return self._err(e)
+
+
+    def _generate_full_diff_for_file(
+        self,
+        owner: str,
+        repo: str,
+        pr: PullRequest,
+        filename: str,
+        status: str,
+        max_diff_lines: int = 5000,
+        context_lines: int = 3,
+    ) -> str | None:
+        """
+        Generate a complete unified diff with safety limits.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            pr: PullRequest object
+            filename: Path to the file
+            status: File status (added, modified, removed)
+            max_diff_lines: Maximum lines in the diff (default 5000)
+            context_lines: Number of context lines (default 3)
+
+        Returns:
+            Complete unified diff as string, truncated if exceeds max_diff_lines,
+            or None if generation fails.
+        """
+        try:
+            base_sha = pr.base.sha
+            head_sha = pr.head.sha
+
+            if not base_sha or not head_sha:
+                return None
+
+            # Fetch file content from base and head commits
+            base_content: str | None = ""
+            if status != "added":
+                base_content = self._fetch_file_content_at_ref(
+                    owner, repo, filename, base_sha
+                )
+
+            head_content: str | None = ""
+            if status != "removed":
+                head_content = self._fetch_file_content_at_ref(
+                    owner, repo, filename, head_sha
+                )
+            # A side that could not be read is not an empty file: diffing it as one
+            # shows the whole file added or deleted. The caller keeps GitHub's patch.
+            if base_content is None or head_content is None:
+                return None
+
+            # Generate unified diff
+            base_lines = base_content.splitlines(keepends=True) if base_content else []
+            head_lines = head_content.splitlines(keepends=True) if head_content else []
+
+            diff_iterator = difflib.unified_diff(
+                base_lines,
+                head_lines,
+                fromfile=f"a/{filename}",
+                tofile=f"b/{filename}",
+                lineterm="",
+                n=context_lines,  # Configurable context
+            )
+
+            # Collect diff lines with limit
+            diff_lines = []
+            for i, line in enumerate(diff_iterator):
+                if i >= max_diff_lines:
+                    # Truncate and add marker
+                    remaining = sum(1 for _ in diff_iterator)  # Count remaining
+                    diff_lines.append(
+                        f"\n... [TRUNCATED: {remaining} more lines omitted to prevent "
+                        f"context overflow. This diff exceeds {max_diff_lines} lines. "
+                        f"Consider reviewing the file directly on GitHub.] ...\n"
+                    )
+                    import logging
+                    logging.warning(
+                        f"Diff for {filename} truncated at {max_diff_lines} lines "
+                        f"({remaining} lines omitted)"
+                    )
+                    break
+                diff_lines.append(line)
+
+            return "".join(diff_lines)
+
+        except Exception as e:
+            import logging
+            logging.debug(f"Error generating full diff for {filename}: {e}")
+            return None
+
+
+    def _fetch_file_content_at_ref(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str,
+    ) -> str | None:
+        """
+        Fetch file content from a specific commit/ref.
+
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            path: File path in the repository
+            ref: Git reference (commit SHA, branch, tag)
+
+        Returns:
+            File content as string, or None when it could not be read as text (a
+            directory, a file over 1 MB that GitHub sends without content, or any error).
+        """
+        try:
+            r = self._repo(owner, repo)
+            content = r.get_contents(path, ref=ref)
+
+            # Handle directory response
+            if isinstance(content, list):
+                return None
+            if getattr(content, "encoding", "base64") != "base64":
+                return None
+
+            # Decode content
+            if hasattr(content, 'decoded_content'):
+                return content.decoded_content.decode("utf-8", errors="replace")
+            elif hasattr(content, 'content'):
+                decoded_bytes = base64.b64decode(content.content)
+                return decoded_bytes.decode("utf-8", errors="replace")
+
+            return None
+
+        except Exception as e:
+            import logging
+            logging.debug(f"Could not fetch {path} at {ref}: {e}")
+            return None
+
+    def get_pull_reviews(self, owner: str, repo: str, number: int) -> GitHubResponse[list[PullRequestReview]]:
+        """Get reviews of a PR (approve, request changes, comment with body)."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            reviews, truncated = _capped(pr.get_reviews())
+            return GitHubResponse(success=True, data=reviews, truncated=truncated)
+        except Exception as e:
+            return self._err(e)
+
+    def create_pull_request_review(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        event: str,
+        body: str | None = None,
+    ) -> GitHubResponse[PullRequestReview]:
+        """Submit a PR review: APPROVE, REQUEST_CHANGES, or COMMENT. Optional body for the review summary."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            review = pr.create_review(event=event, body=body or "")
+            return GitHubResponse(success=True, data=review)
+        except Exception as e:
+            return self._err(e)
+
+    def get_pull_review_comments(self, owner: str, repo: str, number: int) -> GitHubResponse[list[PullRequestComment]]:
+        """Get review comments of a PR."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            comments, truncated = _capped(pr.get_review_comments())
+            return GitHubResponse(success=True, data=comments, truncated=truncated)
+        except Exception as e:
+            return self._err(e)
+
+    def create_pull_request_review_comment(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        body: str,
+        commit_id: str,
+        path: str,
+        line: int | None = None,
+        side: str | None = None,
+        in_reply_to: int | None = None,
+    ) -> GitHubResponse[PullRequestComment]:
+        """Create a review comment on a PR (line comment) or reply to a comment."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            params: dict[str, object] = {"body": body, "commit": commit_id, "path": path}
+            if line is not None:
+                params["line"] = line
+            if side is not None:
+                params["side"] = side
+            if in_reply_to is not None:
+                params["in_reply_to"] = in_reply_to
+            comment = pr.create_review_comment(**params)
+            return GitHubResponse(success=True, data=comment)
+        except Exception as e:
+            return self._err(e)
+
+    def create_pull_request_review_comment_reply(
+        self, owner: str, repo: str, number: int, comment_id: int, body: str
+    ) -> GitHubResponse[PullRequestComment]:
+        """Reply to an existing PR review comment."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            comment = pr.create_review_comment_reply(comment_id=comment_id, body=body)
+            return GitHubResponse(success=True, data=comment)
+        except Exception as e:
+            return self._err(e)
+
+    def edit_pull_request_review_comment(
+        self, owner: str, repo: str, number: int, comment_id: int, body: str
+    ) -> GitHubResponse[PullRequestComment]:
+        """Edit a PR review comment."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            comment = pr.get_review_comment(comment_id)
+            comment.edit(body)
+            return GitHubResponse(success=True, data=comment)
+        except Exception as e:
+            return self._err(e)
+
+    def create_pull(self, owner: str, repo: str, title: str, head: str, base: str, body: str | None = None, draft: bool = False) -> GitHubResponse[PullRequest]:
+        """Create a PR."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(body=body)
+            pr = r.create_pull(title=title, head=head, base=base, draft=draft, **params)
+            return GitHubResponse(success=True, data=pr)
+        except Exception as e:
+            return self._err(e)
+
+
+    def merge_pull(self, owner: str, repo: str, number: int, commit_message: str | None = None, merge_method: str = "merge", sha: str | None = None) -> GitHubResponse[dict[str, object]]:
+        """Merge a PR (merge/squash/rebase). ``sha`` is the head the caller expects: GitHub
+        refuses the merge (409) when the PR has moved past it."""
+        try:
+            r = self._repo(owner, repo)
+            pr = r.get_pull(number)
+            params = self._not_none(commit_message=commit_message, merge_method=merge_method, sha=sha)
+            result = pr.merge(**params)
+            return GitHubResponse(success=True, data={
+                "merged": bool(result.merged), "sha": result.sha, "message": result.message,
+            })
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_releases(self, owner: str, repo: str) -> GitHubResponse[list[GitRelease]]:
+        """List releases."""
+        try:
+            r = self._repo(owner, repo)
+            rel = list(r.get_releases())
+            return GitHubResponse(success=True, data=rel)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_release_by_tag(self, owner: str, repo: str, tag: str) -> GitHubResponse[GitRelease]:
+        """Get release by tag."""
+        try:
+            r = self._repo(owner, repo)
+            rel = r.get_release(tag)
+            return GitHubResponse(success=True, data=rel)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_release(self, owner: str, repo: str, tag: str, name: str | None = None, body: str | None = None, draft: bool = False, prerelease: bool = False) -> GitHubResponse[GitRelease]:
+        """Create a release."""
+        try:
+            r = self._repo(owner, repo)
+            _name = name if name is not None else tag
+            _msg = body if body is not None else ""
+            rel = r.create_git_release(tag=tag, name=_name, message=_msg, draft=draft, prerelease=prerelease)
+            return GitHubResponse(success=True, data=rel)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_branches(self, owner: str, repo: str) -> GitHubResponse[list[Branch]]:
+        """List branches."""
+        try:
+            r = self._repo(owner, repo)
+            branches = list(r.get_branches())
+            return GitHubResponse(success=True, data=branches)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_branch(self, owner: str, repo: str, branch: str) -> GitHubResponse[Branch]:
+        """Get one branch."""
+        try:
+            r = self._repo(owner, repo)
+            b = r.get_branch(branch)
+            return GitHubResponse(success=True, data=b)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_tags(self, owner: str, repo: str) -> GitHubResponse[list[Tag]]:
+        """List tags."""
+        try:
+            r = self._repo(owner, repo)
+            tags = list(r.get_tags())
+            return GitHubResponse(success=True, data=tags)
+        except Exception as e:
+            return self._err(e)
+
+    def get_file_contents(
+        self, owner: str, repo: str, path: str, ref: str | None = None,
+    ) -> GitHubResponse[ContentFile | list[ContentFile]]:
+        """Get file contents. Returns a list when ``path`` names a directory."""
+        try:
+            r = self._repo(owner, repo, lazy=True)
+            params = self._not_none(ref=ref)
+            content = r.get_contents(path, **params)
+            return GitHubResponse(success=True, data=content)
+        except Exception as e:
+            return self._err(e)
+
+    def create_file(self, owner: str, repo: str, path: str, message: str, content: bytes, branch: str | None = None) -> GitHubResponse[dict[str, object]]:
+        """Create a file."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(branch=branch)
+            result = r.create_file(path=path, message=message, content=content, **params)
+            return GitHubResponse(success=True, data=result)
+        except Exception as e:
+            return self._err(e)
+
+
+    def update_file(self, owner: str, repo: str, path: str, message: str, content: bytes, sha: str, branch: str | None = None) -> GitHubResponse[dict[str, object]]:
+        """Update a file."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(branch=branch)
+            result = r.update_file(path=path, message=message, content=content, sha=sha, **params)
+            return GitHubResponse(success=True, data=result)
+        except Exception as e:
+            return self._err(e)
+
+
+    def delete_file(self, owner: str, repo: str, path: str, message: str, sha: str, branch: str | None = None) -> GitHubResponse[dict[str, object]]:
+        """Delete a file."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(branch=branch)
+            result = r.delete_file(path=path, message=message, sha=sha, **params)
+            return GitHubResponse(success=True, data=result)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_collaborators(
+        self, owner: str, repo: str, affiliation: str | None = None
+    ) -> GitHubResponse[list[NamedUser]]:
+        """List collaborators. affiliation: 'outside' | 'direct' | 'all'.
+
+        Each returned ``NamedUser`` carries a ``.permissions`` (admin/maintain/
+        push/triage/pull booleans) reflecting its role on *this* repo — no
+        extra per-user permission call is needed.
+        """
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(affiliation=affiliation)
+            users = list(r.get_collaborators(**params))
+            return GitHubResponse(success=True, data=users)
+        except Exception as e:
+            return self._err(e)
+
+
+    def add_collaborator(self, owner: str, repo: str, username: str, permission: str = "push") -> GitHubResponse[bool]:
+        """Add collaborator."""
+        try:
+            r = self._repo(owner, repo)
+            ok = r.add_to_collaborators(username, permission=permission)
+            return GitHubResponse(success=True, data=bool(ok))
+        except Exception as e:
+            return self._err(e)
+
+
+    def remove_collaborator(self, owner: str, repo: str, username: str) -> GitHubResponse[bool]:
+        """Remove collaborator."""
+        try:
+            r = self._repo(owner, repo)
+            r.remove_from_collaborators(username)
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_repo_teams(self, owner: str, repo: str) -> GitHubResponse[list[Team]]:
+        """List teams with access to the repo. Each Team's `.permission` reflects
+        its role (pull/triage/push/maintain/admin) on *this* repo specifically."""
+        try:
+            r = self._repo(owner, repo)
+            teams = list(r.get_teams())
+            return GitHubResponse(success=True, data=teams)
+        except Exception as e:
+            return self._err(e)
+
+    # -----------------------
+    # Org members / teams (GitHub Teams connector)
+    # -----------------------
+
+    def list_user_orgs(self) -> GitHubResponse[list[Organization]]:
+        """List organizations the authenticated (token-owning) user belongs to.
+
+        Requires the ``read:org`` OAuth scope. Used for org-picker filter
+        options and to discover the sync scope when no ``ORG_IDS`` filter is
+        configured.
+        """
+        try:
+            me = self._sdk.get_user()
+            orgs = list(me.get_orgs())
+            return GitHubResponse(success=True, data=orgs)
+        except Exception as e:
+            return self._err(e)
+
+    def list_org_members(self, org: str, role: str = "all") -> GitHubResponse[list[NamedUser]]:
+        """List members of an organization. role: 'all' | 'admin' | 'member'."""
+        try:
+            o = self._sdk.get_organization(org)
+            members = list(o.get_members(role=role))
+            return GitHubResponse(success=True, data=members)
+        except Exception as e:
+            return self._err(e)
+
+    def list_org_outside_collaborators(self, org: str) -> GitHubResponse[list[NamedUser]]:
+        """List an org's outside collaborators.
+
+        Disjoint from ``list_org_members`` — GitHub excludes outside
+        collaborators from ``/orgs/{org}/members`` even though they hold real
+        repo permissions, so both listings are needed to enumerate every
+        principal that can appear in a repo's collaborator list.
+        """
+        try:
+            o = self._sdk.get_organization(org)
+            collaborators = list(o.get_outside_collaborators())
+            return GitHubResponse(success=True, data=collaborators)
+        except Exception as e:
+            return self._err(e)
+
+    def get_org_membership(self, org: str, username: str) -> GitHubResponse[Membership]:
+        """Get a single member's org-level role (admin/member) and state."""
+        try:
+            o = self._sdk.get_organization(org)
+            membership = o.get_membership(username)
+            return GitHubResponse(success=True, data=membership)
+        except Exception as e:
+            return self._err(e)
+
+    def list_org_teams(self, org: str) -> GitHubResponse[list[Team]]:
+        """List all teams in an organization."""
+        try:
+            o = self._sdk.get_organization(org)
+            teams = list(o.get_teams())
+            return GitHubResponse(success=True, data=teams)
+        except Exception as e:
+            return self._err(e)
+
+    def list_team_members(self, org: str, team_slug: str) -> GitHubResponse[list[NamedUser]]:
+        """List members of a team by slug."""
+        try:
+            o = self._sdk.get_organization(org)
+            team = o.get_team_by_slug(team_slug)
+            members = list(team.get_members())
+            return GitHubResponse(success=True, data=members)
+        except Exception as e:
+            return self._err(e)
+
+    # -----------------------
+    # Code indexing (Git Tree / Compare Commits)
+    # -----------------------
+
+    def get_git_tree(
+        self, owner: str, repo: str, tree_sha: str, recursive: bool = False
+    ) -> GitHubResponse[GitTree]:
+        """Fetch a git tree. ``recursive=True`` returns the full flat tree in one
+        call (subject to GitHub's 100,000-entry / 7MB truncation limit — check
+        ``.truncated`` on the returned ``GitTree``)."""
+        try:
+            r = self._repo(owner, repo, lazy=True)
+            tree = r.get_git_tree(sha=tree_sha, recursive=recursive)
+            return GitHubResponse(success=True, data=tree)
+        except Exception as e:
+            return self._err(e)
+
+    def compare_commits(self, owner: str, repo: str, base: str, head: str) -> GitHubResponse[Comparison]:
+        """Compare two commits/refs. ``.files`` is capped at 300 entries and
+        ``.status`` may be 'diverged' on a force-push/history rewrite — callers
+        must fall back to a full sync in either overflow case."""
+        try:
+            r = self._repo(owner, repo, lazy=True)
+            comparison = r.compare(base=base, head=head)
+            return GitHubResponse(success=True, data=comparison)
+        except Exception as e:
+            return self._err(e)
+
+    def get_git_blob(self, owner: str, repo: str, sha: str) -> GitHubResponse[GitBlob]:
+        """Fetch a blob by sha via the Git Data API.
+
+        The Contents API returns empty content for blobs over 1 MB; this
+        endpoint serves them (up to 100 MB), so it is the fallback for large
+        code files whose sha is already recorded.
+        """
+        try:
+            r = self._repo(owner, repo, lazy=True)
+            return GitHubResponse(success=True, data=r.get_git_blob(sha))
+        except Exception as e:
+            return self._err(e)
+
+    def list_commits_first_and_last(
+        self, owner: str, repo: str, path: str | None = None,
+    ) -> GitHubResponse[tuple[Commit | None, Commit | None]]:
+        """Return ``(newest, oldest)`` commit for a path without walking history.
+
+        ``PaginatedList`` indexing fetches only the page containing the index,
+        so this costs two requests regardless of how many commits exist —
+        materialising the full list costs one request per page.
+        """
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(path=path)
+            paginated = r.get_commits(**params)
+            total = paginated.totalCount
+            if not total:
+                return GitHubResponse(success=True, data=(None, None))
+            newest = paginated[0]
+            oldest = newest if total == 1 else paginated[total - 1]
+            return GitHubResponse(success=True, data=(newest, oldest))
+        except Exception as e:
+            return self._err(e)
+
+    def list_commits(
+        self,
+        owner: str,
+        repo: str,
+        sha: str | None = None,
+        path: str | None = None,
+        since: datetime.datetime | None = None,
+        until: datetime.datetime | None = None,
+        author: str | None = None,
+    ) -> GitHubResponse[list[Commit]]:
+        """List commits, optionally filtered by branch/path/author/date range.
+        Used for commit-email extraction and file timestamp backfill."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(sha=sha, path=path, since=since, until=until, author=author)
+            commits = list(r.get_commits(**params))
+            return GitHubResponse(success=True, data=commits)
+        except Exception as e:
+            return self._err(e)
+
+    def get_repo_by_id(self, repo_id: int) -> GitHubResponse[Repository]:
+        """Resolve a repository from its stable numeric ID (survives rename/transfer)."""
+        try:
+            r = self._sdk.get_repo(repo_id)
+            return GitHubResponse(success=True, data=r)
+        except Exception as e:
+            return self._err(e)
+
+    def list_repo_hooks(self, owner: str, repo: str) -> GitHubResponse[list[Hook]]:
+        """List repo webhooks."""
+        try:
+            r = self._repo(owner, repo)
+            hooks = list(r.get_hooks())
+            return GitHubResponse(success=True, data=hooks)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_repo_hook(self, owner: str, repo: str, name: str, config: dict[str, str], events: Sequence[str] | None = None, active: bool = True) -> GitHubResponse[Hook]:
+        """Create a webhook."""
+        try:
+            r = self._repo(owner, repo)
+            ev = list(events) if events is not None else ["push"]
+            hook = r.create_hook(name=name, config=config, events=ev, active=active)
+            return GitHubResponse(success=True, data=hook)
+        except Exception as e:
+            return self._err(e)
+
+
+    def edit_repo_hook(self, owner: str, repo: str, hook_id: int, config: dict[str, str] | None = None, events: Sequence[str] | None = None, active: bool | None = None) -> GitHubResponse[Hook]:
+        """Edit webhook."""
+        try:
+            r = self._repo(owner, repo)
+            hook = r.get_hook(hook_id)
+            params = self._not_none(config=config, events=list(events) if events is not None else None, active=active)
+            hook.edit(**params)
+            return GitHubResponse(success=True, data=hook)
+        except Exception as e:
+            return self._err(e)
+
+
+    def ping_repo_hook(self, owner: str, repo: str, hook_id: int) -> GitHubResponse[bool]:
+        """Ping webhook."""
+        try:
+            r = self._repo(owner, repo)
+            hook = r.get_hook(hook_id)
+            hook.ping()
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def test_repo_hook(self, owner: str, repo: str, hook_id: int) -> GitHubResponse[bool]:
+        """Test webhook delivery."""
+        try:
+            r = self._repo(owner, repo)
+            hook = r.get_hook(hook_id)
+            hook.test()
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_hook_deliveries(self, owner: str, repo: str, hook_id: int) -> GitHubResponse[list[dict[str, object]]]:
+        """List webhook deliveries."""
+        try:
+            r = self._repo(owner, repo)
+            deliveries = list(r.get_hook_deliveries(hook_id))
+            return GitHubResponse(success=True, data=deliveries)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_hook_delivery(self, owner: str, repo: str, hook_id: int, delivery_id: int) -> GitHubResponse[dict[str, object]]:
+        """Get a webhook delivery."""
+        try:
+            r = self._repo(owner, repo)
+            delivery = r.get_hook_delivery(hook_id, delivery_id)
+            return GitHubResponse(success=True, data=delivery)
+        except Exception as e:
+            return self._err(e)
+
+
+    def delete_repo_hook(self, owner: str, repo: str, hook_id: int) -> GitHubResponse[bool]:
+        """Delete webhook."""
+        try:
+            r = self._repo(owner, repo)
+            hook = r.get_hook(hook_id)
+            hook.delete()
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_workflows(self, owner: str, repo: str) -> GitHubResponse[list[Workflow]]:
+        """List workflows."""
+        try:
+            r = self._repo(owner, repo)
+            workflows = list(r.get_workflows())
+            return GitHubResponse(success=True, data=workflows)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_workflow(self, owner: str, repo: str, workflow_id: int) -> GitHubResponse[Workflow]:
+        """Get a workflow."""
+        try:
+            r = self._repo(owner, repo)
+            wf = r.get_workflow(workflow_id)
+            return GitHubResponse(success=True, data=wf)
+        except Exception as e:
+            return self._err(e)
+
+
+    def enable_workflow(self, owner: str, repo: str, workflow_id: int) -> GitHubResponse[bool]:
+        """Enable a workflow."""
+        try:
+            wf = self._repo(owner, repo).get_workflow(workflow_id)
+            wf.enable()
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def disable_workflow(self, owner: str, repo: str, workflow_id: int) -> GitHubResponse[bool]:
+        """Disable a workflow."""
+        try:
+            wf = self._repo(owner, repo).get_workflow(workflow_id)
+            wf.disable()
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def dispatch_workflow(self, owner: str, repo: str, workflow_id: int, ref: str, inputs: dict[str, str] | None = None) -> GitHubResponse[bool]:
+        """Dispatch a workflow."""
+        try:
+            wf = self._repo(owner, repo).get_workflow(workflow_id)
+            params = self._not_none(inputs=inputs)
+            ok = wf.create_dispatch(ref=ref, **params)
+            return GitHubResponse(success=True, data=bool(ok))
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_workflow_runs(self, owner: str, repo: str, workflow_id: int) -> GitHubResponse[list[WorkflowRun]]:
+        """List runs for a workflow."""
+        try:
+            wf = self._repo(owner, repo).get_workflow(workflow_id)
+            runs = list(wf.get_runs())
+            return GitHubResponse(success=True, data=runs)
+        except Exception as e:
+            return self._err(e)
+
+
+    def rerun_workflow_run(self, owner: str, repo: str, run_id: int) -> GitHubResponse[bool]:
+        """Re-run a workflow run."""
+        try:
+            run = self._repo(owner, repo).get_workflow_run(run_id)
+            ok = run.rerun()
+            return GitHubResponse(success=True, data=bool(ok))
+        except Exception as e:
+            return self._err(e)
+
+
+    def cancel_workflow_run(self, owner: str, repo: str, run_id: int) -> GitHubResponse[bool]:
+        """Cancel a workflow run."""
+        try:
+            run = self._repo(owner, repo).get_workflow_run(run_id)
+            ok = run.cancel()
+            return GitHubResponse(success=True, data=bool(ok))
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_deployment(self, owner: str, repo: str, ref: str, task: str = "deploy", auto_merge: bool = False, required_contexts: Sequence[str] | None = None, environment: str | None = None, description: str | None = None) -> GitHubResponse[Deployment]:
+        """Create a deployment. (Requires suitable permissions)"""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(task=task, auto_merge=auto_merge, required_contexts=list(required_contexts) if required_contexts is not None else None, environment=environment, description=description)
+            dep = r.create_deployment(ref=ref, **params)
+            return GitHubResponse(success=True, data=dep)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_deployments(self, owner: str, repo: str) -> GitHubResponse[list[Deployment]]:
+        """List deployments."""
+        try:
+            r = self._repo(owner, repo)
+            deps = list(r.get_deployments())
+            return GitHubResponse(success=True, data=deps)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_deployment(self, owner: str, repo: str, deployment_id: int) -> GitHubResponse[Deployment]:
+        """Get a deployment."""
+        try:
+            r = self._repo(owner, repo)
+            dep = r.get_deployment(deployment_id)
+            return GitHubResponse(success=True, data=dep)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_deployment_status(self, owner: str, repo: str, deployment_id: int, state: str, target_url: str | None = None, description: str | None = None, environment: str | None = None, environment_url: str | None = None, auto_inactive: bool | None = None) -> GitHubResponse[DeploymentStatus]:
+        """Create a deployment status."""
+        try:
+            dep = self._repo(owner, repo).get_deployment(deployment_id)
+            params = self._not_none(target_url=target_url, description=description, environment=environment, environment_url=environment_url, auto_inactive=auto_inactive)
+            st = dep.create_status(state=state, **params)
+            return GitHubResponse(success=True, data=st)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_commit(self, owner: str, repo: str, sha: str) -> GitHubResponse[Commit]:
+        """Get a commit."""
+        try:
+            c = self._repo(owner, repo).get_commit(sha=sha)
+            return GitHubResponse(success=True, data=c)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_commit_status(self, owner: str, repo: str, sha: str, state: str, target_url: str | None = None, description: str | None = None, context: str | None = None) -> GitHubResponse[bool]:
+        """Create a commit status."""
+        try:
+            commit = self._repo(owner, repo).get_commit(sha=sha)
+            params = self._not_none(target_url=target_url, description=description, context=context)
+            commit.create_status(state=state, **params)
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_topics(self, owner: str, repo: str) -> GitHubResponse[list[str]]:
+        """Get repository topics."""
+        try:
+            r = self._repo(owner, repo)
+            topics = list(r.get_topics())
+            return GitHubResponse(success=True, data=topics)
+        except Exception as e:
+            return self._err(e)
+
+
+    def replace_topics(self, owner: str, repo: str, topics: Sequence[str]) -> GitHubResponse[list[str]]:
+        """Replace repository topics."""
+        try:
+            r = self._repo(owner, repo)
+            out = r.replace_topics(list(topics))
+            return GitHubResponse(success=True, data=out)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_clones_traffic(self, owner: str, repo: str) -> GitHubResponse[dict[str, object]]:
+        """Get clone traffic."""
+        try:
+            r = self._repo(owner, repo)
+            data = r.get_clones_traffic()
+            return GitHubResponse(success=True, data=data.__dict__ if hasattr(data, "__dict__") else data)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_views_traffic(self, owner: str, repo: str) -> GitHubResponse[dict[str, object]]:
+        """Get views traffic."""
+        try:
+            r = self._repo(owner, repo)
+            data = r.get_views_traffic()
+            return GitHubResponse(success=True, data=data.__dict__ if hasattr(data, "__dict__") else data)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_forks(self, owner: str, repo: str) -> GitHubResponse[list[Repository]]:
+        """List forks."""
+        try:
+            r = self._repo(owner, repo)
+            forks = list(r.get_forks())
+            return GitHubResponse(success=True, data=forks)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_fork(self, owner: str, repo: str, org: str | None = None) -> GitHubResponse[Repository]:
+        """Create a fork."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(organization=org)
+            fork = r.create_fork(**params)
+            return GitHubResponse(success=True, data=fork)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_contributors(self, owner: str, repo: str) -> GitHubResponse[list[NamedUser]]:
+        """List contributors."""
+        try:
+            r = self._repo(owner, repo)
+            users = list(r.get_contributors())
+            return GitHubResponse(success=True, data=users)
+        except Exception as e:
+            return self._err(e)
+
+
+    def list_assignees(self, owner: str, repo: str) -> GitHubResponse[list[NamedUser]]:
+        """List potential assignees."""
+        try:
+            r = self._repo(owner, repo)
+            users = list(r.get_assignees())
+            return GitHubResponse(success=True, data=users)
+        except Exception as e:
+            return self._err(e)
+
+    def list_pending_invitations(self, owner: str, repo: str) -> GitHubResponse[list[Invitation]]:
+        """List pending repo invitations."""
+        try:
+            r = self._repo(owner, repo)
+            inv = list(r.get_pending_invitations())
+            return GitHubResponse(success=True, data=inv)
+        except Exception as e:
+            return self._err(e)
+
+
+    def remove_invitation(self, owner: str, repo: str, invitation_id: int) -> GitHubResponse[bool]:
+        """Remove a repo invitation."""
+        try:
+            r = self._repo(owner, repo)
+            r.remove_invitation(invitation_id)
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    # DependabotAlert not available in older PyGithub versions
+    def list_dependabot_alerts(self, owner: str, repo: str) -> GitHubResponse[list[object]]:
+        """List Dependabot alerts for a repo."""
+        try:
+            r = self._repo(owner, repo)
+            alerts = list(r.get_dependabot_alerts())
+            return GitHubResponse(success=True, data=alerts)
+        except Exception as e:
+            return self._err(e)
+
+
+    # DependabotAlert not available in older PyGithub versions
+    def get_dependabot_alert(self, owner: str, repo: str, alert_number: int) -> GitHubResponse[object]:
+        """Get a single Dependabot alert."""
+        try:
+            r = self._repo(owner, repo)
+            alert = r.get_dependabot_alert(alert_number)
+            return GitHubResponse(success=True, data=alert)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_git_ref(self, owner: str, repo: str, ref: str, sha: str) -> GitHubResponse[GitRef]:
+        """Create a git ref."""
+        try:
+            r = self._repo(owner, repo)
+            gitref = r.create_git_ref(ref=ref, sha=sha)
+            return GitHubResponse(success=True, data=gitref)
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_git_ref(self, owner: str, repo: str, ref: str) -> GitHubResponse[GitRef]:
+        """Get a git ref."""
+        try:
+            r = self._repo(owner, repo)
+            out = r.get_git_ref(ref)
+            return GitHubResponse(success=True, data=out)
+        except Exception as e:
+            return self._err(e)
+
+
+    def delete_git_ref(self, owner: str, repo: str, ref: str) -> GitHubResponse[bool]:
+        """Delete a git ref."""
+        try:
+            ref_obj = self._repo(owner, repo).get_git_ref(ref)
+            ref_obj.delete()
+            return GitHubResponse(success=True, data=True)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_git_blob(self, owner: str, repo: str, content: str, encoding: str = "utf-8") -> GitHubResponse[GitBlob]:
+        """Create a git blob."""
+        try:
+            r = self._repo(owner, repo)
+            blob = r.create_git_blob(content, encoding)
+            return GitHubResponse(success=True, data=blob)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_git_tree(self, owner: str, repo: str, tree: list[tuple[str, str, str]], base_tree: str | None = None) -> GitHubResponse[GitTree]:
+        """Create a git tree."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(base_tree=base_tree)
+            out = r.create_git_tree(tree=tree, **params)
+            return GitHubResponse(success=True, data=out)
+        except Exception as e:
+            return self._err(e)
+
+
+    def create_git_tag(self, owner: str, repo: str, tag: str, message: str, object_sha: str, type: str, tagger: dict[str, str] | None = None) -> GitHubResponse[GitTag]:
+        """Create a git tag object."""
+        try:
+            r = self._repo(owner, repo)
+            params = self._not_none(tagger=tagger)
+            out = r.create_git_tag(tag=tag, message=message, object=object_sha, type=type, **params)
+            return GitHubResponse(success=True, data=out)
+        except Exception as e:
+            return self._err(e)
+
+
+    def search_repositories(
+        self,
+        query: str,
+        per_page: int | None = None,
+        page: int | None = None,
+    ) -> GitHubResponse[list[Repository]]:
+        """Search repositories. Default 10 per page, max 100."""
+        try:
+            paginated = self._sdk.search_repositories(query)
+            _per_page, _page = self._clamp_page_args(per_page, page)
+            return GitHubResponse(success=True, data=self._slice_paginated(paginated, _per_page, _page))
+        except Exception as e:
+            return self._err(e)
+
+
+    def get_rate_limit(self) -> GitHubResponse[RateLimit]:
+        """Get current rate limit."""
+        try:
+            limit = self._sdk.get_rate_limit()
+            return GitHubResponse(success=True, data=limit)
+        except Exception as e:
+            return self._err(e)
+
+    # ----------------Other than SDK calls------------------ #
+
+    async def get_img_bytes(self, image_url: str) -> GitHubResponse[bytes]:
+        GITHUB_TOKEN = self.token
+        # self.logger.info(f"Fetching image from URL: {image_url}")
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "*/*",
+        }
+        try:
+            async with httpx.AsyncClient(follow_redirects=True,timeout=30.0) as client:
+                resp = await client.get(image_url, headers=headers)
+                resp.raise_for_status()
+                img_data = resp.content
+                return GitHubResponse(success=True, data=img_data)
+        except httpx.HTTPStatusError as e:
+            return GitHubResponse(
+                success=False,
+                error=f"HTTP {e.response.status_code} fetching image from {image_url}",
+                status_code=e.response.status_code,
+                exception_type=type(e).__name__,
+            )
+        except Exception as e:
+            return GitHubResponse(
+                success=False,
+                error=f"Error fetching image from {image_url}: {str(e)}",
+                exception_type=type(e).__name__,
+            )
+
+    async def get_attachment_files_content(
+        self, weburl: str, max_bytes: int | None = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream raw bytes for an attachment from its web URL.
+
+        Yields 64 KB chunks so a large attachment never buffers whole in memory
+        (GitHub permits uploads up to 25 MB). Raises ``httpx.HTTPStatusError``
+        on non-2xx rather than returning a response envelope, so the caller's
+        eager-first-chunk wrapper can surface it as a clean HTTP error.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+        }
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            async with client.stream("GET", weburl, headers=headers) as response:
+                response.raise_for_status()
+                if max_bytes is not None:
+                    declared = response.headers.get("Content-Length")
+                    if declared and int(declared) > max_bytes:
+                        raise ValueError(
+                            f"Attachment at {weburl} is {declared} bytes, over the {max_bytes}-byte limit"
+                        )
+                streamed = 0
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    streamed += len(chunk)
+                    if max_bytes is not None and streamed > max_bytes:
+                        raise ValueError(
+                            f"Attachment at {weburl} exceeded the {max_bytes}-byte limit while streaming"
+                        )
+                    yield chunk

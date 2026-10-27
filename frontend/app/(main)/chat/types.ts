@@ -1,0 +1,1301 @@
+import type { CitationOrigin } from './components/message-area/response-tabs/citations';
+import type { CitationMaps } from './components/message-area/response-tabs/citations/types';
+import type { ThreadMessageLike } from '@assistant-ui/react';
+import { ACCEPTED_MIME_TYPES, SUPPORTED_FILE_TYPES } from './utils/attachment-file-types';
+
+// Chat types following project conventions
+
+// Confidence level for bot responses
+export type ConfidenceLevel = 'Very High' | 'High' | 'Medium' | 'Low';
+
+// Tab types for response view
+export type ResponseTab = 'answer' | 'sources' | 'citation';
+
+/**
+ * Platform-normalized reasoning effort levels. `null`/absent means "no
+ * explicit user choice" — the backend applies the model's own default
+ * effort, else `DEFAULT_REASONING_EFFORT` ("high"), for any reasoning-capable
+ * model rather than deferring to the provider's own default.
+ *
+ * `'none'` is kept in the type for backward compatibility with
+ * already-persisted conversations/agents, but is no longer offered as a
+ * user choice (see `REASONING_EFFORT_OPTIONS` in `model-selector-panel.tsx`):
+ * fully disabling reasoning made some models prone to hallucinating
+ * malformed tool-call names. The backend silently upgrades an incoming
+ * `'none'` to `'low'` instead of honoring it — see `_reasoning_effort_kwargs`
+ * in `app/utils/aimodels.py`.
+ */
+export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'max';
+
+/**
+ * Effective reasoning effort applied by the backend (`_reasoning_effort_kwargs`
+ * in `backend/python/app/utils/aimodels.py`) when neither the user, the agent
+ * nor the model set one. Kept in sync with `DEFAULT_REASONING_EFFORT` there.
+ */
+export const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'high';
+
+/**
+ * What the backend actually floors a legacy `'none'` to
+ * (`REASONING_MANDATORY_FALLBACK_EFFORT` in `app/utils/llm_api_mode_store.py`).
+ */
+const REASONING_MANDATORY_FALLBACK_EFFORT: ReasoningEffort = 'low';
+
+/**
+ * Maps a persisted/legacy `'none'` to the value the backend actually runs
+ * with, so every UI surface (toolbar label, radio selection, regen payload)
+ * agrees with server behavior instead of echoing a choice that's no longer offered.
+ */
+export function normalizeReasoningEffort(
+  value: ReasoningEffort | null
+): ReasoningEffort | null {
+  return value === 'none' ? REASONING_MANDATORY_FALLBACK_EFFORT : value;
+}
+
+// Inline citation for display within answer text
+export interface InlineCitation {
+  id: string;
+  label: string;      // e.g., "Sales 1", "Gmail 3"
+  sourceType: string; // For icon/color mapping (slack, gmail, jira, etc.)
+  sourceId?: string;  // Reference to source for scroll targeting
+}
+
+export interface ChatMessage {
+  id: string;
+  conversationId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt: string;
+  sources?: ChatSource[];
+}
+
+export interface ChatSource {
+  id: string;
+  title: string;
+  type: string;
+  url?: string;
+  summary?: string;
+  category?: string;
+  topics?: string[];
+  citationLabel?: string; // e.g., "Sales 1" for inline citation display
+}
+
+export interface ModelInfo {
+  modelKey: string;
+  modelName: string;
+  /**
+   * Main assistant: often `quick`, or `agent:<segment>` when restoring agent-style modes.
+   * **Agent** conversations: API uses plain `auto` | `quick` | `planExecute` | `deep` (no `agent:`
+   * prefix); legacy conversations may still carry `verification` (pre-rename alias for `planExecute`).
+   */
+  chatMode: string;
+  modelFriendlyName?: string;
+  /** Restored from the conversation's saved modelInfo when loading a thread. */
+  reasoningEffort?: ReasoningEffort;
+}
+
+/** Entry in the sharedWith array from conversation API responses */
+export interface SharedWithEntry {
+  userId: string;
+  accessLevel: string;
+  _id: string;
+}
+
+/** Initiator of a chat, present on conversations shared with the current user */
+export interface SharedByInfo {
+  userId: string;
+  name: string;
+}
+
+/**
+ * Pagination metadata returned by the conversation detail API.
+ * `hasNextPage` means there are older message batches to load;
+ * the API sorts messages newest-first so page 1 = most recent.
+ */
+export interface ConversationPagination {
+  page: number;
+  limit: number;
+  totalCount: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
+
+export interface ConversationApiResponse {
+  _id: string;
+  userId: string;
+  orgId: string;
+  title: string;
+  initiator: string;
+  isShared: boolean;
+  isDeleted: boolean;
+  isArchived: boolean;
+  lastActivityAt: number;
+  status: string;
+  modelInfo: ModelInfo;
+  sharedWith: SharedWithEntry[];
+  /** API may return string[] or structured error objects */
+  conversationErrors?: unknown[];
+  createdAt: string;
+  updatedAt: string;
+  isOwner: boolean;
+  accessLevel: string;
+  /** `true` when the owner pinned it; absent (never `false`) otherwise. Owner's own list only. */
+  isPinned?: boolean;
+  /** Present when this conversation is linked to a Project. */
+  projectId?: string;
+  projectVisibility?: 'private' | 'project';
+  sharedBy?: SharedByInfo;
+  /** Only on agent conversations shared with the user; needed to open them (`?agentId=`). */
+  agentKey?: string;
+}
+
+export type ConversationSource = 'owned' | 'shared';
+
+export interface ConversationsListResponse {
+  conversations: ConversationApiResponse[];
+  source: ConversationSource;
+  pagination: {
+    page: number;
+    limit: number;
+    totalCount: number;
+    totalPages: number;
+    hasNextPage: boolean;
+    hasPrevPage: boolean;
+  };
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  isShared: boolean;
+  sharedWith: SharedWithEntry[];
+  lastActivityAt?: number;
+  status?: string;
+  modelInfo?: ModelInfo;
+  isOwner?: boolean;
+  /** Pinned by its owner. Absent when not pinned; only set on the owner's own list. */
+  isPinned?: boolean;
+  /** Present when this conversation is linked to a Project. */
+  projectId?: string;
+  projectVisibility?: 'private' | 'project';
+  sharedBy?: SharedByInfo;
+  /** Set on a shared agent conversation: the agent it belongs to. */
+  agentKey?: string;
+}
+
+export interface ChatSuggestion {
+  id: string;
+  text: string;
+  icons: Array<'slack' | 'jira' | 'notion' | 'sheets' | 'confluence' | 'github'>;
+}
+
+/**
+ * Top-level UI mode toggle (Internal Search vs Chat/Web).
+ *
+ * This is **NOT** the `chatMode` field in stream request payloads — that is
+ * {@link StreamChatModePayload}. Code that handles `settings.mode` must not
+ * import or assign `StreamChatModePayload` values here.
+ */
+export type ChatMode = 'chat' | 'search';
+
+/**
+ * Query sub-modes selectable from the dropdown panel.
+ * These map to API `chatMode` for assistant streams.
+ */
+export type QueryMode = 'chat' | 'web-search' | 'image' | 'agent';
+
+/** Strategy when query mode is Agent (toolbar dropdown). */
+export type AgentStrategy = 'auto' | 'quick' | 'plan-execute' | 'deep';
+
+/**
+ * Segment after `agent:` in the stream API body (differs from {@link AgentStrategy} for plan-execute → planExecute).
+ */
+export type AgentStrategyApiSegment = 'auto' | 'quick' | 'planExecute' | 'deep';
+
+/**
+ * API `chatMode` for streams (assistant modes + agent strategy variant).
+ * `web-search`/`image` are UI mode tags persisted for restore; Python route
+ * model config currently treats unrecognized values as standard behavior.
+ */
+export type StreamChatModePayload =
+  | 'web_search'
+  | 'image'
+  | 'internal_search'
+  | 'agent'
+  | `agent:${AgentStrategyApiSegment}`;
+
+/** Maps UI agent strategy to the API `agent:` segment (plan-execute → planExecute). */
+export function agentStrategyToApiSegment(strategy: AgentStrategy): AgentStrategyApiSegment {
+  if (strategy === 'plan-execute') return 'planExecute';
+  return strategy;
+}
+
+/**
+ * Segments accepted by agent stream/regenerate HTTP bodies (`chatMode` field).
+ * Only the current canonical segments — outgoing requests always go through
+ * {@link agentStrategyToApiSegment}, which never produces the legacy
+ * `verification` wire value; restoring THAT from persisted history is
+ * `apply-conversation-model-info.ts`'s job, not this outgoing-request path.
+ */
+const AGENT_HTTP_CHAT_MODES: readonly AgentStrategyApiSegment[] = [
+  'auto',
+  'quick',
+  'planExecute',
+  'deep',
+];
+
+/**
+ * Map internal {@link StreamChatModePayload} to the plain `chatMode` string
+ * expected by POST `/api/v1/agents/.../stream` (Python agent routes).
+ */
+export function streamChatModeToAgentApiChatMode(
+  chatMode: StreamChatModePayload
+): AgentStrategyApiSegment {
+  if (typeof chatMode === 'string' && chatMode.startsWith('agent:')) {
+    const rest = chatMode.slice(6) as AgentStrategyApiSegment;
+    if (AGENT_HTTP_CHAT_MODES.includes(rest)) return rest;
+  }
+  return 'auto';
+}
+
+/** Configuration for a single query mode option in the selector panel. */
+export interface QueryModeConfig {
+  id: QueryMode;
+  label: string;
+  /** Short label for the bottom toolbar (e.g. "Chat", "Image") */
+  toolbarLabel: string;
+  description: string;
+  /** Icon identifier — Material Icon name or SVG path (see iconType) */
+  icon: string;
+  /** How to render the icon */
+  iconType: 'material' | 'svg' | 'component';
+  /** CSS variable references for this mode's color scheme */
+  colors: {
+    bg: string;     // Background for active state
+    fg: string;     // Text/label color
+    icon: string;   // Icon color
+    toggle: string; // Active toggle/indicator color
+  };
+  /** Whether this mode is currently supported by the backend */
+  enabled: boolean;
+}
+
+/**
+ * Assistant chat knowledge scope — **same shape as stream/search `filters`**.
+ *
+ * - **`apps`** — whole apps: connectors and collections.
+ * - **`kb`** — older name for collection ids; read, no longer written by the picker.
+ * - **`recordGroups`** — record groups, each with the groups nested in it and their records.
+ * - **`records`** — folders and records, each with everything under it.
+ *
+ * Only the topmost selected node is kept: selecting a node drops what was
+ * selected under it (see `utils/tree-selection.ts`).
+ */
+export interface ChatKnowledgeFilters {
+  apps: string[];
+  kb: string[];
+  recordGroups?: string[];
+  records?: string[];
+  /**
+   * Records selected alone, without what is under them. The picker has no
+   * control for it; an API client can start a conversation with it, and the
+   * conversation keeps it when it is opened here.
+   */
+  recordsExact?: string[];
+}
+
+/** What the chat UI remembers about a node it has listed or selected. */
+export interface CollectionMeta {
+  name: string;
+  nodeType: string;
+  connector: string;
+  /** Ids of the nodes above it in the picker tree, root first (absent for a root). */
+  ancestorIds?: string[];
+  extension?: string | null;
+  mimeType?: string | null;
+  /** The place lookup was refused: deleted, or not readable by this user. */
+  unavailable?: boolean;
+}
+
+export interface AppliedFilterNode {
+  id: string;
+  name: string;
+  nodeType: string;
+  connector: string;
+  extension?: string;
+  mimeType?: string;
+  /** Named in the question with @. Absent on messages saved before this was kept. */
+  mentioned?: boolean;
+}
+
+export interface AppliedFilters {
+  apps: AppliedFilterNode[];
+  kb: AppliedFilterNode[];
+  recordGroups?: AppliedFilterNode[];
+  records?: AppliedFilterNode[];
+  recordsExact?: AppliedFilterNode[];
+}
+
+/** Shallow copy for stream/search payloads (keeps a stable object shape for callers). */
+export function buildAssistantApiFilters(filters: ChatKnowledgeFilters): ChatKnowledgeFilters {
+  return {
+    apps: [...(filters.apps ?? [])],
+    kb: [...(filters.kb ?? [])],
+    ...(filters.recordGroups?.length ? { recordGroups: [...filters.recordGroups] } : {}),
+    ...(filters.records?.length ? { records: [...filters.records] } : {}),
+    ...(filters.recordsExact?.length ? { recordsExact: [...filters.recordsExact] } : {}),
+  };
+}
+
+/** Attached on send for replay + UI; `kind` defaults to `collectionRoot` when absent (legacy). */
+export type ChatCollectionAttachmentKind = 'collectionRoot' | 'recordGroup';
+
+export interface ChatCollectionAttachment {
+  id: string;
+  name: string;
+  kind?: ChatCollectionAttachmentKind;
+}
+
+/**
+ * Per-agent-mode capability toggles.
+ *
+ * - `internalSearch` gates knowledge tools (retrieval, knowledgegraph, knowledgehub),
+ *   and disables the Connectors + Collections tabs in the UI when false.
+ * - `webSearch` gates web_search + fetch_url tools.
+ *
+ * When absent from a stream request, the backend defaults both to `true`
+ * (preserving today's behavior for existing clients).
+ */
+export interface AgentCapabilities {
+  internalSearch: boolean;
+  webSearch: boolean;
+}
+
+/** Default capabilities — both search modes enabled. */
+export const DEFAULT_AGENT_CAPABILITIES: AgentCapabilities = {
+  internalSearch: true,
+  webSearch: true,
+};
+
+export interface ChatSettings {
+  mode: ChatMode;
+  queryMode: QueryMode;
+  /** Used when queryMode is 'agent'. */
+  agentStrategy: AgentStrategy;
+  filters: ChatKnowledgeFilters;
+  /**
+   * Capability toggles for universal agent mode (main chat, no agentId).
+   * Persisted to localStorage key `pipeshub-agent-capabilities`.
+   */
+  agentCapabilities: AgentCapabilities;
+  /**
+   * Per-context map of the model explicitly chosen by the user in the model
+   * selector panel. The key is either ASSISTANT_CTX (for the non-agent chat) or
+   * an agentId string. A missing/null value means "use defaultModels[ctxKey]".
+   *
+   * Keeping selections scoped per context prevents leaks across assistant and
+   * agents that have different model configurations.
+   */
+  selectedModels: Record<string, ModelOverride | null>;
+  /**
+   * Per-context default model (API `isDefault: true`). Populated when models
+   * are loaded for that context.
+   */
+  defaultModels: Record<string, ModelOverride | null>;
+  /**
+   * Per-context cache of the full model list, with a freshness timestamp.
+   * Used for deduping fetches and for invalidating stale selections.
+   */
+  availableModels: Record<string, { models: AvailableLlmModel[]; fetchedAt: number }>;
+  /**
+   * Per-context reasoning effort override, keyed the same way as
+   * `selectedModels`. `null`/missing means "use the model's own default".
+   * Only meaningful when the selected model has `isReasoning: true`.
+   */
+  reasoningEffort: Record<string, ReasoningEffort | null>;
+  /**
+   * Per-agent default reasoning effort from the agent's config. Populated by
+   * `fetchModelsForContext` when loading an agent. Used as the fallback when
+   * the user hasn't set an explicit override.
+   */
+  agentDefaultReasoningEffort: Record<string, ReasoningEffort | null>;
+}
+
+/**
+ * Per-attachment upload state. Uploads start the moment the user adds the
+ * file to the composer (not at send time), so each chip carries its own
+ * status. Send is blocked until every chip is `'uploaded'` (or removed).
+ */
+export type AttachmentUploadStatus = 'uploading' | 'uploaded' | 'error';
+
+/**
+ * How a chip entered the composer. `'paste-text'` marks a large plain-text
+ * clipboard paste that was auto-converted into a synthetic `.txt` file (see
+ * `utils/paste-attachment.ts`) — used to render a specialized chip/preview
+ * instead of the generic file chip. The others are informational only.
+ */
+export type UploadedFileSource = 'upload' | 'drag' | 'paste' | 'paste-text';
+
+export interface UploadedFile {
+  id: string;
+  file: File;
+  name: string;
+  size: number;
+  type: string;
+  preview?: string;
+  status: AttachmentUploadStatus;
+  /** Server-assigned ref, present once status === 'uploaded'. */
+  ref?: AttachmentRef;
+  /** User-facing message when status === 'error'. */
+  errorMessage?: string;
+  /** Origin of this chip — see {@link UploadedFileSource}. */
+  source?: UploadedFileSource;
+  /**
+   * A file already stored with the question being edited, not one picked now. Removing the chip
+   * only detaches it from the edit: the stored file stays, since a fork of the chat may use it.
+   */
+  existing?: boolean;
+  /** First-line excerpt shown on the chip, present only when `source === 'paste-text'`. */
+  pastePreview?: string;
+  /** Character count of the original pasted text (present only when `source === 'paste-text'`). */
+  pasteCharCount?: number;
+  /** Line count of the original pasted text (present only when `source === 'paste-text'`). */
+  pasteLineCount?: number;
+}
+
+/** Derived from `SUPPORTED_FILE_TYPES`/`ACCEPTED_MIME_TYPES` in `utils/attachment-file-types.ts`
+ * (the single source of truth) so the two allowlists cannot drift apart. */
+export type SupportedFileType = (typeof SUPPORTED_FILE_TYPES)[number];
+
+/** Returned by the attachment upload endpoint; forwarded verbatim in the SSE stream body. */
+export interface AttachmentRef {
+  recordId: string;
+  recordName: string;
+  mimeType: string;
+  extension: string;
+  virtualRecordId: string;
+  /**
+   * Origin metadata, mirrored from `UploadedFileSource` when known
+   * ('upload' | 'paste-text'). Deliberately not the bare 'paste' of
+   * `UploadedFileSource`, which means a pasted image/file. Not currently
+   * populated by the
+   * upload API — detection of pasted-text attachments instead relies on
+   * the `pasted-text-<timestamp>.txt` filename convention (see
+   * `isPastedTextAttachment` in `utils/paste-attachment.ts`), matching the
+   * same defense-in-depth pattern used server-side. Reserved for future
+   * use once the upload pipeline threads real origin metadata through.
+   */
+  source?: 'upload' | 'paste-text';
+}
+
+/** MIME types accepted by the chat attachment upload endpoint. */
+export const CHAT_ATTACHMENT_ACCEPTED_MIMETYPES = Object.keys(ACCEPTED_MIME_TYPES);
+
+/** Maximum file size for a single chat attachment (5 MB). */
+export const CHAT_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Maximum number of attachments per message. */
+export const CHAT_ATTACHMENT_MAX_FILES = 10;
+
+/**
+ * How long one attachment upload may take. The server parses the file and has
+ * a vision model describe its images before it answers, which can outlast the
+ * API client's 90s default on a scanned or image-heavy PDF.
+ */
+export const CHAT_ATTACHMENT_UPLOAD_TIMEOUT_MS = 180_000;
+
+/**
+ * AG-UI wire event type discriminators (`data.type` on every AG-UI frame —
+ * see `backend/python/app/agents/agent_loop/protocol/agui.py::AGUIEventType`
+ * and the Node-side mirror in `backend/nodejs/.../utils/agui.ts`).
+ * Consumed exclusively by `agui-event-handler.ts`. The frontend always
+ * negotiates `protocol: 'agui'` (see `api.ts::runChatStream`), so this is
+ * the only wire vocabulary the client needs to parse.
+ */
+export type AGUIWireEventType =
+  | 'RUN_STARTED'
+  | 'RUN_FINISHED'
+  | 'RUN_ERROR'
+  | 'STEP_STARTED'
+  | 'STEP_FINISHED'
+  | 'TEXT_MESSAGE_START'
+  | 'TEXT_MESSAGE_CONTENT'
+  | 'TEXT_MESSAGE_END'
+  | 'REASONING_START'
+  | 'REASONING_MESSAGE_START'
+  | 'REASONING_MESSAGE_CONTENT'
+  | 'REASONING_MESSAGE_END'
+  | 'REASONING_END'
+  | 'TOOL_CALL_START'
+  | 'TOOL_CALL_ARGS'
+  | 'TOOL_CALL_END'
+  | 'TOOL_CALL_RESULT'
+  | 'STATE_DELTA'
+  | 'STATE_SNAPSHOT'
+  | 'CUSTOM'
+  | 'HEARTBEAT';
+
+/** One JSON Patch (RFC 6902) operation, as carried by AG-UI `STATE_DELTA.delta`. */
+export interface AGUIJsonPatchOp {
+  op: string;
+  path: string;
+  value?: unknown;
+}
+
+/** Envelope every AG-UI frame's `data` field satisfies (fields beyond `type` vary per event). */
+export interface AGUIEventEnvelope {
+  type: AGUIWireEventType;
+  runId?: string;
+  parentRunId?: string;
+  [key: string]: unknown;
+}
+
+/** Single option in an ask_user_question tool payload. */
+export interface AskUserQuestionOption {
+  id: string;
+  label: string;
+  isUserInput: boolean;
+  /** What happens if this option is picked. */
+  description?: string;
+}
+
+export interface AskUserQuestionItem {
+  uuid: string;
+  question: string;
+  options: AskUserQuestionOption[];
+  multiSelect: boolean;
+  /** Short label shown above the question. */
+  header?: string;
+}
+
+export interface AskUserQuestionPayload {
+  name: 'ask_user_question';
+  userIntent?: string;
+  questions: AskUserQuestionItem[];
+  /** ISO time after which the card can no longer be answered with its options. */
+  expiresAt?: string;
+  /** Set on this client when the user typed a reply in the chat instead of answering. */
+  repliedInChat?: boolean;
+}
+
+export interface SSEAskUserQuestionEvent {
+  status: string;
+  toolData: AskUserQuestionPayload;
+}
+
+/** User's collected answers per question (keyed by question uuid in slot state). */
+export interface AskUserQuestionAnswer {
+  questionUuid: string;
+  selectedOptionIds: string[];
+  /** Free-text values keyed by option id when isUserInput is true. */
+  userInputs: Record<string, string>;
+}
+
+export interface PendingAskUserQuestion {
+  /** Matches ThreadMessageLike.id for the assistant row (same as MessagePair.key). */
+  assistantMessageId: string;
+  payload: AskUserQuestionPayload;
+  answers: Record<string, AskUserQuestionAnswer>;
+  /** Answers the model already received. A resume only carries what is not here or differs. */
+  sentAnswers?: Record<string, AskUserQuestionAnswer>;
+  status: 'pending' | 'submitted' | 'persisted';
+}
+
+/** New answers to a reply's question card, sent with its regeneration. */
+export interface RegenAnswers {
+  messageId: string;
+  payload: AskUserQuestionPayload;
+  /** `User selections: ...`, as a tapped answer is sent. */
+  message: string;
+  answers: Record<string, AskUserQuestionAnswer>;
+}
+
+/** Artifact produced by a sandbox tool (coding/database). */
+export interface SSEArtifactEvent {
+  artifactId?: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes?: number;
+  downloadUrl: string;
+  artifactType?: string;
+  isTemporary?: boolean;
+  recordId?: string;
+  /** Version number in the artifact registry (1-based, increments on each update). */
+  version?: number;
+  /** Id of the CODE artifact this was generated from, if any — lets the UI offer "view source". */
+  derivedFromCodeArtifactId?: string;
+  /**
+   * Visibility of the artifact set by the backend.
+   * 'VISIBLE' (default) — shown to the user.
+   * 'STAGING' — internal intermediate artifact; Python already suppresses these
+   * before emitting SSE events, so this field serves as a defensive signal only.
+   */
+  visibility?: 'VISIBLE' | 'STAGING';
+}
+
+/** Artifact metadata attached to a chat slot for display. */
+export interface ChatArtifact {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  downloadUrl: string;
+  artifactType: string;
+  recordId?: string;
+  /** Version number in the artifact registry (1-based, increments on each update). */
+  version?: number;
+  /** Id of the CODE artifact this was generated from, if any — lets the UI offer "view source". */
+  derivedFromCodeArtifactId?: string;
+  /** Mirrors the backend visibility field — STAGING artifacts should never be rendered. */
+  visibility?: 'VISIBLE' | 'STAGING';
+}
+
+export interface SSEConnectedEvent {
+  message: string;
+  /** Set by Node when a new conversation row is created before streaming (main + agent). */
+  conversationId?: string;
+  /**
+   * Initial title persisted with that row (same source as list/detail APIs).
+   * Present on `connected` for new streams only — avoids a separate GET for sidebar UX.
+   * If the backend later async-refines titles, `complete` still refreshes list/title state.
+   */
+  title?: string;
+}
+
+/** Backend status phases (planning / tools / generation); keep open-ended for forward compatibility */
+export interface SSEStatusEvent {
+  status: string;
+  message: string;
+}
+
+export interface ChatCitation {
+  id: string;
+  title: string;
+  url?: string;
+  type: string;
+}
+
+/**
+ * Citation structure from API response (GET /api/v1/conversations/:id)
+ * More detailed than ChatCitation - this is the raw backend format.
+ * Transformed to ChatSource for display via loadHistoricalMessages().
+ */
+export interface CitationApiResponse {
+  citationId: string;
+  citationData: {
+    _id: string;
+    content: string;
+    chunkIndex: number;
+    metadata: {
+      recordName: string;
+      recordId: string;
+      connector: string;
+      /** Connector instance the record came from; absent on older saved answers */
+      connectorId?: string;
+      connectorInstanceName?: string;
+      recordType: string;
+      webUrl?: string;
+      mimeType: string;
+      pageNum?: number[];
+      blockNum?: number[];
+      extension: string;
+      previewRenderable: boolean;
+      orgId: string;
+      recordVersion: number;
+      topics?: string[];
+      languages?: string[];
+      departments?: string[];
+      /** When the cited record was last updated at its source */
+      updatedAt?: string;
+    };
+    citationType: string;
+    createdAt: string;
+    updatedAt: string;
+  };
+}
+
+export interface SSEAnswerChunkEvent {
+  chunk: string;
+  accumulated: string;
+  citations: SSEChunkCitation[];
+  confidence?: string;
+}
+
+/**
+ * Raw citation shape received in SSE answer_chunk events.
+ * Unlike CitationApiResponse, these do NOT have citationId — only chunkIndex.
+ */
+export interface SSEChunkCitation {
+  content: string;
+  chunkIndex: number;
+  metadata: {
+    orgId: string;
+    recordId: string;
+    virtualRecordId?: string;
+    recordName: string;
+    recordType: string;
+    recordVersion: number;
+    origin: CitationOrigin;
+    connector: string;
+    blockText: string;
+    blockType: string;
+    bounding_box?: Array<{ x: number; y: number }>;
+    pageNum?: number[];
+    extension: string;
+    mimeType: string;
+    blockNum?: number[];
+    webUrl?: string;
+    previewRenderable: boolean;
+    hideWeburl: boolean;
+  };
+  citationType: string;
+}
+
+export interface ReferenceData {
+  id: string;
+  title: string;
+  summary?: string;
+  category?: string;
+  topics?: string[];
+  url?: string;
+  type: string;
+}
+
+export interface ToolCallEntry {
+  toolName: string;
+  toolResult: Record<string, unknown>;
+}
+
+/** One model-turn's persisted chain-of-thought (opt-in server-side; see reasoning_persistence.py). */
+export interface ReasoningTurn {
+  messageId?: string;
+  turnIndex?: number;
+  content: string;
+}
+
+/**
+ * One entry in the ordered agent-activity transcript — text, reasoning, a
+ * tool call, or a nested sub-agent's own timeline. Mirrors the Python
+ * `TranscriptCollector`'s `MessagePart` / Node's `IMessagePart` byte-for-
+ * byte; built live from AG-UI wire events during streaming
+ * (`agui-event-handler.ts`) and rendered identically from persisted
+ * `ConversationMessage.parts` after reload — see the "Parts-Based Agent
+ * Message Transcript" plan.
+ *
+ * `resultPreview` is always a bounded preview (~500 chars), never the full
+ * external tool result — the server never sends more than that.
+ */
+/** On an `mcp_sign_in` part: an MCP server whose sign-in lacked permission this turn (Python `mcp_sign_in.py`). */
+export interface McpSignInServer {
+  instanceId: string;
+  serverName: string;
+  scopes: string[];
+  /** Set for a service-account agent's own sign-in, redone through the agent's route. */
+  agentKey?: string;
+}
+
+export interface MessagePart {
+  type: 'text' | 'reasoning' | 'tool_call' | 'sub_agent' | 'mcp_sign_in';
+  content?: string;
+  toolCallId?: string;
+  toolName?: string;
+  displayName?: string;
+  args?: string;
+  /** Human-readable summary of `args`, computed server-side. Falls back to `args` when absent. */
+  argsSummary?: string;
+  status?: 'running' | 'completed' | 'failed' | 'blocked' | 'awaiting_approval';
+  resultPreview?: string;
+  /** Human-readable summary of the tool result, computed server-side from the full (untruncated) output. Falls back to `resultPreview` when absent. */
+  resultSummary?: string;
+  /** A table or field list of the result, built server-side; unchecked here, see `toolResultView`. */
+  resultView?: unknown;
+  /** On an `awaiting_approval` call: what the approval card shows. */
+  approval?: ToolApprovalDetails;
+  /** The call a person approved, run when they answered. */
+  approved?: boolean;
+  /** How a call that waited for approval was settled (Python `tool_approvals.Outcome.answer`). */
+  approvalAnswer?: 'allowed' | 'declined' | 'expired';
+  /** On the `mcp_sign_in` part: the reply's sign-in card. Not activity, so never in the timeline. */
+  servers?: McpSignInServer[];
+  runId?: string;
+  roleName?: string;
+  parts?: MessagePart[];
+  /**
+   * Set ONLY on the one root-level `text` part that IS the final answer
+   * (mirrors Python's `TranscriptCollector.replace_final_text`) — every
+   * other root `text` part is narration (Cursor-Style Agent Transparency
+   * plan) and renders in the activity timeline instead. Never set on
+   * child (sub-agent) text parts.
+   */
+  isFinal?: boolean;
+  /**
+   * Set on a root-level, non-`isFinal` `text` part once a later root event
+   * proves it was narration rather than the (still-pending) final answer —
+   * a tool call starting, a reasoning block starting, or a new text turn
+   * starting all imply "more work follows this turn" (see
+   * `agui-event-handler.ts`'s `LivePartsBuilder.settleLastRootText()`,
+   * called from each of those three event handlers). The live answer
+   * buffer (`streamingContent`) is cleared in the same event, so the text
+   * is no longer duplicated there — `filterRootParts` shows `settled` text
+   * in the activity timeline as narration even while still streaming, and
+   * hides any not-yet-`settled` text (still mirrored in the answer buffer).
+   * `TEXT_MESSAGE_END` alone does NOT settle the part — at that point it's
+   * still ambiguous whether narration (tool call/reasoning follows) or the
+   * final answer (`RUN_FINISHED` follows) is next.
+   */
+  settled?: boolean;
+}
+
+export interface ConversationMessage {
+  _id: string;
+  messageType: 'user_query' | 'bot_response' | 'tool_call' | 'error';
+  content: string;
+  contentFormat: 'MARKDOWN';
+  citations: CitationApiResponse[];
+  confidence?: 'Very High' | 'High' | 'Medium' | 'Low';
+  followUpQuestions: string[];
+  referenceData: ReferenceData[];
+  modelInfo: ModelInfo;
+  createdAt: string;
+  updatedAt: string;
+  feedback: Record<string, unknown>[];
+  appliedFilters?: AppliedFilters;
+  /** File attachments uploaded with this user query (PDF / JPEG / PNG). */
+  attachments?: AttachmentRef[];
+  tools?: ToolCallEntry[];
+  /** Present only when the org has reasoning persistence enabled server-side. */
+  reasoning?: ReasoningTurn[];
+  /** Persisted agent-activity transcript (`agui` protocol only) — see MessagePart. */
+  parts?: MessagePart[];
+  /** Set when this bot response was cut short by a user-initiated Stop (see Node's `IMessage.status`). */
+  status?: 'stopped';
+}
+
+export interface ConversationCompleteData {
+  userId: string;
+  orgId: string;
+  title: string;
+  initiator: string;
+  messages: ConversationMessage[];
+  isShared: boolean;
+  isDeleted: boolean;
+  isArchived: boolean;
+  lastActivityAt: number;
+  status: string;
+  modelInfo: ModelInfo;
+  _id: string;
+  sharedWith: string[];
+  conversationErrors: string[];
+  createdAt: string;
+  updatedAt: string;
+  __v: number;
+  projectId?: string;
+  projectVisibility?: 'private' | 'project';
+}
+
+export interface SSECompleteEvent {
+  conversation: ConversationCompleteData;
+  meta: {
+    requestId: string;
+    timestamp: string;
+    duration: number;
+  };
+}
+
+export interface SSEErrorEvent {
+  error: string;
+  message: string;
+  code?: string;
+  /**
+   * Stable error classification the backend derives from the underlying
+   * failure (`rate_limit` / `request_too_large` / `auth_error` /
+   * `invalid_request` / `server_error` / `timeout` / `unknown` — see
+   * `error_classification.py`).
+   * `message` is already a user-friendly string for any of these, so this
+   * is only needed if a caller wants to branch on the failure kind (e.g.
+   * offer a "try again" affordance for `rate_limit` specifically, or show
+   * a "shorten your message" hint for `request_too_large`).
+   */
+  type?: string;
+}
+
+// Status message for display during streaming
+export interface StatusMessage {
+  id: string;
+  /** Mirrors SSE status when applicable (`connected`, `planning`, `executing`, …) */
+  status: string;
+  message: string;
+  timestamp: string;
+}
+
+// Request payload for streaming API
+export interface StreamChatRequest {
+  query: string;
+  modelKey: string;
+  modelName: string;
+  modelFriendlyName: string;
+  /**
+   * `quick` for normal modes; when query mode is Agent, `agent:<segment>`
+   * e.g. `agent:auto`, `agent:planExecute` (UI “Plan & Execute” strategy).
+   */
+  chatMode: StreamChatModePayload;
+  filters: ChatKnowledgeFilters;
+  timezone?: string;
+  currentTime?: string;
+  appliedFilters?: AppliedFilters;
+  conversationId?: string;
+  /** When set, the stream uses /api/v1/agents/:id/conversations/.../stream */
+  agentId?: string;
+  /**
+   * Agent streams only → JSON `tools`: explicit tool `fullName` subset.
+   * `undefined` (field omitted) means "every configured toolset, no
+   * filter" — NEVER resolved into an exploded full-catalog array on this
+   * type, since that would defeat the backend's own "no filter" handling
+   * and needlessly approach its request-size cap. `[]` means "none".
+   */
+  agentStreamTools?: string[];
+  /**
+   * Agent mode capability overrides. When present and `chatMode` is
+   * `'agent'` or `'agent:*'`, the backend gates `has_knowledge` /
+   * `web_search_config` accordingly. Omitting this field keeps today's
+   * default behavior (both capabilities enabled).
+   */
+  agentCapabilities?: AgentCapabilities;
+  /** Uploaded file refs to include with this message (PDF / JPEG / PNG). */
+  attachments?: AttachmentRef[];
+  /**
+   * Only sent when the user has explicitly picked a non-default effort for a
+   * reasoning-capable model. Omitted → backend uses the model's own default.
+   */
+  reasoningEffort?: ReasoningEffort;
+  /**
+   * Client-generated UUID for this run, minted before the fetch in
+   * `streamMessageForSlot`/`streamRegenerateForSlot`. Lets a later
+   * `POST .../cancel` (see `ChatApi.cancelStream`) target this exact run —
+   * see `cancelRunBodySchema` (Node) / `CancelRunRequest` (Python).
+   */
+  runId?: string;
+  /**
+   * Links a brand-new conversation to a Project. Only meaningful when
+   * `conversationId` is absent — once a session exists its `projectId` is
+   * the source of truth server-side and this field is ignored on follow-ups
+   * (see Node `es_controller.ts` / plan's "projectId on follow-up requests
+   * is ignored").
+   */
+  projectId?: string;
+  /** The person's answer to a tool approval card; the call itself is saved server-side. */
+  toolApproval?: ToolApprovalAnswer;
+}
+
+export type ToolApprovalDecision = 'allow' | 'deny';
+
+export interface ToolApprovalAnswer {
+  approvalId: string;
+  decision: ToolApprovalDecision;
+  /** "Don't ask again for this tool": the answer becomes the person's own rule for it. */
+  remember?: boolean;
+}
+
+/** A tool call waiting for a person's approval (Python `tool_approvals._ask`). */
+export interface ToolApprovalDetails {
+  approvalId: string;
+  instanceId: string;
+  serverName: string;
+  toolName: string;
+  toolTitle?: string | null;
+  readOnly?: boolean;
+  /** What the tool does to data; a deleting tool is marked on the card. */
+  kind?: 'read' | 'write' | 'destructive' | null;
+  /** False when "Don't ask again" can't set a rule: a toolset's rules are its admin's. */
+  canRemember?: boolean;
+  /** Epoch milliseconds. */
+  expiresAt: number;
+  /** Null when the arguments were too large to send; `argumentsPreview` holds their start. */
+  arguments?: Record<string, unknown> | null;
+  argumentsPreview?: string;
+}
+
+/**
+ * Builds mode-related fields for stream/regenerate payloads from settings.
+ *
+ * `isScopedAgent` distinguishes the two very different consumers of Agent
+ * `QueryMode`: a conversation scoped to a specific custom Agent (`agentId`
+ * set) still needs the `agent:<strategy>` wire value — its endpoint
+ * (`agent.py`) unwraps that via {@link streamChatModeToAgentApiChatMode} to
+ * drive `PipesHubAgentFactory`'s loop selection. The *main* chat's Agent
+ * mode (no `agentId` — "Universal Agent Mode") has no such strategy
+ * concept server-side (`chat_modes/policy.py`'s `AGENT_POLICY` decides
+ * internal-search vs web-search vs both from the query itself), so it must
+ * send the plain `'agent'` value instead.
+ */
+export function buildStreamRequestModeFields(
+  settings: ChatSettings,
+  isScopedAgent = false
+): Pick<StreamChatRequest, 'chatMode'> {
+  if (settings.queryMode === 'agent') {
+    return isScopedAgent
+      ? { chatMode: `agent:${agentStrategyToApiSegment(settings.agentStrategy)}` }
+      : { chatMode: 'agent' };
+  }
+  if (settings.queryMode === 'web-search') {
+    return {
+      chatMode: 'web_search',
+    };
+  }
+  if (settings.queryMode === 'image') {
+    return {
+      chatMode: 'image',
+    };
+  }
+  return {
+    chatMode: 'internal_search',
+  };
+}
+
+// ── Message Action Types ──
+
+/** Model override for regenerate / edit query flows. */
+export interface ModelOverride {
+  modelKey: string;
+  modelName: string;
+  modelFriendlyName: string;
+  /** Provider key from GET …/available/llm (e.g. `openAI`). */
+  modelProvider?: string;
+}
+
+/** A single LLM model entry from GET /api/v1/configurationManager/ai-models/available/llm */
+export interface AvailableLlmModel {
+  modelType: string;
+  provider: string;
+  modelName: string;
+  modelKey: string;
+  isMultimodal: boolean;
+  isReasoning: boolean;
+  isDefault: boolean;
+  modelFriendlyName: string;
+  /** The model's own effort, used when the request sets no reasoningEffort and the agent has no default. Absent when nothing valid is stored; a legacy `none` is shown as Low. */
+  defaultReasoningEffort?: ReasoningEffort;
+}
+
+/**
+ * Transient UI state for the active message action indicator.
+ * Lives in ChatInput (component-local, NOT in the Zustand store) to avoid
+ * unnecessary selector evaluations and rerenders across unrelated components.
+ */
+export type ActiveMessageAction =
+  | null
+  | { type: 'regenerate'; messageId: string; appliedFilters?: AppliedFilters }
+  | { type: 'editQuery'; messageId: string; text: string; appliedFilters?: AppliedFilters; attachments?: AttachmentRef[] };
+
+// ── Multi-Chat Slot Types ──
+
+/** Maximum number of concurrent chat slots before LRU eviction. */
+export const MAX_SLOTS = 15;
+
+/**
+ * Per-conversation state stored in the slots dictionary.
+ *
+ * Each slot represents one open conversation — the single
+ * `useExternalStoreRuntime` reads from the active slot.
+ */
+export interface ChatSlot {
+  /** Server-assigned conversation ID, or null for a brand-new chat. */
+  convId: string | null;
+  /**
+   * When set, this thread is scoped to an agent (`/chat?agentId=…`).
+   * Used to keep agent conversations out of the main chat sidebar and URL sync.
+   */
+  threadAgentId: string | null;
+  /**
+   * Tool fullNames for agent SSE, captured when the thread is scoped to an agent.
+   * Lets background / off-URL agent slots stream with the correct tools without
+   * relying on the global `agentStreamTools` (which tracks the current URL agent only).
+   */
+  agentStreamTools: string[] | null;
+  /**
+   * Project this thread is linked to (`/chat?projectId=…`), or null.
+   * Only used to seed `StreamChatRequest.projectId` on the first message of
+   * a brand-new chat — once `convId` is assigned, the session row is the
+   * source of truth and this field is not sent on follow-ups.
+   */
+  projectId: string | null;
+  /** True until the server assigns a real convId. */
+  isTemp: boolean;
+  /** True once messages have been loaded (or immediately for new chats). */
+  isInitialized: boolean;
+  /**
+   * Bumped by every `invalidateConversation`, including one that arrives while a history load is
+   * in flight; the loader discards and repeats a response fetched under an older value.
+   */
+  refreshGeneration: number;
+  /** True after first successful message load — drives tracker selection. */
+  hasLoaded: boolean;
+  /**
+   * The loaded conversation was still `Inprogress` on the server — a run that kept going after this
+   * tab's connection dropped (refresh, closed tab). Drives `startRemoteRunPoll`.
+   */
+  remoteRunInProgress: boolean;
+
+  /** Messages in assistant-ui ThreadMessageLike[] format. */
+  messages: ThreadMessageLike[];
+
+  // ── Per-slot streaming state ──
+  isStreaming: boolean;
+  streamingContent: string;
+  streamingQuestion: string;
+  currentStatusMessage: StatusMessage | null;
+  streamingCitationMaps: CitationMaps | null;
+  /**
+   * Live agent-activity transcript for the message currently streaming —
+   * built incrementally from AG-UI events (see `agui-event-handler.ts`'s
+   * `onParts` callback) so thinking/tool-call/sub-agent activity renders
+   * as it happens instead of only appearing after reload. Cleared when a
+   * new stream starts; the array reference is replaced (not mutated) on
+   * every update so it works as a plain render dependency.
+   */
+  streamingParts: MessagePart[];
+
+  // ── Per-slot scroll state (persisted across switches) ──
+  userScrollOverride: boolean;
+  /** Captured on switch-away, restored on switch-in. null = never saved. */
+  savedScrollTop: number | null;
+  /**
+   * True if savedScrollTop was captured while the slot was actively streaming.
+   * When true and the slot is no longer streaming on restore, treat the chat
+   * as historical (scroll to top-of-last-message) instead of restoring the
+   * stale mid-stream position.
+   */
+  savedScrollWasStreaming: boolean;
+
+  // ── Per-slot UI state ──
+  /**
+   * The messageId of the message currently showing a non-answer tab
+   * (sources or citations). Only one message per slot can be expanded
+   * at a time. null means all messages show the Answer tab.
+   */
+  activeExpandedMessageId: string | null;
+  regenerateMessageId: string | null;
+  /** Assistant row this run is writing into. A resume can be an older card. */
+  streamingAssistantId: string | null;
+  pendingCollections: ChatCollectionAttachment[];
+
+  /** Artifacts produced during the current streaming response. */
+  artifacts: ChatArtifact[];
+
+  /**
+   * Pending interactive questionnaire from SSE `ask_user_question`.
+   * Stays on the same assistant row through submit (`status: 'submitted'`)
+   * so the follow-up answer streams in-place. Replaced by
+   * `persistedAskUserQuestion` after `onComplete` / reload.
+   */
+  pendingAskUserQuestion: PendingAskUserQuestion | null;
+
+  /** AbortController for the in-flight SSE stream (if any). */
+  abortController: AbortController | null;
+
+  /**
+   * Client-generated UUID for the in-flight run, minted in
+   * `streamMessageForSlot`/`streamRegenerateForSlot` and sent to the backend
+   * so a later Stop can target this exact run. `null` when nothing is
+   * streaming. NOT cleared until the run fully settles (grace-timeout abort
+   * fallback in `stopStreamForSlot` still needs it after `stopping` starts).
+   */
+  runId: string | null;
+  /**
+   * True from the moment Stop is clicked until the run actually ends
+   * (`RUN_FINISHED` with `status: 'stopped'`, or the 5s grace-timeout abort
+   * fallback in `stopStreamForSlot`). Disables a second Stop click / shows a
+   * "Stopping…" affordance instead of hard-aborting immediately, so Python
+   * gets a chance to persist the partial answer before the connection dies.
+   */
+  stopping: boolean;
+
+  /**
+   * Tracks message pagination for the "load older messages" flow.
+   * null = not yet set (happens after first successful load).
+   * hasOlderMessages mirrors the API `hasNextPage` (next page = older batch).
+   */
+  messagePagination: {
+    currentPage: number;
+    hasOlderMessages: boolean;
+    isLoadingOlder: boolean;
+  } | null;
+
+  /**
+   * The stored rows `messages` was built from. "Load older messages" joins an
+   * older page onto these and rebuilds, so a card that spans two pages comes
+   * out as one card. `null` when the thread was not built from stored rows.
+   */
+  rawMessages: ConversationMessage[] | null;
+
+  /** Epoch ms of last interaction — used for LRU eviction. */
+  lastAccessedAt: number;
+
+  /**
+   * From GET conversation detail `access.isOwner`.
+   * `null` until the first fetch completes; `false` for chats opened from Shared Chats (hide share UI).
+   */
+  isOwner: boolean | null;
+  /**
+   * Last known API `modelInfo` for this thread (from list/detail/SSE), used
+   * to restore model + mode in the input when the user returns to this tab.
+   */
+  conversationModelInfo?: ModelInfo;
+}
+
+// ── Search types ──────────────────────────────────────────────────────
+
+export interface SearchRequest {
+  query: string;
+  limit: number;
+  filters: ChatKnowledgeFilters;
+}
+
+export interface SearchResultMetadata {
+  orgId: string;
+  recordId: string;
+  virtualRecordId: string;
+  recordName: string;
+  recordType: string;
+  recordVersion?: number;
+  origin: string;
+  connector: string;
+  /** Connector instance the record came from; marks demo records. */
+  connectorId?: string;
+  connectorInstanceName?: string;
+  blockText?: string;
+  blockType?: string;
+  bounding_box?: Array<{ x: number; y: number }>;
+  pageNum?: (number | null)[];
+  extension?: string;
+  mimeType?: string;
+  blockNum?: (number | null)[];
+  webUrl?: string;
+  previewRenderable?: boolean;
+  hideWeburl?: boolean;
+  kbId?: string | null;
+  blockIndex?: number;
+  isBlock?: boolean;
+  isBlockGroup?: boolean;
+  point_id?: string;
+}
+
+export interface SearchResultItem {
+  score: number;
+  citationType: string;
+  metadata: SearchResultMetadata;
+  content: string;
+  block_type?: string;
+  virtual_record_id?: string;
+  block_index?: number;
+  block_group_index?: number;
+}
+
+export interface SearchResponse {
+  searchId: string;
+  searchResponse: {
+    searchResults: SearchResultItem[];
+  };
+}

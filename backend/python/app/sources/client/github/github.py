@@ -1,0 +1,300 @@
+import logging
+import time
+from collections.abc import Mapping
+from typing import Any, cast
+
+from github import Auth, Github
+from pydantic import BaseModel, Field  # type: ignore
+from urllib3.util.retry import Retry
+
+from app.config.constants.http_status_code import HttpStatusCode
+
+# PyGithub's default retry (GithubRetry) silently sleeps INSIDE the SDK until
+# the rate-limit window resets — observed parking worker threads for 30+ min.
+# Rate limits are handled explicitly by the connector (probe + pause + backfill
+# floor), so the SDK should only retry transient server errors, briefly, and
+# let 403s surface immediately as failures.
+_TRANSIENT_RETRY = Retry(
+    total=3,
+    backoff_factor=1.0,
+    status_forcelist=(500, 502, 503, 504),
+    # Reads only. urllib3's default also retries PUT and DELETE: a merge (PUT) that
+    # GitHub completed behind a 502 was sent again, failed as "not mergeable", and was
+    # reported to the user as a failed merge.
+    allowed_methods=frozenset({"GET", "HEAD"}),
+)
+
+from app.config.configuration_service import ConfigurationService
+from app.sources.client.iclient import IClient
+
+
+def _lowered_headers(headers: object) -> dict[str, str]:
+    if not isinstance(headers, Mapping):
+        return {}
+    items = cast("Mapping[object, object]", headers).items()
+    return {str(k).lower(): str(v).strip() for k, v in items}
+
+
+def github_retry_after_seconds(headers: object, *, now: float | None = None) -> int | None:
+    """Seconds GitHub asked us to wait: ``Retry-After``, else until ``X-RateLimit-Reset``.
+
+    The reset is honoured only when ``X-RateLimit-Remaining`` is 0: GitHub
+    sends both headers on every response, and a reset an hour away means
+    nothing while budget is left.
+    """
+    lowered = _lowered_headers(headers)
+    retry_after = lowered.get("retry-after", "")
+    if retry_after.isdigit():
+        return int(retry_after)
+    reset = lowered.get("x-ratelimit-reset", "")
+    if reset.isdigit() and lowered.get("x-ratelimit-remaining") == "0":
+        current = time.time() if now is None else now
+        return max(0, int(reset) - int(current))
+    return None
+
+
+def is_github_rate_limit(status: int | None, headers: object, message: str | None) -> bool:
+    """True when a GitHub error response is a rate limit rather than a refusal.
+
+    GitHub answers both an exhausted primary limit and a secondary (abuse)
+    limit with 403 as well as 429, so the status alone cannot say "permission
+    denied". Its documented markers are ``X-RateLimit-Remaining: 0``, a
+    ``Retry-After`` header, or a body naming the rate limit.
+    """
+    if status == HttpStatusCode.TOO_MANY_REQUESTS.value:
+        return True
+    if status != HttpStatusCode.FORBIDDEN.value:
+        return False
+    lowered = _lowered_headers(headers)
+    if lowered.get("x-ratelimit-remaining") == "0" or "retry-after" in lowered:
+        return True
+    return "rate limit" in (message or "").lower()
+
+
+# Standardized Github API response wrapper
+class GitHubResponse(BaseModel):
+    success: bool
+    data: Any | None = None
+    error: str | None = None
+    message: str | None = None
+    # HTTP status and exception class are preserved separately because callers
+    # need to tell 401 (re-auth) from 403 (rate limit) from 5xx (retry), and
+    # stringifying the exception into `error` loses that distinction.
+    status_code: int | None = None
+    exception_type: str | None = None
+    # GitHub's own explanation (its "message" plus any field errors), and how long
+    # it asked us to wait on a rate limit, so tools can explain a failure plainly.
+    api_message: str | None = None
+    retry_after_seconds: int | None = None
+    # A listing cut at the SDK's item cap; more items exist on GitHub.
+    truncated: bool = False
+    # The ``after`` cursor from a listing page's ``Link: rel="next"``, when GitHub
+    # offers one. Listings that refuse deep ``page`` numbers are read with it.
+    next_cursor: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:  # type: ignore
+        return self.model_dump()
+
+    @property
+    def is_rate_limited(self) -> bool:
+        if self.success:
+            return False
+        if self.exception_type == "RateLimitExceededException":
+            return True
+        # retry_after_seconds is only ever read off rate-limit headers.
+        if self.status_code == HttpStatusCode.FORBIDDEN.value and self.retry_after_seconds is not None:
+            return True
+        return is_github_rate_limit(self.status_code, None, self.api_message or self.error)
+
+
+# Auth holder clients
+class GitHubClientViaToken:
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        per_page: int | None = None,
+    ) -> None:
+        self.token = token
+        self.base_url = base_url
+        self._sdk = None  # PyGithub instance
+        self.timeout = timeout
+        self.per_page = per_page
+
+    def create_client(self) -> None:
+        # Build kwargs dynamically to exclude None values
+        kwargs = {"auth": Auth.Token(self.token), "retry": _TRANSIENT_RETRY}
+
+        if self.base_url is not None:
+            kwargs["base_url"] = self.base_url
+        if self.timeout is not None:
+            kwargs["timeout"] = self.timeout
+        if self.per_page is not None:
+            kwargs["per_page"] = self.per_page
+
+        self._sdk = Github(**kwargs)
+
+
+    def get_sdk(self) -> Github:
+        if self._sdk is None:
+            raise RuntimeError("Client not initialized. Call create_client() first.")
+        return self._sdk
+
+    def get_base_url(self) -> str | None:
+        return self.base_url
+
+    def get_token(self) ->str:
+        return self.token
+
+    def set_token(self, token: str) -> None:
+        """Rotate the access token and rebuild the underlying PyGithub SDK instance.
+
+        PyGithub binds the ``Auth.Token`` at construction time, so a refreshed
+        OAuth access token requires a new ``Github`` instance rather than
+        mutating the existing one in place.
+        """
+        self.token = token
+        self.create_client()
+
+
+class GitHubConfig(BaseModel):
+    token: str
+    base_url: str | None = Field(
+        default=None,
+        description='e.g. "https://ghe.example.com/api/v3" for GH Enterprise',
+    )
+    timeout: float | None = None
+    per_page: int | None = None
+
+    def create_client(self) -> GitHubClientViaToken:
+        return GitHubClientViaToken(
+            token=self.token,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            per_page=self.per_page,
+        )
+
+
+class GitHubClient(IClient):
+    def __init__(self, client: GitHubClientViaToken) -> None:
+        self.client = client
+
+    def get_client(self) -> GitHubClientViaToken:
+        return self.client
+
+    def get_sdk(self) -> Github:
+        return self.client.get_sdk()
+
+    def get_token(self) -> str:
+        return self.client.get_token()
+
+    @classmethod
+    def build_with_config(
+        cls,
+        config: GitHubConfig,
+    ) -> "GitHubClient":
+        client = config.create_client()
+        client.create_client()
+        return cls(client)
+
+    @classmethod
+    async def build_from_toolset(
+        cls,
+        toolset_config: dict[str, Any],
+        logger: logging.Logger,
+    ) -> "GitHubClient":
+        """Build GitHubClient from toolset configuration (new architecture).
+
+        Toolset configs are stored per-user at:
+        /services/toolsets/{user_id}/{toolset_type}
+
+        Args:
+            toolset_config: Toolset configuration dictionary from etcd
+            logger: Logger instance
+
+        Returns:
+            GitHubClient instance
+        """
+        try:
+            if not toolset_config:
+                raise ValueError("Toolset config is required for GitHub client")
+
+            credentials_config = toolset_config.get("credentials", {}) or {}
+            token = credentials_config.get("access_token", "")
+            if not token:
+                raise ValueError("Access token required for GitHub client (OAuth)")
+
+            client = GitHubClientViaToken(token=token, per_page=90)
+            client.create_client()
+            logger.info("Built GitHub client from toolset config")
+            return cls(client)
+
+        except Exception as e:
+            logger.error(f"Failed to build GitHub client from toolset config: {str(e)}")
+            raise
+
+    @classmethod
+    async def build_from_services(
+        cls,
+        logger: logging.Logger,
+        config_service: ConfigurationService,
+        connector_instance_id: str | None = None,
+    ) -> "GitHubClient":
+        """Build GitHubClient using configuration service
+        Args:
+            logger: Logger instance
+            config_service: Configuration service instance
+        Returns:
+            GitHubClient instance
+        """
+        try:
+            config = await cls._get_connector_config(logger, config_service, connector_instance_id)
+            if not config:
+                raise ValueError("Failed to get GitHub connector configuration")
+            auth_config = config.get("auth", {})
+            if not auth_config:
+                raise ValueError ("Auth configuration not found in Github connector configuration")
+
+            # Credentials are written by the OAuth flow. A token-only (API_TOKEN)
+            # connector has none, so they are required only for OAUTH below.
+            credentials_config = config.get("credentials") or {}
+            # Extract configuration values
+            auth_type = auth_config.get("authType", "API_TOKEN")  # API_TOKEN or OAUTH
+
+            if auth_type == "API_TOKEN":
+                token = auth_config.get("token", "")
+                if not token:
+                    raise ValueError("Token required for token auth type")
+
+                client_via_token = GitHubClientViaToken(token=token,per_page=90)
+                client_via_token.create_client()
+                client =client_via_token
+            elif auth_type == "OAUTH":
+                if not credentials_config:
+                    raise ValueError("Credentials configuration not found in Github connector configuration")
+                access_token =credentials_config.get("access_token","")
+                if not access_token:
+                    raise ValueError("Access token required for OAuth auth type")
+
+                client_via_token = GitHubClientViaToken(token=access_token,per_page=90)
+                client_via_token.create_client()
+                client =client_via_token
+            else:
+                raise ValueError(f"Invalid auth type: {auth_type}")
+            return cls(client)
+        except Exception as e:
+            logger.error(f"Failed to build Github client from services: {str(e)}")
+            raise
+
+    @staticmethod
+    async def _get_connector_config(logger: logging.Logger, config_service: ConfigurationService, connector_instance_id: str | None = None) -> dict[str, Any]:
+        """Fetch connector config from etcd for GitHub."""
+        try:
+            config = await config_service.get_config(f"/services/connectors/{connector_instance_id}/config")
+            if not config:
+                raise ValueError(f"Failed to get GitHub connector configuration for instance {connector_instance_id}")
+            return config
+        except Exception as e:
+            logger.error(f"Failed to get GitHub connector config: {e}")
+            raise ValueError(f"Failed to get GitHub connector configuration for instance {connector_instance_id}") from e

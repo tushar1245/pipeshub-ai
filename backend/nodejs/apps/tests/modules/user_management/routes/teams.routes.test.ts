@@ -1,0 +1,398 @@
+import 'reflect-metadata';
+import { expect } from 'chai';
+import sinon from 'sinon';
+import { Container } from 'inversify';
+import { createTeamsRouter } from '../../../../src/modules/user_management/routes/teams.routes';
+import { AuthMiddleware } from '../../../../src/libs/middlewares/auth.middleware';
+import { TeamsController } from '../../../../src/modules/user_management/controller/teams.controller';
+
+describe('Teams Routes', () => {
+  let container: Container;
+  let mockAuthMiddleware: any;
+  let mockTeamsController: any;
+
+  beforeEach(() => {
+    container = new Container();
+
+    mockAuthMiddleware = {
+      authenticate: sinon.stub().callsFake((_req: any, _res: any, next: any) => next()),
+      scopedTokenValidator: sinon.stub().returns(
+        sinon.stub().callsFake((_req: any, _res: any, next: any) => next()),
+      ),
+    };
+
+    mockTeamsController = {
+      createTeam: sinon.stub().resolves(),
+      getTeam: sinon.stub().resolves(),
+      updateTeam: sinon.stub().resolves(),
+      deleteTeam: sinon.stub().resolves(),
+      getTeamUsers: sinon.stub().resolves(),
+      getUserTeams: sinon.stub().resolves(),
+    };
+
+    container.bind<AuthMiddleware>('AuthMiddleware').toConstantValue(mockAuthMiddleware as any);
+    container.bind<TeamsController>('TeamsController').toConstantValue(mockTeamsController as any);
+
+  });
+
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  it('should create a router successfully', () => {
+    const router = createTeamsRouter(container);
+    expect(router).to.be.a('function');
+  });
+
+  describe('route registration', () => {
+    it('should register POST / route for creating team', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack;
+
+      const createRoute = routes.find(
+        (layer: any) =>
+          layer.route &&
+          layer.route.path === '/' &&
+          layer.route.methods.post,
+      );
+      expect(createRoute).to.not.be.undefined;
+    });
+
+    it('should register GET /user/teams route', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack;
+
+      const userTeamsRoute = routes.find(
+        (layer: any) =>
+          layer.route &&
+          layer.route.path === '/user/teams' &&
+          layer.route.methods.get,
+      );
+      expect(userTeamsRoute).to.not.be.undefined;
+    });
+
+    it('should register GET /:teamId route', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack;
+
+      const getRoute = routes.find(
+        (layer: any) =>
+          layer.route &&
+          layer.route.path === '/:teamId' &&
+          layer.route.methods.get,
+      );
+      expect(getRoute).to.not.be.undefined;
+    });
+
+    it('should register PUT /:teamId route', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack;
+
+      const putRoute = routes.find(
+        (layer: any) =>
+          layer.route &&
+          layer.route.path === '/:teamId' &&
+          layer.route.methods.put,
+      );
+      expect(putRoute).to.not.be.undefined;
+    });
+
+    it('should register DELETE /:teamId route', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack;
+
+      const deleteRoute = routes.find(
+        (layer: any) =>
+          layer.route &&
+          layer.route.path === '/:teamId' &&
+          layer.route.methods.delete,
+      );
+      expect(deleteRoute).to.not.be.undefined;
+    });
+
+    it('should register GET /:teamId/users route', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack;
+
+      const usersRoute = routes.find(
+        (layer: any) =>
+          layer.route &&
+          layer.route.path === '/:teamId/users' &&
+          layer.route.methods.get,
+      );
+      expect(usersRoute).to.not.be.undefined;
+    });
+  });
+
+  describe('route count', () => {
+    it('should register all expected routes', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack.filter((layer: any) => layer.route);
+
+      // POST /, GET /user/teams, GET /:teamId, PUT /:teamId, DELETE /:teamId, GET /:teamId/users = 6
+      expect(routes.length).to.equal(6);
+    });
+  });
+
+  describe('middleware chains', () => {
+    it('should include auth middleware on all routes', () => {
+      const router = createTeamsRouter(container);
+      const routes = (router as any).stack.filter((layer: any) => layer.route);
+
+      for (const routeLayer of routes) {
+        // Each route must have at least: authenticate + handler = 2 handlers in its stack
+        expect(routeLayer.route.stack.length).to.be.greaterThanOrEqual(2,
+          `Route ${routeLayer.route.methods} ${routeLayer.route.path} should include auth middleware`);
+      }
+    });
+
+    it('should have full middleware chain on write routes (POST, PUT, DELETE)', () => {
+      const router = createTeamsRouter(container);
+      const writeRoutes = [
+        { path: '/', method: 'post' },
+        { path: '/:teamId', method: 'put' },
+        { path: '/:teamId', method: 'delete' },
+      ];
+
+      for (const { path, method } of writeRoutes) {
+        const routeLayer = (router as any).stack.find(
+          (l: any) => l.route && l.route.path === path && l.route.methods[method],
+        );
+        expect(routeLayer).to.not.be.undefined;
+        // authenticate + requireScopes + validate + handler = 4
+        expect(routeLayer.route.stack.length).to.equal(4,
+          `${method.toUpperCase()} ${path} should have 4 middleware handlers`);
+      }
+    });
+
+    it('should have full middleware chain on read routes (GET)', () => {
+      const router = createTeamsRouter(container);
+      const readRoutes = [
+        { path: '/user/teams', method: 'get' },
+        { path: '/:teamId', method: 'get' },
+        { path: '/:teamId/users', method: 'get' },
+      ];
+
+      for (const { path, method } of readRoutes) {
+        const routeLayer = (router as any).stack.find(
+          (l: any) => l.route && l.route.path === path && l.route.methods[method],
+        );
+        expect(routeLayer).to.not.be.undefined;
+        // authenticate + requireScopes + validate + handler = 4
+        expect(routeLayer.route.stack.length).to.equal(4,
+          `${method.toUpperCase()} ${path} should have 4 middleware handlers`);
+      }
+    });
+  });
+
+  describe('handler wiring', () => {
+    const VALID_TEAM_ID = '550e8400-e29b-41d4-a716-446655440000';
+
+    function findRouteHandler(router: any, path: string, method: string) {
+      const layer = router.stack.find(
+        (l: any) => l.route && l.route.path === path && l.route.methods[method],
+      );
+      if (!layer) return null;
+      return layer.route.stack[layer.route.stack.length - 1].handle;
+    }
+
+    function createMockReqRes() {
+      const mockReq: any = {
+        user: { userId: '507f1f77bcf86cd799439011', orgId: '507f1f77bcf86cd799439012' },
+        body: { name: 'Team' },
+        params: { teamId: VALID_TEAM_ID },
+        query: {},
+        headers: {},
+      };
+      const mockRes: any = {
+        status: sinon.stub().returnsThis(),
+        json: sinon.stub().returnsThis(),
+      };
+      const mockNext = sinon.stub();
+      return { mockReq, mockRes, mockNext };
+    }
+
+    it('POST / handler should call teamsController.createTeam', async () => {
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/', 'post');
+      const next = sinon.stub();
+      await handler({ body: { name: 'Team' } }, { status: sinon.stub().returnsThis(), json: sinon.stub() }, next);
+      expect(mockTeamsController.createTeam.calledOnce).to.be.true;
+    });
+
+    it('POST / handler should call next on error', async () => {
+      mockTeamsController.createTeam.rejects(new Error('Create failed'));
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/', 'post');
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockNext.calledOnce).to.be.true;
+    });
+
+    it('GET /user/teams handler should call teamsController.getUserTeams', async () => {
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/user/teams', 'get');
+      expect(handler).to.not.be.undefined;
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockTeamsController.getUserTeams.calledOnce).to.be.true;
+    });
+
+    it('GET /:teamId handler should call teamsController.getTeam', async () => {
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/:teamId', 'get');
+      expect(handler).to.not.be.undefined;
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockTeamsController.getTeam.calledOnce).to.be.true;
+    });
+
+    it('PUT /:teamId handler should call teamsController.updateTeam', async () => {
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/:teamId', 'put');
+      expect(handler).to.not.be.undefined;
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockTeamsController.updateTeam.calledOnce).to.be.true;
+    });
+
+    it('DELETE /:teamId handler should call teamsController.deleteTeam', async () => {
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/:teamId', 'delete');
+      expect(handler).to.not.be.undefined;
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockTeamsController.deleteTeam.calledOnce).to.be.true;
+    });
+
+    it('GET /:teamId/users handler should call teamsController.getTeamUsers', async () => {
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/:teamId/users', 'get');
+      expect(handler).to.not.be.undefined;
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockTeamsController.getTeamUsers.calledOnce).to.be.true;
+    });
+
+    it('DELETE /:teamId handler should call next on error', async () => {
+      mockTeamsController.deleteTeam.rejects(new Error('Delete failed'));
+      const router = createTeamsRouter(container);
+      const handler = findRouteHandler(router, '/:teamId', 'delete');
+
+      const { mockReq, mockRes, mockNext } = createMockReqRes();
+      await handler(mockReq, mockRes, mockNext);
+
+      expect(mockNext.calledOnce).to.be.true;
+    });
+  });
+});
+
+describe('Teams Routes - handler coverage', () => {
+  let container: Container
+  let mockTeamsController: any
+  let router: any
+
+  beforeEach(() => {
+    container = new Container()
+
+    const mockAuthMiddleware = {
+      authenticate: sinon.stub().callsFake((_req: any, _res: any, next: any) => next()),
+    }
+
+    mockTeamsController = {
+      createTeam: sinon.stub().resolves(),
+      getTeam: sinon.stub().resolves(),
+      updateTeam: sinon.stub().resolves(),
+      deleteTeam: sinon.stub().resolves(),
+      getTeamUsers: sinon.stub().resolves(),
+      getUserTeams: sinon.stub().resolves(),
+    }
+
+    container.bind<AuthMiddleware>('AuthMiddleware').toConstantValue(mockAuthMiddleware as any)
+    container.bind<TeamsController>('TeamsController').toConstantValue(mockTeamsController as any)
+
+    router = createTeamsRouter(container)
+  })
+
+  afterEach(() => {
+    sinon.restore()
+  })
+
+  function findHandler(path: string, method: string) {
+    const layer = router.stack.find(
+      (l: any) => l.route && l.route.path === path && l.route.methods[method],
+    )
+    if (!layer) return null
+    return layer.route.stack[layer.route.stack.length - 1].handle
+  }
+
+  function mockRes() {
+    return { status: sinon.stub().returnsThis(), json: sinon.stub().returnsThis(), send: sinon.stub().returnsThis() }
+  }
+
+  describe('POST / handler', () => {
+    it('should call teamsController.createTeam', async () => {
+      const handler = findHandler('/', 'post')
+      expect(handler).to.exist
+      await handler({ body: { name: 'Team1' } } as any, mockRes(), sinon.stub())
+      expect(mockTeamsController.createTeam.calledOnce).to.be.true
+    })
+  })
+
+  describe('GET /user/teams handler', () => {
+    it('should call teamsController.getUserTeams', async () => {
+      const handler = findHandler('/user/teams', 'get')
+      expect(handler).to.exist
+      await handler({} as any, mockRes(), sinon.stub())
+      expect(mockTeamsController.getUserTeams.calledOnce).to.be.true
+    })
+  })
+
+  describe('GET /:teamId handler', () => {
+    it('should call teamsController.getTeam', async () => {
+      const handler = findHandler('/:teamId', 'get')
+      expect(handler).to.exist
+      await handler({ params: { teamId: 'team1' } } as any, mockRes(), sinon.stub())
+      expect(mockTeamsController.getTeam.calledOnce).to.be.true
+    })
+  })
+
+  describe('PUT /:teamId handler', () => {
+    it('should call teamsController.updateTeam', async () => {
+      const handler = findHandler('/:teamId', 'put')
+      expect(handler).to.exist
+      await handler({ params: { teamId: 'team1' }, body: {} } as any, mockRes(), sinon.stub())
+      expect(mockTeamsController.updateTeam.calledOnce).to.be.true
+    })
+  })
+
+  describe('DELETE /:teamId handler', () => {
+    it('should call teamsController.deleteTeam', async () => {
+      const handler = findHandler('/:teamId', 'delete')
+      expect(handler).to.exist
+      await handler({ params: { teamId: 'team1' } } as any, mockRes(), sinon.stub())
+      expect(mockTeamsController.deleteTeam.calledOnce).to.be.true
+    })
+  })
+
+  describe('GET /:teamId/users handler', () => {
+    it('should call teamsController.getTeamUsers', async () => {
+      const handler = findHandler('/:teamId/users', 'get')
+      expect(handler).to.exist
+      await handler({ params: { teamId: 'team1' } } as any, mockRes(), sinon.stub())
+      expect(mockTeamsController.getTeamUsers.calledOnce).to.be.true
+    })
+  })
+})

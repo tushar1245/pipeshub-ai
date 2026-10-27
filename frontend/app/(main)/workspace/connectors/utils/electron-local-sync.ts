@@ -1,0 +1,405 @@
+import { getApiBaseUrl } from '@/lib/utils/api-base-url';
+import { isElectron } from '@/lib/electron';
+import { useAuthStore } from '@/config';
+import { ConnectorsApi } from '../api';
+import { isLocalFsConnectorType } from './local-fs-helpers';
+import type { Connector, ConnectorConfig, LocalSyncStatus } from '../types';
+
+interface LocalSyncStartPayload {
+  connectorId: string;
+  connectorName: string;
+  rootPath: string;
+  /** Crawling-manager connector segment (usually the connector `type` string). */
+  connectorDisplayType?: string;
+  syncStrategy?: 'MANUAL' | 'SCHEDULED';
+  /** Mirrors connector sync custom field `include_subfolders` (default true if omitted). */
+  includeSubfolders?: boolean;
+}
+
+export type LocalFsWatcherOptionsPayload = Pick<LocalSyncStartPayload, 'includeSubfolders'>;
+
+/** API may send booleans as strings (e.g. saved JSON). */
+function parseIncludeSubfolders(merged: Record<string, unknown>): boolean | undefined {
+  const v = merged.include_subfolders;
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s === 'true' || s === '1') return true;
+    if (s === 'false' || s === '0') return false;
+  }
+  if (typeof v === 'number' && (v === 0 || v === 1)) return v === 1;
+  return undefined;
+}
+
+export interface LocalRootPathConflictResult {
+  available: boolean;
+  ownerConnectorId?: string;
+  ownerConnectorName?: string;
+}
+
+interface ElectronLocalSyncApi {
+  start: (payload: {
+    connectorId: string;
+    connectorName: string;
+    rootPath: string;
+    apiBaseUrl: string;
+    connectorDisplayType?: string;
+    syncStrategy?: 'MANUAL' | 'SCHEDULED';
+    includeSubfolders?: boolean;
+  }) => Promise<LocalSyncStatus>;
+  checkRootPathConflict: (
+    connectorId: string,
+    rootPath: string
+  ) => Promise<LocalRootPathConflictResult>;
+  stop: (connectorId: string) => Promise<LocalSyncStatus>;
+  remove: (connectorId: string) => Promise<{ ok: boolean }>;
+  reap: (connectorIds: string[]) => Promise<{ removed: string[] }>;
+  status: (connectorId: string) => Promise<LocalSyncStatus>;
+  bootstrap: () => Promise<Array<{ connectorId: string; ok: boolean; error?: string }>>;
+  setAccessToken: (
+    accessToken: string,
+    apiBaseUrl: string
+  ) => Promise<{ ok: boolean; deviceId?: string; error?: string }>;
+  clearCredentials: () => Promise<{ ok: boolean }>;
+  getDeviceInfo: () => Promise<ElectronDeviceInfoResult>;
+}
+
+export type ElectronDeviceInfoResult =
+  | { ok: true; deviceId: string; deviceName: string }
+  | { ok: false; error: string };
+
+function getElectronLocalSyncApi() {
+  if (!isElectron()) return null;
+  const api = (window as unknown as { electronAPI?: { localSync?: ElectronLocalSyncApi } })
+    .electronAPI?.localSync;
+  if (!api) return null;
+  return api;
+}
+
+let deviceInfoRequest: Promise<ElectronDeviceInfoResult> | null = null;
+
+/**
+ * The OS-derived identity of this desktop, or null outside Electron. Only a
+ * successful answer is cached: a failure is retried on the next call so a
+ * transient identity error doesn't stick for the life of the window.
+ */
+export function getElectronDeviceInfo(): Promise<ElectronDeviceInfoResult | null> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return Promise.resolve(null);
+  if (!deviceInfoRequest) {
+    const request = api
+      .getDeviceInfo()
+      .catch((error: unknown): ElectronDeviceInfoResult => ({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    deviceInfoRequest = request;
+    void request.then((result) => {
+      if (result.ok === false && deviceInfoRequest === request) deviceInfoRequest = null;
+    });
+  }
+  return deviceInfoRequest;
+}
+
+export async function startElectronLocalSync(
+  payload: LocalSyncStartPayload
+): Promise<LocalSyncStatus | null> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return null;
+
+  const apiBaseUrl = getApiBaseUrl();
+  if (!apiBaseUrl) return null;
+
+  return api.start({
+    connectorId: payload.connectorId,
+    connectorName: payload.connectorName,
+    rootPath: payload.rootPath,
+    apiBaseUrl,
+    ...(payload.connectorDisplayType
+      ? { connectorDisplayType: payload.connectorDisplayType }
+      : {}),
+    ...(payload.syncStrategy ? { syncStrategy: payload.syncStrategy } : {}),
+    ...(payload.includeSubfolders !== undefined ? { includeSubfolders: payload.includeSubfolders } : {}),
+  });
+}
+
+/** Last value handed to main, so a store change that left the token alone is not re-pushed. */
+let lastPushedAccessToken: string | null = null;
+let tokenBridgeStarted = false;
+
+/**
+ * Hand the current access token to the Electron main process.
+ *
+ * Main stores nothing on disk and cannot mint tokens of its own, so the
+ * desktop answers the server's pull only while this process holds a live one.
+ */
+export async function pushElectronDesktopAccessToken(): Promise<void> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return;
+
+  const apiBaseUrl = getApiBaseUrl();
+  const accessToken = useAuthStore.getState().accessToken;
+  if (!apiBaseUrl || !accessToken) return;
+  if (accessToken === lastPushedAccessToken) return;
+
+  const result = await api.setAccessToken(accessToken, apiBaseUrl);
+  if (result?.ok) {
+    lastPushedAccessToken = accessToken;
+  } else if (result?.error) {
+    console.warn(`[local-sync] desktop rejected the access token: ${result.error}`);
+  }
+}
+
+/**
+ * Keep main's copy fresh for as long as a window is alive. The refresh
+ * scheduler re-mints ~90s before expiry and writes the result to the auth
+ * store, so subscribing here is enough — main never has to ask.
+ *
+ * Idempotent: mirrors `initTokenRefreshScheduler`, which mounts from the same
+ * layout and may re-run on hot reload.
+ */
+export function startElectronDesktopTokenBridge(): void {
+  if (tokenBridgeStarted) return;
+  if (!getElectronLocalSyncApi()) return;
+  tokenBridgeStarted = true;
+  useAuthStore.subscribe(() => {
+    void pushElectronDesktopAccessToken().catch((error) => {
+      console.warn('[local-sync] could not push the access token to the desktop:', error);
+    });
+  });
+}
+
+/**
+ * Read-only preflight: does another Local FS connector already watch this
+ * root? Call this *before* activating (toggling sync on / creating) a Local
+ * FS connector so a conflicting path never flips the backend to active in
+ * the first place — the watcher-start failure that follows an already-active
+ * connector is confusing and leaves the instance stuck active with no
+ * watcher. Returns `available: true` outside Electron (nothing to conflict
+ * with client-side) so callers can always await this unconditionally.
+ */
+export async function checkLocalRootPathConflict(
+  connectorId: string,
+  rootPath: string
+): Promise<LocalRootPathConflictResult> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return { available: true };
+  return api.checkRootPathConflict(connectorId, rootPath);
+}
+
+/**
+ * Maps Local FS connector saved settings into watcher/full-sync options so the
+ * Electron app matches backend indexing rules.
+ */
+export function buildLocalFsWatcherOptionsFromConnectorConfig(
+  config: ConnectorConfig | null | undefined
+): LocalFsWatcherOptionsPayload {
+  const out: LocalFsWatcherOptionsPayload = {};
+  if (!config?.config) return out;
+
+  const sync = config.config.sync;
+  if (sync) {
+    const merged: Record<string, unknown> = {
+      ...(sync.values || {}),
+      ...(sync.customValues || {}),
+    };
+    const inc = parseIncludeSubfolders(merged);
+    if (inc !== undefined) out.includeSubfolders = inc;
+  }
+
+  return out;
+}
+
+/**
+ * Reads only what the desktop watcher needs from the saved connector config.
+ * Sync cadence is no longer a desktop concern — the connector service schedules
+ * every run and pulls, so the watcher's only job is keeping the journal warm.
+ */
+export function buildLocalSyncStartOptionsFromConnectorConfig(
+  config: ConnectorConfig | null | undefined,
+  connectorDisplayType?: string | null
+): Pick<LocalSyncStartPayload, 'syncStrategy' | 'connectorDisplayType' | 'includeSubfolders'> {
+  const out: Pick<
+    LocalSyncStartPayload,
+    'syncStrategy' | 'connectorDisplayType' | 'includeSubfolders'
+  > = { ...buildLocalFsWatcherOptionsFromConnectorConfig(config) };
+  const typeTrim = typeof connectorDisplayType === 'string' ? connectorDisplayType.trim() : '';
+  if (typeTrim) out.connectorDisplayType = typeTrim;
+  // Informational only: surfaced in the desktop status card so the UI can say
+  // which cadence the server is running.
+  if (config?.config?.sync?.selectedStrategy === 'SCHEDULED') out.syncStrategy = 'SCHEDULED';
+  return out;
+}
+
+export async function stopElectronLocalSync(connectorId: string): Promise<LocalSyncStatus | null> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return null;
+  return api.stop(connectorId);
+}
+
+export async function getElectronLocalSyncStatus(
+  connectorId: string
+): Promise<LocalSyncStatus | null> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return null;
+  return api.status(connectorId);
+}
+
+/**
+ * Call when a connector is **deleted**, not merely deactivated or navigated
+ * away from. Unmounting alone leaves the journal meta on disk, and the boot
+ * bootstrap mounts a watcher for every connector the journal knows about — so
+ * the deleted connector comes back on the next launch and holds its sync root
+ * against any new connector pointed at the same folder.
+ */
+export async function removeElectronLocalSync(connectorId: string): Promise<void> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return;
+  await api.remove(connectorId);
+}
+
+const ACTIVE_CONNECTORS_PAGE_LIMIT = 100;
+
+/**
+ * `getActiveConnectors` is capped at `ACTIVE_CONNECTORS_PAGE_LIMIT` per page
+ * with no total/hasMore in the response, so page through until a page comes
+ * back short. Personal scope only — Local FS is registered
+ * `.with_scopes([ConnectorScope.PERSONAL])` in the backend connector
+ * definition, so there is nothing to enumerate under team scope today.
+ */
+async function fetchAllPersonalConnectors(): Promise<Connector[]> {
+  const all: Connector[] = [];
+  let page = 1;
+  for (;;) {
+    const { connectors } = await ConnectorsApi.getActiveConnectors(
+      'personal',
+      page,
+      ACTIVE_CONNECTORS_PAGE_LIMIT
+    );
+    const batch = connectors || [];
+    all.push(...batch);
+    if (batch.length < ACTIVE_CONNECTORS_PAGE_LIMIT) break;
+    page += 1;
+  }
+  return all;
+}
+
+/**
+ * Boot-time mount for **every** active Local FS connector owned by this
+ * device, not just scheduled ones. The server drives all sync now and routes
+ * each pull to the owner device only, and a pull that lands on a machine
+ * with no watcher mounted finds an empty journal — the responder can mount one
+ * lazily, but that turns every incremental sync into a full rescan. Mounting
+ * at boot keeps the journal warm so an incremental pull is cheap.
+ *
+ * Enumerates from the backend rather than the Electron journal so instances
+ * that were never opened on this machine are covered too. Throws if the
+ * connector list can't be fetched, so the caller can fall back to
+ * `bootstrapElectronLocalSyncFromJournal`; a per-instance failure only skips
+ * that instance.
+ */
+export async function startLocalWatchers(): Promise<void> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return;
+
+  const connectors = await fetchAllPersonalConnectors();
+  const localFsConnectors = connectors.filter(
+    (connector) => Boolean(connector._key) && isLocalFsConnectorType(connector.type)
+  );
+
+  // Reap first, and against *every* Local FS instance the backend knows about
+  // rather than the eligible subset below — a connector that is merely toggled
+  // off still exists, and dropping its journal would throw away pending events.
+  // This is the only place with an authoritative view of what still exists, so
+  // it is what undoes a delete that happened while the desktop was closed.
+  await api.reap(localFsConnectors.map((connector) => connector._key as string));
+
+  const device = await getElectronDeviceInfo();
+  if (!device) return;
+  if (device.ok === false) {
+    console.warn(
+      `[local-sync] not mounting watchers, device identity unavailable: ${device.error}`
+    );
+    return;
+  }
+
+  const eligible = localFsConnectors.filter(
+    (connector) =>
+      connector.isActive &&
+      connector.isConfigured &&
+      connector.isAuthenticated &&
+      connector.ownerDeviceId === device.deviceId
+  );
+
+  await Promise.allSettled(
+    eligible.map(async (connector) => {
+      const connectorId = connector._key as string;
+      const config = await ConnectorsApi.getConnectorConfig(connectorId);
+      const rootPath = extractLocalFsRootPath(config);
+      if (!rootPath) return;
+
+      await startElectronLocalSync({
+        connectorId,
+        connectorName: connector.name,
+        rootPath,
+        ...buildLocalSyncStartOptionsFromConnectorConfig(config, connector.type),
+      });
+    })
+  );
+}
+
+/**
+ * Offline fallback for `startLocalWatchers`: brings up the Local FS connectors
+ * the Electron journal already knows about (persisted by a prior `start()`)
+ * when the backend can't be reached. Connectors already running are skipped,
+ * and each start goes through the normal reconcile-or-seed path.
+ */
+export async function bootstrapElectronLocalSyncFromJournal(): Promise<void> {
+  const api = getElectronLocalSyncApi();
+  if (!api) return;
+  await api.bootstrap();
+}
+
+export function extractLocalFsRootPath(
+  connectorConfig?: {
+    config?: {
+      sync?: {
+        values?: Record<string, unknown>;
+        customValues?: Record<string, unknown>;
+      };
+    };
+  } | null
+): string | null {
+  const syncConfig = connectorConfig?.config?.sync || {};
+  const values = {
+    ...(syncConfig.values || {}),
+    ...(syncConfig.customValues || {}),
+  };
+
+  const preferredKeys = [
+    'sync_root_path',
+    'rootPath',
+    'folderPath',
+    'directoryPath',
+    'path',
+  ];
+  for (const key of preferredKeys) {
+    const candidate = values[key];
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  for (const [key, value] of Object.entries(values)) {
+    if (
+      typeof value === 'string' &&
+      value.trim() &&
+      /(folder|directory|root|path)/i.test(key)
+    ) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}

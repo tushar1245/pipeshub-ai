@@ -1,0 +1,21 @@
+name: code_file_layer
+description: CodeFileRecord fields not on Record
+fields:
+  commit_sha:
+    required: false
+    type: string
+  extension:
+    required: false
+    type: string
+  file_hash:
+    required: false
+    type: string
+  file_path:
+    required: false
+    type: string
+  file_role:
+    required: false
+    type: string
+  language:
+    required: false
+    type: string

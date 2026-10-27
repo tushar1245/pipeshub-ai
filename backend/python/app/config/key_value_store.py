@@ -1,0 +1,201 @@
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Generic, List, Optional, TypeVar
+
+T = TypeVar("T")
+
+
+class KeyValueStore(ABC, Generic[T]):
+    """
+    Abstract base class defining the interface for distributed key-value stores.
+
+    This interface provides a common contract for different key-value store implementations,
+    ensuring consistent behavior across different backends.
+
+    Type Parameters:
+        T: The type of values stored in the key-value store
+    """
+
+    @property
+    @abstractmethod
+    def client(self) -> Optional[object]:
+        """
+        Expose the underlying client for watchers and diagnostics.
+
+        Returns:
+            The underlying client instance (e.g., Redis client, etcd3 client),
+            or None if not connected.
+        """
+        pass
+
+    @abstractmethod
+    async def create_key(self, key: str, value: T, overwrite: bool = True, ttl: Optional[int] = None) -> bool:
+        """
+        Create a new key-value pair in the store.
+
+        Args:
+            key: The key to create
+            value: The value to associate with the key
+            overwrite: If True, overwrite existing key. If False, skip if key exists.
+            ttl: Optional time-to-live in seconds
+
+        Returns:
+            True if the key was created or updated, False if the key already existed
+            and overwrite was False.
+
+        Raises:
+            ValueError: If the key or value is invalid
+            ConnectionError: If the store is unavailable
+        """
+        pass
+
+    @abstractmethod
+    async def update_value(self, key: str, value: T, ttl: Optional[int] = None) -> None:
+        """
+        Update the value for an existing key.
+
+        Args:
+            key: The key to update
+            value: The new value
+            ttl: Optional time-to-live in seconds
+
+        Raises:
+            KeyError: If the key doesn't exist
+            ValueError: If the value is invalid
+            ConnectionError: If the store is unavailable
+        """
+        pass
+
+    @abstractmethod
+    async def get_key(self, key: str, *, raise_on_error: bool = False) -> Optional[T]:
+        """
+        Retrieve the value associated with a key.
+
+        Args:
+            key: The key to retrieve
+
+        Returns:
+            The value associated with the key, or None if the key doesn't exist
+
+        Raises:
+            ConnectionError: If the store is unavailable
+
+        ``raise_on_error=True`` re-raises a failure to read instead of answering
+        ``None``, so a caller can tell an unreadable store from a missing key.
+        A key that is not set is still ``None``.
+        """
+        pass
+
+    @abstractmethod
+    async def delete_key(self, key: str) -> bool:
+        """
+        Delete a key-value pair from the store.
+
+        Args:
+            key: The key to delete
+
+        Returns:
+            True if the key was deleted, False if it didn't exist
+
+        Raises:
+            ConnectionError: If the store is unavailable
+        """
+        pass
+
+    @abstractmethod
+    async def get_all_keys(self) -> List[str]:
+        """
+        Retrieve all keys in the store.
+
+        Returns:
+            List of all keys in the store
+
+        Raises:
+            ConnectionError: If the store is unavailable
+        """
+        pass
+
+    @abstractmethod
+    async def watch_key(
+        self,
+        key: str,
+        callback: Callable[[Optional[T]], None],
+        error_callback: Optional[Callable[[Exception], None]] = None,
+    ) -> int:
+        """
+        Watch a key for changes and execute callbacks when changes occur.
+
+        Args:
+            key: The key to watch
+            callback: Function to call when the value changes
+            error_callback: Optional function to call when errors occur
+
+        Returns:
+            Watch identifier that can be used to cancel the watch
+
+        Raises:
+            ConnectionError: If the store is unavailable
+            NotImplementedError: If watching is not supported
+        """
+        pass
+
+    @abstractmethod
+    async def cancel_watch(self, key: str, watch_id: str) -> None:
+        """
+        Cancel a watch for a key.
+        """
+        pass
+
+    @abstractmethod
+    async def list_keys_in_directory(self, directory: str) -> List[str]:
+        """
+        List all keys under a specific directory prefix.
+
+        Args:
+            directory: The directory prefix to search under
+
+        Returns:
+            List of keys under the specified directory
+
+        Raises:
+            ConnectionError: If the store is unavailable
+        """
+        pass
+
+    @abstractmethod
+    async def close(self) -> None:
+        """
+        Clean up resources and close connections.
+
+        This method should be called when the store is no longer needed.
+        """
+        pass
+
+    # -------------------------------------------------------------------
+    # Cross-process change notification (R15). Concrete with a no-op
+    # default rather than abstract: single-process stores (in-memory) have
+    # nothing to notify, and every existing implementation predates this
+    # method. Backends that DO support cross-process notification (Redis
+    # via Pub/Sub, etcd via its native watch) override all three so
+    # ``ConfigurationService`` never branches on store type or reaches for
+    # a ``client`` property to get there.
+    # -------------------------------------------------------------------
+
+    async def subscribe_changes(self, callback: Callable[[str], None]) -> Optional[Any]:
+        """Subscribe to notifications that some key changed in another process.
+
+        ``callback`` receives the changed key, or the sentinel
+        ``"__CLEAR_ALL__"`` meaning every cached value should be dropped.
+
+        Returns an opaque subscription handle to pass to
+        :meth:`unsubscribe_changes`, or ``None`` if this store has no
+        cross-process notification mechanism (the default).
+        """
+        return None
+
+    async def publish_change(self, key: str) -> None:
+        """Notify other processes that ``key`` changed. No-op by default."""
+        return None
+
+    async def unsubscribe_changes(self, handle: Any) -> None:  # noqa: ANN401
+        """Cancel a subscription returned by :meth:`subscribe_changes`. No-op by default."""
+        return None

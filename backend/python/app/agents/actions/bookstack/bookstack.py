@@ -1,0 +1,423 @@
+import asyncio
+import json
+import logging
+import threading
+from typing import Coroutine, List, Optional, Tuple
+
+from app.agent_loop_lib.tools.base import ParameterType, Tag, ToolParameter
+from app.agent_loop_lib.tools.decorators import tool
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolDefinition,
+    ToolsetBuilder,
+    ToolsetCategory,
+)
+from app.sources.client.bookstack.bookstack import BookStackClient
+from app.sources.external.bookstack.bookstack import BookStackDataSource
+
+logger = logging.getLogger(__name__)
+
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="create_page",
+        description="Create a new page",
+        parameters=[
+            {"name": "book_id", "type": "integer", "description": "Book ID", "required": True},
+            {"name": "name", "type": "string", "description": "Page name", "required": True},
+            {"name": "content", "type": "string", "description": "Page content", "required": True}
+        ],
+        tags=["pages", "create"]
+    ),
+    ToolDefinition(
+        name="get_page",
+        description="Get page details",
+        parameters=[
+            {"name": "page_id", "type": "integer", "description": "Page ID", "required": True}
+        ],
+        tags=["pages", "read"]
+    ),
+    ToolDefinition(
+        name="update_page",
+        description="Update a page",
+        parameters=[
+            {"name": "page_id", "type": "integer", "description": "Page ID", "required": True}
+        ],
+        tags=["pages", "update"]
+    ),
+    ToolDefinition(
+        name="delete_page",
+        description="Delete a page",
+        parameters=[
+            {"name": "page_id", "type": "integer", "description": "Page ID", "required": True}
+        ],
+        tags=["pages", "delete"]
+    ),
+    ToolDefinition(
+        name="search_all",
+        description="Search pages, books, and chapters",
+        parameters=[
+            {"name": "query", "type": "string", "description": "Search query", "required": True}
+        ],
+        tags=["search"]
+    ),
+]
+
+
+# Register BookStack toolset
+@ToolsetBuilder("BookStack")\
+    .in_group("Documentation")\
+    .with_description("BookStack integration for documentation and knowledge management")\
+    .with_category(ToolsetCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("BookStack Token ID", "your-token-id", field_name="tokenId"),
+            CommonFields.api_token("BookStack Token Secret", "your-token-secret", field_name="tokenSecret"),
+            CommonFields.api_token("BookStack Base URL", "https://your-instance.bookstack.app", field_name="baseUrl")
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon("/assets/icons/connectors/bookstack.svg"))\
+    .build_decorator()
+class BookStack:
+    """BookStack tools exposed to agents using BookStackDataSource.
+
+    This provides CRUD operations for BookStack pages and a search tool,
+    following the same pattern as Confluence and Google Meet tools.
+    """
+
+    def __init__(self, client: BookStackClient) -> None:
+        """Initialize the BookStack tool with a data source wrapper.
+
+        Args:
+            client: An initialized `BookStackClient` instance
+        """
+        self.client = BookStackDataSource(client)
+        # Dedicated background event loop for running coroutines from sync context
+        self._bg_loop = asyncio.new_event_loop()
+        self._bg_loop_thread = threading.Thread(
+            target=self._start_background_loop,
+            daemon=True
+        )
+        self._bg_loop_thread.start()
+
+    def _start_background_loop(self) -> None:
+        """Start the background event loop."""
+        asyncio.set_event_loop(self._bg_loop)
+        self._bg_loop.run_forever()
+
+    def _run_async(self, coro: Coroutine[None, None, object]) -> object:
+        """Run a coroutine safely from sync context via a dedicated loop."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
+        return future.result()
+
+    def shutdown(self) -> None:
+        """Gracefully stop the background event loop and thread."""
+        try:
+            if getattr(self, "_bg_loop", None) is not None and self._bg_loop.is_running():
+                self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+            if getattr(self, "_bg_loop_thread", None) is not None:
+                self._bg_loop_thread.join()
+            if getattr(self, "_bg_loop", None) is not None:
+                self._bg_loop.close()
+        except Exception as exc:
+            logger.warning(f"BookStack shutdown encountered an issue: {exc}")
+
+    def _handle_response(
+        self,
+        response,
+        success_message: str
+    ) -> Tuple[bool, str]:
+        """Handle BookStack response and return standardized format."""
+        try:
+            if hasattr(response, 'success') and response.success:
+                return True, json.dumps({
+                    "message": success_message,
+                    "data": response.data or {}
+                })
+            else:
+                error_msg = getattr(response, 'error', 'Unknown error')
+                return False, json.dumps({"error": error_msg})
+        except Exception as e:
+            logger.error(f"Error handling response: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/bookstack/create_page",
+        short_description="Create a new page in BookStack",
+        description="Create a new page in BookStack with a name and optional book/chapter, content, tags, and priority.",
+        parameters=[
+            ToolParameter(
+                name="name",
+                type=ParameterType.STRING,
+                description="The name/title of the page"
+            ),
+            ToolParameter(
+                name="book_id",
+                type=ParameterType.INTEGER,
+                description="The ID of the book to create the page in",
+                required=False
+            ),
+            ToolParameter(
+                name="chapter_id",
+                type=ParameterType.INTEGER,
+                description="The ID of the chapter to create the page in",
+                required=False
+            ),
+            ToolParameter(
+                name="html",
+                type=ParameterType.STRING,
+                description="The HTML content of the page",
+                required=False
+            ),
+            ToolParameter(
+                name="markdown",
+                type=ParameterType.STRING,
+                description="The Markdown content of the page",
+                required=False
+            ),
+            ToolParameter(
+                name="tags",
+                type=ParameterType.STRING,
+                description="JSON array of tag objects: [{'name': 'tag1', 'value': 'value1'}]",
+                required=False
+            ),
+            ToolParameter(
+                name="priority",
+                type=ParameterType.INTEGER,
+                description="Priority/order of the page",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="documentation"), Tag(key="type", value="create")],
+    )
+    async def create_page(
+        self,
+        name: str,
+        book_id: Optional[int] = None,
+        chapter_id: Optional[int] = None,
+        html: Optional[str] = None,
+        markdown: Optional[str] = None,
+        tags: Optional[str] = None,
+        priority: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """Create a new page in BookStack."""
+        try:
+            # Parse tags if provided
+            tags_list = None
+            if tags:
+                try:
+                    tags_list = json.loads(tags)
+                    if not isinstance(tags_list, list):
+                        raise ValueError("tags must be a JSON array")
+                except json.JSONDecodeError as exc:
+                    return False, json.dumps({"error": f"Invalid JSON for tags: {exc}"})
+
+            response = self._run_async(
+                self.client.create_page(
+                    name=name,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    html=html,
+                    markdown=markdown,
+                    tags=tags_list,
+                    priority=priority
+                )
+            )
+            return self._handle_response(response, "Page created successfully")
+        except Exception as e:
+            logger.error(f"Error creating page: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/bookstack/get_page",
+        short_description="Get a page by ID from BookStack",
+        description="Get a page by its ID from BookStack.",
+        parameters=[
+            ToolParameter(
+                name="page_id",
+                type=ParameterType.INTEGER,
+                description="The ID of the page to retrieve"
+            )
+        ],
+        tags=[Tag(key="category", value="documentation"), Tag(key="type", value="read")],
+    )
+    async def get_page(self, page_id: int) -> Tuple[bool, str]:
+        """Get a page by ID from BookStack."""
+        try:
+            response = self._run_async(
+                self.client.get_page(page_id=page_id)
+            )
+            return self._handle_response(response, "Page retrieved successfully")
+        except Exception as e:
+            logger.error(f"Error getting page: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/bookstack/update_page",
+        short_description="Update an existing page in BookStack",
+        description="Update an existing BookStack page's name, content, book/chapter assignment, tags, or priority.",
+        parameters=[
+            ToolParameter(
+                name="page_id",
+                type=ParameterType.INTEGER,
+                description="The ID of the page to update"
+            ),
+            ToolParameter(
+                name="name",
+                type=ParameterType.STRING,
+                description="The new name/title of the page",
+                required=False
+            ),
+            ToolParameter(
+                name="book_id",
+                type=ParameterType.INTEGER,
+                description="The new book ID",
+                required=False
+            ),
+            ToolParameter(
+                name="chapter_id",
+                type=ParameterType.INTEGER,
+                description="The new chapter ID",
+                required=False
+            ),
+            ToolParameter(
+                name="html",
+                type=ParameterType.STRING,
+                description="The new HTML content",
+                required=False
+            ),
+            ToolParameter(
+                name="markdown",
+                type=ParameterType.STRING,
+                description="The new Markdown content",
+                required=False
+            ),
+            ToolParameter(
+                name="tags",
+                type=ParameterType.STRING,
+                description="JSON array of tag objects: [{'name': 'tag1', 'value': 'value1'}]",
+                required=False
+            ),
+            ToolParameter(
+                name="priority",
+                type=ParameterType.INTEGER,
+                description="New priority/order of the page",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="documentation"), Tag(key="type", value="update")],
+    )
+    async def update_page(
+        self,
+        page_id: int,
+        name: Optional[str] = None,
+        book_id: Optional[int] = None,
+        chapter_id: Optional[int] = None,
+        html: Optional[str] = None,
+        markdown: Optional[str] = None,
+        tags: Optional[str] = None,
+        priority: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """Update an existing page in BookStack."""
+        try:
+            # Parse tags if provided
+            tags_list = None
+            if tags:
+                try:
+                    tags_list = json.loads(tags)
+                    if not isinstance(tags_list, list):
+                        raise ValueError("tags must be a JSON array")
+                except json.JSONDecodeError as exc:
+                    return False, json.dumps({"error": f"Invalid JSON for tags: {exc}"})
+
+            response = self._run_async(
+                self.client.update_page(
+                    page_id=page_id,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    name=name,
+                    html=html,
+                    markdown=markdown,
+                    tags=tags_list,
+                    priority=priority
+                )
+            )
+            return self._handle_response(response, "Page updated successfully")
+        except Exception as e:
+            logger.error(f"Error updating page: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/bookstack/delete_page",
+        short_description="Delete a page from BookStack",
+        description="Delete a page from BookStack by its ID.",
+        parameters=[
+            ToolParameter(
+                name="page_id",
+                type=ParameterType.INTEGER,
+                description="The ID of the page to delete"
+            )
+        ],
+        tags=[Tag(key="category", value="documentation"), Tag(key="type", value="delete")],
+    )
+    async def delete_page(self, page_id: int) -> Tuple[bool, str]:
+        """Delete a page from BookStack."""
+        try:
+            response = self._run_async(
+                self.client.delete_page(page_id=page_id)
+            )
+            return self._handle_response(response, "Page deleted successfully")
+        except Exception as e:
+            logger.error(f"Error deleting page: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/bookstack/search_all",
+        short_description="Search across all content in BookStack",
+        description="Search across all content in BookStack (pages, books, chapters) with optional pagination.",
+        parameters=[
+            ToolParameter(
+                name="query",
+                type=ParameterType.STRING,
+                description="Search query string",
+                required=False
+            ),
+            ToolParameter(
+                name="page",
+                type=ParameterType.INTEGER,
+                description="Page number for pagination",
+                required=False
+            ),
+            ToolParameter(
+                name="count",
+                type=ParameterType.INTEGER,
+                description="Number of results per page",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="documentation"), Tag(key="type", value="search")],
+    )
+    async def search_all(
+        self,
+        query: Optional[str] = None,
+        page: Optional[int] = None,
+        count: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """Search across all content in BookStack."""
+        try:
+            response = self._run_async(
+                self.client.search_all(
+                    query=query,
+                    page=page,
+                    count=count
+                )
+            )
+            return self._handle_response(response, "Search completed successfully")
+        except Exception as e:
+            logger.error(f"Error searching: {e}")
+            return False, json.dumps({"error": str(e)})

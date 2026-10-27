@@ -1,0 +1,103 @@
+// ── Graph API response types (from Python backend) ──
+
+export interface GraphUser {
+  id: string;
+  userId: string;
+  orgId: string;
+  name?: string;
+  email?: string;
+  isActive?: boolean;
+  createdAtTimestamp?: number;
+  updatedAtTimestamp?: number;
+  // Enriched by Node.js backend
+  profilePicture?: string;
+  hasLoggedIn?: boolean;
+  role?: string;
+  groupCount?: number;
+  userGroups?: UserGroupSummary[];
+}
+
+export interface GraphUserListResponse {
+  users: GraphUser[];
+  pagination?: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages?: number;
+  };
+}
+
+export interface UserGroupSummary {
+  _id: string;
+  name: string;
+  type: string;
+}
+
+// ── Team types (from Python backend) ──
+
+export interface TeamMemberResponse {
+  id: string;
+  userId: string;
+  userName: string;
+  userEmail: string;
+  role: string;
+  joinedAt?: number;
+  isOwner: boolean;
+  profilePicture?: string;
+}
+
+export interface TeamCreatedByUser {
+  /** Graph user key of the team creator */
+  id: string;
+  userId: string;
+  name: string;
+  email: string;
+  profilePicture?: string;
+}
+
+export interface TeamResponse {
+  id: string;
+  name: string;
+  description?: string | null;
+  createdByUser?: TeamCreatedByUser | null;
+  orgId: string;
+  memberCount: number;
+  // Relayed from the team service unchecked, so an entry may be null.
+  members?: Array<TeamMemberResponse | null>;
+  [key: string]: unknown;
+}
+
+export interface TeamsListResponse {
+  teams: TeamResponse[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    pages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+  };
+}
+
+export interface TeamUsersResponse {
+  members: TeamMemberResponse[];
+}
+
+// ── MongoDB filter types ──
+
+// Loose on purpose: callers add optional clauses (search, dates) one by one and the
+// strict filter typing of Mongoose 9 rejects the string ids these carry.
+export type UserGroupFilter = {
+  orgId: unknown;
+  isDeleted: boolean;
+  name?: { $regex: string; $options: string };
+  [key: string]: unknown;
+};
+
+export type UserFilter = {
+  _id: { $in: string[] };
+  orgId?: unknown;
+  isDeleted: { $ne: boolean };
+  $or?: Array<{ fullName?: { $regex: string; $options: string }; email?: { $regex: string; $options: string } }>;
+  [key: string]: unknown;
+};

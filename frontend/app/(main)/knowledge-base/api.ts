@@ -1,0 +1,892 @@
+// Knowledge Base API - Action Operations (CRUD)
+
+import type { AxiosRequestConfig } from 'axios';
+import { asArray } from '@/lib/utils/safe';
+import { apiClient, type ProcessedError } from '@/lib/api';
+import { streamSSEUpload, type SSEEvent } from '@/lib/api/streaming';
+import type {
+  KnowledgeHubApiResponse,
+  NodeType,
+  KnowledgeHubQueryParams,
+  RecordDetailsResponse,
+} from './types';
+import { FOLDER_REINDEX_DEPTH } from './constants';
+import { DEFAULT_PAGE_SIZE } from './store';
+import { isKbCollectionsHubApp } from './utils/all-records-transformer';
+import { getReindexNodeFromHubItem, isKbCollectionNode } from './utils/reindex-label';
+import { normalizeKbId } from './utils/resolve-root-kb-id';
+import { quietRejectedCursor } from './utils/cursor-recovery';
+import { ConnectorsApi } from '../workspace/connectors/api';
+import type { ReindexStage } from '../workspace/connectors/types';
+
+const BASE_URL = '/api/v1/knowledgeBase';
+
+/** A 422 (view too large to list) and a 503 (busy, retried by the page) are explained in the All Records table, not in a toast. */
+function quietListingRefusals(cursor: string | null | undefined) {
+  const quietCursor = quietRejectedCursor(cursor);
+  return (error: ProcessedError) => error.statusCode === 422 || error.statusCode === 503 || quietCursor(error);
+}
+
+const pendingGetNodeChildren = new Map<string, Promise<KnowledgeHubApiResponse>>();
+
+/** Stops later callers sharing a request made for the previous session (sign-out). */
+export function forgetPendingNodeChildrenRequests(): void {
+  pendingGetNodeChildren.clear();
+}
+
+function getNodeChildrenCacheKey(
+  nodeType: NodeType,
+  nodeId: string,
+  params?: {
+    cursor?: string;
+    limit?: number;
+    include?: string;
+    onlyContainers?: boolean;
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
+  }
+) {
+  const cursor = params?.cursor ?? '';
+  const limit = params?.limit ?? 50;
+  const include = params?.include ?? '';
+  const sortBy = params?.sortBy ?? '';
+  const sortOrder = params?.sortOrder ?? '';
+  const onlyContainers = params?.onlyContainers !== false;
+  return `${nodeType}\0${nodeId}\0${cursor}\0${limit}\0${include}\0${onlyContainers ? '1' : '0'}\0${sortBy}\0${sortOrder}`;
+}
+
+function filterSidebarItems(items: KnowledgeHubApiResponse['items']) {
+  return asArray(items).filter(
+    item => item.nodeType !== 'record' || item.hasChildren !== false
+  );
+}
+
+function withSidebarFilteredItems(data: KnowledgeHubApiResponse): KnowledgeHubApiResponse {
+  return {
+    ...data,
+    items: filterSidebarItems(data.items),
+  };
+}
+
+// File metadata for folder uploads (preserves folder hierarchy)
+export interface FileMetadata {
+  file_path: string;
+  last_modified: number;
+}
+
+// ============================================================================
+// GET OPERATIONS - Knowledge Hub APIs (Read-only hierarchical navigation)
+// ============================================================================
+
+/**
+ * Knowledge Hub Get Operations
+ * 
+ * These APIs handle all read operations for the Collections view.
+ * They provide convenient wrappers around the 2 core API endpoints with
+ * pre-configured parameters for common use cases.
+ */
+export const KnowledgeHubApi = {
+  /**
+   * Collections View: Initial sidebar load
+   *
+   * Fetches top-level nodes for the sidebar navigation tree. Leaf records
+   * (`hasChildren: false`) are omitted; record groups and containers remain.
+   *
+   * @returns Root navigation nodes with counts
+   */
+  async initializeSidebar() {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes`,
+      {
+        params: {
+          limit: DEFAULT_PAGE_SIZE,
+          include: 'counts',
+        },
+      }
+    );
+
+    return withSidebarFilteredItems(data);
+  },
+
+  /**
+   * Collections View: Expand folder in sidebar
+   *
+   * Fetches children of a specific folder/KB for sidebar expansion. Omits leaf
+   * records (same rule as {@link initializeSidebar}).
+   *
+   * @param nodeId - ID of the folder/KB to expand
+   * @returns Child navigation nodes
+   */
+  async expandFolder(nodeId: string) {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes`,
+      {
+        params: {
+          nodeId,
+          limit: DEFAULT_PAGE_SIZE,
+        },
+      }
+    );
+
+    return withSidebarFilteredItems(data);
+  },
+
+  /**
+   * Collections View: Load data area for selected folder
+   * 
+   * Fetches all items (files + folders) within a selected node for the data table.
+   * Includes full metadata: breadcrumbs, permissions, filters, counts.
+   * 
+   * @param nodeType - Type of the selected node (kb, folder, app, recordGroup)
+   * @param nodeId - ID of the selected node
+   * @param params - Optional filters, pagination, sorting
+   * @returns Complete data area response with items and metadata
+   */
+  async loadFolderData(
+    nodeType: NodeType,
+    nodeId: string,
+    params?: Partial<KnowledgeHubQueryParams>,
+    options?: { suppressErrorToast?: boolean; quietRefusals?: boolean; signal?: AbortSignal }
+  ) {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes/${nodeType}/${nodeId}`,
+      {
+        params: {
+          limit: DEFAULT_PAGE_SIZE,
+          include: 'counts,permissions,breadcrumbs,availableFilters',
+          // Data area: Never use onlyContainers (we need both folders AND files)
+          ...params,
+        },
+        signal: options?.signal,
+        suppressErrorToast:
+          options?.suppressErrorToast ||
+          (options?.quietRefusals ? quietListingRefusals : quietRejectedCursor)(params?.cursor),
+      }
+    );
+    return data;
+  },
+
+  /**
+   * Collections View: Search/filter within folder
+   * 
+   * Same as loadFolderData but explicitly for filtering.
+   * Pass filters via params (q, recordTypes, sortBy, etc.)
+   * 
+   * @param nodeType - Type of the current node
+   * @param nodeId - ID of the current node
+   * @param filters - Search query, filters, sorting
+   * @returns Filtered data area response
+   */
+  async filterFolderData(
+    nodeType: NodeType,
+    nodeId: string,
+    filters: KnowledgeHubQueryParams
+  ) {
+    return this.loadFolderData(nodeType, nodeId, filters);
+  },
+
+  /**
+   * All Records View: Global search/filter
+   * 
+   * Search across all accessible nodes with filters.
+   * Used when no specific folder is selected (All Records mode).
+   * 
+   * @param params - Search query, filters, sorting, pagination
+   * @returns Filtered results across all sources
+   */
+  async searchAllRecords(params: KnowledgeHubQueryParams, options?: { suppressErrorToast?: boolean }) {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes`,
+      {
+        params: {
+          limit: DEFAULT_PAGE_SIZE,
+          include: 'counts,permissions,availableFilters',
+          // Data area: Never use onlyContainers (we need all record types)
+          ...params,
+        },
+        ...options,
+      }
+    );
+    return data;
+  },
+
+  /**
+   * Get node children (sidebar tree expansion by default).
+   *
+   * Sends `onlyContainers` to the API (default `true`, as required for sidebar
+   * child lists). When `onlyContainers` is `false`, returns the raw response
+   * (no client-side leaf-record stripping).
+   *
+   * @param nodeType - Type of parent node
+   * @param nodeId - ID of parent node
+   * @param params - Pagination, `include`, and `onlyContainers` (default true)
+   */
+  async getNodeChildren(
+    nodeType: NodeType,
+    nodeId: string,
+    params?: {
+      onlyContainers?: boolean;
+      cursor?: string;
+      limit?: number;
+      include?: string;
+      sortBy?: string;
+      sortOrder?: 'asc' | 'desc';
+      /** No error toast: the caller handles a failure itself. */
+      quiet?: boolean;
+    }
+  ) {
+    const key = getNodeChildrenCacheKey(nodeType, nodeId, params);
+    const existing = pendingGetNodeChildren.get(key);
+    if (existing) return existing;
+
+    const onlyContainers = params?.onlyContainers !== false;
+
+    const promise = (async (): Promise<KnowledgeHubApiResponse> => {
+      try {
+        const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+          `${BASE_URL}/knowledge-hub/nodes/${nodeType}/${nodeId}`,
+          {
+            params: {
+              // Omitted, not defaulted: no cursor means the first page.
+              ...(params?.cursor ? { cursor: params.cursor } : {}),
+              limit: params?.limit ?? 50,
+              include: params?.include,
+              onlyContainers,
+              ...(params?.sortBy != null ? { sortBy: params.sortBy } : {}),
+              ...(params?.sortOrder != null ? { sortOrder: params.sortOrder } : {}),
+            },
+            ...(params?.quiet ? { suppressErrorToast: true } : {}),
+          }
+        );
+
+        return onlyContainers ? withSidebarFilteredItems(data) : data;
+      } finally {
+        pendingGetNodeChildren.delete(key);
+      }
+    })();
+
+    pendingGetNodeChildren.set(key, promise);
+    return promise;
+  },
+
+  /**
+   * Nodes whose name contains `q`, at any depth: everywhere the user can
+   * reach, or under one node when `parent` is given.
+   */
+  async searchNodes(params: {
+    q: string;
+    parent?: { nodeType: string; id: string };
+    origins?: 'CONNECTOR' | 'COLLECTION';
+    limit?: number;
+    cursor?: string | null;
+    signal?: AbortSignal;
+    /** False keeps the search on this level. A global flatten only walks connectors, so a root collection is invisible to it. */
+    flattened?: boolean;
+  }): Promise<KnowledgeHubApiResponse> {
+    const path = params.parent
+      ? `${BASE_URL}/knowledge-hub/nodes/${params.parent.nodeType}/${params.parent.id}`
+      : `${BASE_URL}/knowledge-hub/nodes`;
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(path, {
+      params: {
+        q: params.q,
+        flattened: params.flattened !== false,
+        onlyContainers: false,
+        limit: params.limit ?? 20,
+        sortBy: 'name',
+        sortOrder: 'asc',
+        ...(params.origins ? { origins: params.origins } : {}),
+        ...(params.cursor ? { cursor: params.cursor } : {}),
+      },
+      signal: params.signal,
+      // The picker shows its own message when a search fails.
+      suppressErrorToast: true,
+    });
+    return data;
+  },
+
+  /**
+   * Get node table data (all items in a folder for data table)
+   *
+   * Fetches top-level nodes. When onlyContainers is not false, delegates to
+   * initializeSidebar for the same root /knowledge-hub/nodes request used by the sidebar.
+   *
+   * @param params - Query parameters
+   * @returns Root nodes
+   */
+  async getRootNodes(params?: { cursor?: string; limit?: number; onlyContainers?: boolean }) {
+    if (params?.onlyContainers !== false) {
+      return this.initializeSidebar();
+    }
+    
+    // For data view: get all items
+    return this.getAllRootItems(params);
+  },
+
+  /**
+   * All Records View: Get all root items
+   *
+   * Fetches all accessible items at root level (not just containers).
+   * Used for populating the All Records data table.
+   *
+   * @param params - Optional filters, pagination, sorting
+   * @returns All root-level items with metadata
+   */
+  async getAllRootItems(
+    params?: Partial<KnowledgeHubQueryParams>,
+    options?: { signal?: AbortSignal }
+  ) {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes`,
+      {
+        params: {
+          limit: DEFAULT_PAGE_SIZE,
+          include: 'counts,permissions,breadcrumbs,availableFilters',
+          // Data area: Never use onlyContainers (we need all root items including records)
+          ...params,
+        },
+        signal: options?.signal,
+        suppressErrorToast: quietListingRefusals(params?.cursor),
+      }
+    );
+    return data;
+  },
+
+  // ============================================================================
+  // Low-level API methods (for advanced use cases)
+  // ============================================================================
+
+  /**
+   * API 1: Get Navigation Nodes (Root or Filtered)
+   * 
+   * Low-level method for custom queries. Prefer using the higher-level methods above.
+   * 
+   * GET /api/v1/knowledgeBase/knowledge-hub/nodes
+   * 
+   * @param params Query parameters for filtering, pagination, sorting
+   * @returns Root nodes or filtered results with metadata
+   */
+  async getNavigationNodes(
+    params?: KnowledgeHubQueryParams,
+    options?: { signal?: AbortSignal }
+  ): Promise<KnowledgeHubApiResponse> {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes`,
+      { params, signal: options?.signal, suppressErrorToast: quietRejectedCursor(params?.cursor) }
+    );
+    return data;
+  },
+
+  /**
+   * API 2: Get Data Nodes (Children of Specific Node)
+   * 
+   * Low-level method for custom queries. Prefer using loadFolderData/filterFolderData.
+   * 
+   * GET /api/v1/knowledgeBase/knowledge-hub/nodes/:nodeType/:nodeId
+   * 
+   * @param nodeType Type of parent node (app, kb, folder, recordGroup, record)
+   * @param nodeId UUID of parent node
+   * @param params Query parameters for filtering, pagination, sorting
+   * @returns Child items with pagination and metadata
+   */
+  async getDataNodes(
+    nodeType: NodeType,
+    nodeId: string,
+    params?: KnowledgeHubQueryParams
+  ): Promise<KnowledgeHubApiResponse> {
+    const { data } = await apiClient.get<KnowledgeHubApiResponse>(
+      `${BASE_URL}/knowledge-hub/nodes/${nodeType}/${nodeId}`,
+      { params }
+    );
+    return data;
+  },
+};
+
+// ============================================================================
+// ACTION OPERATIONS - KB CRUD APIs (Create, Update, Delete)
+// ============================================================================
+
+/**
+ * Knowledge Base Action Operations
+ * 
+ * These APIs handle all write operations for managing knowledge bases,
+ * folders, and records (upload, create, update, delete, permissions).
+ */
+export const KnowledgeBaseApi = {
+  // Get upload limits from server (max file size)
+  async getUploadLimits() {
+    const { data } = await apiClient.get<{ maxFileSizeBytes?: number }>(
+      '/api/v1/knowledgebase/limits',
+      { suppressErrorToast: true }
+    );
+    return data;
+  },
+
+  // List all knowledge bases
+  async listKnowledgeBases() {
+    const { data } = await apiClient.get<{ knowledgeBases: Record<string, unknown>[]; total: number }>(BASE_URL);
+    return data;
+  },
+
+  // Create knowledge base (collection)
+  async createKnowledgeBase(kbName: string, kbDescription?: string) {
+    const { data } = await apiClient.post<{
+      id: string;
+      name: string;
+      createdAtTimestamp: number;
+      updatedAtTimestamp: number;
+      userRole: string;
+    }>(BASE_URL, {
+      kbName,
+      kbDescription: kbDescription || '',
+      // isPrivate: false, // Reserved for future use - will distinguish workspace vs private
+    }, {
+      suppressErrorToast: true,
+    });
+    return data;
+  },
+
+  // Get single knowledge base
+  async getKnowledgeBase(id: string) {
+    const { data } = await apiClient.get<Record<string, unknown>>(`${BASE_URL}/${id}`);
+    return data;
+  },
+
+  // Get knowledge base folder structure
+  async getFolderTree(knowledgeBaseId: string) {
+    const { data } = await apiClient.get<{ folders: Record<string, unknown>[] }>(`${BASE_URL}/${knowledgeBaseId}/folders`);
+    return data;
+  },
+
+  // Get items in a folder (or root)
+  async getItems(
+    knowledgeBaseId: string,
+    folderId?: string | null,
+    params?: {
+      page?: number;
+      limit?: number;
+      search?: string;
+      sortField?: string;
+      sortOrder?: string;
+    }
+  ) {
+    const basePath = folderId
+      ? `${BASE_URL}/${knowledgeBaseId}/folders/${folderId}/items`
+      : `${BASE_URL}/${knowledgeBaseId}/items`;
+
+    const { data } = await apiClient.get<{ items: Record<string, unknown>[]; total: number; page: number; limit: number }>(
+      basePath,
+      { params }
+    );
+    return data;
+  },
+
+  // Create folder (root or nested via optional folderId query param)
+  async createFolder(knowledgeBaseId: string, name: string, description?: string, parentId?: string | null) {
+    const endpoint = `${BASE_URL}/${knowledgeBaseId}/folder`;
+
+    const { data } = await apiClient.post<Record<string, unknown>>(
+      endpoint,
+      {
+        folderName: name,
+        // Note: API currently doesn't support description in request body
+        // If description is needed in future, add it here
+      },
+      {
+        params: parentId ? { folderId: parentId } : undefined,
+        suppressErrorToast: true,
+      },
+    );
+    return data;
+  },
+
+  /**
+   * Upload a batch of files to a KB (root when `folderId` is null) and consume
+   * the streaming SSE response: the POST itself emits a per-file
+   * `file:succeeded` / `file:failed` and a final `done`. Resolves when the
+   * stream ends. Uses native fetch (axios cannot read streaming responses), so
+   * the upload byte-% is not surfaced — per-file events drive the UI instead.
+   */
+  async streamUpload(
+    knowledgeBaseId: string,
+    folderId: string | null,
+    files: File[],
+    filesMetadata: FileMetadata[] | undefined,
+    options: {
+      onEvent: (event: SSEEvent) => void;
+      onError: (error: Error) => void;
+      signal?: AbortSignal;
+    }
+  ): Promise<void> {
+    const formData = new FormData();
+    files.forEach((file) => formData.append('files', file));
+
+    if (filesMetadata && filesMetadata.length === files.length) {
+      // Folder upload: per-file path + last-modified metadata.
+      formData.append('files_metadata', JSON.stringify(filesMetadata));
+    } else {
+      files.forEach((file) => formData.append('file_paths', file.name));
+      files.forEach((file) =>
+        formData.append('last_modified', file.lastModified.toString())
+      );
+    }
+
+    // Note: lowercase 'knowledgebase' in URL (Express routing is case-insensitive).
+    const url = `/api/v1/knowledgebase/${knowledgeBaseId}/upload${
+      folderId ? `?folderId=${encodeURIComponent(folderId)}` : ''
+    }`;
+
+    // Errors (rate limit, payload-too-large, 5xx, transport) surface through
+    // `streamSSEUpload`, which reads the server's structured error body and
+    // reports the EXACT message via `onError` — the caller fails the affected
+    // rows with that reason. No automatic retry: the user decides whether to
+    // re-upload, so a rate limit (or any failure) is reported, not hidden.
+    await streamSSEUpload(url, formData, options);
+  },
+
+  // Rename knowledge base
+  async renameKnowledgeBase(kbId: string, kbName: string) {
+    const { data } = await apiClient.put(`${BASE_URL}/${kbId}`, { kbName });
+    return data;
+  },
+
+  // Delete knowledge base
+  async deleteKnowledgeBase(kbId: string) {
+    await apiClient.delete(`${BASE_URL}/${kbId}`, { suppressErrorToast: true });
+  },
+
+  // Delete folder (from new API structure)
+  async deleteFolder(kbId: string, folderId: string) {
+    const normalizedKbId = normalizeKbId(kbId);
+    if (!normalizedKbId) {
+      throw new Error('Knowledge base id is required to delete a folder');
+    }
+    await apiClient.delete(`${BASE_URL}/${normalizedKbId}/folder/${folderId}`, { suppressErrorToast: true });
+  },
+
+  // Delete record (file)
+  async deleteRecord(recordId: string) {
+    await apiClient.delete(`${BASE_URL}/record/${recordId}`, { suppressErrorToast: true });
+  },
+
+  // Replace record (update file)
+  async replaceRecord(
+    recordId: string,
+    file?: File,
+    recordName?: string,
+    onProgress?: (progress: number) => void
+  ) {
+    const formData = new FormData();
+    
+    // Add file if provided
+    if (file) {
+      formData.append('file', file);
+    }
+    
+    // Add recordName if provided
+    if (recordName) {
+      formData.append('recordName', recordName);
+    }
+
+    const { data } = await apiClient.put(
+      `${BASE_URL}/record/${recordId}`,
+      formData,
+      {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+        onUploadProgress: (progressEvent) => {
+          if (progressEvent.total && onProgress) {
+            const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            onProgress(progress);
+          }
+        },
+      }
+    );
+    return data;
+  },
+
+  // Rename item (legacy - uses PATCH endpoint)
+  async renameItem(knowledgeBaseId: string, itemId: string, newName: string) {
+    const { data } = await apiClient.patch<Record<string, unknown>>(`${BASE_URL}/${knowledgeBaseId}/items/${itemId}`, {
+      name: newName,
+    });
+    return data;
+  },
+
+  // Rename folder
+  async renameFolder(rootKbId: string, folderId: string, newName: string) {
+    const normalizedKbId = normalizeKbId(rootKbId);
+    if (!normalizedKbId) {
+      throw new Error('Knowledge base id is required to rename a folder');
+    }
+    const { data } = await apiClient.put(`${BASE_URL}/${normalizedKbId}/folder/${folderId}`, {
+      folderName: newName,
+    }, {
+      suppressErrorToast: true,
+    });
+    return data;
+  },
+
+  /**
+   * Unified rename dispatcher — dispatches to renameKnowledgeBase or renameFolder
+   * based on nodeType and whether the node is the root KB itself.
+   */
+  async renameNode(args: {
+    nodeId: string;
+    newName: string;
+    nodeType?: string;
+    rootKbId?: string;
+  }) {
+    const { nodeId, newName, nodeType, rootKbId } = args;
+    const normalizedRootKbId = normalizeKbId(rootKbId);
+    if (nodeType === 'kb' || nodeType === 'app') {
+      return this.renameKnowledgeBase(nodeId, newName);
+    }
+    if (
+      (nodeType === 'folder' || nodeType === 'recordGroup') &&
+      normalizedRootKbId &&
+      normalizedRootKbId !== nodeId
+    ) {
+      return this.renameFolder(normalizedRootKbId, nodeId, newName);
+    }
+    if ((nodeType === 'folder' || nodeType === 'recordGroup') && normalizedRootKbId === nodeId) {
+      return this.renameKnowledgeBase(nodeId, newName);
+    }
+    throw new Error(`Cannot rename "${nodeId}": node type ${nodeType ?? 'unknown'} without its collection`);
+  },
+
+  /**
+   * Unified delete dispatcher — dispatches to deleteKnowledgeBase, deleteFolder,
+   * or deleteRecord based on nodeType and whether the node is the root KB itself.
+   */
+  async deleteNode(args: {
+    nodeId: string;
+    nodeType?: string;
+    rootKbId?: string;
+  }) {
+    const { nodeId, nodeType, rootKbId } = args;
+    const normalizedRootKbId = normalizeKbId(rootKbId);
+    if (nodeType === 'record') {
+      return this.deleteRecord(nodeId);
+    }
+    if (
+      nodeType === 'folder' &&
+      normalizedRootKbId &&
+      normalizedRootKbId !== nodeId
+    ) {
+      return this.deleteFolder(normalizedRootKbId, nodeId);
+    }
+    if (nodeType === 'kb' || nodeType === 'app' || (nodeType === 'folder' && normalizedRootKbId === nodeId)) {
+      return this.deleteKnowledgeBase(nodeId);
+    }
+    throw new Error(`Cannot delete "${nodeId}": node type ${nodeType ?? 'unknown'} without its collection`);
+  },
+
+  // Rename record (file)
+  async renameRecord(recordId: string, newName: string) {
+    const formData = new FormData();
+    formData.append('recordName', newName);
+    const { data } = await apiClient.put(
+      `${BASE_URL}/record/${recordId}`,
+      formData,
+      {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        suppressErrorToast: true,
+      }
+    );
+    return data;
+  },
+
+  // Move item
+  async moveItem(knowledgeBaseId: string, itemId: string, newParentId: string) {
+    const { data } = await apiClient.put<Record<string, unknown>>(`${BASE_URL}/${knowledgeBaseId}/record/${itemId}/move`, {
+      newParentId,
+    });
+    return data;
+  },
+
+  // Reindex item (works for both records and folders)
+  // depth=0 for single record, depth=100 for folder (reindex all children)
+  async reindexItem(
+    recordId: string,
+    depth: number = 0,
+    statusFilters?: string[]
+  ) {
+    const body: { depth: number; statusFilters?: string[] } = { depth };
+    if (statusFilters?.length) {
+      body.statusFilters = statusFilters;
+    }
+    const { data } = await apiClient.post<Record<string, unknown>>(
+      `${BASE_URL}/reindex/record/${recordId}`,
+      body,
+      { suppressErrorToast: true }
+    );
+    return data;
+  },
+
+  // Reindex record group (folders inside app nodes like Sharepoint, OneDrive)
+  async reindexRecordGroup(
+    recordGroupId: string,
+    depth: number = FOLDER_REINDEX_DEPTH,
+    statusFilters?: string[],
+  ) {
+    const body: { force: boolean; depth: number; statusFilters?: string[] } = {
+      force: false,
+      depth,
+    };
+    if (statusFilters?.length) {
+      body.statusFilters = statusFilters;
+    }
+    const { data } = await apiClient.post<Record<string, unknown>>(
+      `${BASE_URL}/reindex/record-group/${recordGroupId}`,
+      body,
+      { suppressErrorToast: true }
+    );
+    return data;
+  },
+
+  // Reindex an entire KB. A KB is itself a connector instance, so this
+  // delegates to the shared connector-wide reindex endpoint. Omitting
+  // statusFilters means "reindex everything" for a KB connector (unlike
+  // other connectors, which default server-side to FAILED-only).
+  async reindexKnowledgeBase(
+    kbId: string,
+    statusFilters?: string[],
+    stages?: ReindexStage[]
+  ) {
+    return ConnectorsApi.reindexConnector(kbId, statusFilters, stages);
+  },
+
+  // Download a record file via stream endpoint
+  async streamDownloadRecord(
+    recordId: string,
+    fileName?: string,
+    options?: { version?: number; suppressErrorToast?: AxiosRequestConfig['suppressErrorToast'] }
+  ): Promise<void> {
+    const params: Record<string, number> = {};
+    if (options?.version !== undefined) {
+      params.version = options.version;
+    }
+    const response = await apiClient.get(`${BASE_URL}/stream/record/${recordId}`, {
+      responseType: 'blob',
+      timeout: 300000,
+      params,
+      suppressErrorToast: options?.suppressErrorToast,
+    });
+
+    // response.data is already a Blob with the correct MIME type when responseType is 'blob'
+    const blob: Blob = response.data;
+
+    const downloadName = fileName || 'download';
+
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = downloadName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+  },
+
+  /**
+   * Get full record details including metadata and permissions
+   */
+  async getRecordDetails(
+    recordId: string,
+    options?: { suppressErrorToast?: AxiosRequestConfig['suppressErrorToast'] }
+  ) {
+    const { data } = await apiClient.get<RecordDetailsResponse>(
+      `${BASE_URL}/record/${recordId}`,
+      { suppressErrorToast: options?.suppressErrorToast }
+    );
+    return data;
+  },
+
+  /**
+   * Stream record file using recordId
+   * Returns blob that can be converted to object URL
+   * Works for both UPLOAD (collection) and CONNECTOR (external) sources
+   *
+   * @param recordId - The ID of the record to stream
+   * @param options.convertTo - Optional format conversion (e.g. 'pdf').
+   *   Used for PPT/PPTX files which need server-side conversion to PDF for preview.
+   * @param options.version - Optional artifact registry version to pin the
+   *   content to (ARTIFACT records only) — omit for the latest version.
+   */
+  async streamRecord(
+    recordId: string,
+    options?: { convertTo?: string; version?: number; suppressErrorToast?: AxiosRequestConfig['suppressErrorToast'] }
+  ): Promise<Blob> {
+    const params: Record<string, string | number> = {};
+    if (options?.convertTo) {
+      params.convertTo = options.convertTo;
+    }
+    if (options?.version !== undefined) {
+      params.version = options.version;
+    }
+    const { data } = await apiClient.get(
+      `${BASE_URL}/stream/record/${recordId}`,
+      { responseType: 'blob', params, suppressErrorToast: options?.suppressErrorToast }
+    );
+    return data;
+  },
+
+  /**
+   * Bulk reindex multiple records
+   * @param items - Array of items with id and nodeType to reindex
+   * @returns Promise.allSettled results for each reindex operation
+   */
+  async bulkReindex(
+    items: Array<{ id: string; nodeType?: string; connector?: string; subType?: string }>
+  ) {
+    const results = await Promise.allSettled(
+      items.map(item => {
+        const reindexNode = getReindexNodeFromHubItem({
+          nodeType: item.nodeType,
+          connector: item.connector,
+          subType: item.subType,
+        });
+        
+        if (isKbCollectionNode(reindexNode)) {
+          return this.reindexKnowledgeBase(item.id);
+        }
+        if (item.nodeType === 'recordGroup' || item.nodeType === 'app') {
+          return this.reindexRecordGroup(item.id);
+        }
+        return this.reindexItem(item.id, FOLDER_REINDEX_DEPTH);
+      })
+    );
+    return results;
+  },
+
+  /**
+   * Bulk delete multiple items
+   * @param items - Array of items with id, nodeType, and optional kbId
+   * @returns Promise.allSettled results for each delete operation
+   */
+  async bulkDelete(
+    items: Array<{ id: string; nodeType: 'kb' | 'app' | 'folder' | 'record'; kbId?: string }>
+  ) {
+    const results = await Promise.allSettled(
+      items.map(item =>
+        this.deleteNode({
+          nodeId: item.id,
+          nodeType: item.nodeType,
+          rootKbId: item.kbId,
+        })
+      )
+    );
+    return results;
+  },
+
+  /**
+   * Get indexing stats for a KB collection (delegates to ConnectorsApi)
+   * @param kbId - Knowledge base collection ID
+   * @returns Promise with connector stats response
+   */
+  async getCollectionStats(kbId: string) {
+    return ConnectorsApi.getConnectorStats(kbId);
+  },
+};
+

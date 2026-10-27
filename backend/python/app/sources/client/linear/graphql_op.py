@@ -1,0 +1,1398 @@
+from typing import Any, Dict
+
+
+class LinearGraphQLOperations:
+    """Registry of Linear GraphQL operations and fragments."""
+
+    # Common fragments
+    FRAGMENTS = {
+        "UserFields": """
+            fragment UserFields on User {
+                id
+                name
+                displayName
+                email
+                avatarUrl
+                active
+                guest
+                createdAt
+                updatedAt
+            }
+        """,
+
+        "TeamFields": """
+            fragment TeamFields on Team {
+                id
+                name
+                key
+                description
+                private
+                visibility
+                parent {
+                    id
+                    name
+                    key
+                }
+                createdAt
+                updatedAt
+            }
+        """,
+
+        "IssueFields": """
+            fragment IssueFields on Issue {
+                id
+                identifier
+                number
+                title
+                description
+                priority
+                estimate
+                url
+                createdAt
+                updatedAt
+                completedAt
+                trashed
+                archivedAt
+                canceledAt
+                state {
+                    id
+                    name
+                    type
+                }
+                assignee {
+                    ...UserFields
+                }
+                creator {
+                    ...UserFields
+                }
+                team {
+                    ...TeamFields
+                }
+                labels(first: 50) {
+                    nodes {
+                        id
+                        name
+                        color
+                    }
+                }
+                parent {
+                    id
+                    identifier
+                }
+                relations(first: 50) {
+                    nodes {
+                        id
+                        type
+                        relatedIssue {
+                            id
+                            identifier
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+                comments(first: 100) {
+                    nodes {
+                        ...CommentFields
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+                attachments(first: 100) {
+                    nodes {
+                        id
+                        title
+                        subtitle
+                        url
+                        createdAt
+                        updatedAt
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+        """,
+
+        # The list query asks for less per issue than the single-issue query so that a
+        # page of 50 stays well under Linear's 10,000 point cap per query: attachments
+        # have their own listing, and long comment or relation lists are completed with
+        # follow-up pages only for the issues that need them.
+        "IssueListFields": """
+            fragment IssueListFields on Issue {
+                id
+                identifier
+                number
+                title
+                description
+                priority
+                estimate
+                url
+                createdAt
+                updatedAt
+                completedAt
+                trashed
+                archivedAt
+                canceledAt
+                state {
+                    id
+                    name
+                    type
+                }
+                assignee {
+                    id
+                    name
+                    displayName
+                    email
+                }
+                creator {
+                    id
+                    name
+                    displayName
+                    email
+                }
+                team {
+                    id
+                    key
+                    name
+                }
+                labels(first: 20) {
+                    nodes {
+                        id
+                        name
+                    }
+                }
+                parent {
+                    id
+                    identifier
+                }
+                relations(first: 20) {
+                    nodes {
+                        id
+                        type
+                        relatedIssue {
+                            id
+                            identifier
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+                comments(first: 20) {
+                    nodes {
+                        id
+                        body
+                        url
+                        createdAt
+                        updatedAt
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+        """,
+
+        "ProjectFields": """
+            fragment ProjectFields on Project {
+                id
+                name
+                description
+                slugId
+                icon
+                color
+                url
+                priority
+                priorityLabel
+                progress
+                scope
+                health
+                content
+                trashed
+                createdAt
+                updatedAt
+                archivedAt
+                startDate
+                targetDate
+                startedAt
+                completedAt
+                canceledAt
+                status {
+                    id
+                    name
+                    type
+                    color
+                }
+                creator {
+                    id
+                    name
+                    displayName
+                    email
+                }
+                lead {
+                    id
+                    name
+                    displayName
+                    email
+                }
+                leadTeamId
+                teams(first: 50) {
+                    nodes {
+                        id
+                        name
+                        key
+                        private
+                        visibility
+                    }
+                }
+                issues(first: 100) {
+                    nodes {
+                        id
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+        """,
+
+        "CommentFields": """
+            fragment CommentFields on Comment {
+                id
+                body
+                url
+                createdAt
+                updatedAt
+                parent {
+                    id
+                }
+                user {
+                    ...UserFields
+                }
+            }
+        """,
+
+        "ProjectCommentFields": """
+            fragment ProjectCommentFields on Comment {
+                id
+                body
+                url
+                createdAt
+                updatedAt
+                editedAt
+                quotedText
+                resolvedAt
+                parent {
+                    id
+                }
+                resolvingUser {
+                    id
+                    name
+                    displayName
+                    email
+                }
+                user {
+                    id
+                    name
+                    displayName
+                    email
+                }
+            }
+        """,
+
+        "ProjectUpdateCommentFields": """
+            fragment ProjectUpdateCommentFields on Comment {
+                id
+                body
+                url
+                createdAt
+                updatedAt
+                parent {
+                    id
+                }
+                user {
+                    id
+                    name
+                    displayName
+                    email
+                }
+            }
+        """,
+
+        "ProjectMilestoneFields": """
+            fragment ProjectMilestoneFields on ProjectMilestone {
+                id
+                name
+                description
+                sortOrder
+                targetDate
+                createdAt
+                updatedAt
+                archivedAt
+            }
+        """,
+
+        "ProjectUpdateFields": """
+            fragment ProjectUpdateFields on ProjectUpdate {
+                id
+                body
+                health
+                url
+                createdAt
+                updatedAt
+                user {
+                    id
+                    name
+                    displayName
+                    email
+                }
+            }
+        """,
+
+        "ProjectExternalLinkFields": """
+            fragment ProjectExternalLinkFields on EntityExternalLink {
+                id
+                url
+                label
+                sortOrder
+                createdAt
+                updatedAt
+                creator {
+                    id
+                    name
+                    email
+                }
+            }
+        """,
+
+        "ProjectDocumentFields": """
+            fragment ProjectDocumentFields on Document {
+                id
+                title
+                content
+                url
+                slugId
+                createdAt
+                updatedAt
+                creator {
+                    id
+                    name
+                    email
+                }
+            }
+        """
+    }
+
+    # Query operations
+    QUERIES = {
+        "viewer": {
+            "query": """
+                query viewer {
+                    viewer {
+                        ...UserFields
+                    }
+                }
+            """,
+            "fragments": ["UserFields"],
+            "description": "Get current user information"
+        },
+
+        "teams": {
+            "query": """
+                query teams($first: Int, $after: String, $filter: TeamFilter) {
+                    teams(first: $first, after: $after, filter: $filter) {
+                        nodes {
+                            ...TeamFields
+                            members(first: 100) {
+                                nodes {
+                                    id
+                                    email
+                                    active
+                                    guest
+                                }
+                                pageInfo {
+                                    hasNextPage
+                                    endCursor
+                                }
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": ["TeamFields"],
+            "description": "Get teams with optional filtering and cursor-based pagination"
+        },
+
+        "users": {
+            "query": """
+                query users($first: Int, $after: String, $filter: UserFilter, $orderBy: PaginationOrderBy) {
+                    users(first: $first, after: $after, filter: $filter, orderBy: $orderBy) {
+                        nodes {
+                            ...UserFields
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": ["UserFields"],
+            "description": "Get users with filtering and cursor-based pagination"
+        },
+
+        "issues": {
+            "query": """
+                query issues($first: Int, $after: String, $filter: IssueFilter, $includeArchived: Boolean, $orderBy: PaginationOrderBy) {
+                    issues(first: $first, after: $after, filter: $filter, includeArchived: $includeArchived, orderBy: $orderBy) {
+                        nodes {
+                            ...IssueListFields
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": ["IssueListFields"],
+            "description": "Get issues with filtering and cursor-based pagination"
+        },
+
+        "issue": {
+            "query": """
+                query issue($id: String!) {
+                    issue(id: $id) {
+                        ...IssueFields
+                        documents(first: 50) {
+                            nodes {
+                                id
+                                title
+                                url
+                                slugId
+                                content
+                                createdAt
+                                updatedAt
+                                creator {
+                                    id
+                                    name
+                                    email
+                                }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["IssueFields", "CommentFields", "UserFields", "TeamFields"],
+            "description": "Get single issue with comments, attachments, and documents"
+        },
+
+        "projects": {
+            "query": """
+                query Projects($first: Int, $after: String, $filter: ProjectFilter, $orderBy: PaginationOrderBy, $includeArchived: Boolean) {
+                    projects(first: $first, after: $after, filter: $filter, orderBy: $orderBy, includeArchived: $includeArchived) {
+                        nodes {
+                            ...ProjectFields
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [
+                "ProjectFields"
+            ],
+            "description": "Get projects with basic fields for sync (nested data fetched separately)"
+        },
+
+        "issueSearch": {
+            "query": """
+                query issueSearch($query: String!, $first: Int, $after: String, $filter: IssueFilter) {
+                    issueSearch(query: $query, first: $first, after: $after, filter: $filter) {
+                        nodes {
+                            ...IssueListFields
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": ["IssueListFields"],
+            "description": "Search issues by query string"
+        },
+
+        "trashedIssues": {
+            "query": """
+                query TrashedIssues($first: Int, $after: String, $filter: IssueFilter) {
+                    issues(first: $first, after: $after, filter: $filter, includeArchived: true) {
+                        nodes {
+                            id
+                            identifier
+                            title
+                            trashed
+                            archivedAt
+                            canceledAt
+                            updatedAt
+                            team {
+                                id
+                                key
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Get trashed issues for deletion sync"
+        },
+
+        "trashedProjects": {
+            "query": """
+                query TrashedProjects($first: Int, $after: String, $filter: ProjectFilter) {
+                    projects(first: $first, after: $after, filter: $filter, includeArchived: true) {
+                        nodes {
+                            id
+                            name
+                            slugId
+                            url
+                            trashed
+                            archivedAt
+                            canceledAt
+                            updatedAt
+                            teams(first: 10) {
+                                nodes {
+                                    id
+                                    key
+                                }
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Get trashed projects for deletion sync"
+        },
+
+        "organization": {
+            "query": """
+                query organization {
+                    organization {
+                        id
+                        name
+                        urlKey
+                        createdAt
+                        updatedAt
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Get organization information"
+        },
+
+        "comment": {
+            "query": """
+                query comment($id: String!) {
+                    comment(id: $id) {
+                        ...CommentFields
+                    }
+                }
+            """,
+            "fragments": ["CommentFields", "UserFields"],
+            "description": "Get single comment by ID"
+        },
+
+        "attachment": {
+            "query": """
+                query attachment($id: String!) {
+                    attachment(id: $id) {
+                        id
+                        title
+                        subtitle
+                        url
+                        createdAt
+                        updatedAt
+                        issue {
+                            id
+                            identifier
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Get single attachment by ID"
+        },
+
+        "document": {
+            "query": """
+                query document($id: String!) {
+                    document(id: $id) {
+                        id
+                        title
+                        url
+                        slugId
+                        content
+                        createdAt
+                        updatedAt
+                        creator {
+                            id
+                            name
+                            email
+                        }
+                        issue {
+                            id
+                            identifier
+                            team {
+                                id
+                                key
+                            }
+                        }
+                        project {
+                            id
+                            name
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Get single document by ID"
+        },
+
+        "attachments": {
+            "query": """
+                query Attachments($first: Int, $after: String, $filter: AttachmentFilter) {
+                    attachments(first: $first, after: $after, filter: $filter) {
+                        nodes {
+                            id
+                            title
+                            subtitle
+                            url
+                            createdAt
+                            updatedAt
+                            issue {
+                                id
+                                identifier
+                                team {
+                                    id
+                                    key
+                                }
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "List attachments with optional filtering and pagination"
+        },
+
+        "documents": {
+            "query": """
+                query Documents($first: Int, $after: String, $filter: DocumentFilter) {
+                    documents(first: $first, after: $after, filter: $filter) {
+                        nodes {
+                            id
+                            title
+                            url
+                            slugId
+                            content
+                            createdAt
+                            updatedAt
+                            creator {
+                                id
+                                name
+                                email
+                            }
+                            issue {
+                                id
+                                identifier
+                                team {
+                                    id
+                                    key
+                                }
+                            }
+                            project {
+                                id
+                                name
+                                teams(first: 10) {
+                                    nodes {
+                                        id
+                                    }
+                                }
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            hasPreviousPage
+                            startCursor
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "List documents with optional filtering and pagination"
+        },
+
+        "project": {
+            "query": """
+                query Project($id: String!) {
+                    project(id: $id) {
+                        ...ProjectFields
+                        content
+                        externalLinks(first: 50) {
+                            nodes {
+                                ...ProjectExternalLinkFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                        documents(first: 50) {
+                            nodes {
+                                ...ProjectDocumentFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                        projectMilestones(first: 50) {
+                            nodes {
+                                ...ProjectMilestoneFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                        comments(first: 50) {
+                            nodes {
+                                ...ProjectCommentFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                        projectUpdates(first: 50) {
+                            nodes {
+                                ...ProjectUpdateFields
+                                comments(first: 20) {
+                                    nodes {
+                                        ...ProjectUpdateCommentFields
+                                    }
+                                    pageInfo {
+                                        hasNextPage
+                                        endCursor
+                                    }
+                                }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": [
+                "ProjectFields",
+                "ProjectExternalLinkFields",
+                "ProjectDocumentFields",
+                "ProjectMilestoneFields",
+                "ProjectCommentFields",
+                "ProjectUpdateFields",
+                "ProjectUpdateCommentFields"
+            ],
+            "description": "Get single project with all nested data"
+        },
+
+        "issueComments": {
+            "query": """
+                query issueComments($id: String!, $first: Int, $after: String) {
+                    issue(id: $id) {
+                        id
+                        comments(first: $first, after: $after) {
+                            nodes {
+                                ...CommentFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["CommentFields", "UserFields"],
+            "description": "Further pages of an issue's comments"
+        },
+
+        "issueAttachments": {
+            "query": """
+                query issueAttachments($id: String!, $first: Int, $after: String) {
+                    issue(id: $id) {
+                        id
+                        attachments(first: $first, after: $after) {
+                            nodes {
+                                id title subtitle url createdAt updatedAt
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Further pages of an issue's attachments"
+        },
+
+        "issueRelations": {
+            "query": """
+                query issueRelations($id: String!, $first: Int, $after: String) {
+                    issue(id: $id) {
+                        id
+                        relations(first: $first, after: $after) {
+                            nodes {
+                                id type relatedIssue { id identifier }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Further pages of an issue's relations"
+        },
+
+        "issueDocuments": {
+            "query": """
+                query issueDocuments($id: String!, $first: Int, $after: String) {
+                    issue(id: $id) {
+                        id
+                        documents(first: $first, after: $after) {
+                            nodes {
+                                id title url slugId content createdAt updatedAt creator { id name email }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Further pages of an issue's documents"
+        },
+
+        "teamMembers": {
+            "query": """
+                query teamMembers($id: String!, $first: Int, $after: String) {
+                    team(id: $id) {
+                        id
+                        members(first: $first, after: $after) {
+                            nodes {
+                                ...UserFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["UserFields"],
+            "description": "Further pages of a team's members"
+        },
+
+        "projectDocuments": {
+            "query": """
+                query projectDocuments($id: String!, $first: Int, $after: String) {
+                    project(id: $id) {
+                        id
+                        documents(first: $first, after: $after) {
+                            nodes {
+                                ...ProjectDocumentFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["ProjectDocumentFields"],
+            "description": "Further pages of a project's documents"
+        },
+
+        "projectExternalLinks": {
+            "query": """
+                query projectExternalLinks($id: String!, $first: Int, $after: String) {
+                    project(id: $id) {
+                        id
+                        externalLinks(first: $first, after: $after) {
+                            nodes {
+                                ...ProjectExternalLinkFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["ProjectExternalLinkFields"],
+            "description": "Further pages of a project's external links"
+        },
+
+        "projectMilestones": {
+            "query": """
+                query projectMilestones($id: String!, $first: Int, $after: String) {
+                    project(id: $id) {
+                        id
+                        projectMilestones(first: $first, after: $after) {
+                            nodes {
+                                ...ProjectMilestoneFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["ProjectMilestoneFields"],
+            "description": "Further pages of a project's milestones"
+        },
+
+        "projectComments": {
+            "query": """
+                query projectComments($id: String!, $first: Int, $after: String) {
+                    project(id: $id) {
+                        id
+                        comments(first: $first, after: $after) {
+                            nodes {
+                                ...ProjectCommentFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["ProjectCommentFields"],
+            "description": "Further pages of a project's comments"
+        },
+
+        "projectUpdates": {
+            "query": """
+                query projectUpdates($id: String!, $first: Int, $after: String) {
+                    project(id: $id) {
+                        id
+                        projectUpdates(first: $first, after: $after) {
+                            nodes {
+                                ...ProjectUpdateFields comments(first: 20) { nodes { ...ProjectUpdateCommentFields } pageInfo { hasNextPage endCursor } }
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["ProjectUpdateFields", "ProjectUpdateCommentFields"],
+            "description": "Further pages of a project's updates"
+        },
+
+        "projectIssues": {
+            "query": """
+                query projectIssues($id: String!, $first: Int, $after: String) {
+                    project(id: $id) {
+                        id
+                        issues(first: $first, after: $after) {
+                            nodes {
+                                id
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Further pages of a project's issues"
+        },
+
+        "projectUpdateComments": {
+            "query": """
+                query projectUpdateComments($id: String!, $first: Int, $after: String) {
+                    projectUpdate(id: $id) {
+                        id
+                        comments(first: $first, after: $after) {
+                            nodes {
+                                ...ProjectUpdateCommentFields
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                    }
+                }
+            """,
+            "fragments": ["ProjectUpdateCommentFields"],
+            "description": "Further pages of the comments on a project update"
+        },
+
+        "issueIds": {
+            "query": """
+                query issueIds($first: Int, $after: String, $filter: IssueFilter, $includeArchived: Boolean) {
+                    issues(first: $first, after: $after, filter: $filter, includeArchived: $includeArchived) {
+                        nodes {
+                            id trashed archivedAt team { id }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Ids of issues, for reconciling what is stored with what Linear has"
+        },
+
+        "projectIds": {
+            "query": """
+                query projectIds($first: Int, $after: String, $filter: ProjectFilter, $includeArchived: Boolean) {
+                    projects(first: $first, after: $after, filter: $filter, includeArchived: $includeArchived) {
+                        nodes {
+                            id trashed archivedAt updatedAt teams(first: 10) { nodes { id } }
+                            externalLinks(first: 50) { nodes { id updatedAt } pageInfo { hasNextPage } }
+                            projectMilestones(first: 50) { nodes { id updatedAt } pageInfo { hasNextPage } }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Ids of projects, for reconciling what is stored with what Linear has"
+        },
+
+        "issueChildren": {
+            "query": """
+                query issueChildren($first: Int, $after: String, $filter: IssueFilter, $includeArchived: Boolean) {
+                    issues(first: $first, after: $after, filter: $filter, includeArchived: $includeArchived) {
+                        nodes {
+                            id
+                            attachments(first: 20) {
+                                nodes { id title subtitle url createdAt updatedAt }
+                                pageInfo { hasNextPage endCursor }
+                            }
+                            documents(first: 10) {
+                                nodes { id title url slugId createdAt updatedAt creator { id name email } }
+                                pageInfo { hasNextPage endCursor }
+                            }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Attachments and documents of chosen issues, for issues that newly enter the sync"
+        },
+
+        "attachmentIds": {
+            "query": """
+                query attachmentIds($first: Int, $after: String, $filter: AttachmentFilter, $includeArchived: Boolean) {
+                    attachments(first: $first, after: $after, filter: $filter, includeArchived: $includeArchived) {
+                        nodes {
+                            id
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Ids of attachments"
+        },
+
+        "documentIds": {
+            "query": """
+                query documentIds($first: Int, $after: String, $filter: DocumentFilter, $includeArchived: Boolean) {
+                    documents(first: $first, after: $after, filter: $filter, includeArchived: $includeArchived) {
+                        nodes {
+                            id
+                            trashed
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Ids of documents"
+        },
+
+        "commentActivity": {
+            "query": """
+                query commentActivity($first: Int, $after: String, $filter: CommentFilter) {
+                    comments(first: $first, after: $after, filter: $filter) {
+                        nodes {
+                            id updatedAt issue { id } project { id } projectUpdate { id project { id } }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Which issues and projects had comment activity"
+        },
+
+        "projectUpdateActivity": {
+            "query": """
+                query projectUpdateActivity($first: Int, $after: String, $filter: ProjectUpdateFilter) {
+                    projectUpdates(first: $first, after: $after, filter: $filter) {
+                        nodes {
+                            id updatedAt project { id }
+                        }
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Which projects had a status update posted or edited"
+        },
+
+        "team": {
+            "query": """
+                query team($id: String!) {
+                    team(id: $id) {
+                        ...TeamFields
+                        archivedAt
+                    }
+                }
+            """,
+            "fragments": ["TeamFields"],
+            "description": "Get a team by ID"
+        },
+
+        "user": {
+            "query": """
+                query user($id: String!) {
+                    user(id: $id) {
+                        ...UserFields
+                    }
+                }
+            """,
+            "fragments": ["UserFields"],
+            "description": "Get a user by ID"
+        }
+    }
+
+    # Mutation operations
+    MUTATIONS = {
+        "issueCreate": {
+            "query": """
+                mutation IssueCreate($input: IssueCreateInput!) {
+                    issueCreate(input: $input) {
+                        success
+                        issue {
+                            ...IssueFields
+                        }
+                        lastSyncId
+                    }
+                }
+            """,
+            "fragments": ["IssueFields", "CommentFields", "UserFields", "TeamFields"],
+            "description": "Create a new issue"
+        },
+
+        "issueUpdate": {
+            "query": """
+                mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+                    issueUpdate(id: $id, input: $input) {
+                        success
+                        issue {
+                            ...IssueFields
+                        }
+                        lastSyncId
+                    }
+                }
+            """,
+            "fragments": ["IssueFields", "CommentFields", "UserFields", "TeamFields"],
+            "description": "Update an existing issue"
+        },
+
+        "issueDelete": {
+            "query": """
+                mutation IssueDelete($id: String!) {
+                    issueDelete(id: $id) {
+                        success
+                        lastSyncId
+                    }
+                }
+            """,
+            "fragments": [],
+            "description": "Delete an issue"
+        },
+
+        "commentCreate": {
+            "query": """
+                mutation CommentCreate($input: CommentCreateInput!) {
+                    commentCreate(input: $input) {
+                        success
+                        comment {
+                            ...CommentFields
+                        }
+                        lastSyncId
+                    }
+                }
+            """,
+            "fragments": ["CommentFields", "UserFields"],
+            "description": "Create a comment on an issue"
+        },
+
+        "projectCreate": {
+            "query": """
+                mutation ProjectCreate($input: ProjectCreateInput!) {
+                    projectCreate(input: $input) {
+                        success
+                        project {
+                            ...ProjectFields
+                        }
+                        lastSyncId
+                    }
+                }
+            """,
+            "fragments": ["ProjectFields"],
+            "description": "Create a new project"
+        },
+
+        "projectUpdate": {
+            "query": """
+                mutation ProjectUpdate($id: String!, $input: ProjectUpdateInput!) {
+                    projectUpdate(id: $id, input: $input) {
+                        success
+                        project {
+                            ...ProjectFields
+                        }
+                        lastSyncId
+                    }
+                }
+            """,
+            "fragments": ["ProjectFields"],
+            "description": "Update a project"
+        }
+    }
+
+    @classmethod
+    def get_operation_with_fragments(cls, operation_type: str, operation_name: str) -> str:
+        """Get a complete GraphQL operation with all required fragments."""
+        operations = cls.QUERIES if operation_type == "query" else cls.MUTATIONS
+
+        if operation_name not in operations:
+            raise ValueError(f"Operation {operation_name} not found in {operation_type}s")
+        operation = operations[operation_name]
+        fragments_needed = operation.get("fragments", [])
+
+        # Collect all fragments
+        fragment_definitions = []
+        for fragment_name in fragments_needed:
+            if fragment_name in cls.FRAGMENTS:
+                fragment_definitions.append(cls.FRAGMENTS[fragment_name])
+
+        # Combine fragments and operation
+        if fragment_definitions:
+            return "\n\n".join(fragment_definitions) + "\n\n" + operation["query"]
+        else:
+            return operation["query"]
+
+    @classmethod
+    def get_all_operations(cls) -> Dict[str, Dict[str, Any]]:
+        """Get all available operations."""
+        return {
+            "queries": cls.QUERIES,
+            "mutations": cls.MUTATIONS,
+            "fragments": cls.FRAGMENTS
+        }

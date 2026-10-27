@@ -1,0 +1,4131 @@
+import base64
+import html
+import uuid
+from collections.abc import AsyncGenerator, Awaitable
+from datetime import datetime, timedelta, timezone
+from logging import Logger
+from urllib.parse import quote
+
+import httpx
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+from msgraph.generated.models.attachment import Attachment  # type: ignore
+from msgraph.generated.models.conversation_thread import (
+    ConversationThread,  # type: ignore
+)
+from msgraph.generated.models.group import Group  # type: ignore
+from msgraph.generated.models.mail_folder import MailFolder  # type: ignore
+from msgraph.generated.models.message import Message  # type: ignore
+from msgraph.generated.models.post import Post  # type: ignore
+from msgraph.generated.models.user import User  # type: ignore
+
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.arangodb import (
+    PermissionModel,
+    CollectionNames,
+    Connectors,
+    MimeTypes,
+    OriginTypes,
+    ProgressStatus,
+    RecordRelations,
+)
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.connector.connector_service import (
+    BaseConnector,
+    ConnectorInitError,
+)
+from app.connectors.core.base.data_processor.data_source_entities_processor import (
+    DataSourceEntitiesProcessor,
+)
+from app.connectors.core.base.data_store.data_store import DataStoreProvider
+from app.connectors.core.base.error.stream_errors import (
+    connector_not_ready,
+    not_downloadable,
+    not_found_at_source,
+    raise_for_stream_fetch,
+)
+from app.connectors.core.base.sync_point.sync_point import (
+    SyncDataPointType,
+    SyncPoint,
+    generate_record_sync_point_key,
+)
+from app.connectors.core.constants import (
+    AuthFieldKeys,
+    BatchConfig,
+    ConfigPaths,
+    CONNECTOR_EMAIL_IDENTITY_INFO,
+    IconPaths,
+    OAuthConfigKeys,
+)
+from app.connectors.core.registry.auth_builder import AuthBuilder, AuthType
+from app.connectors.core.registry.connector_builder import (
+    AuthField,
+    CommonFields,
+    ConnectorBuilder,
+    ConnectorScope,
+    DocumentationLink,
+    SyncStrategy,
+)
+from app.connectors.core.registry.filters import (
+    DatetimeOperator,
+    FilterCategory,
+    FilterCollection,
+    FilterField,
+    FilterOperator,
+    FilterOption,
+    FilterOptionsResponse,
+    FilterType,
+    IndexingFilterKey,
+    MultiselectOperator,
+    OptionSourceType,
+    SyncFilterKey,
+    load_connector_filters,
+)
+from app.connectors.core.registry.types import FieldType
+from app.connectors.sources.microsoft.common.apps import OutlookApp
+from app.connectors.sources.microsoft.common.content_type_utils import (
+    attachment_metadata_from_graph,
+)
+from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
+from app.connectors.core.sync.full_sync_coverage import FullSyncCoverage
+from app.connectors.sources.microsoft.common.outlook_constants import (
+    MessagesDeltaResult,
+    OutlookAPIFields,
+    OutlookConnectorNames,
+    OutlookCredentials,
+    OutlookDefaults,
+    OutlookDocs,
+    OutlookFilterKeys,
+    OutlookFolders,
+    OutlookHTTPDetails,
+    OutlookMediaTypes,
+    OutlookODataFields,
+    OutlookSyncConfig,
+    OutlookSyncPointKeys,
+    OutlookThreadDetection,
+    describe_sign_in_error,
+    graph_error_status,
+    is_folder_not_found_error,
+    is_no_mailbox_error,
+    mail_content_revision,
+    normalize_conversation_index,
+)
+from app.connectors.sources.microsoft.common.outlook_folders import (
+    MailThreadRef,
+    OutlookFolderInventoryMixin,
+    cap_attachment_indexing,
+    close_graph_client,
+    graph_stream_error,
+    iter_graph_stream,
+    mail_thread_ref,
+    notify_sync_outcome,
+    open_graph_stream,
+    pace_graph_calls,
+    prefer_immutable_ids,
+    raise_for_graph_stream,
+    read_child_folders,
+    read_delta_pages,
+    removed_mail_update,
+    unsynced_attachment_kind,
+)
+from app.models.entities import (
+    AppUser,
+    AppUserGroup,
+    FileRecord,
+    MailRecord,
+    Record,
+    RecordGroup,
+    RecordGroupType,
+    RecordType,
+)
+from app.models.permission import EntityType, Permission, PermissionType
+from app.sources.client.microsoft.microsoft import (
+    GraphMode,
+    MSGraphClientWithClientIdSecretConfig,
+)
+from app.sources.client.microsoft.microsoft import (
+    MSGraphClient as ExternalMSGraphClient,
+)
+from app.sources.external.microsoft.outlook.outlook import (
+    OutlookCalendarContactsDataSource,
+    OutlookCalendarContactsResponse,
+    OutlookMailFoldersResponse,
+)
+from app.sources.external.microsoft.users_groups.users_groups import (
+    UsersGroupsDataSource,
+    UsersGroupsResponse,
+)
+from app.utils.streaming import create_stream_record_response
+from app.utils.time_conversion import (
+    datetime_to_epoch_ms,
+    get_epoch_timestamp_in_ms,
+)
+
+
+MAILBOX_GROUP_PREFIX = "mailbox:"
+
+
+class AttachmentListingError(Exception):
+    """A mail's attachment list could not be read: the mail must be retried, not half-saved."""
+
+
+@ConnectorBuilder(OutlookConnectorNames.TEAM)\
+    .in_group("Microsoft 365")\
+    .with_description("Sync emails from Outlook")\
+    .with_categories(["Email"])\
+    .with_scopes([ConnectorScope.TEAM.value])\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH_ADMIN_CONSENT).fields([
+            AuthField(
+                name=AuthFieldKeys.CLIENT_ID,
+                display_name="Application (Client) ID",
+                placeholder="Enter your Azure AD Application ID",
+                description="The Application (Client) ID from Azure AD App Registration",
+                field_type=FieldType.TEXT.value
+            ),
+            AuthField(
+                name=AuthFieldKeys.CLIENT_SECRET,
+                display_name="Client Secret",
+                placeholder="Enter your Azure AD Client Secret",
+                description="The Client Secret from Azure AD App Registration",
+                field_type=FieldType.PASSWORD.value,
+                is_secret=True
+            ),
+            AuthField(
+                name=AuthFieldKeys.TENANT_ID,
+                display_name="Directory (Tenant) ID",
+                placeholder="Enter your Azure AD Tenant ID",
+                description="The Directory (Tenant) ID from Azure AD",
+                field_type=FieldType.TEXT.value
+            ),
+            AuthField(
+                name=AuthFieldKeys.HAS_ADMIN_CONSENT,
+                display_name="Has Admin Consent",
+                description="Check if admin consent has been granted for the application",
+                field_type=FieldType.CHECKBOX.value,
+                required=True,
+                default_value=False
+            ),
+        ])
+    ])\
+    .with_info(CONNECTOR_EMAIL_IDENTITY_INFO)\
+    .with_resilience_config(rate_limit=OutlookSyncConfig.GRAPH_RATE_LIMIT, max_retries=3)\
+    .configure(lambda builder: builder
+        .with_icon(IconPaths.connector_icon(Connectors.OUTLOOK.value))
+        .add_documentation_link(DocumentationLink(
+            "Azure AD App Registration Setup",
+            OutlookDocs.AZURE_AD_SETUP_URL,
+            "setup"
+        ))
+        .add_documentation_link(DocumentationLink(
+            "Pipeshub Documentation",
+            OutlookDocs.PIPESHUB_DOCS_URL_TEAM,
+            "pipeshub"
+        ))
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
+        .with_scheduled_config(True, OutlookSyncConfig.DEFAULT_SYNC_INTERVAL_MINUTES)
+        .add_filter_field(FilterField(
+            name=SyncFilterKey.FOLDERS.value,
+            display_name="Standard Folders",
+            description="Select standard Outlook folders to sync emails from. Leave empty to sync "
+            "every standard folder except Deleted Items; select Deleted Items to sync it too.",
+            filter_type=FilterType.MULTISELECT,
+            category=FilterCategory.SYNC,
+            option_source_type=OptionSourceType.STATIC,
+            options=OutlookFolders.STANDARD_FOLDERS
+        ))
+        .add_filter_field(FilterField(
+            name=SyncFilterKey.CUSTOM_FOLDERS.value,
+            display_name="Custom Folders",
+            description="Include custom/non-standard email folders",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.SYNC,
+        ))
+        .add_filter_field(FilterField(
+            name=SyncFilterKey.USERS.value,
+            display_name="Users",
+            filter_type=FilterType.MULTISELECT,
+            category=FilterCategory.SYNC,
+            description="Select specific users to sync. Leave empty to sync all users.",
+            option_source_type=OptionSourceType.DYNAMIC,
+            default_operator=MultiselectOperator.IN.value
+        ))
+        .add_filter_field(FilterField(
+            name=SyncFilterKey.GROUPS.value,
+            display_name="Groups",
+            filter_type=FilterType.MULTISELECT,
+            category=FilterCategory.SYNC,
+            description="Select Microsoft 365 groups to sync. "
+            "Leave empty to sync all groups.",
+            option_source_type=OptionSourceType.DYNAMIC,
+            default_operator=MultiselectOperator.IN.value
+        ))
+        .add_filter_field(FilterField(
+            name=SyncFilterKey.RECEIVED_DATE.value,
+            display_name="Received Date",
+            description="Filter emails by received date. Defaults to last 90 days.",
+            filter_type=FilterType.DATETIME,
+            category=FilterCategory.SYNC,
+            default_operator=DatetimeOperator.LAST_90_DAYS.value,
+            default_value=None  # For LAST_X_DAYS operators, value is not needed
+        ))
+        .add_filter_field(CommonFields.enable_manual_sync_filter())
+        .add_filter_field(FilterField(
+            name=IndexingFilterKey.MAILS.value,
+            display_name="Index Emails",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.INDEXING,
+            description="Enable indexing of email messages",
+            default_value=True
+        ))
+        .add_filter_field(FilterField(
+            name=IndexingFilterKey.ATTACHMENTS.value,
+            display_name="Index Attachments",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.INDEXING,
+            description="Enable indexing of email attachments",
+            default_value=True
+        ))
+        .add_filter_field(FilterField(
+            name=IndexingFilterKey.GROUP_CONVERSATIONS.value,
+            display_name="Index Group Conversations",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.INDEXING,
+            description="Enable indexing of Microsoft 365 group conversations",
+            default_value=True
+        ))
+    )\
+    .build_decorator()
+class OutlookConnector(OutlookFolderInventoryMixin, BaseConnector):
+    """Microsoft Outlook connector for syncing emails and attachments."""
+
+    FOLDER_FILTER_KEYS = (SyncFilterKey.FOLDERS, SyncFilterKey.CUSTOM_FOLDERS)
+
+    def __init__(
+        self,
+        logger: Logger,
+        data_entities_processor: DataSourceEntitiesProcessor,
+        data_store_provider: DataStoreProvider,
+        config_service: ConfigurationService,
+        connector_id: str,
+        scope: str,
+        created_by: str,
+    ) -> None:
+        super().__init__(
+            OutlookApp(connector_id),
+            logger,
+            data_entities_processor,
+            data_store_provider,
+            config_service,
+            connector_id,
+            scope,
+            created_by,
+        )
+        self.external_outlook_client: OutlookCalendarContactsDataSource | None = None
+        self.external_users_client: UsersGroupsDataSource | None = None
+        self.credentials: OutlookCredentials | None = None
+        self.connector_id = connector_id
+
+        # User cache for performance optimization
+        self._user_cache: dict[str, str] = {}  # email -> source_user_id mapping
+        self._user_cache_timestamp: int | None = None
+        self._user_cache_ttl: int = 3600  # 1 hour TTL in seconds
+
+        # Group cache for web URL construction
+        self._disabled_user_ids: set[str] = set()  # accountEnabled false, from the last /users read
+        self._group_cache: dict[str, dict[str, str]] = {}  # group_id -> {'mail': ..., 'mailNickname': ...}
+
+        self.email_delta_sync_point = SyncPoint(
+            connector_id=self.connector_id,
+            org_id=self.data_entities_processor.org_id,
+            sync_data_point_type=SyncDataPointType.RECORDS,
+            data_store_provider=self.data_store_provider
+        )
+
+        self.group_conversations_sync_point = SyncPoint(
+            connector_id=self.connector_id,
+            org_id=self.data_entities_processor.org_id,
+            sync_data_point_type=SyncDataPointType.RECORDS,
+            data_store_provider=self.data_store_provider
+        )
+
+        self.sync_filters: FilterCollection = FilterCollection()
+        self.indexing_filters: FilterCollection = FilterCollection()
+        # What this run skipped after errors, for its one summary notification.
+        self._skipped: dict[str, int] = {"mailboxes": 0, "folders": 0, "groups": 0}
+
+
+    async def init(self) -> bool:
+        """Initialize the Outlook connector with credentials and Graph client."""
+        try:
+
+            connector_id = self.connector_id
+
+            # Load credentials
+            self.credentials = await self._get_credentials(connector_id)
+
+            # A re-init (config change) replaces the client: close the old one's sign-in session.
+            await close_graph_client(getattr(self, "external_client", None), self.logger)
+            try:
+                # Create shared MSGraph client - store as instance variable for proper cleanup
+                self.external_client: ExternalMSGraphClient = prefer_immutable_ids(ExternalMSGraphClient.build_with_config(
+                    MSGraphClientWithClientIdSecretConfig(
+                        self.credentials.client_id,
+                        self.credentials.client_secret,
+                        self.credentials.tenant_id
+                    ),
+                    mode=GraphMode.APP
+                ))
+            except ValueError as e:
+                # azure-identity rejects a malformed tenant id or an empty secret before any request.
+                raise ConnectorInitError(
+                    f"The connector's Microsoft credentials are not valid: {e}. Check the Directory "
+                    "(Tenant) ID, Application (Client) ID and client secret on the connector's settings."
+                ) from e
+            pace_graph_calls(self.external_client, self.resilience)
+
+            # Create both data source clients
+            self.external_outlook_client = OutlookCalendarContactsDataSource(self.external_client)
+            self.external_users_client = UsersGroupsDataSource(self.external_client)
+
+            return True
+
+        except ConnectorInitError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Outlook connector: {e}")
+            return False
+
+    async def _reinitialize_client_if_needed(self) -> None:
+        """Rebuild the Graph client if its idle HTTP transport has been closed.
+
+        The connector instance is cached and reused across scheduled runs that can be
+        hours/days apart (see EventService._ensure_connector). azure-identity closes the
+        credential's HTTP session when idle, but the wrapper objects stay non-None, so the
+        first Graph call of a later run fails with "HTTP transport has already been closed".
+        Probe the credential and rebuild the client on failure.
+        """
+        try:
+            await self.external_client.get_client().credential.get_token(
+                "https://graph.microsoft.com/.default"
+            )
+            return
+        except Exception as e:
+            self.logger.warning(f"Graph credential needs reinitialization: {e}")
+
+        await close_graph_client(self.external_client, self.logger)
+
+        self.external_client = prefer_immutable_ids(ExternalMSGraphClient.build_with_config(
+            MSGraphClientWithClientIdSecretConfig(
+                self.credentials.client_id,
+                self.credentials.client_secret,
+                self.credentials.tenant_id
+            ),
+            mode=GraphMode.APP
+        ))
+        pace_graph_calls(self.external_client, self.resilience)
+        self.external_outlook_client = OutlookCalendarContactsDataSource(self.external_client)
+        self.external_users_client = UsersGroupsDataSource(self.external_client)
+
+        # Fail loudly if the rebuilt credential still can't get a token (e.g. expired secret).
+        await self.external_client.get_client().credential.get_token(
+            "https://graph.microsoft.com/.default"
+        )
+        self.logger.info("✅ Outlook Graph credential reinitialized")
+
+    async def test_connection_and_access(self) -> bool:
+        """Check the sign-in and each application permission sync needs, with one cheap call each.
+
+        A failure raises ConnectorInitError with what to fix, which the setup screen shows.
+        """
+        if not self.external_outlook_client or not self.external_users_client or not self.credentials:
+            return False
+        if not (self.credentials.tenant_id and self.credentials.client_id and self.credentials.client_secret):
+            raise ConnectorInitError("Enter the Directory (Tenant) ID, the Application (Client) ID and the client secret.")
+
+        try:
+            users = await self.external_users_client.users_user_list_user(
+                top=1, select=OutlookAPIFields.USER_ID_SELECT_FIELDS
+            )
+            self._raise_for_probe(users, "User.Read.All")
+            first_user = next(iter(getattr(users.data, "value", None) or []), None)
+            if first_user is not None:
+                folders = await self.external_outlook_client.users_list_mail_folders(user_id=first_user.id, top=1)
+                # A user without a mailbox answers 404; only a refusal says the permission is missing.
+                if graph_error_status(folders.error) in (HttpStatusCode.UNAUTHORIZED.value, HttpStatusCode.FORBIDDEN.value):
+                    self._raise_for_probe(folders, "Mail.Read")
+            groups = await self.external_users_client.groups_list_groups(top=1, select=["id"])
+            self._raise_for_probe(groups, "Group.Read.All")
+        except ConnectorInitError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+
+        self.logger.info("✅ Outlook connector connection test passed")
+        return True
+
+    def _raise_for_probe(self, response: object, permission: str) -> None:
+        """Raise ConnectorInitError saying what to fix when a permission probe failed."""
+        if response.success:
+            return
+        error = response.error
+        self.logger.error(f"Connection test failed checking {permission}: {error}")
+        problem = describe_sign_in_error(error)
+        if problem:
+            raise ConnectorInitError(problem)
+        status = graph_error_status(error)
+        if status == HttpStatusCode.FORBIDDEN.value or "Authorization_RequestDenied" in str(error) or "ErrorAccessDenied" in str(error):
+            raise ConnectorInitError(
+                f"The app is missing the Microsoft Graph application permission {permission}, or admin "
+                "consent was not granted for it. Add it in the app registration's API permissions and "
+                "grant admin consent."
+            )
+        if status == HttpStatusCode.UNAUTHORIZED.value:
+            raise ConnectorInitError(
+                "Microsoft rejected the app's token (401). Check the Directory (Tenant) ID, the "
+                "Application (Client) ID and the client secret."
+            )
+        raise ConnectorInitError(f"Could not check the {permission} permission: Microsoft Graph returned an error ({status or 'no status'}).")
+
+    async def _get_credentials(self, connector_id: str) -> OutlookCredentials:
+        """Load Outlook credentials from configuration."""
+        try:
+            config_path = ConfigPaths.CONNECTOR_CONFIG_PATH.format(connector_id=connector_id)
+            config = await self.config_service.get_config(config_path)
+
+            if not config:
+                raise ValueError(f"Outlook configuration not found for connector {connector_id}")
+
+            auth = config[OAuthConfigKeys.AUTH]
+            return OutlookCredentials(
+                tenant_id=auth[AuthFieldKeys.TENANT_ID],
+                client_id=auth[AuthFieldKeys.CLIENT_ID],
+                client_secret=auth[AuthFieldKeys.CLIENT_SECRET],
+                has_admin_consent=auth.get(AuthFieldKeys.HAS_ADMIN_CONSENT, False),
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to load Outlook credentials for connector {connector_id}: {e}")
+            raise
+
+    async def _populate_user_cache(self, users: list[AppUser] | None = None) -> None:
+        """Map email -> source_user_id, from ``users`` (a list already read this run) or /users.
+
+        A failed read raises: group memberships are built from this cache, and an empty or
+        partial one would save every group without its members.
+        """
+        current_time = int(datetime.now(timezone.utc).timestamp())
+        if users is None:
+            if (self._user_cache_timestamp and
+                current_time - self._user_cache_timestamp < self._user_cache_ttl and
+                self._user_cache):
+                return
+            self.logger.info("Refreshing user cache...")
+            users = await self._get_all_users_external()
+
+        self._user_cache = {user.email.lower(): user.source_user_id for user in users if user.email}
+        self._user_cache_timestamp = current_time
+        self.logger.info(f"User cache refreshed with {len(self._user_cache)} users")
+
+    async def _get_user_id_from_email(self, email: str) -> str | None:
+        """Get user ID from email using cache."""
+        try:
+            # Ensure cache is populated
+            await self._populate_user_cache()
+
+            return self._user_cache.get(email.lower())
+        except Exception as e:
+            self.logger.error(f"Error getting user ID from cache for {email}: {e}")
+            return None
+
+
+    async def run_sync(self) -> None:
+        """Run full Outlook sync - users, groups, emails and attachments."""
+        try:
+            org_id = self.data_entities_processor.org_id
+            self.logger.info("Starting Outlook sync...")
+
+            # Load filters from config service
+            self.sync_filters, self.indexing_filters = await load_connector_filters(
+                self.config_service, OutlookFilterKeys.TEAM, self.connector_id, self.logger
+            )
+
+            # Ensure external clients are initialized
+            if not self.external_outlook_client or not self.external_users_client:
+                raise Exception("External API clients not initialized. Call init() first.")
+
+            # Set when a mailbox, folder, mail or group is skipped after an error; see
+            # full_sync_coverage.
+            self._full_sync_incomplete = False
+            self._skipped = {"mailboxes": 0, "folders": 0, "groups": 0, "mails": 0}
+
+            # Recover from an idle-closed HTTP transport before the first Graph call.
+            await self._reinitialize_client_if_needed()
+
+            # Sync users and get list of users to process
+            users_to_sync = await self._sync_users()
+
+            # Groups and mailboxes are independent: a groups failure (throttling, a tenant
+            # without Group.Read.All) must not stop mail from syncing. It is counted as skipped,
+            # not raised: a failed full sync is owed again, which first clears every delta link.
+            try:
+                synced_groups = await self._sync_user_groups()
+                await self._sync_group_conversations(synced_groups)
+            except Exception as e:
+                self.logger.error(f"Microsoft 365 groups sync failed; syncing mailboxes anyway: {e}")
+                self._skipped["groups"] += 1
+                self._full_sync_incomplete = True
+
+            # Process emails per user
+            async for status in self._process_users(org_id, users_to_sync):
+                self.logger.info(status)
+
+            if users_to_sync and self._skipped["mailboxes"] == len(users_to_sync):
+                raise Exception(f"All {len(users_to_sync)} mailboxes failed to sync")
+
+            self.logger.info("Outlook sync completed successfully")
+            await notify_sync_outcome(self, None, self._skipped)
+
+        except Exception as e:
+            self.logger.error(f"Error during Outlook sync: {e}")
+            await notify_sync_outcome(self, e, self._skipped)
+            raise
+
+    def full_sync_coverage(self) -> FullSyncCoverage:
+        """A full sync that skipped a mailbox, folder, mail or group after an error did not
+        see what it holds, so nothing is unlinked after it. Graph gives no cheap way to note
+        a skipped mailbox's stored mail as seen, so the whole run counts as incomplete."""
+        # No window_start_ms: Received Date is saved as absolute bounds, so stored mail older
+        # than the start is there only because the filter was narrowed, and should be unlinked.
+        return FullSyncCoverage(complete=not self._full_sync_incomplete)
+
+    async def _sync_users(self) -> list[AppUser]:
+        """Sync organization users and return active users to process."""
+        try:
+            self.logger.info("Syncing organization users...")
+
+            # Get all users from Microsoft Graph
+            all_enterprise_users = await self._get_all_users_external()
+
+            # Get active users from database
+            all_active_users = await self.data_entities_processor.get_all_active_users()
+
+            # The same list feeds the user cache: a second /users read could fail or differ.
+            await self._populate_user_cache(all_enterprise_users)
+            email_to_source_id = self._user_cache
+
+            # Filter active users that exist in enterprise (add source_user_id)
+            users_to_sync = []
+            for user in all_active_users:
+                if user.email and user.email.lower() in email_to_source_id:
+                    user.source_user_id = email_to_source_id[user.email.lower()]
+                    users_to_sync.append(user)
+
+            # Apply user filter
+            users_filter = self.sync_filters.get(SyncFilterKey.USERS)
+            has_users_filter = users_filter and not users_filter.is_empty()
+
+            if has_users_filter:
+                selected_emails = {e.lower() for e in users_filter.get_value()}
+                exclude = users_filter.get_operator() == MultiselectOperator.NOT_IN
+
+                filtered_users = [
+                    user for user in users_to_sync
+                    if user.email
+                    and (user.email.lower() in selected_emails) != exclude
+                ]
+                self.logger.info(
+                    "Users filter (%s) applied: %d users selected "
+                    "out of %d active users",
+                    "NOT_IN" if exclude else "IN",
+                    len(filtered_users),
+                    len(users_to_sync),
+                )
+                users_to_sync = filtered_users
+
+            # Sync all enterprise users to database
+            await self.data_entities_processor.on_new_app_users(all_enterprise_users)
+            await self._withdraw_disabled_app_users()
+
+            self.logger.info(f"✅ Synced {len(all_enterprise_users)} enterprise users, {len(users_to_sync)} active users to process")
+
+            return users_to_sync
+
+        except Exception as e:
+            self.logger.error(f"Error syncing users: {e}")
+            raise
+
+    async def _withdraw_disabled_app_users(self) -> None:
+        """Take the connector away from stored users whose account is disabled, so no mailbox
+        or group grant reaches them. Enabling the account saves the user, and the access, again."""
+        if not self._disabled_user_ids:
+            return
+        gone = [
+            u for u in await self.data_entities_processor.get_all_app_users(self.connector_id, raise_on_error=True)
+            if u.source_user_id in self._disabled_user_ids
+        ]
+        if gone:
+            await self.data_entities_processor.withdraw_app_user_access(self.connector_id, gone)
+
+    async def _get_all_users_external(self) -> list[AppUser]:
+        """Get all users using external Users Groups API with pagination."""
+        try:
+            if not self.external_users_client:
+                raise Exception("External Users Groups client not initialized")
+
+            all_users = []
+            self._disabled_user_ids = set()
+            next_url = None
+            page_num = 1
+
+            while True:
+                if next_url:
+                    response: UsersGroupsResponse = await self.external_users_client.users_user_list_user(
+                        next_url=next_url
+                    )
+                else:
+                    response: UsersGroupsResponse = await self.external_users_client.users_user_list_user(
+                        select=OutlookAPIFields.USER_SYNC_SELECT_FIELDS,
+                    )
+
+                if not response.success:
+                    # Any failed page fails the list: a partial one would drop the missing
+                    # users from every group they belong to.
+                    raise Exception(f"Failed to fetch users (page {page_num}): {response.error}")
+                if not response.data:
+                    break
+
+                # response.data is UserCollectionResponse with .value containing list[User]
+                user_data = response.data.value if response.data.value else []
+
+                for user in user_data:
+                    # A disabled account is left out like a deleted one: no mailbox sync and
+                    # no group membership (the cache is built from this list).
+                    if user.account_enabled is False:
+                        self._disabled_user_ids.add(user.id)
+                        continue
+                    # Azure AD guest users have no mailbox in this tenant; never sync them.
+                    if user.user_type == "Guest":
+                        self.logger.info(
+                            "Skipping guest user %s (userType=Guest): no mailbox in this tenant",
+                            user.mail or user.user_principal_name,
+                        )
+                        continue
+
+                    display_name = user.display_name or ''
+                    given_name = user.given_name or ''
+                    surname = user.surname or ''
+
+                    full_name = display_name if display_name else f"{given_name} {surname}".strip()
+                    if not full_name:
+                        full_name = (
+                            user.mail
+                            or user.user_principal_name
+                            or OutlookDefaults.UNKNOWN_USER_LABEL
+                        )
+
+                    app_user = AppUser(
+                        app_name=Connectors.OUTLOOK,
+                        connector_id=self.connector_id,
+                        source_user_id=user.id,
+                        email=user.mail or user.user_principal_name,
+                        full_name=full_name
+                    )
+                    all_users.append(app_user)
+
+                # Check for next page
+                next_url = response.data.odata_next_link if response.data.odata_next_link else None
+                if not next_url:
+                    break
+
+                page_num += 1
+
+            self.logger.info(f"Retrieved {len(all_users)} total users across {page_num} page(s)")
+            return all_users
+
+        except Exception as e:
+            # Propagate instead of returning [] — a swallowed failure here makes a dead
+            # transport or auth error look like a legitimately empty tenant.
+            self.logger.error(f"Error getting users from external API: {e}")
+            raise
+
+    async def _sync_user_groups(self) -> list[AppUserGroup]:
+        """Sync Microsoft 365 groups and their memberships (full sync)."""
+        try:
+            self.logger.info("Starting Microsoft 365 groups synchronization...")
+
+            if not self.external_users_client:
+                raise Exception("External Users Groups client not initialized")
+
+            # Get all groups (full sync, no delta)
+            groups = await self._get_all_microsoft_365_groups()
+
+            self.logger.info(f"Found {len(groups)} Microsoft 365 groups to process")
+
+            # Apply groups filter (IN / NOT_IN) based on group mail address
+            groups_filter = self.sync_filters.get(SyncFilterKey.GROUPS)
+            if groups_filter and not groups_filter.is_empty():
+                total_before = len(groups)
+                selected_mails = {m.lower() for m in groups_filter.get_value()}
+                operator = groups_filter.get_operator()
+
+                if operator == MultiselectOperator.IN:
+                    groups = [
+                        g for g in groups
+                        if g.mail and g.mail.lower() in selected_mails
+                    ]
+                elif operator == MultiselectOperator.NOT_IN:
+                    groups = [
+                        g for g in groups
+                        if not g.mail or g.mail.lower() not in selected_mails
+                    ]
+
+                self.logger.info(
+                    "Groups filter (%s) applied: %d groups selected out of %d",
+                    operator.value, len(groups), total_before,
+                )
+
+            # Process groups in batches
+            user_groups_batch: list[tuple[AppUserGroup, list[AppUser]]] = []
+            group_record_groups_batch: list[tuple[RecordGroup, list]] = []
+            all_synced_user_groups: list[AppUserGroup] = []
+            batch_size = OutlookSyncConfig.USER_GROUPS_SYNC_BATCH_SIZE
+
+            # groups are Pydantic Group objects from _get_all_microsoft_365_groups
+            for group in groups:
+                try:
+                    # Check if group was deleted
+                    additional_data = group.additional_data or {}
+                    is_deleted = (additional_data.get('@removed', {}).get('reason') == 'deleted')
+
+                    if is_deleted:
+                        group_id = group.id
+                        self.logger.info(f"Deleting group: {group_id}")
+                        await self.data_entities_processor.on_user_group_deleted(
+                            external_group_id=group_id,
+                            connector_id=self.connector_id
+                        )
+                        continue
+
+                    # Process add/update
+                    group_id = group.id
+                    group_name = group.display_name or OutlookDefaults.UNKNOWN_GROUP_LABEL
+
+                    if not group_id:
+                        continue
+
+                    self.logger.debug(f"Processing group: {group_name} ({group_id})")
+
+                    # Create AppUserGroup
+                    user_group = AppUserGroup(
+                        app_name=Connectors.OUTLOOK,
+                        connector_id=self.connector_id,
+                        source_user_group_id=group_id,
+                        name=group_name,
+                        org_id=self.data_entities_processor.org_id,
+                        description=group.description,
+                    )
+
+                    # Cache group mail properties for URL construction
+                    group_mail = group.mail
+                    group_mail_nickname = group.mail_nickname
+                    if group_id and group_mail and group_mail_nickname:
+                        self._group_cache[group_id] = {
+                            'mail': group_mail,
+                            'mailNickname': group_mail_nickname
+                        }
+
+                    # Create RecordGroup for group mailbox
+                    group_record_group = self._transform_group_to_record_group(group)
+
+                    # Fetch members for this group. Unknown is not empty: a failed read keeps
+                    # the stored members, while the mailbox and its conversations sync as usual.
+                    try:
+                        members = await self._get_group_members(group_id)
+                    except Exception as e:
+                        self.logger.error(f"Keeping stored members of group {group_id}: {e}")
+                        self._full_sync_incomplete = True
+                        self._skipped["groups"] += 1
+                        await self.data_entities_processor.note_kept_user_group(self.connector_id, group_id)
+                        members = None
+
+                    # Convert to AppUser objects - members are Pydantic User objects from _get_group_members
+                    app_users = []
+                    for member in members or []:
+                        # transitiveMembers also lists nested groups and devices, which have no UPN.
+                        member_email = getattr(member, "mail", None) or getattr(member, "user_principal_name", None)
+                        if member_email:
+                            # Look up existing user from cache
+                            user_id = self._user_cache.get(member_email.lower())
+                            if user_id:
+                                app_user = AppUser(
+                                    app_name=Connectors.OUTLOOK,
+                                    connector_id=self.connector_id,
+                                    source_user_id=user_id,
+                                    email=member_email,
+                                    full_name=member.display_name or '',
+                                )
+                                app_users.append(app_user)
+
+                    if members is not None:
+                        user_groups_batch.append((user_group, app_users))
+                    all_synced_user_groups.append(user_group)
+
+                    # Add group mailbox RecordGroup to batch with group permission
+                    if group_record_group:
+                        # Create group-level permission for the Microsoft 365 group
+                        group_permission = Permission(
+                            external_id=group_id,
+                            type=PermissionType.READ,
+                            entity_type=EntityType.GROUP
+                        )
+                        group_record_groups_batch.append((group_record_group, [group_permission]))
+
+                    # Process batch if size reached
+                    if len(user_groups_batch) >= batch_size:
+                        await self.data_entities_processor.on_new_user_groups(user_groups_batch)
+                        self.logger.info(f"Processed batch of {len(user_groups_batch)} groups")
+                        user_groups_batch = []
+
+                        # Also sync group mailbox RecordGroups
+                        if group_record_groups_batch:
+                            await self.data_entities_processor.on_new_record_groups(group_record_groups_batch)
+                            group_record_groups_batch = []
+
+                except Exception as e:
+                    group_name = group.display_name or 'unknown'
+                    self.logger.error(f"Error processing group {group_name}: {e}")
+                    self._full_sync_incomplete = True
+                    self._skipped["groups"] += 1
+                    # Unknown is not empty: keep the stored members of this group.
+                    if group.id:
+                        await self.data_entities_processor.note_kept_user_group(self.connector_id, group.id)
+                    continue
+
+            # Process remaining groups
+            if user_groups_batch:
+                await self.data_entities_processor.on_new_user_groups(user_groups_batch)
+                self.logger.info(f"Processed final batch of {len(user_groups_batch)} groups")
+
+            # Process remaining group mailbox RecordGroups
+            if group_record_groups_batch:
+                await self.data_entities_processor.on_new_record_groups(group_record_groups_batch)
+
+            await self._drop_missing_groups({group.id for group in groups if group.id})
+
+            self.logger.info(f"✅ Synced {len(all_synced_user_groups)} Microsoft 365 groups")
+
+            # Return synced AppUserGroups for conversation sync
+            return all_synced_user_groups
+
+        except Exception as e:
+            self.logger.error(f"Error syncing user groups: {e}", exc_info=True)
+            raise
+
+    async def _drop_missing_groups(self, current_group_ids: set[str]) -> None:
+        """Delete the groups synced last run that are gone now, with their mailbox and posts.
+
+        The group list is not a delta query, so a deleted group shows only as an absence.
+        Left in place it keeps its members' grant on every post. The inventory is a sync
+        point, cleared by a full sync, so a groups-filter change never reads as a deletion.
+        """
+        key = generate_record_sync_point_key(
+            OutlookSyncPointKeys.RECORD_TYPE_GROUP_CONVERSATIONS,
+            OutlookSyncPointKeys.SEGMENT_GROUP_INVENTORY,
+            "all",
+        )
+        fingerprint = self._filter_fingerprint(SyncFilterKey.GROUPS)
+        previous = await self.group_conversations_sync_point.read_sync_point(key) or {}
+        failed: set[str] = set()  # kept in the inventory, so the next run deletes them again
+        if previous.get(OutlookSyncPointKeys.FILTER_FINGERPRINT) == fingerprint:
+            for group_id in set(previous.get(OutlookSyncPointKeys.GROUP_IDS) or []) - current_group_ids:
+                self.logger.info("Microsoft 365 group %s is gone; deleting it", group_id)
+                if not await self._delete_record_group(group_id):
+                    failed.add(group_id)
+                    continue
+                await self.data_entities_processor.on_user_group_deleted(
+                    external_group_id=group_id, connector_id=self.connector_id,
+                )
+                # A deleted group can be restored with the same id; its old cursor would
+                # then hide every earlier post.
+                await self.group_conversations_sync_point.delete_sync_point(
+                    generate_record_sync_point_key(
+                        OutlookSyncPointKeys.RECORD_TYPE_GROUP_CONVERSATIONS,
+                        OutlookSyncPointKeys.SEGMENT_GROUP,
+                        group_id,
+                    )
+                )
+        await self.group_conversations_sync_point.update_sync_point(
+            key,
+            {
+                OutlookSyncPointKeys.GROUP_IDS: sorted(current_group_ids | failed),
+                OutlookSyncPointKeys.FILTER_FINGERPRINT: fingerprint,
+            },
+        )
+
+    async def _get_all_microsoft_365_groups(self) -> list[Group]:
+        """Get all Microsoft 365 groups with pagination.
+
+        Raises on any failed page: an empty or partial list would make the missing
+        groups look deleted.
+        """
+        try:
+            if not self.external_users_client:
+                raise Exception("External Users Groups client not initialized")
+
+            all_groups = []
+            next_url = None
+            page_num = 1
+
+            while True:
+                response = await self.external_users_client.groups_list_groups(
+                    next_url=next_url,
+                    select=OutlookAPIFields.GROUP_SELECT_FIELDS
+                )
+
+                if not response.success:
+                    raise Exception(f"Failed to get groups page {page_num}: {response.error}")
+
+                # response.data is GroupCollectionResponse with .value containing list[Group]
+                groups_page = response.data.value if response.data.value else []
+                all_groups.extend(groups_page)
+
+                # Check for next page
+                next_url = response.data.odata_next_link if response.data.odata_next_link else None
+                if not next_url:
+                    break
+
+                page_num += 1
+
+            # Filter: Microsoft 365 (Unified) groups with a mailbox
+            microsoft_365_groups = [
+                group for group in all_groups
+                if group.group_types and 'Unified' in group.group_types
+                and group.mail_enabled is True
+            ]
+
+            self.logger.info(f"Retrieved {len(all_groups)} total groups across {page_num} page(s), filtered to {len(microsoft_365_groups)} Microsoft 365 groups with mailbox")
+            return microsoft_365_groups
+
+        except Exception as e:
+            self.logger.error(f"Error getting Microsoft 365 groups: {e}", exc_info=True)
+            raise
+
+    async def _get_group_members(self, group_id: str) -> list[User]:
+        """Get members of a specific group with pagination."""
+        try:
+            if not self.external_users_client:
+                raise Exception("External Users Groups client not initialized")
+
+            all_members = []
+            next_url = None
+            page_num = 1
+
+            while True:
+                response = await self.external_users_client.groups_list_transitive_members(
+                    group_id=group_id,
+                    next_url=next_url,
+                    select=OutlookAPIFields.GROUP_MEMBER_SELECT_FIELDS
+                )
+
+                if not response.success:
+                    # Raise: the member list replaces every membership edge, so a partial
+                    # one would revoke the missing members' access for this run.
+                    raise Exception(f"Failed to get members page {page_num} for group {group_id}: {response.error}")
+
+                # response.data is DirectoryObjectCollectionResponse with .value containing list[User]
+                members_page = response.data.value if response.data.value else []
+                all_members.extend(members_page)
+
+                # Check for next page
+                next_url = response.data.odata_next_link if response.data.odata_next_link else None
+                if not next_url:
+                    break
+
+                page_num += 1
+
+            return all_members
+
+        except Exception as e:
+            self.logger.error(f"Error getting group members for {group_id}: {e}")
+            raise
+
+    async def _get_user_groups(self, user_id: str) -> list[Group]:
+        """Get groups that a user is a member of (cached for performance).
+
+        Returns:
+            List of Pydantic Group objects
+        """
+        try:
+            if not self.external_users_client:
+                return []
+
+            # Use the existing groups_list_member_of method
+            response = await self.external_users_client.groups_list_member_of(
+                group_id=user_id,  # Note: This method name is misleading, it actually takes user_id
+                select=OutlookAPIFields.USER_GROUP_SELECT_FIELDS
+            )
+
+            if not response.success:
+                return []
+
+            # response.data is DirectoryObjectCollectionResponse with .value containing list[Group]
+            return response.data.value if response.data.value else []
+
+        except Exception as e:
+            self.logger.error(f"Error getting user groups for {user_id}: {e}")
+            return []
+
+    def _transform_group_to_record_group(self, group: Group) -> RecordGroup | None:
+        """
+        Transform Microsoft 365 group to RecordGroup entity for group mailbox.
+
+        Args:
+            group: Pydantic Group object from Microsoft Graph API
+
+        Returns:
+            RecordGroup object or None if transformation fails
+        """
+        try:
+            # group is a Pydantic Group object
+            group_id = group.id
+            group_name = group.display_name or OutlookDefaults.UNKNOWN_GROUP_LABEL
+
+            if not group_id:
+                self.logger.warning("Group has no ID, skipping RecordGroup creation")
+                return None
+
+            # Get group description and mail
+            group_mail = group.mail or ''
+
+            # Create simple description
+            description = f"{group_name} group mailbox"
+            if group_mail:
+                description += f" ({group_mail})"
+
+            # Get timestamps if available
+            created_at = datetime_to_epoch_ms(group.created_date_time)
+
+            return RecordGroup(
+                org_id=self.data_entities_processor.org_id,
+                name=group_name,
+                short_name=group_name,
+                description=description,
+                external_group_id=group_id,
+                parent_external_group_id=None,
+                connector_name=Connectors.OUTLOOK,
+                connector_id=self.connector_id,
+                group_type=RecordGroupType.GROUP_MAILBOX,
+                permission_model=PermissionModel.RECORD_GROUP_LEVEL,
+                # The group grant is the audience. Posts and attachments inherit
+                # it; an inherit edge to the app would open the mailbox to everyone
+                # who can open the connector.
+                inherit_permissions=False,
+                web_url=None,
+                source_created_at=created_at,
+                source_updated_at=created_at,
+            )
+
+
+        except Exception as e:
+            self.logger.error(f"Error transforming group to RecordGroup: {e}")
+            return None
+
+    async def _sync_group_conversations(self, user_groups: list[AppUserGroup]) -> None:
+        """Sync conversations from all Microsoft 365 group mailboxes."""
+        try:
+            self.logger.info("Starting group conversations synchronization...")
+
+            if not self.external_outlook_client:
+                raise Exception("External Outlook client not initialized")
+
+            if not user_groups:
+                self.logger.info("No groups provided for conversation sync")
+                return
+
+            self.logger.info(f"Syncing conversations for {len(user_groups)} groups")
+
+            total_conversations = 0
+            for group in user_groups:
+                try:
+                    count = await self._sync_single_group_conversations(group)
+                    total_conversations += count
+                except Exception as e:
+                    self.logger.error(f"Error syncing conversations for group {group.name}: {e}")
+                    continue
+
+            self.logger.info(f"✅ Synced {total_conversations} group conversation posts across {len(user_groups)} groups")
+
+        except Exception as e:
+            self.logger.error(f"Error syncing group conversations: {e}", exc_info=True)
+            raise
+
+    async def _sync_single_group_conversations(self, group: AppUserGroup) -> int:
+        """Sync conversations for a single group with incremental thread filtering."""
+        try:
+            group_id = group.source_user_group_id
+            group_name = group.name
+            org_id = self.data_entities_processor.org_id
+
+            self.logger.info(f"Syncing conversations for group: {group_name}")
+
+            # Get sync point for this group (tracks last thread sync)
+            sync_point_key = generate_record_sync_point_key(
+                OutlookSyncPointKeys.RECORD_TYPE_GROUP_CONVERSATIONS,
+                OutlookSyncPointKeys.SEGMENT_GROUP,
+                group_id
+            )
+            sync_point = await self.group_conversations_sync_point.read_sync_point(sync_point_key)
+            last_sync_timestamp = sync_point.get('last_sync_timestamp') if sync_point else None
+
+            # Convert timestamp to correct format if needed
+            if last_sync_timestamp:
+                try:
+                    dt = datetime.fromisoformat(last_sync_timestamp.replace('Z', '+00:00'))
+                    # Read back an overlap: a post can become visible after a later one with an earlier
+                    # delivery time. Replayed posts are unchanged, so they are not re-indexed.
+                    dt -= timedelta(minutes=OutlookSyncConfig.GROUP_CURSOR_OVERLAP_MINUTES)
+                    last_sync_timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                except (ValueError, AttributeError) as e:
+                    self.logger.warning(f"Failed to parse timestamp '{last_sync_timestamp}': {e}. Will perform full sync for this group.")
+                    last_sync_timestamp = None
+
+            # Threads delivered since the last sync and inside the Received Date filter (filtered client-side)
+            received_after, received_before = self._received_date_window()
+            threads = await self._get_group_threads(group_id, last_sync_timestamp, received_after)
+
+            if not threads:
+                self.logger.debug(f"No updated threads found for group {group_name}")
+                return 0
+
+            self.logger.info(f"Found {len(threads)} updated threads for group {group_name}")
+
+            total_posts = 0
+            failed_threads = 0
+            for thread in threads:
+                try:
+                    # Get all posts for this thread, filter client-side
+                    posts_count = await self._process_group_thread(
+                        org_id, group, thread, last_sync_timestamp, received_after, received_before
+                    )
+                    total_posts += posts_count
+                except Exception as e:
+                    # threads are Pydantic ConversationThread objects from _get_group_threads
+                    thread_id = thread.id if hasattr(thread, 'id') else 'unknown'
+                    self.logger.error(f"Error processing thread {thread_id}: {e}")
+                    failed_threads += 1
+
+            if failed_threads:
+                # Moving the cursor past a failed thread would drop its posts for good.
+                self._full_sync_incomplete = True
+                self._skipped["groups"] += 1
+                self.logger.warning(
+                    "Group %s: %d thread(s) failed; keeping the cursor so the next run retries them",
+                    group_name, failed_threads,
+                )
+                return total_posts
+
+            # The cursor is the newest delivery Graph reported, not the host clock: a skewed
+            # host clock would skip posts. Truncating to the second only replays, never skips.
+            newest = max((t.last_delivered_date_time for t in threads if t.last_delivered_date_time), default=None)
+            if newest is None:
+                return total_posts
+            timestamp_str = newest.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+
+            await self.group_conversations_sync_point.update_sync_point(
+                sync_point_key,
+                {
+                    'last_sync_timestamp': timestamp_str,
+                    'group_id': group_id,
+                    'group_name': group_name
+                }
+            )
+
+            return total_posts
+
+        except Exception as e:
+            self.logger.error(f"Error syncing conversations for group {group.name}: {e}")
+            self._full_sync_incomplete = True
+            self._skipped["groups"] += 1
+            return 0
+
+    def _received_date_window(self) -> tuple[datetime | None, datetime | None]:
+        """The Received Date sync filter as UTC datetimes (after, before); None where unset."""
+        received_date_filter = self.sync_filters.get(SyncFilterKey.RECEIVED_DATE)
+        if not received_date_filter or received_date_filter.is_empty():
+            return None, None
+        after_iso, before_iso = received_date_filter.get_datetime_iso()
+
+        def parse(iso: str | None) -> datetime | None:
+            return datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) if iso else None
+
+        return parse(after_iso), parse(before_iso)
+
+    async def _get_group_threads(
+        self, group_id: str, last_sync_timestamp: str | None = None, received_after: datetime | None = None
+    ) -> list[ConversationThread]:
+        """Get the threads of a group delivered at or after ``last_sync_timestamp`` and ``received_after`` (follows nextLink).
+
+        Filtered here, not by $filter: the threads collection rejects any filter but IsLocked
+        (501 ConversationFilterOther). Raises on failure: the caller would otherwise read
+        "no new threads" and move on.
+        """
+        if not self.external_outlook_client:
+            raise Exception("External Outlook client not initialized")
+
+        since = (
+            datetime.fromisoformat(last_sync_timestamp.replace('Z', '+00:00'))
+            if last_sync_timestamp else None
+        )
+        if received_after and (since is None or received_after > since):
+            since = received_after
+        threads: list[ConversationThread] = []
+        next_url = None
+        while True:
+            response = await self.external_outlook_client.groups_list_threads(
+                group_id=group_id,
+                select=OutlookAPIFields.THREAD_SELECT_FIELDS,
+                next_url=next_url,
+            )
+            if not response.success:
+                raise Exception(f"Failed to get threads for group {group_id}: {response.error}")
+            for thread in response.data.value or []:
+                delivered = thread.last_delivered_date_time
+                if since is None or delivered is None or delivered >= since:
+                    threads.append(thread)
+            next_url = response.data.odata_next_link
+            if not next_url:
+                return threads
+
+    async def _process_group_thread(
+        self, org_id: str, group: AppUserGroup, thread: ConversationThread, last_sync_timestamp: str | None = None,
+        received_after: datetime | None = None, received_before: datetime | None = None,
+    ) -> int:
+        """Process a single thread and its posts with client-side post filtering.
+
+        Args:
+            thread: Pydantic ConversationThread object
+        """
+        try:
+            group_id = group.source_user_group_id
+            # thread is a Pydantic ConversationThread object from _get_group_threads
+            thread_id = thread.id
+
+            if not thread_id:
+                return 0
+
+            # Parse last sync time for comparison
+            last_sync_time = None
+            if last_sync_timestamp:
+                try:
+                    last_sync_time = datetime.fromisoformat(last_sync_timestamp.replace('Z', '+00:00'))
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse sync timestamp: {e}")
+
+            # Get ALL posts in the thread (API doesn't support filtering)
+            all_posts = await self._get_thread_posts(group_id, thread_id)
+
+            if not all_posts:
+                return 0
+
+            # Filter posts client-side - only process new ones
+            posts_to_process = []
+
+            # all_posts are Pydantic Post objects from _get_thread_posts
+            for post in all_posts:
+                post_received = post.received_date_time
+                if post_received:
+                    try:
+                        if isinstance(post_received, str):
+                            post_time = datetime.fromisoformat(post_received.replace('Z', '+00:00'))
+                        else:
+                            post_time = post_received
+
+                        # Include post if it's new (after last sync) and inside the Received Date filter
+                        in_window = (not received_after or post_time >= received_after) and (
+                            not received_before or post_time < received_before
+                        )
+                        if in_window and (not last_sync_time or post_time > last_sync_time):
+                            posts_to_process.append(post)
+                    except Exception as e:
+                        self.logger.warning(f"Error parsing post time: {e}")
+                        # Include post if we can't parse time (safer)
+                        posts_to_process.append(post)
+                else:
+                    # No timestamp - include it (safer)
+                    posts_to_process.append(post)
+
+            if not posts_to_process:
+                return 0
+
+            self.logger.debug(f"Processing {len(posts_to_process)} new posts out of {len(all_posts)} total")
+
+            # Process each new post as a MailRecord
+            batch_records = []
+            for post in posts_to_process:
+                try:
+                    record_update = await self._process_group_post(org_id, group, thread, post)
+                    if record_update and record_update.record:
+                        permissions = record_update.new_permissions or []
+                        batch_records.append((record_update.record, permissions))
+
+                        # Process attachments if post has them
+                        has_attachments = post.has_attachments or False
+                        if has_attachments:
+                            attachment_updates = await self._process_group_post_attachments(
+                                org_id, group, thread, post, permissions,
+                                parent_post_record_id=record_update.record.id,
+                                parent_post_weburl=record_update.record.weburl,
+                            )
+                            if attachment_updates:
+                                batch_records.extend(attachment_updates)
+                except Exception as e:
+                    post_id = post.id if hasattr(post, 'id') else 'unknown'
+                    self.logger.error(f"Error processing post {post_id}: {e}")
+                    raise
+
+            # Save batch
+            if batch_records:
+                await self.data_entities_processor.on_new_records(
+                    batch_records, replace_permissions=True
+                )
+
+            return len(batch_records)
+
+        except Exception as e:
+            self.logger.error(f"Error processing thread: {e}")
+            raise
+
+    async def _get_thread_posts(self, group_id: str, thread_id: str) -> list[Post]:
+        """Get all posts in a thread (follows nextLink). Raises on failure."""
+        if not self.external_outlook_client:
+            raise Exception("External Outlook client not initialized")
+
+        posts: list[Post] = []
+        next_url = None
+        while True:
+            response = await self.external_outlook_client.groups_threads_list_posts(
+                group_id=group_id,
+                thread_id=thread_id,
+                select=OutlookAPIFields.POST_SELECT_FIELDS,
+                next_url=next_url,
+            )
+            if not response.success:
+                raise Exception(f"Failed to get posts for thread {thread_id}: {response.error}")
+            posts.extend(response.data.value or [])
+            next_url = response.data.odata_next_link
+            if not next_url:
+                return posts
+
+    async def _process_group_post(
+        self,
+        org_id: str,
+        group: AppUserGroup,
+        thread: ConversationThread,
+        post: Post
+    ) -> RecordUpdate | None:
+        """Process a single group post as a MailRecord.
+
+        Args:
+            thread: Pydantic ConversationThread object
+            post: Pydantic Post object
+        """
+        try:
+            # post and thread are Pydantic objects
+            post_id = post.id
+
+            # Check if record exists
+            existing_record = await self._get_existing_record(org_id, post_id)
+            is_new = existing_record is None
+            is_updated = False
+
+            if not is_new:
+                # Check if post was updated (no etag for posts, use receivedDateTime)
+                current_received = post.received_date_time
+                if current_received and existing_record.source_updated_at:
+                    current_ts = datetime_to_epoch_ms(current_received)
+                    if current_ts and current_ts > existing_record.source_updated_at:
+                        is_updated = True
+
+            record_id = existing_record.id if existing_record else str(uuid.uuid4())
+
+            # Extract sender
+            from_obj = post.from_
+            sender_email = self._extract_email_from_recipient(from_obj) if from_obj else ''
+
+            # Get thread topic as subject
+            thread_topic = thread.topic
+
+            # Get thread ID from the thread object
+            thread_id = thread.id
+
+            # Group conversations don't have individual recipients - access is controlled by group membership
+            to_emails = []
+            cc_emails = []
+
+            # Graph gives posts and threads no web link, and Outlook on the web has no stable
+            # link to one group conversation, so a post opens its group's mailbox.
+            group_id = group.source_user_group_id
+            weburl = await self._construct_group_mail_weburl(group_id)
+
+            # Create MailRecord for the post
+            mail_record = MailRecord(
+                id=record_id,
+                org_id=org_id,
+                record_name=thread_topic,
+                record_type=RecordType.GROUP_MAIL,
+                external_record_id=post_id,
+                version=0 if is_new else existing_record.version + (1 if is_updated else 0),
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.OUTLOOK,
+                connector_id=self.connector_id,
+                source_created_at=datetime_to_epoch_ms(post.received_date_time),
+                source_updated_at=datetime_to_epoch_ms(post.received_date_time),
+                weburl=weburl,
+                mime_type=MimeTypes.HTML.value,
+                external_record_group_id=group_id,
+                record_group_type=RecordGroupType.GROUP_MAILBOX,
+                inherit_permissions=True,
+                subject=thread_topic,
+                from_email=sender_email,
+                to_emails=to_emails,
+                cc_emails=cc_emails,
+                bcc_emails=[],
+                thread_id=thread_id,
+                is_parent=False,
+                internet_message_id='',
+                conversation_index='',
+            )
+
+            # Apply indexing filter
+            if not self.indexing_filters.is_enabled(IndexingFilterKey.GROUP_CONVERSATIONS, default=True):
+                mail_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+
+            # The group mailbox already holds the grant. A copy on the post
+            # would be a second path to the same people.
+            return RecordUpdate(
+                record=mail_record,
+                is_new=is_new,
+                is_updated=is_updated,
+                is_deleted=False,
+                metadata_changed=False,
+                content_changed=is_updated,
+                permissions_changed=False,
+                new_permissions=[],
+                external_record_id=post_id,
+            )
+
+        except Exception as e:
+            # Raise, not None: a skipped post would let its thread count as synced.
+            self.logger.error(f"Error processing group post: {e}")
+            raise
+
+    async def _process_group_post_attachments(
+        self,
+        org_id: str,
+        group: AppUserGroup,
+        thread: ConversationThread,
+        post: Post,
+        _post_permissions: list[Permission],
+        parent_post_record_id: str,
+        parent_post_weburl: str | None = None,
+    ) -> list[tuple[Record, list[Permission]]]:
+        """Process attachments for a group post.
+
+        Args:
+            thread: Pydantic ConversationThread object
+            post: Pydantic Post object
+        """
+        try:
+            group_id = group.source_user_group_id
+            # Posts listed under a thread do not carry conversationThreadId; the thread does.
+            thread_id = thread.id or post.conversation_thread_id
+            post_id = post.id
+
+            if not thread_id:
+                self.logger.warning(f"No thread_id for post {post_id}")
+                return []
+
+            attachments = await self._get_group_post_attachments(group_id, thread_id, post_id)
+
+            if not attachments:
+                return []
+
+            attachment_records = []
+
+            # attachments are Pydantic Attachment objects from _get_group_post_attachments
+            for attachment in attachments:
+                try:
+                    attachment_id = attachment.id
+                    kind = unsynced_attachment_kind(attachment)
+                    if kind:
+                        self.logger.info(f"Skipping attachment '{attachment.name}' of post {post_id}: {kind} has no file to index")
+                        continue
+                    existing_record = await self._get_existing_record(org_id, attachment_id)
+
+                    content_type = attachment.content_type
+                    if not content_type:
+                        continue
+
+                    is_new = existing_record is None
+                    record_id = existing_record.id if existing_record else str(uuid.uuid4())
+                    modified_at = datetime_to_epoch_ms(attachment.last_modified_date_time)
+                    changed = not is_new and modified_at != existing_record.source_updated_at
+
+                    file_name, mime_type, extension = attachment_metadata_from_graph(
+                        attachment.name,
+                        content_type,
+                        OutlookDefaults.ATTACHMENT_NAME,
+                    )
+
+                    attachment_record = FileRecord(
+                        id=record_id,
+                        org_id=org_id,
+                        record_name=file_name,
+                        record_type=RecordType.FILE,
+                        external_record_id=attachment_id,
+                        version=0 if is_new else existing_record.version + (1 if changed else 0),
+                        origin=OriginTypes.CONNECTOR,
+                        connector_name=Connectors.OUTLOOK,
+                        connector_id=self.connector_id,
+                        source_created_at=datetime_to_epoch_ms(attachment.last_modified_date_time),
+                        source_updated_at=datetime_to_epoch_ms(attachment.last_modified_date_time),
+                        mime_type=mime_type,
+                        parent_external_record_id=post_id,
+                        parent_record_type=RecordType.GROUP_MAIL,
+                        external_record_group_id=group_id,
+                        record_group_type=RecordGroupType.GROUP_MAILBOX,
+                        inherit_permissions=True,
+                        weburl=parent_post_weburl,
+                        is_file=True,
+                        size_in_bytes=attachment.size or 0,
+                        extension=extension,
+                        is_dependent_node=True,
+                        parent_node_id=parent_post_record_id,
+                    )
+
+                    if not self.indexing_filters.is_enabled(IndexingFilterKey.ATTACHMENTS, default=True):
+                        attachment_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+                    cap_attachment_indexing(attachment_record, self.logger)
+
+                    attachment_records.append((attachment_record, []))
+
+                except Exception as e:
+                    # Raise, not skip: the post is not read again once the cursor moves past it.
+                    self.logger.error(f"Error processing group post attachment: {e}")
+                    raise
+
+            return attachment_records
+
+        except Exception as e:
+            # Raise so the thread counts as failed and the group cursor stays put; returning []
+            # saved the post and lost its attachments for good.
+            self.logger.error(f"Error processing attachments for post: {e}")
+            raise
+
+    async def _get_group_post_attachments(self, group_id: str, thread_id: str, post_id: str) -> list[Attachment]:
+        """Get the attachments of a group post (with their content).
+
+        Read through ``$expand=attachments`` on the post: app-only tokens get 403 from
+        the post's attachments endpoint. Raises on failure, since an empty list would
+        read as "this post has no attachments".
+        """
+        if not self.external_outlook_client:
+            raise Exception("External Outlook client not initialized")
+
+        response = await self.external_outlook_client.groups_threads_get_post(
+            group_id=group_id,
+            thread_id=thread_id,
+            post_id=post_id,
+            # Metadata only: listing needs no content bytes (streaming fetches them).
+            expand=[OutlookAPIFields.POST_ATTACHMENTS_METADATA_EXPAND],
+        )
+        if not response.success:
+            raise Exception(f"Failed to get attachments for post {post_id}: {response.error}")
+        return list(getattr(response.data, "attachments", None) or [])
+
+    async def _download_group_post_attachment(
+        self, group_id: str, thread_id: str, post_id: str, attachment_id: str
+    ) -> bytes:
+        """Download attachment content from a group post.
+
+        Raises rather than returning empty bytes: a failed download that returns
+        ``b''`` streams a zero-byte file with a 200 the client cannot detect.
+        """
+        if not self.external_outlook_client:
+            raise connector_not_ready(self.display_name)
+
+        # $expand=attachments loads every attachment of the post with its content, so the
+        # post's total size is checked first, from the metadata alone.
+        response = await self.external_outlook_client.groups_threads_get_post(
+            group_id=group_id,
+            thread_id=thread_id,
+            post_id=post_id,
+            expand=[OutlookAPIFields.POST_ATTACHMENTS_METADATA_EXPAND],
+        )
+        if response.success and response.data is not None:
+            total = sum(a.size or 0 for a in (getattr(response.data, "attachments", None) or []))
+            if total > OutlookSyncConfig.MAX_INDEXED_ATTACHMENT_BYTES:
+                raise not_downloadable(OutlookHTTPDetails.GROUP_ATTACHMENT_TOO_LARGE, connector=self.display_name)
+            response = await self.external_outlook_client.groups_threads_get_post(
+                group_id=group_id,
+                thread_id=thread_id,
+                post_id=post_id,
+                expand=["attachments"],
+            )
+
+        if not response.success:
+            self.logger.error(
+                f"Failed to download group post attachment {attachment_id}: {response.error}"
+            )
+        raise_for_stream_fetch(
+            success=response.success,
+            has_payload=response.data is not None,
+            connector=self.display_name,
+            message=response.error,
+        )
+
+        attachment = next(
+            (a for a in (getattr(response.data, "attachments", None) or []) if a.id == attachment_id),
+            None,
+        )
+        if attachment is None:
+            raise not_found_at_source(self.display_name)
+        content_bytes = getattr(attachment, "content_bytes", None)
+        if not content_bytes:
+            raise not_downloadable(
+                OutlookHTTPDetails.ATTACHMENT_NOT_DOWNLOADABLE,
+                connector=self.display_name,
+            )
+
+        # Kiota (>=1.11.7, pinned) has already base64-decoded contentBytes.
+        return content_bytes
+
+    async def _process_users(self, org_id: str, users: list[AppUser]) -> AsyncGenerator[str, None]:
+        """Process users sequentially."""
+        for i, user in enumerate(users):
+            self.logger.info(f"Processing user {i+1}/{len(users)}: {user.email}")
+            try:
+                # Process emails from all folders (includes folder discovery)
+                email_result = await self._process_user_emails(org_id, user)
+                yield f"User {i+1}/{len(users)}: {email_result}"
+            except Exception as e:
+                self.logger.error(f"Error processing user {user.email}: {e}")
+                self._full_sync_incomplete = True
+                self._skipped["mailboxes"] += 1
+                yield f"User {i+1}/{len(users)}: Failed - {str(e)}"
+
+    async def _process_user_emails(self, org_id: str, user: AppUser) -> str:
+        """Process emails from all folders sequentially."""
+        try:
+            incomplete_before, self._full_sync_incomplete = self._full_sync_incomplete, False
+            # Sync folders as RecordGroups and get folder data for email processing
+            folders = await self._sync_user_folders(user)
+
+            if not folders:
+                self._full_sync_incomplete = incomplete_before or self._full_sync_incomplete
+                return f"No folders found for {user.email}"
+
+            total_processed = 0
+            folder_results = []
+            all_mail_records = []  # Id, thread and conversation index of each mail, for thread edges
+            failed_folders = 0
+            self._pending_removals = []
+            self._pending_full_reads = []
+
+            # Process folders sequentially instead of concurrently
+            # folders are MailFolder Pydantic objects from _sync_user_folders
+            for folder in folders:
+                folder_name = folder.display_name or OutlookDefaults.FOLDER_NAME
+                try:
+                    result, folder_mail_records = await self._process_single_folder_messages(org_id, user, folder)
+                    folder_results.append(f"{folder_name}: {result} messages")
+                    total_processed += result
+                    all_mail_records.extend(folder_mail_records)  # Collect mail records
+                except Exception as e:
+                    self.logger.error(f"Error processing folder {folder_name}: {e}")
+                    folder_results.append(f"{folder_name}: Failed")
+                    failed_folders += 1
+
+            await self._apply_mail_removals()
+            self._full_sync_incomplete = incomplete_before or bool(failed_folders) or self._full_sync_incomplete
+            if failed_folders == len(folders):
+                raise Exception(f"All {len(folders)} folders of {user.email} failed to sync")
+            self._skipped["folders"] += failed_folders
+
+            # After all folders are processed, create email thread edges using collected records
+            try:
+                thread_edges_created = await self._create_all_thread_edges_for_user(org_id, user, all_mail_records)
+                if thread_edges_created > 0:
+                    self.logger.info(f"Created {thread_edges_created} thread edges for user {user.email}")
+            except Exception as e:
+                self.logger.error(f"Error creating thread edges for user {user.email}: {e}")
+
+            return f"Processed {total_processed} items across {len(folders)} folders: {'; '.join(folder_results)}"
+
+        except Exception as e:
+            self.logger.error(f"Error processing all folders for user {user.email}: {e}")
+            raise
+
+    async def _find_parent_by_conversation_index_from_db(
+        self, conversation_index: str, thread_id: str, org_id: str, user: AppUser,
+        known_ids: dict[tuple[str, str], str] | None = None,
+    ) -> str | None:
+        """Find parent message ID using conversation index: first in ``known_ids``
+        ((thread id, conversation index) -> record id of this run's mail), then in the DB."""
+        if not conversation_index:
+            self.logger.debug(f"No conversation_index provided for thread {thread_id}")
+            return None
+
+        try:
+            # Decode conversation index
+            index_bytes = base64.b64decode(conversation_index)
+
+            # Root message (22 bytes) has no parent
+            if len(index_bytes) <= OutlookThreadDetection.ROOT_CONVERSATION_INDEX_LENGTH:
+                return None
+
+            # Get parent index by removing last 5 bytes
+            parent_bytes = index_bytes[:-OutlookThreadDetection.CHILD_INDEX_SUFFIX_LENGTH]
+            parent_index = base64.b64encode(parent_bytes).decode('utf-8')
+            self.logger.debug(f"Thread {thread_id}: Looking for parent with conversation_index={parent_index}")
+            if known_ids and (thread_id, parent_index) in known_ids:
+                return known_ids[(thread_id, parent_index)]
+
+            parent_record = await self.data_entities_processor.get_record_by_conversation_index(
+                self.connector_id, parent_index, thread_id, user.user_id
+            )
+
+            if parent_record:
+                return parent_record.id
+            else:
+                return None
+
+        except Exception as e:
+            self.logger.error(f"Error finding parent by conversation index from DB for thread {thread_id}: {e}")
+            return None
+
+    async def _create_all_thread_edges_for_user(self, org_id: str, user: AppUser, user_mail_records: list[MailThreadRef]) -> int:
+        """Create thread edges for all email messages of a user by searching ArangoDB for parents."""
+        try:
+            if not user_mail_records:
+                self.logger.debug(f"No mail records provided for user {user.email}")
+                return 0
+
+            edges = []
+            processed_count = 0
+            # One DB lookup per reply is a scan each; parents synced in this run are found here.
+            known_ids = {
+                (r.thread_id, r.conversation_index): r.id
+                for r in user_mail_records if r.thread_id and r.conversation_index
+            }
+
+            # Process each mail record to find its parent
+            for record in user_mail_records:
+                if (hasattr(record, 'conversation_index') and record.conversation_index and
+                    hasattr(record, 'thread_id') and record.thread_id):
+
+                    # Find parent using ArangoDB lookup
+                    parent_id = await self._find_parent_by_conversation_index_from_db(
+                        record.conversation_index,
+                        record.thread_id,
+                        org_id,
+                        user,
+                        known_ids,
+                    )
+
+                    if parent_id:
+                        edge = {
+                            "from_id": parent_id,
+                            "from_collection": CollectionNames.RECORDS.value,
+                            "to_id": record.id,
+                            "to_collection": CollectionNames.RECORDS.value,
+                            "relationshipType": RecordRelations.SIBLING.value
+                        }
+                        edges.append(edge)
+                        processed_count += 1
+
+            # Create all edges in batch
+            if edges:
+                try:
+                    async with self.data_store_provider.transaction() as tx_store:
+                        await tx_store.batch_create_edges(edges, collection=CollectionNames.NODE_RELATIONS.value)
+                except Exception as e:
+                    self.logger.error(f"Error creating thread edges batch for user {user.email}: {e}")
+                    processed_count = 0
+
+            return processed_count
+
+        except Exception as e:
+            self.logger.error(f"Error creating all thread edges for user {user.email}: {e}")
+            return 0
+
+    def _determine_folder_filter_strategy(self) -> tuple[list[str] | None, str | None]:
+        """Determine the folder filtering strategy based on user's filter selections.
+
+        Retrieves filter settings and determines the appropriate filtering strategy:
+
+        Deleted Items (OutlookFolders.DEFAULT_EXCLUDED) is synced only when selected with IN.
+
+        5 Scenarios:
+        1. Nothing selected + custom enabled → Sync ALL folders (standard + custom) but Deleted Items
+        2. Nothing selected + custom disabled → Sync ONLY standard folders but Deleted Items
+        3. Standard folders selected + custom disabled → Sync ONLY selected standard folders
+        4. Standard folders selected + custom enabled → Sync selected standard + ALL custom folders
+        5. All standard folders selected + custom enabled → Sync ALL folders
+
+        Returns:
+            Tuple of (folder_names, filter_mode):
+            - (None, None) = No filter, sync all folders
+            - (list, "include") = Sync only these folders
+            - (list, "exclude") = Sync all except these folders
+        """
+        # Get selected standard folders from filter (NOT_IN selects the others)
+        selected_folders = []
+        has_selection = False
+        folders_filter = self.sync_filters.get(SyncFilterKey.FOLDERS)
+        if folders_filter and not folders_filter.is_empty():
+            selected_folders = folders_filter.get_value()
+            has_selection = True
+            if folders_filter.get_operator() == MultiselectOperator.NOT_IN:
+                selected_folders = [
+                    f for f in OutlookFolders.STANDARD_FOLDERS
+                    if f not in selected_folders and f not in OutlookFolders.DEFAULT_EXCLUDED
+                ]
+
+        # Get sync_custom_folders boolean (default: True)
+        sync_custom_folders = True
+        sync_custom_folders_filter = self.sync_filters.get(SyncFilterKey.CUSTOM_FOLDERS)
+        if sync_custom_folders_filter and not sync_custom_folders_filter.is_empty():
+            sync_custom_folders = sync_custom_folders_filter.get_value()
+
+        if not has_selection:
+            # No folders selected - behavior depends on sync_custom_folders
+            if sync_custom_folders:
+                # Scenario 1: Sync everything but Deleted Items (default behavior)
+                self.logger.info("No folders selected, custom enabled - syncing all folders but Deleted Items")
+                return list(OutlookFolders.DEFAULT_EXCLUDED), "exclude"
+            else:
+                # Scenario 2: Sync only standard folders
+                self.logger.info("No folders selected, custom disabled - syncing only standard folders")
+                return [f for f in OutlookFolders.STANDARD_FOLDERS if f not in OutlookFolders.DEFAULT_EXCLUDED], "include"
+
+        if not sync_custom_folders:
+            # Scenario 3: Only selected standard folders
+            self.logger.info(f"Syncing only selected standard folders: {selected_folders}")
+            return selected_folders, "include"
+
+        # Custom folders are enabled and some standard folders are selected
+        all_standard_selected = set(selected_folders) == set(OutlookFolders.STANDARD_FOLDERS)
+
+        if all_standard_selected:
+            # Scenario 4: All standard folders + custom = everything
+            self.logger.info("All standard folders selected + custom enabled - syncing all folders")
+            return None, None
+
+        # Scenario 5: Selected standard + all custom folders
+        # Strategy: Exclude the non-selected standard folders
+        non_selected = [f for f in OutlookFolders.STANDARD_FOLDERS if f not in selected_folders]
+        self.logger.info(
+            f"Syncing selected standard folders {selected_folders} + all custom folders "
+            f"(excluding non-selected standard: {non_selected})"
+        )
+        return non_selected, "exclude"
+
+    async def _get_child_folders_recursive(
+        self,
+        user_id: str,
+        parent_folder: MailFolder
+    ) -> list[MailFolder]:
+        """Recursively get all child folders of a parent folder.
+
+        Args:
+            user_id: User identifier
+            parent_folder: Parent MailFolder Pydantic object
+
+        Returns:
+            Flattened list of all child folders (including nested children)
+        """
+        parent_folder_id = parent_folder.id
+        parent_folder_name = parent_folder.display_name or OutlookDefaults.UNKNOWN_FOLDER_LABEL
+
+        if not parent_folder_id:
+            return []
+
+        if (parent_folder.child_folder_count or 0) == 0:
+            self.logger.debug(f"Folder '{parent_folder_name}' has no child folders")
+            return []
+
+        if not self.external_outlook_client:
+            raise Exception("External Outlook client not initialized")
+
+        child_folders, complete = await read_child_folders(
+            lambda top, skip: self.external_outlook_client.users_mail_folders_list_child_folders(
+                user_id=user_id, mailFolder_id=parent_folder_id, top=top, skip=skip,
+            ),
+            # A childFolders nextLink is a full URL; any mailFolders builder can follow it.
+            lambda url: self.external_outlook_client.users_list_mail_folders(user_id=user_id, next_url=url),
+            parent_folder,
+        )
+        if not complete:
+            self.logger.warning(
+                f"Graph listed fewer child folders under '{parent_folder_name}' than it counts "
+                f"({parent_folder.child_folder_count}); no folder of this mailbox is removed this run"
+            )
+            self._folder_listing_complete = False
+
+        if not child_folders:
+            return []
+
+        self.logger.info(
+            f"Found {len(child_folders)} child folder(s) under '{parent_folder_name}'"
+        )
+
+        all_descendants = []
+        for child in child_folders:
+            all_descendants.append(child)
+            all_descendants.extend(await self._get_child_folders_recursive(user_id, child))
+
+        return all_descendants
+
+    async def _get_standard_folder_ids(self, user_id: str, folder_names: list[str]) -> set[str]:
+        """Ids of the named standard folders in this mailbox, read by well-known name.
+
+        Display names are localized ("Posteingang"), well-known names are not. A folder
+        the mailbox lacks is skipped; any other failure raises, since a misread standard
+        folder would be synced or dropped against the filter.
+        """
+        ids: set[str] = set()
+        for name in folder_names:
+            well_known = OutlookFolders.WELL_KNOWN_NAMES.get(name)
+            if not well_known:
+                continue
+            response = await self.external_outlook_client.users_get_mail_folders(
+                user_id=user_id, mailFolder_id=well_known,
+            )
+            if response.success and response.data and response.data.id:
+                ids.add(response.data.id)
+            elif is_folder_not_found_error(response.error):
+                self._standard_folder_missing = True
+            else:
+                raise Exception(f"Failed to read the '{name}' folder: {response.error}")
+        return ids
+
+    async def _get_all_folders_for_user(
+        self,
+        user_id: str,
+        folder_names: list[str] | None = None,
+        folder_filter_mode: str | None = None
+    ) -> tuple[list[MailFolder], set[str]]:
+        """Get all folders for a user with optional filtering and nested folder support.
+
+        Args:
+            user_id: User identifier
+            folder_names: Optional list of standard folder labels (OutlookFolders.STANDARD_FOLDERS)
+            folder_filter_mode: 'include' to keep only those top-level folders, 'exclude' to drop them
+
+        Returns:
+            Tuple of (folders, top_level_folder_ids):
+                - folders: List of MailFolder Pydantic objects (includes nested folders by default)
+                - top_level_folder_ids: Set of folder IDs that are top-level
+        """
+        try:
+            if not self.external_outlook_client:
+                raise Exception("External Outlook client not initialized")
+
+            # Paginate through all top-level folders using cursor-based pagination
+            top_level_folders = []
+            next_url = None
+            page_num = 1
+            page_size = OutlookSyncConfig.FOLDER_PAGE_SIZE
+
+            while True:
+                # Get folders page with API-level filtering
+                if next_url:
+                    response: OutlookMailFoldersResponse = await self.external_outlook_client.users_list_mail_folders(
+                        user_id=user_id,
+                        next_url=next_url
+                    )
+                else:
+                    response: OutlookMailFoldersResponse = await self.external_outlook_client.users_list_mail_folders(
+                        user_id=user_id,
+                        top=page_size
+                    )
+
+                if not response.success:
+                    if page_num == 1 and await self._has_no_mailbox(user_id, response.error):
+                        # An unlicensed user: an empty mailbox, not a failed one that keeps
+                        # every run incomplete.
+                        self.logger.info(f"User {user_id} has no Exchange Online mailbox; nothing to sync")
+                        self._no_mailbox = True
+                        return [], set()
+                    # Fail the whole listing: a partial one makes the rest look deleted.
+                    raise Exception(f"Failed to get folders page {page_num}: {response.error}")
+
+                # response.data is MailFolderCollectionResponse with .value containing list[MailFolder]
+                raw_folders = response.data.value if response.data.value else []
+                top_level_folders.extend(raw_folders)
+
+                # Check for next page
+                next_url = response.data.odata_next_link if response.data.odata_next_link else None
+                if not next_url:
+                    break
+
+                page_num += 1
+
+            self.logger.info(f"Retrieved {len(top_level_folders)} top-level folders across {page_num} page(s)")
+
+            if folder_names is not None and folder_filter_mode:
+                self._standard_folder_missing = False
+                standard_ids = await self._get_standard_folder_ids(user_id, folder_names)
+                keep = folder_filter_mode == "include"
+                if keep and self._standard_folder_missing:
+                    # A selected folder Graph answered 404 for may still be there (it was listed
+                    # before): the top-level folders left out are not taken as deleted.
+                    self._folders_maybe_present = {f.id for f in top_level_folders if f.id not in standard_ids}
+                top_level_folders = [f for f in top_level_folders if (f.id in standard_ids) == keep]
+
+            # Track top-level folder IDs to avoid storing parent references for them
+            # This is required to differentiate between top-level folders and nested folders
+            top_level_folder_ids = {folder.id for folder in top_level_folders if folder.id}
+
+            # "include" lists standard folders only (Custom Folders off), and a subfolder
+            # of a standard folder is a custom folder, so it is not read.
+            include_children = folder_filter_mode != "include"
+            all_folders = []
+            for folder in top_level_folders:
+                all_folders.append(folder)
+                if include_children:
+                    all_folders.extend(await self._get_child_folders_recursive(user_id, folder))
+
+            total_nested = len(all_folders) - len(top_level_folders)
+            if total_nested > 0:
+                self.logger.info(
+                    f"Total: {len(top_level_folders)} top-level + "
+                    f"{total_nested} nested = {len(all_folders)} total folders"
+                )
+            else:
+                self.logger.info(f"Total: {len(all_folders)} folders (no nested folders found)")
+
+            return all_folders, top_level_folder_ids
+
+        except Exception as e:
+            self.logger.error(f"Error getting folders for user {user_id}: {e}")
+            raise
+
+    async def _folders_listed_before_upgrade(self, user: AppUser, listed: list[MailFolder]) -> set[str]:
+        """Earlier versions synced Deleted Items with its subfolders, and with Custom Folders
+        off still read the subfolders of the standard folders."""
+        user_id = user.source_user_id
+        roots: list[MailFolder] = []
+        response = await self.external_outlook_client.users_get_mail_folders(user_id=user_id, mailFolder_id="deleteditems")
+        if response.success and response.data and response.data.id:
+            roots.append(response.data)
+        elif not is_folder_not_found_error(response.error):
+            raise Exception(f"Failed to read the Deleted Items folder: {response.error}")
+        if self._determine_folder_filter_strategy()[1] == "include":
+            roots.extend(listed)
+        ids = {folder.id for folder in roots}
+        for root in roots:
+            ids.update(child.id for child in await self._get_child_folders_recursive(user_id, root))
+        return ids
+
+    def _mailbox_external_id(self, user: AppUser) -> str:
+        """Stable id for the one record group that represents this user's mailbox."""
+        return f"{MAILBOX_GROUP_PREFIX}{user.source_user_id}"
+
+    def _transform_to_mailbox_record_group(self, user: AppUser) -> RecordGroup:
+        """The permission root for one user mailbox.
+
+        Exchange can grant another person a single folder, but Graph mail does
+        not return those ACLs and this connector does not read them. The owner
+        is the only audience, so the grant sits on this group and every folder,
+        mail and attachment inherits it.
+        """
+        label = user.email or user.full_name or "Mailbox"
+        return RecordGroup(
+            org_id=self.data_entities_processor.org_id,
+            name=label,
+            short_name=label,
+            description=f"Mailbox for {label}",
+            external_group_id=self._mailbox_external_id(user),
+            parent_external_group_id=None,
+            connector_name=Connectors.OUTLOOK,
+            connector_id=self.connector_id,
+            group_type=RecordGroupType.MAILBOX,
+            permission_model=PermissionModel.RECORD_GROUP_LEVEL,
+            inherit_permissions=False,
+        )
+
+    def _transform_folder_to_record_group(
+        self,
+        folder: MailFolder,
+        user: AppUser,
+        is_top_level: bool = False,
+        mailbox_external_id: str | None = None,
+    ) -> RecordGroup | None:
+        """
+        Transform Outlook mail folder to RecordGroup entity.
+
+        Args:
+            folder: MailFolder Pydantic object from Microsoft Graph API
+            user: AppUser who owns this mailbox
+            is_top_level: Whether this folder hangs directly under the mailbox
+
+        Returns:
+            RecordGroup object or None if transformation fails
+        """
+        try:
+            # folder is a MailFolder Pydantic object
+            folder_id = folder.id
+            folder_name = folder.display_name or OutlookDefaults.FOLDER_NAME
+
+            if not folder_id:
+                return None
+
+            # A top-level folder hangs under the mailbox. Graph also returns a
+            # parent id for those, which is the message-root and not a folder we sync.
+            parent_folder_id = mailbox_external_id if is_top_level else folder.parent_folder_id
+
+            # Create simple description
+            description = f"{folder_name} folder for {user.email}"
+
+            return RecordGroup(
+                org_id=self.data_entities_processor.org_id,
+                name=folder_name,
+                short_name=folder_name,
+                description=description,
+                external_group_id=folder_id,
+                parent_external_group_id=parent_folder_id,
+                connector_name=Connectors.OUTLOOK,
+                connector_id=self.connector_id,
+                group_type=RecordGroupType.MAILBOX,
+                permission_model=PermissionModel.RECORD_GROUP_LEVEL,
+                inherit_permissions=True,
+                web_url=None,
+                source_created_at=None,
+                source_updated_at=None,
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error transforming folder to RecordGroup: {e}")
+            return None
+
+    async def _sync_user_folders(self, user: AppUser) -> list[MailFolder]:
+        """
+        Sync mail folders for a user as RecordGroup entities and return folder data.
+
+        Args:
+            user: AppUser whose folders to sync
+
+        Returns:
+            List of MailFolder Pydantic objects (for email processing)
+        """
+        try:
+            user_id = user.source_user_id
+
+            # Get all folders for this user (respects filter settings)
+            self._folder_listing_complete, self._folders_maybe_present, self._no_mailbox = True, set(), False
+            folder_names, folder_filter_mode = self._determine_folder_filter_strategy()
+            folders, top_level_folder_ids = await self._get_all_folders_for_user(
+                user_id,
+                folder_names=folder_names,
+                folder_filter_mode=folder_filter_mode
+            )
+
+            if not folders:
+                # One "no mailbox" answer deletes nothing: Graph also gives it for a mailbox in
+                # transition. Its stored mail is unlinked by the next full sync if it stays gone.
+                if not self._no_mailbox:
+                    await self._drop_missing_user_folders(user, set(), folders)
+                self.logger.debug(f"No folders to sync for user {user.email}")
+                return []
+
+            mailbox_external_id = self._mailbox_external_id(user)
+            owner_permission = Permission(
+                email=user.email,
+                type=PermissionType.OWNER,
+                entity_type=EntityType.USER,
+            )
+
+            # Transform folders to RecordGroups. They inherit the mailbox grant.
+            record_groups = []
+            for folder in folders:
+                is_top_level = folder.id in top_level_folder_ids
+                record_group = self._transform_folder_to_record_group(
+                    folder, user, is_top_level, mailbox_external_id
+                )
+                if record_group:
+                    record_groups.append(record_group)
+
+            self.logger.info(f"Syncing {len(record_groups)} folders for user {user.email}")
+
+            if record_groups:
+                # The mailbox is written first so a top-level folder's parent exists
+                # in the same call. [] on a folder drops a grant an older sync stored.
+                await self.data_entities_processor.on_new_record_groups(
+                    [(self._transform_to_mailbox_record_group(user), [owner_permission])]
+                    + [(rg, []) for rg in record_groups]
+                )
+
+            # After the upsert: a subfolder moved out of a deleted folder has its new parent
+            # stored by then, so the delete does not take it along.
+            await self._drop_missing_user_folders(user, {folder.id for folder in folders if folder.id}, folders)
+
+            # Return raw folder data for email processing
+            return folders
+
+        except Exception as e:
+            self.logger.error(f"Error syncing folders for user {user.email}: {e}")
+            raise
+
+    async def _process_single_folder_messages(
+        self, org_id: str, user: AppUser, folder: MailFolder
+    ) -> tuple[int, list[MailThreadRef]]:
+        """Process messages using batch processing with automatic pagination.
+
+        Returns the processed count and, for thread edges, a light reference to each mail saved.
+        """
+        try:
+            user_id = user.source_user_id
+            # folder is a MailFolder Pydantic object
+            folder_id = folder.id
+            folder_name = folder.display_name or OutlookDefaults.FOLDER_NAME
+
+            # Create folder-specific sync point
+            sync_point_key = self._folder_sync_point_key(user, folder_id)
+            sync_point = await self.email_delta_sync_point.read_sync_point(sync_point_key)
+            delta_link = self._saved_delta_link(sync_point)
+
+            # Each delta page is written before the next is fetched, so a large folder is
+            # never held in memory. The link is saved only once every page succeeded.
+            processed_count = 0
+            message_count = 0
+            mail_records = []  # Collect mail records for thread processing
+            failed_ids: list[str] = []
+            removed_ids: list[str] = []
+            new_delta_link = None
+            seen_ids: set[str] | None = None  # every mail id of a full read, failed ones included
+            async for result in self._get_all_messages_delta_external(user_id, folder_id, delta_link):
+                message_count += len(result.messages)
+                new_delta_link = result.delta_link
+                if result.full_read:
+                    seen_ids = (seen_ids or set()) | {m.id for m in result.messages if m.id}
+                page_records = []
+                for message in result.messages:
+                    record_updates, ok = await self._process_single_message(org_id, user, message, folder_id, folder_name)
+                    if not ok:
+                        failed_ids.append(message.id)
+                    for update in record_updates:
+                        if update.is_deleted:
+                            removed_ids.append(update.external_record_id)
+                        elif update.record:
+                            page_records.append((update.record, update.new_permissions or []))
+                            if update.record.record_type == RecordType.MAIL:
+                                mail_records.append(mail_thread_ref(update.record))
+                for start in range(0, len(page_records), BatchConfig.DEFAULT_BATCH_SIZE):
+                    batch = page_records[start:start + BatchConfig.DEFAULT_BATCH_SIZE]
+                    await self.data_entities_processor.on_new_records(batch, replace_permissions=True)
+                    processed_count += len(batch)
+
+            sync_point_data = {
+                OutlookSyncPointKeys.DELTA_LINK: new_delta_link,
+                OutlookSyncPointKeys.LAST_SYNC_TIMESTAMP: get_epoch_timestamp_in_ms(),
+                OutlookSyncPointKeys.FOLDER_ID: folder_id,
+                OutlookSyncPointKeys.FOLDER_NAME: folder_name,
+            }
+            if failed_ids:
+                await self._hold_back_folder_link(
+                    sync_point_key, sync_point, sync_point_data, folder_id, removed_ids, failed_ids,
+                )
+            else:
+                await self._save_folder_link(sync_point_key, sync_point_data, folder_id, removed_ids)
+            if seen_ids is not None:
+                await self._note_full_read(folder_id, seen_ids)
+
+            # Log final summary
+            self.logger.info(f"Folder '{folder_name}' completed: {processed_count} records processed from {message_count} messages")
+
+            return processed_count, mail_records
+
+        except Exception as e:
+            self.logger.error(f"Error processing messages in folder '{folder_name}' for user {user.email}: {e}")
+            raise
+
+    async def _get_all_messages_delta_external(
+        self, user_id: str, folder_id: str, delta_link: str | None = None
+    ) -> AsyncGenerator[MessagesDeltaResult, None]:
+        """Yield a folder's messages page by page using delta sync from external Outlook API.
+
+        This method handles both initial sync and incremental sync:
+        - Initial sync (delta_link=None): Retrieves all messages in the folder
+        - Incremental sync (delta_link provided): Retrieves only changes since last sync
+
+        Pagination is handled automatically:
+        - The method follows nextLink URLs and yields each page before fetching the next
+        - The last page (the one Graph sends a deltaLink with) carries the new deltaLink
+
+        Args:
+            user_id: User identifier
+            folder_id: Mail folder identifier
+            delta_link: Previously saved deltaLink for incremental sync (optional)
+
+        Yields:
+            MessagesDeltaResult with:
+                - messages: list[Message] - one page of Pydantic Message objects
+                - delta_link: str | None - New deltaLink to save, on the last page only
+        """
+        try:
+            if not self.external_outlook_client:
+                raise Exception("External Outlook client not initialized")
+
+            # Build filter string for receivedDateTime if configured
+            # Note: MS Graph delta queries have limited filter support
+            # receivedDateTime filter only supports 'ge' (greater than or equal)
+            # For 'le' (IS_BEFORE), we apply client-side filtering after fetching
+            filter_string = None
+            received_before_dt: datetime | None = None  # For client-side filtering
+
+            received_date_filter = self.sync_filters.get(SyncFilterKey.RECEIVED_DATE)
+            if received_date_filter and not received_date_filter.is_empty():
+                received_after_iso, received_before_iso = received_date_filter.get_datetime_iso()
+
+                # API supports 'ge' (greater than or equal) - apply server-side
+                if received_after_iso:
+                    filter_string = f"{OutlookODataFields.RECEIVED_DATE_TIME} ge {received_after_iso}Z"
+                    self.logger.info(f"Applying received date filter (server-side): {filter_string}")
+
+                # API doesn't support 'le' - we'll filter client-side
+                if received_before_iso:
+                    # Parse ISO string to datetime for client-side comparison
+                    received_before_dt = datetime.strptime(received_before_iso, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    self.logger.info(f"Will apply received date filter (client-side): receivedDateTime before {received_before_iso}")
+
+            def fetch_page(url: str | None) -> Awaitable[object]:
+                return self.external_outlook_client.users_user_mail_folders_mail_folder_messages_delta(
+                    user_id=user_id,
+                    mailFolder_id=folder_id,
+                    continuation_url=url,
+                    page_size=OutlookSyncConfig.MESSAGE_PAGE_SIZE,
+                    filter=filter_string,
+                    select=OutlookAPIFields.MESSAGE_SELECT_FIELDS,
+                )
+
+            async for page_messages, new_delta_link, full_read in read_delta_pages(fetch_page, delta_link, folder_id, self.logger):
+                messages = page_messages
+                # Apply client-side filtering for IS_BEFORE if needed
+                if received_before_dt is not None and messages:
+                    original_count = len(messages)
+                    filtered_messages = []
+
+                    # messages are Pydantic Message objects from one delta page
+                    for msg in messages:
+                        # Get receivedDateTime from message
+                        received_dt = msg.received_date_time
+                        if received_dt is None:
+                            # If no received date, include the message
+                            filtered_messages.append(msg)
+                            continue
+
+                        # Compare datetime objects directly
+                        if isinstance(received_dt, datetime):
+                            # Ensure timezone-aware comparison
+                            if received_dt.tzinfo is None:
+                                received_dt = received_dt.replace(tzinfo=timezone.utc)
+                            # Include message if received before the cutoff
+                            if received_dt < received_before_dt:
+                                filtered_messages.append(msg)
+                        else:
+                            filtered_messages.append(msg)
+
+                    messages = filtered_messages
+                    filtered_out = original_count - len(messages)
+                    if filtered_out > 0:
+                        self.logger.info(
+                            f"Client-side date filter applied: {original_count} -> {len(messages)} messages "
+                            f"(filtered out {filtered_out} messages received after cutoff)"
+                        )
+
+                yield MessagesDeltaResult(messages=messages, delta_link=new_delta_link, full_read=full_read)
+
+        except Exception as e:
+            # Raise, not an empty result: the folder counts as failed and keeps its link.
+            self.logger.error(f"Error getting messages delta for folder {folder_id}: {e}", exc_info=True)
+            raise
+
+    async def _process_single_message(
+        self, org_id: str, user: AppUser, message: Message, folder_id: str, folder_name: str
+    ) -> tuple[list[RecordUpdate], bool]:
+        """Process one message and its attachments together.
+
+        Returns (updates, ok); ok is False when the change failed, so the folder's delta
+        link is not advanced past it.
+
+        Args:
+            message: Pydantic Message object
+        """
+        updates = []
+
+        try:
+            # message is a Pydantic Message object
+            message_id = message.id
+
+            # Check if message is deleted
+            additional_data = message.additional_data or {}
+            # Any @removed reason ("deleted", or "changed" for an item that left this folder's
+            # delta scope but may be restorable) means the item is no longer in this folder.
+            # The caller deletes it once every folder was read (_save_folder_link).
+            if '@removed' in additional_data:
+                return [removed_mail_update(message_id)], True
+
+            # Process email with attachments
+            email_update = await self._process_single_email_with_folder(org_id, user.email, message, folder_id, folder_name)
+            if email_update and not email_update.is_new and not email_update.is_updated and not self._full_sync_running():
+                # Same content, same folder (a read or flag change): nothing to write and no
+                # attachment listing. A full sync still writes it, so it counts as seen.
+                email_update = None
+            if email_update:
+                updates.append(email_update)
+
+                current_attachment_ids: set[str] = set()
+                if message.has_attachments:
+                    email_permissions = await self._extract_email_permissions(message, None, user.email)
+                    attachment_updates = await self._process_email_attachments_with_folder(
+                        org_id, user, message, email_permissions, folder_id, folder_name,
+                        parent_node_id=email_update.record.id, kept_ids=current_attachment_ids,
+                    )
+                    updates.extend(attachment_updates)
+                    current_attachment_ids |= {u.external_record_id for u in attachment_updates}
+                if not email_update.is_new and email_update.content_changed:
+                    await self._drop_removed_attachments(message_id, current_attachment_ids)
+            else:
+                self.logger.debug(f"Skipping attachment processing for unchanged email {message_id}")
+
+        except Exception as e:
+            self.logger.error(f"Error processing message {message.id if hasattr(message, 'id') else 'unknown'}: {e}")
+            if updates:
+                # The mail is saved without a revision, so the next read takes it as changed
+                # and lists its attachments again instead of skipping it as unchanged.
+                updates[0].record.external_revision_id = None
+            return updates, False
+
+        return updates, True
+
+    async def _process_single_email_with_folder(
+        self,
+        org_id: str,
+        user_email: str,
+        message: Message,
+        folder_id: str,
+        folder_name: str,
+        existing_record: Record | None = None,
+    ) -> RecordUpdate | None:
+        """Process a single email with folder information.
+
+        Args:
+            message: Pydantic Message object
+            existing_record: Optional existing record to skip DB lookup (used during reindex)
+        """
+        try:
+            # message is a Pydantic Message object
+            message_id = message.id
+
+            # Skip DB lookup if existing_record is provided (reindex case)
+            if existing_record is None:
+                existing_record = await self._get_existing_record(org_id, message_id)
+            is_new = existing_record is None
+            is_updated = False
+            metadata_changed = False
+            content_changed = False
+
+            # From content, not changeKey: a read, flag or category change moves changeKey.
+            current_revision = mail_content_revision(message)
+            if not is_new:
+                if existing_record.external_revision_id != current_revision:
+                    content_changed = True
+                    is_updated = True
+                    self.logger.info(f"Email {message_id} content changed")
+
+                current_folder_id = folder_id
+                existing_folder_id = existing_record.external_record_group_id
+                if existing_folder_id and current_folder_id != existing_folder_id:
+                    metadata_changed = True
+                    is_updated = True
+                    self.logger.info(f"Email {message_id} moved from folder {existing_folder_id} to {current_folder_id}")
+
+            record_id = existing_record.id if existing_record else str(uuid.uuid4())
+
+            # Create email record with folder information
+            email_record = MailRecord(
+                id=record_id,
+                org_id=org_id,
+                record_name=message.subject or OutlookDefaults.SUBJECT,
+                record_type=RecordType.MAIL,
+                external_record_id=message_id,
+                external_revision_id=current_revision,
+                version=0 if is_new else existing_record.version + (1 if content_changed else 0),
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.OUTLOOK,
+                connector_id=self.connector_id,
+                source_created_at=datetime_to_epoch_ms(message.created_date_time),
+                source_updated_at=datetime_to_epoch_ms(message.last_modified_date_time),
+                weburl=message.web_link or '',
+                mime_type=MimeTypes.HTML.value,
+                parent_external_record_id=None,
+                external_record_group_id=folder_id,
+                record_group_type=RecordGroupType.MAILBOX,
+                inherit_permissions=True,
+                subject=message.subject or OutlookDefaults.SUBJECT,
+                from_email=self._extract_email_from_recipient(message.from_),
+                to_emails=[self._extract_email_from_recipient(r) for r in (message.to_recipients or [])],
+                cc_emails=[self._extract_email_from_recipient(r) for r in (message.cc_recipients or [])],
+                bcc_emails=[self._extract_email_from_recipient(r) for r in (message.bcc_recipients or [])],
+                thread_id=message.conversation_id or '',
+                is_parent=False,
+                internet_message_id=message.internet_message_id or '',
+                conversation_index=normalize_conversation_index(message.conversation_index),
+            )
+
+            # Apply indexing filter for mail records
+            if not self.indexing_filters.is_enabled(IndexingFilterKey.MAILS, default=True):
+                email_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+
+            permissions = await self._extract_email_permissions(message, email_record.id, user_email)
+
+            return RecordUpdate(
+                record=email_record,
+                is_new=is_new,
+                is_updated=is_updated,
+                is_deleted=False,
+                metadata_changed=metadata_changed,
+                content_changed=content_changed,
+                permissions_changed=bool(permissions),
+                new_permissions=permissions,
+                external_record_id=message_id,
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error processing email {message.id if hasattr(message, 'id') else 'unknown'}: {str(e)}")
+            raise
+
+    async def _drop_removed_attachments(self, message_id: str, current_attachment_ids: set[str]) -> None:
+        """Delete attachment records of a mail whose attachment is no longer on the message.
+
+        Only called after the attachment list was read successfully (a failed read raises
+        before this), so an empty set means the mail really has no attachments left.
+        """
+        existing = await self.data_entities_processor.get_records_by_parent(
+            self.connector_id, message_id, RecordType.FILE.value
+        )
+        for child in existing:
+            if child.external_record_id not in current_attachment_ids:
+                self.logger.info("Attachment %s was removed from mail %s; deleting it", child.external_record_id, message_id)
+                await self.data_entities_processor.delete_record_by_external_id(
+                    self.connector_id, child.external_record_id
+                )
+
+    async def _extract_email_permissions(self, message: Message, record_id: str | None, inbox_owner_email: str) -> list[Permission]:
+        """Mails inherit the mailbox grant. Recipients are not a second audience.
+
+        A recipient has their own copy in their own mailbox. A grant here would
+        let them read this mailbox's copy, and it would duplicate the owner
+        grant the mailbox record group already carries.
+        """
+        del message, record_id, inbox_owner_email
+        return []
+
+    async def _create_attachment_record(
+        self,
+        org_id: str,
+        attachment: Attachment,
+        message_id: str,
+        folder_id: str,
+        parent_node_id: str,
+        existing_record: Record | None = None,
+        parent_weburl: str | None = None,
+    ) -> FileRecord | None:
+        """Helper method to create a FileRecord from an attachment.
+
+        Args:
+            org_id: Organization ID
+            attachment: Pydantic Attachment object
+            message_id: Parent message external ID (Graph message id)
+            folder_id: Folder ID
+            existing_record: Existing record if updating
+            parent_weburl: Web URL of the parent mail
+            parent_node_id: Internal record ID of the parent mail
+
+        Returns:
+            FileRecord: Created attachment record, or None if attachment should be skipped
+        """
+        # attachment is a Pydantic Attachment object
+        attachment_id = attachment.id
+        is_new = existing_record is None
+
+        kind = unsynced_attachment_kind(attachment)
+        if kind:
+            self.logger.info(f"Skipping attachment '{attachment.name}' (id: {attachment_id}) of mail {message_id}: {kind} has no file to index")
+            return None
+
+        # Check if content_type is available, skip attachment if not
+        content_type = attachment.content_type
+        if not content_type:
+            file_name = attachment.name or OutlookDefaults.UNKNOWN_FOLDER_LABEL
+            self.logger.warning(f"Skipping attachment '{file_name}' (id: {attachment_id}) - no content_type available")
+            return None
+
+        file_name, mime_type, extension = attachment_metadata_from_graph(
+            attachment.name,
+            content_type,
+            OutlookDefaults.ATTACHMENT_NAME,
+        )
+
+        attachment_record_id = existing_record.id if existing_record else str(uuid.uuid4())
+        revision = attachment.last_modified_date_time.isoformat() if attachment.last_modified_date_time else None
+
+        if not parent_weburl:
+            self.logger.error(f"No parent weburl found for attachment id {attachment_id}, file name {file_name}, with parent message id {message_id}")
+
+        attachment_record = FileRecord(
+            id=attachment_record_id,
+            org_id=org_id,
+            record_name=file_name,
+            record_type=RecordType.FILE,
+            external_record_id=attachment_id,
+            external_revision_id=revision,
+            version=0 if is_new else existing_record.version + (1 if existing_record.external_revision_id != revision else 0),
+            origin=OriginTypes.CONNECTOR,
+            connector_name=Connectors.OUTLOOK,
+            connector_id=self.connector_id,
+            source_created_at=datetime_to_epoch_ms(attachment.last_modified_date_time),
+            source_updated_at=datetime_to_epoch_ms(attachment.last_modified_date_time),
+            mime_type=mime_type,
+            parent_external_record_id=message_id,
+            parent_record_type=RecordType.MAIL,
+            external_record_group_id=folder_id,
+            record_group_type=RecordGroupType.MAILBOX,
+            inherit_permissions=True,
+            weburl=parent_weburl,
+            is_file=True,
+            size_in_bytes=attachment.size or 0,
+            extension=extension,
+            is_dependent_node=True,
+            parent_node_id=parent_node_id,
+        )
+
+        # Apply indexing filter for attachment records
+        if not self.indexing_filters.is_enabled(IndexingFilterKey.ATTACHMENTS, default=True):
+            attachment_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+        cap_attachment_indexing(attachment_record, self.logger)
+
+        return attachment_record
+
+    async def _process_email_attachments_with_folder(
+        self,
+        org_id: str,
+        user: AppUser,
+        message: Message,
+        email_permissions: list[Permission],
+        folder_id: str,
+        folder_name: str,
+        parent_node_id: str,
+        kept_ids: set[str] | None = None,
+    ) -> list[RecordUpdate]:
+        """Process email attachments with folder information.
+
+        Args:
+            message: Pydantic Message object
+            kept_ids: gets the ids of listed attachments skipped this time (no content type),
+                so a stored record of theirs is not taken as removed
+        """
+        attachment_updates = []
+
+        try:
+            user_id = user.source_user_id
+            # message is a Pydantic Message object
+            message_id = message.id
+            parent_weburl = message.web_link
+
+            # attachments are Pydantic Attachment objects from _get_message_attachments_external
+            attachments = await self._get_message_attachments_external(user_id, message_id)
+
+            for attachment in attachments:
+                attachment_id = attachment.id
+                existing_record = await self._get_existing_record(org_id, attachment_id)
+                is_new = existing_record is None
+                is_updated = False
+                metadata_changed = False
+                content_changed = False
+
+                if not is_new:
+                    current_revision = attachment.last_modified_date_time.isoformat() if attachment.last_modified_date_time else None
+                    if existing_record.external_revision_id != current_revision:
+                        content_changed = True
+                        is_updated = True
+                        self.logger.info(f"Attachment {attachment_id} content changed (revision changed)")
+
+                    current_folder_id = folder_id
+                    existing_folder_id = existing_record.external_record_group_id
+                    if existing_folder_id and current_folder_id != existing_folder_id:
+                        metadata_changed = True
+                        is_updated = True
+
+                attachment_record = await self._create_attachment_record(
+                    org_id,
+                    attachment,
+                    message_id,
+                    folder_id,
+                    parent_node_id,
+                    existing_record,
+                    parent_weburl,
+                )
+
+                # Skip if attachment was filtered out (e.g., no content_type)
+                if not attachment_record:
+                    if kept_ids is not None and not unsynced_attachment_kind(attachment):
+                        kept_ids.add(attachment_id)
+                    continue
+
+                attachment_updates.append(RecordUpdate(
+                    record=attachment_record,
+                    is_new=is_new,
+                    is_updated=is_updated,
+                    is_deleted=False,
+                    metadata_changed=metadata_changed,
+                    content_changed=content_changed,
+                    permissions_changed=bool(email_permissions),
+                    new_permissions=email_permissions,
+                    external_record_id=attachment_id,
+                ))
+
+            return attachment_updates
+
+        except Exception as e:
+            self.logger.error(f"Error processing attachments for email {message.id if hasattr(message, 'id') else 'unknown'}: {e}")
+            raise
+
+    async def _get_message_attachments_external(self, user_id: str, message_id: str) -> list[Attachment]:
+        """Get message attachments using external Outlook API.
+
+        Returns:
+            List of Pydantic Attachment objects
+        """
+        try:
+            if not self.external_outlook_client:
+                raise Exception("External Outlook client not initialized")
+
+            response: OutlookCalendarContactsResponse = await self.external_outlook_client.users_messages_list_attachments(
+                user_id=user_id,
+                message_id=message_id,
+                select=OutlookAPIFields.ATTACHMENT_SELECT_FIELDS,
+            )
+
+            if not response.success:
+                raise AttachmentListingError(f"Failed to get attachments for message {message_id}: {response.error}")
+
+            # response.data is AttachmentCollectionResponse with .value containing list[Attachment]
+            page = response.data
+            attachments = list(page.value or [])
+            # The data source has no nextLink parameter for this call, so later pages go
+            # through the same Graph client it wraps.
+            builder = self.external_outlook_client.client.users.by_user_id(user_id).messages.by_message_id(message_id).attachments
+            followed: set[str] = set()
+            while page.odata_next_link:
+                if page.odata_next_link in followed:
+                    raise AttachmentListingError(f"Graph repeated an attachments nextLink for message {message_id}")
+                followed.add(page.odata_next_link)
+                page = await builder.with_url(page.odata_next_link).get()
+                attachments.extend(page.value or [])
+            return attachments
+
+        except AttachmentListingError:
+            raise
+        except Exception as e:
+            # Raise, not []: an empty list here would delete the mail's attachment records.
+            self.logger.error(f"Error getting attachments for message {message_id}: {e}")
+            raise AttachmentListingError(str(e)) from e
+
+    async def _group_post_thread_id(self, post_record: Record) -> str | None:
+        """Thread id of a GROUP_MAIL record.
+
+        ``get_record_by_external_id`` returns the base Record, which has no thread_id, so
+        the typed MailRecord is loaded for it.
+        """
+        thread_id = getattr(post_record, "thread_id", None)
+        if thread_id:
+            return thread_id
+        async with self.data_store_provider.transaction() as tx_store:
+            typed = await tx_store.graph_provider.get_record_by_id(post_record.id, transaction=tx_store.txn)
+        return getattr(typed, "thread_id", None)
+
+    async def _get_existing_record(self, org_id: str, external_record_id: str) -> Record | None:
+        """Get existing record from data store.
+
+        A lookup error raises: returning None would save the item again under a new record id.
+        """
+        return await self.data_entities_processor.get_record_by_external_id(
+            self.connector_id, external_record_id
+        )
+
+    def _augment_email_html_with_metadata(self, email_body: str, record: MailRecord) -> str:
+        """Augment email HTML with searchable recipient metadata.
+
+        Prepends a hidden div containing email metadata (from, to, cc, bcc, subject)
+        to the HTML content. This makes recipient information searchable while keeping
+        the original email HTML intact and visually unaffected.
+
+        Args:
+            email_body: Original HTML content from email body
+            record: MailRecord containing metadata (from, to, cc, bcc, subject)
+
+        Returns:
+            HTML string with prepended metadata div
+        """
+        metadata_parts = {
+            "From": record.from_email,
+            "To": ", ".join(record.to_emails) if record.to_emails else None,
+            "CC": ", ".join(record.cc_emails) if record.cc_emails else None,
+            "BCC": ", ".join(record.bcc_emails) if record.bcc_emails else None,
+            "Subject": record.subject,
+        }
+
+        metadata_lines = [
+            f"{key}: {html.escape(value)}"
+            for key, value in metadata_parts.items()
+            if value
+        ]
+
+        if metadata_lines:
+            metadata_content = "<br>\n".join(metadata_lines)
+            metadata_div = f'<div style="display:none;" class="email-metadata">{metadata_content}</div>\n'
+            return metadata_div + email_body
+
+        return email_body
+
+    async def stream_record(self, record: Record) -> StreamingResponse:
+        """Stream record content (email or attachment)."""
+        try:
+            if not self.external_outlook_client:
+                raise connector_not_ready(self.display_name)
+
+            # Recover from an idle-closed HTTP transport before the first Graph call.
+            await self._reinitialize_client_if_needed()
+
+            # Handle group posts (don't need user_id)
+            if record.record_type == RecordType.GROUP_MAIL:
+                group_id = record.external_record_group_id
+                thread_id = record.thread_id if hasattr(record, 'thread_id') else None
+                post_id = record.external_record_id
+
+                if not group_id:
+                    raise HTTPException(
+                        status_code=HttpStatusCode.BAD_REQUEST.value,
+                        detail=OutlookHTTPDetails.MISSING_GROUP_ID_POST,
+                    )
+
+                if not thread_id:
+                    raise HTTPException(
+                        status_code=HttpStatusCode.BAD_REQUEST.value,
+                        detail=OutlookHTTPDetails.MISSING_THREAD_ID_POST,
+                    )
+
+                response = await self.external_outlook_client.groups_threads_get_post(
+                    group_id=group_id,
+                    thread_id=thread_id,
+                    post_id=post_id
+                )
+
+                if not response.success:
+                    self.logger.warning(
+                        "Failed to fetch group post %s: %s",
+                        post_id,
+                        response.error,
+                    )
+                    # MSGraphResponse has no HTTP status — do not invent a 404.
+                    raise RuntimeError(
+                        response.error or f"Failed to fetch group post {post_id}"
+                    )
+
+                # response.data is a Pydantic Post object
+                post = response.data
+                if not post:
+                    raise not_found_at_source(self.display_name)
+
+                # Extract body content from Pydantic Post object
+                post_body = post.body.content or '' if post.body else ''
+
+                # Augment with metadata for indexing
+                if isinstance(record, MailRecord):
+                    post_body = self._augment_email_html_with_metadata(post_body, record)
+                async def generate_post() -> AsyncGenerator[bytes, None]:
+                    yield post_body.encode('utf-8')
+
+                return StreamingResponse(generate_post(), media_type=OutlookMediaTypes.TEXT_HTML)
+
+            # Handle FILE records (check if parent is group post)
+            if record.record_type == RecordType.FILE and record.parent_external_record_id:
+                parent_record = await self.data_entities_processor.get_record_by_external_id(
+                    self.connector_id, record.parent_external_record_id
+                )
+
+                if parent_record and parent_record.record_type == RecordType.GROUP_MAIL:
+                    # Group post attachment (don't need user_id)
+                    if (getattr(record, "size_in_bytes", 0) or 0) > OutlookSyncConfig.MAX_INDEXED_ATTACHMENT_BYTES:
+                        # App-only tokens get 403 from a post attachment's /$value, so the only read
+                        # is $expand=attachments, which loads every attachment of the post at once.
+                        raise not_downloadable(
+                            OutlookHTTPDetails.GROUP_ATTACHMENT_TOO_LARGE, connector=self.display_name,
+                        )
+                    group_id = record.external_record_group_id or parent_record.external_record_group_id
+                    post_id = record.parent_external_record_id
+                    attachment_id = record.external_record_id
+                    thread_id = await self._group_post_thread_id(parent_record)
+
+                    if not group_id or not thread_id:
+                        raise HTTPException(
+                            status_code=HttpStatusCode.BAD_REQUEST.value,
+                            detail=OutlookHTTPDetails.MISSING_GROUP_OR_THREAD_FOR_ATTACHMENT,
+                        )
+
+                    attachment_data = await self._download_group_post_attachment(
+                        group_id, thread_id, post_id, attachment_id
+                    )
+
+                    async def generate_group_attachment() -> AsyncGenerator[bytes, None]:
+                        yield attachment_data
+
+                    return create_stream_record_response(
+                        generate_group_attachment(),
+                        filename=record.record_name or "attachment",
+                        mime_type=record.mime_type,
+                        fallback_filename=f"record_{record.id}"
+                    )
+
+            # User mailbox records (need user_id)
+            user_id = await self._mailbox_owner_id(record.external_record_group_id)
+            if not user_id:
+                user_email = await self.data_entities_processor.get_record_owner_source_user_email(record.id)
+                if user_email:
+                    user_id = await self._get_user_id_from_email(user_email)
+
+            if not user_id:
+                raise HTTPException(
+                    status_code=HttpStatusCode.BAD_REQUEST.value,
+                    detail=OutlookHTTPDetails.USER_CONTEXT_UNKNOWN,
+                )
+
+            if record.record_type == RecordType.MAIL:
+                # User email - message is a Pydantic Message object
+                message = await self._get_message_by_id_external(user_id, record.external_record_id)
+                if not message:
+                    raise not_found_at_source(self.display_name)
+
+                # Extract body content from Pydantic Message object
+                if message.body:
+                    email_body = message.body.content or ''
+                else:
+                    email_body = ''
+                # Augment with recipient metadata for indexing
+                if isinstance(record, MailRecord):
+                    email_body = self._augment_email_html_with_metadata(email_body, record)
+                async def generate_email() -> AsyncGenerator[bytes, None]:
+                    yield email_body.encode('utf-8')
+
+                return StreamingResponse(generate_email(), media_type=OutlookMediaTypes.TEXT_HTML)
+
+            elif record.record_type == RecordType.FILE:
+                # User email attachment
+                attachment_id = record.external_record_id
+                parent_message_id = record.parent_external_record_id
+
+                if not parent_message_id:
+                    raise HTTPException(
+                        status_code=HttpStatusCode.NOT_FOUND.value,
+                        detail=OutlookHTTPDetails.NO_PARENT_MESSAGE,
+                    )
+
+                attachment = await self._open_attachment_stream(user_id, parent_message_id, attachment_id)
+
+                filename = record.record_name or "attachment"
+                return create_stream_record_response(
+                    iter_graph_stream(attachment),
+                    filename=filename,
+                    mime_type=record.mime_type,
+                    fallback_filename=f"record_{record.id}"
+                )
+
+            else:
+                raise HTTPException(
+                    status_code=HttpStatusCode.BAD_REQUEST.value,
+                    detail=OutlookHTTPDetails.UNSUPPORTED_RECORD_TYPE,
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            self.logger.error(
+                f"❌ Error streaming record {record.id}: {e}", exc_info=True
+            )
+            raise graph_stream_error(e, self.display_name) from e
+
+    async def _has_no_mailbox(self, user_id: str, error: object) -> bool:
+        """Whether a failed folder listing means the user has no mailbox. A 404 whose text lacks
+        the Graph code (newer Kiota drops it) is asked again for Graph's own error body."""
+        if is_no_mailbox_error(error):
+            return True
+        if graph_error_status(error) != HttpStatusCode.NOT_FOUND.value:
+            return False
+        try:
+            response = await open_graph_stream(self.external_client, f"users/{quote(user_id, safe='')}/mailFolders?$top=1")
+            try:
+                body = await response.aread()
+            finally:
+                await response.aclose()
+        except Exception as e:
+            self.logger.warning(f"Could not confirm whether user {user_id} has a mailbox: {e}")
+            return False
+        return response.status_code == HttpStatusCode.NOT_FOUND.value and is_no_mailbox_error(body.decode(errors="replace"))
+
+    async def _mailbox_owner_id(self, folder_id: str | None) -> str | None:
+        """The Graph user id of the mailbox a folder belongs to, read from the stored folder tree
+        (a top-level folder's parent is ``mailbox:<user id>``). None when it can't be read."""
+        prefix = MAILBOX_GROUP_PREFIX
+        seen: set[str] = set()
+        try:
+            while folder_id and folder_id not in seen:
+                if folder_id.startswith(prefix):
+                    return folder_id[len(prefix):] or None
+                seen.add(folder_id)
+                group = await self.data_entities_processor.get_record_group_by_external_id(self.connector_id, folder_id)
+                folder_id = getattr(group, "parent_external_group_id", None)
+        except Exception as e:
+            self.logger.warning(f"Could not read the mailbox of folder {folder_id}: {e}")
+        return None
+
+    async def _get_message_by_id_external(self, user_id: str, message_id: str) -> Message | None:
+        """Get a specific message by ID using external Outlook API.
+
+        Returns None only when Graph succeeded but returned no message. Every
+        failure raises: the caller turns None into a 404, and an expired token
+        or a 429 must not be reported to the user as a deleted email.
+        """
+        if not self.external_outlook_client:
+            raise connector_not_ready(self.display_name)
+
+        response: OutlookCalendarContactsResponse = await self.external_outlook_client.users_get_messages(
+            user_id=user_id,
+            message_id=message_id
+        )
+
+        if not response.success:
+            self.logger.error(f"Failed to get message {message_id}: {response.error}")
+            # MSGraphResponse has no HTTP status — do not invent a 404.
+            raise RuntimeError(response.error or f"Failed to get message {message_id}")
+
+        return response.data
+
+    async def _open_attachment_stream(self, user_id: str, message_id: str, attachment_id: str) -> httpx.Response:
+        """Open a mail attachment's raw content (``/$value``) for streaming in chunks.
+
+        A failed status raises the mapped stream error, never an empty 200.
+        """
+        if not self.external_outlook_client:
+            raise connector_not_ready(self.display_name)
+
+        response = await open_graph_stream(
+            self.external_client,
+            f"users/{quote(user_id, safe='')}/messages/{quote(message_id, safe='')}"
+            f"/attachments/{quote(attachment_id, safe='')}/$value",
+        )
+        if not response.is_success:
+            self.logger.error(
+                f"Failed to download attachment {attachment_id} for message {message_id}: HTTP {response.status_code}"
+            )
+        await raise_for_graph_stream(response, self.display_name)
+        return response
+
+    def get_signed_url(self, record: Record) -> str | None:
+        """Get signed URL for record access. Not supported for Outlook."""
+        return None
+
+
+    async def handle_webhook_notification(self, org_id: str, notification: dict) -> bool:
+        """Handle webhook notifications from Microsoft Graph."""
+        try:
+            return True
+        except Exception as e:
+            self.logger.error(f"Error handling webhook notification: {e}")
+            return False
+
+
+    async def cleanup(self) -> None:
+        """Clean up resources used by the connector."""
+        try:
+            # Close the MSGraph client to properly close the HTTP transport
+            if hasattr(self, 'external_client') and self.external_client:
+                try:
+                    underlying_client = self.external_client.get_client()
+                    if hasattr(underlying_client, 'close'):
+                        await underlying_client.close()
+                except Exception as client_error:
+                    self.logger.debug(f"Error closing MSGraph client: {client_error}")
+                finally:
+                    self.external_client = None
+
+            self.external_outlook_client = None
+            self.external_users_client = None
+            self.credentials = None
+            # Clear user cache
+            self._user_cache.clear()
+            self._user_cache_timestamp = None
+        except Exception as e:
+            self.logger.error(f"Error during Outlook connector cleanup: {e}")
+
+
+    async def run_incremental_sync(self) -> None:
+        """Run incremental synchronization for Outlook emails."""
+        # Delegate to full sync - incremental is handled by delta links
+        await self.run_sync()
+
+    async def reindex_records(self, records: list[Record]) -> None:
+        """Reindex a list of Outlook records.
+
+        This method:
+        1. For each record, checks if it has been updated at the source
+        2. If updated, upserts the record in DB
+        3. Publishes reindex events for all records via data_entities_processor
+
+        Args:
+            records: List of properly typed Record instances (MailRecord, FileRecord, etc.)
+        """
+        try:
+            if not records:
+                self.logger.info("No records to reindex")
+                return
+
+            self.logger.info(f"Starting reindex for {len(records)} Outlook records")
+
+            # Ensure external clients are initialized
+            if not self.external_outlook_client or not self.external_users_client:
+                self.logger.error("External API clients not initialized. Call init() first.")
+                raise Exception("External API clients not initialized. Call init() first.")
+
+            # Recover from an idle-closed HTTP transport before the first Graph call.
+            await self._reinitialize_client_if_needed()
+
+            # Populate user cache for better performance
+            await self._populate_user_cache()
+
+            # Separate GROUP_MAIL records from user mailbox records
+            user_mailbox_records = []
+            group_mailbox_records = []
+
+            for record in records:
+                if record.record_type == RecordType.GROUP_MAIL:
+                    group_mailbox_records.append(record)
+                elif record.record_type == RecordType.FILE and record.parent_external_record_id:
+                    parent_record = await self.data_entities_processor.get_record_by_external_id(
+                        self.connector_id, record.parent_external_record_id
+                    )
+                    if parent_record and parent_record.record_type == RecordType.GROUP_MAIL:
+                        group_mailbox_records.append(record)
+                    else:
+                        user_mailbox_records.append(record)
+                else:
+                    user_mailbox_records.append(record)
+
+            self.logger.info(f"Separated: {len(user_mailbox_records)} user mailbox records, {len(group_mailbox_records)} group mailbox records")
+
+            # Process user mailbox records
+            user_updated, user_non_updated = await self._reindex_user_mailbox_records(user_mailbox_records)
+
+            # Process group mailbox records
+            group_updated, group_non_updated = await self._reindex_group_mailbox_records(group_mailbox_records)
+
+            # Combine results
+            all_updated_records_with_permissions = user_updated + group_updated
+            all_non_updated_records = user_non_updated + group_non_updated
+
+            # Update DB and publish events for updated records
+            if all_updated_records_with_permissions:
+                await self.data_entities_processor.on_new_records(
+                    all_updated_records_with_permissions, replace_permissions=True
+                )
+                self.logger.info(f"Updated {len(all_updated_records_with_permissions)} records in DB that changed at source")
+
+            # Publish reindex events for non-updated records
+            if all_non_updated_records:
+                await self.data_entities_processor.reindex_existing_records(all_non_updated_records)
+                self.logger.info(f"Published reindex events for {len(all_non_updated_records)} non-updated records")
+
+            self.logger.info(f"Outlook reindex completed for {len(records)} records")
+
+        except Exception as e:
+            self.logger.error(f"Error during Outlook reindex: {e}")
+            raise
+
+    async def get_filter_options(
+        self,
+        filter_key: str,
+        page: int = 1,
+        limit: int = 20,
+        search: str | None = None,
+        cursor: str | None = None
+    ) -> FilterOptionsResponse:
+        """Get dynamic filter options for the users or groups filter."""
+        if filter_key == SyncFilterKey.USERS.value:
+            return await self._get_user_options(page, limit, search, cursor)
+        if filter_key == SyncFilterKey.GROUPS.value:
+            return await self._get_group_options(page, limit, search, cursor)
+        raise ValueError(f"Unsupported filter key: {filter_key}")
+
+    def _graph_user_to_filter_option(self, user: object) -> FilterOption | None:
+        """Build a FilterOption from a Microsoft Graph Pydantic User object."""
+        # user is a Pydantic User object
+        email = user.mail or user.user_principal_name
+        if not email:
+            return None
+
+        display_name = user.display_name or ""
+        given_name = user.given_name or ""
+        surname = user.surname or ""
+
+        full_name = display_name if display_name else f"{given_name} {surname}".strip()
+        if not full_name:
+            full_name = email
+        display_label = f"{full_name} ({email})" if full_name else email
+        return FilterOption(id=email, label=display_label)
+
+    async def _get_user_options(
+        self,
+        page: int,
+        limit: int,
+        search: str | None,
+        cursor: str | None = None,
+    ) -> FilterOptionsResponse:
+        """List users for the filter UI with one Graph request per call.
+
+        Without a search term: ``$top`` ordered by displayName.
+        With a search term: uses ``$search`` with OR clauses on displayName, mail, and
+        userPrincipalName (``$count=true`` + ConsistencyLevel are set by the client).
+        Graph ``/users`` has no ``$skip``: page > 1 needs ``cursor`` (the prior nextLink).
+        """
+        try:
+            if not self.external_users_client:
+                return FilterOptionsResponse(
+                    success=False,
+                    options=[],
+                    page=page,
+                    limit=limit,
+                    has_more=False,
+                    message="Outlook connector is not initialized",
+                )
+
+            cap = max(1, min(limit, OutlookSyncConfig.MAX_FOLDER_PAGE_SIZE))
+            search_term = search.strip() if search else None
+
+            if search_term:
+                if page > 1 and not cursor:
+                    return FilterOptionsResponse(
+                        success=True,
+                        options=[],
+                        page=page,
+                        limit=cap,
+                        has_more=False,
+                        message="Paginated search requires the cursor from the previous response.",
+                    )
+                if cursor:
+                    response: UsersGroupsResponse = await self.external_users_client.users_user_list_user(
+                        next_url=cursor,
+                    )
+                else:
+                    esc = search_term.replace("\\", "\\\\").replace('"', '\\"')
+                    graph_search = (f'"displayName:{esc}" OR "mail:{esc}" OR "userPrincipalName:{esc}"')
+                    response = await self.external_users_client.users_user_list_user(
+                        top=cap,
+                        search=graph_search,
+                        select=OutlookAPIFields.USER_FILTER_SELECT_FIELDS,
+                        headers={"ConsistencyLevel": "eventual"},
+                    )
+            else:
+                # Graph /users has no $skip: page 2+ follows the previous nextLink.
+                if page > 1 and not cursor:
+                    return FilterOptionsResponse(
+                        success=True,
+                        options=[],
+                        page=page,
+                        limit=cap,
+                        has_more=False,
+                        message="Paginated listing requires the cursor from the previous response.",
+                    )
+                if cursor:
+                    response = await self.external_users_client.users_user_list_user(
+                        next_url=cursor,
+                    )
+                else:
+                    response = await self.external_users_client.users_user_list_user(
+                        top=cap,
+                        select=OutlookAPIFields.USER_FILTER_SELECT_FIELDS,
+                        orderby="displayName",
+                    )
+
+            if not response.success or not response.data:
+                return FilterOptionsResponse(
+                    success=False,
+                    options=[],
+                    page=page,
+                    limit=cap,
+                    has_more=False,
+                    message=response.error or "Failed to fetch users",
+                )
+
+            # response.data is UserCollectionResponse with .value containing list[User]
+            user_data = response.data.value if response.data.value else []
+
+            user_options: list[FilterOption] = []
+            for user in user_data:
+                # Sync skips these (_get_all_users_external), so they are not offered.
+                if user.account_enabled is False or user.user_type == "Guest":
+                    continue
+                opt = self._graph_user_to_filter_option(user)
+                if opt:
+                    user_options.append(opt)
+
+            # Get next URL from response
+            next_url = response.data.odata_next_link if response.data.odata_next_link else None
+
+            has_more = bool(next_url)
+            out_cursor = str(next_url) if next_url else None
+
+            return FilterOptionsResponse(
+                success=True,
+                options=user_options,
+                page=page,
+                limit=cap,
+                has_more=has_more,
+                cursor=out_cursor,
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to get user options: {e}")
+            return FilterOptionsResponse(
+                success=False,
+                options=[],
+                page=page,
+                limit=limit,
+                has_more=False,
+                message=f"Error fetching users: {str(e)}",
+            )
+
+    def _graph_group_to_filter_option(self, group: Group) -> FilterOption | None:
+        """Build a FilterOption from a Microsoft Graph Pydantic Group object.
+
+        Only the groups sync handles: mail-enabled Microsoft 365 (Unified) groups.
+        Returns None for anything else (distribution lists, security groups) or no mail.
+        """
+        if not group.mail_enabled or "Unified" not in (group.group_types or []):
+            return None
+
+        mail = group.mail
+        if not mail:
+            return None
+
+        display_name = group.display_name or ""
+        mail_nickname = group.mail_nickname or ""
+
+        label_name = display_name or mail_nickname or mail
+        display_label = f"{label_name} ({mail})"
+        return FilterOption(id=mail, label=display_label)
+
+    async def _get_group_options(
+        self,
+        page: int,
+        limit: int,
+        search: str | None,
+        cursor: str | None = None,
+    ) -> FilterOptionsResponse:
+        """List Microsoft 365 groups for the filter UI with one Graph request per call.
+
+        Graph ``GET /groups`` does not support ``$skip``; listing uses ``$top`` and
+        ``@odata.nextLink`` only (page > 1 requires ``cursor`` from the prior response).
+        With a search term: ``$search`` on displayName and mail (count + ConsistencyLevel
+        are set by the client). Search pagination is also nextLink-only.
+        """
+        try:
+            if not self.external_users_client:
+                return FilterOptionsResponse(
+                    success=False,
+                    options=[],
+                    page=page,
+                    limit=limit,
+                    has_more=False,
+                    message="Outlook connector is not initialized",
+                )
+
+            cap = max(1, min(limit, OutlookSyncConfig.MAX_FOLDER_PAGE_SIZE))
+            search_term = search.strip() if search else None
+
+            if search_term:
+                if page > 1 and not cursor:
+                    return FilterOptionsResponse(
+                        success=True,
+                        options=[],
+                        page=page,
+                        limit=cap,
+                        has_more=False,
+                        message="Paginated search requires the cursor from the previous response.",
+                    )
+                if cursor:
+                    response: UsersGroupsResponse = await self.external_users_client.groups_list_groups(
+                        next_url=cursor,
+                    )
+                else:
+                    esc = search_term.replace("\\", "\\\\").replace('"', '\\"')
+                    graph_search = f'"displayName:{esc}" OR "mail:{esc}"'
+                    response = await self.external_users_client.groups_list_groups(
+                        top=cap,
+                        search=graph_search,
+                        filter=OutlookAPIFields.GROUP_FILTER_ODATA,
+                        select=OutlookAPIFields.GROUP_FILTER_SELECT_FIELDS,
+                        headers={"ConsistencyLevel": "eventual"},
+                    )
+            else:
+                if page > 1 and not cursor:
+                    return FilterOptionsResponse(
+                        success=True,
+                        options=[],
+                        page=page,
+                        limit=cap,
+                        has_more=False,
+                        message="Paginated listing requires the cursor from the previous response.",
+                    )
+                if cursor:
+                    response = await self.external_users_client.groups_list_groups(
+                        next_url=cursor,
+                    )
+                else:
+                    response = await self.external_users_client.groups_list_groups(
+                        top=cap,
+                        filter=OutlookAPIFields.GROUP_FILTER_ODATA,
+                        select=OutlookAPIFields.GROUP_FILTER_SELECT_FIELDS,
+                        orderby="displayName",
+                    )
+
+            if not response.success or not response.data:
+                return FilterOptionsResponse(
+                    success=False,
+                    options=[],
+                    page=page,
+                    limit=cap,
+                    has_more=False,
+                    message=response.error or "Failed to fetch groups",
+                )
+
+            # response.data is GroupCollectionResponse with .value containing list[Group]
+            group_data = response.data.value if response.data.value else []
+
+            group_options: list[FilterOption] = []
+            for group in group_data:
+                opt = self._graph_group_to_filter_option(group)
+                if opt:
+                    group_options.append(opt)
+
+            # Get next URL from response
+            next_url = response.data.odata_next_link if response.data.odata_next_link else None
+
+            has_more = bool(next_url)
+            out_cursor = str(next_url) if next_url else None
+
+            return FilterOptionsResponse(
+                success=True,
+                options=group_options,
+                page=page,
+                limit=cap,
+                has_more=has_more,
+                cursor=out_cursor,
+            )
+
+        except Exception as e:
+            self.logger.error("Failed to get group options: %s", e, exc_info=True)
+            return FilterOptionsResponse(
+                success=False,
+                options=[],
+                page=page,
+                limit=limit,
+                has_more=False,
+                message=f"Error fetching groups: {str(e)}",
+            )
+
+    async def _reindex_user_mailbox_records(
+        self, records: list[Record]
+    ) -> tuple[list[tuple[Record, list[Permission]]], list[Record]]:
+        """Reindex user mailbox records. Checks source for updates.
+
+        Returns:
+            Tuple of (updated_records_with_permissions, non_updated_records)
+        """
+        if not records:
+            return ([], [])
+
+        # Group records by owner email for efficient processing
+        records_by_user: dict[str, list[Record]] = {}
+        for record in records:
+            try:
+                user_email = await self.data_entities_processor.get_record_owner_source_user_email(record.id)
+
+                if not user_email:
+                    self.logger.warning(f"No owner found for record {record.id}, skipping")
+                    continue
+
+                if user_email not in records_by_user:
+                    records_by_user[user_email] = []
+                records_by_user[user_email].append(record)
+            except Exception as e:
+                self.logger.error(f"Error getting owner for record {record.id}: {e}")
+                continue
+
+        # Collect updated and non-updated records across all users
+        all_updated_records_with_permissions: list[tuple[Record, list[Permission]]] = []
+        all_non_updated_records: list[Record] = []
+
+        # Process records by user - check for source updates
+        for user_email, user_records in records_by_user.items():
+            try:
+                updated, non_updated = await self._reindex_single_user_records(user_email, user_records)
+                all_updated_records_with_permissions.extend(updated)
+                all_non_updated_records.extend(non_updated)
+            except Exception as e:
+                self.logger.error(f"Error reindexing records for user {user_email}: {e}")
+
+        return (all_updated_records_with_permissions, all_non_updated_records)
+
+    async def _reindex_single_user_records(
+        self, user_email: str, records: list[Record]
+    ) -> tuple[list[tuple[Record, list[Permission]]], list[Record]]:
+        """Reindex records for a specific user. Checks source for updates.
+
+        Returns:
+            Tuple of (updated_records_with_permissions, non_updated_records)
+        """
+        updated_records_with_permissions: list[tuple[Record, list[Permission]]] = []
+        non_updated_records: list[Record] = []
+
+        try:
+            user_id = await self._get_user_id_from_email(user_email)
+            if not user_id:
+                self.logger.error(f"Could not find user ID for email {user_email}")
+                return ([], records)  # Return all as non-updated if user not found
+
+            self.logger.info(f"Checking {len(records)} records at source for user {user_email}")
+
+            org_id = self.data_entities_processor.org_id
+
+            for record in records:
+                try:
+                    updated_record_data = await self._check_and_fetch_updated_record(
+                        org_id, user_id, user_email, record
+                    )
+                    if updated_record_data:
+                        updated_record, permissions = updated_record_data
+                        updated_records_with_permissions.append((updated_record, permissions))
+                    else:
+                        non_updated_records.append(record)
+                except Exception as e:
+                    self.logger.error(f"Error checking record {record.id} at source: {e}")
+                    continue
+
+            self.logger.info(f"Completed source check for user {user_email}: {len(updated_records_with_permissions)} updated, {len(non_updated_records)} unchanged")
+
+        except Exception as e:
+            self.logger.error(f"Error reindexing records for user {user_email}: {e}")
+            raise
+
+        return (updated_records_with_permissions, non_updated_records)
+
+    async def _reindex_group_mailbox_records(
+        self, records: list[Record]
+    ) -> tuple[list[tuple[Record, list[Permission]]], list[Record]]:
+        """Reindex GROUP_MAIL records (no user_id needed).
+
+        Returns:
+            Tuple of (updated_records_with_permissions, non_updated_records)
+        """
+        updated_records_with_permissions: list[tuple[Record, list[Permission]]] = []
+        non_updated_records: list[Record] = []
+
+        if not records:
+            return ([], [])
+
+        try:
+            org_id = self.data_entities_processor.org_id
+
+            self.logger.info(f"Checking {len(records)} GROUP_MAIL records at source")
+
+            for record in records:
+                try:
+                    updated_record_data = await self._check_and_fetch_updated_group_mail_record(org_id, record)
+                    if updated_record_data:
+                        updated_record, permissions = updated_record_data
+                        updated_records_with_permissions.append((updated_record, permissions))
+                    else:
+                        non_updated_records.append(record)
+                except Exception as e:
+                    self.logger.error(f"Error checking GROUP_MAIL record {record.id} at source: {e}")
+                    continue
+
+            self.logger.info(f"Completed GROUP_MAIL source check: {len(updated_records_with_permissions)} updated, {len(non_updated_records)} unchanged")
+
+        except Exception as e:
+            self.logger.error(f"Error reindexing GROUP_MAIL records: {e}")
+            raise
+
+        return (updated_records_with_permissions, non_updated_records)
+
+    async def _check_and_fetch_updated_group_mail_record(
+        self, org_id: str, record: Record
+    ) -> tuple[Record, list[Permission]] | None:
+        """Fetch GROUP_MAIL record from source (mirrors stream_record logic).
+
+        Args:
+            org_id: Organization ID
+            record: GROUP_MAIL or FILE (with GROUP_MAIL parent) record
+
+        Returns:
+            Tuple of (Record, List[Permission]) if updated, None otherwise
+        """
+        try:
+            # Handle GROUP_MAIL posts
+            if record.record_type == RecordType.GROUP_MAIL:
+                return await self._check_and_fetch_updated_group_post(org_id, record)
+
+            # Handle GROUP_MAIL attachments
+            elif record.record_type == RecordType.FILE:
+                return await self._check_and_fetch_updated_group_post_attachment(org_id, record)
+
+            else:
+                self.logger.warning(f"Unexpected record type in GROUP_MAIL reindex: {record.record_type}")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"Error checking GROUP_MAIL record {record.id} at source: {e}")
+            return None
+
+    async def _check_and_fetch_updated_group_post(
+        self, org_id: str, record: MailRecord
+    ) -> tuple[Record, list[Permission]] | None:
+        """Fetch group post from source and check for updates."""
+        try:
+            group_id = record.external_record_group_id
+            thread_id = record.thread_id if hasattr(record, 'thread_id') else None
+            post_id = record.external_record_id
+
+            if not group_id:
+                self.logger.warning(f"GROUP_MAIL record {record.id} missing group_id")
+                return None
+
+            if not thread_id:
+                self.logger.warning(f"GROUP_MAIL record {record.id} missing thread_id - may be old record")
+                return None
+
+            # Fetch post from API (same as stream_record)
+            response = await self.external_outlook_client.groups_threads_get_post(
+                group_id=group_id,
+                thread_id=thread_id,
+                post_id=post_id
+            )
+
+            if not response.success or not response.data:
+                self.logger.warning(f"GROUP_MAIL post {post_id} not found at source")
+                return None
+
+            post = response.data
+
+            # Fetch thread for topic (need for MailRecord)
+            # threads are Pydantic ConversationThread objects from _get_group_threads
+            threads = await self._get_group_threads(group_id)
+            thread = None
+            for t in threads:
+                if t.id == thread_id:
+                    thread = t
+                    break
+
+            if not thread:
+                self.logger.warning(f"Thread {thread_id} not found for group {group_id}")
+                return None
+
+            # Get group info for permissions
+            group_data = await self.data_entities_processor.get_user_group_by_external_id(
+                connector_id=self.connector_id,
+                external_id=group_id
+            )
+
+            if not group_data:
+                self.logger.warning(f"Group {group_id} not found in database")
+                return None
+
+            # Create AppUserGroup for _process_group_post
+            group = AppUserGroup(
+                app_name=Connectors.OUTLOOK,
+                connector_id=self.connector_id,
+                source_user_group_id=group_id,
+                name=group_data.name if group_data.name else OutlookDefaults.UNKNOWN_GROUP_LABEL,
+                org_id=org_id,
+                description=group_data.description
+            )
+
+            # Reuse existing processing logic
+            record_update = await self._process_group_post(org_id, group, thread, post)
+
+            if not record_update or not record_update.record:
+                return None
+
+            # Check if updated (GROUP_MAIL uses receivedDateTime, no etag)
+            if not record_update.is_new and not record_update.is_updated:
+                self.logger.debug(f"GROUP_MAIL post {post_id} has not changed at source")
+                return None
+
+            return (record_update.record, record_update.new_permissions or [])
+
+        except Exception as e:
+            self.logger.error(f"Error fetching GROUP_MAIL post {record.external_record_id}: {e}")
+            return None
+
+    async def _check_and_fetch_updated_group_post_attachment(
+        self, org_id: str, record: FileRecord
+    ) -> tuple[Record, list[Permission]] | None:
+        """Fetch group post attachment from source and check for updates."""
+        try:
+            attachment_id = record.external_record_id
+            post_id = record.parent_external_record_id
+
+            if not post_id:
+                self.logger.warning(f"GROUP_MAIL attachment {attachment_id} has no parent post ID")
+                return None
+
+            parent_record = await self.data_entities_processor.get_record_by_external_id(
+                self.connector_id, post_id
+            )
+
+            if not parent_record or parent_record.record_type != RecordType.GROUP_MAIL:
+                self.logger.warning(f"Parent GROUP_MAIL not found for attachment {attachment_id}")
+                return None
+
+            group_id = record.external_record_group_id or parent_record.external_record_group_id
+            thread_id = await self._group_post_thread_id(parent_record)
+
+            if not group_id or not thread_id:
+                self.logger.warning(f"GROUP_MAIL attachment {attachment_id} missing group_id or thread_id")
+                return None
+
+            # Fetch attachments for this post
+            attachments = await self._get_group_post_attachments(group_id, thread_id, post_id)
+
+            # Find our attachment - attachments are Pydantic Attachment objects from _get_group_post_attachments
+            attachment = None
+            for att in attachments:
+                if att.id == attachment_id:
+                    attachment = att
+                    break
+
+            if not attachment:
+                self.logger.warning(f"GROUP_MAIL attachment {attachment_id} not found in post {post_id}")
+                return None
+
+            # Check if updated (compare timestamp - no etag for group attachments)
+            is_updated = False
+            current_modified = attachment.last_modified_date_time
+            if current_modified and record.source_updated_at:
+                current_ts = datetime_to_epoch_ms(current_modified)
+                if current_ts and current_ts > record.source_updated_at:
+                    is_updated = True
+                    self.logger.info(f"GROUP_MAIL attachment {attachment_id} has changed at source")
+
+            if not is_updated:
+                self.logger.debug(f"GROUP_MAIL attachment {attachment_id} has not changed at source")
+                return None
+
+            content_type = attachment.content_type
+            if not content_type:
+                return None
+
+            file_name, mime_type, extension = attachment_metadata_from_graph(
+                attachment.name,
+                content_type,
+                OutlookDefaults.ATTACHMENT_NAME,
+            )
+
+            attachment_record = FileRecord(
+                id=record.id,
+                org_id=org_id,
+                record_name=file_name,
+                record_type=RecordType.FILE,
+                external_record_id=attachment_id,
+                version=record.version + 1,
+                origin=OriginTypes.CONNECTOR,
+                connector_name=Connectors.OUTLOOK,
+                connector_id=self.connector_id,
+                source_created_at=datetime_to_epoch_ms(attachment.last_modified_date_time),
+                source_updated_at=datetime_to_epoch_ms(attachment.last_modified_date_time),
+                mime_type=mime_type,
+                parent_external_record_id=post_id,
+                parent_record_type=RecordType.GROUP_MAIL,
+                external_record_group_id=group_id,
+                record_group_type=RecordGroupType.GROUP_MAILBOX,
+                inherit_permissions=True,
+                weburl=parent_record.weburl,
+                is_file=True,
+                size_in_bytes=attachment.size or 0,
+                extension=extension,
+                is_dependent_node=True,
+                parent_node_id=parent_record.id,
+            )
+
+            # Apply indexing filter
+            if not self.indexing_filters.is_enabled(IndexingFilterKey.ATTACHMENTS, default=True):
+                attachment_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            cap_attachment_indexing(attachment_record, self.logger)
+
+            return (attachment_record, [])
+
+        except Exception as e:
+            self.logger.error(f"Error fetching GROUP_MAIL attachment {record.external_record_id}: {e}")
+            return None
+
+    async def _check_and_fetch_updated_record(
+        self, org_id: str, user_id: str, user_email: str, record: Record
+    ) -> tuple[Record, list[Permission]] | None:
+        """Fetch record from source and return data for reindexing.
+
+        Args:
+            org_id: Organization ID
+            user_id: Source user ID for API calls
+            user_email: User email for permission extraction
+            record: Record to check
+
+        Returns:
+            Tuple of (Record, List[Permission]) for processing via on_new_records
+        """
+        try:
+            if record.record_type == RecordType.MAIL:
+                return await self._check_and_fetch_updated_email(org_id, user_id, user_email, record)
+            elif record.record_type == RecordType.FILE:
+                return await self._check_and_fetch_updated_attachment(org_id, user_id, user_email, record)
+            else:
+                self.logger.warning(f"Unsupported record type for reindex: {record.record_type}")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"Error checking record {record.id} at source: {e}")
+            return None
+
+    async def _check_and_fetch_updated_email(
+        self, org_id: str, user_id: str, user_email: str, record: Record
+    ) -> tuple[Record, list[Permission]] | None:
+        """Fetch email from source for reindexing."""
+        try:
+            message_id = record.external_record_id
+
+            message = await self._get_message_by_id_external(user_id, message_id)
+            if not message:
+                self.logger.warning(f"Email {message_id} not found at source, may have been deleted")
+                return None
+
+            folder_id = record.external_record_group_id or ""
+            folder_name = OutlookDefaults.UNKNOWN_FOLDER_LABEL
+
+            email_update = await self._process_single_email_with_folder(
+                org_id, user_email, message, folder_id, folder_name,
+                existing_record=record  # Pass record to skip DB lookup
+            )
+
+            if not email_update or not email_update.record:
+                return None
+
+            if not email_update.is_new and not email_update.is_updated:
+                self.logger.debug(f"Email {message_id} has not changed at source, skipping update")
+                return None
+
+            return (email_update.record, email_update.new_permissions or [])
+
+        except Exception as e:
+            self.logger.error(f"Error fetching email {record.external_record_id}: {e}")
+            return None
+
+    async def _check_and_fetch_updated_attachment(
+        self, org_id: str, user_id: str, user_email: str, record: Record
+    ) -> tuple[Record, list[Permission]] | None:
+        """Fetch attachment from source for reindexing."""
+        try:
+            attachment_id = record.external_record_id
+            parent_message_id = record.parent_external_record_id
+
+            if not parent_message_id:
+                self.logger.warning(f"Attachment {attachment_id} has no parent message ID")
+                return None
+
+            message = await self._get_message_by_id_external(user_id, parent_message_id)
+            if not message:
+                self.logger.warning(f"Parent message {parent_message_id} not found at source")
+                return None
+
+            # attachments are Pydantic Attachment objects from _get_message_attachments_external
+            attachments = await self._get_message_attachments_external(user_id, parent_message_id)
+
+            attachment = None
+            for att in attachments:
+                if att.id == attachment_id:
+                    attachment = att
+                    break
+
+            if not attachment:
+                self.logger.warning(f"Attachment {attachment_id} not found in parent message")
+                return None
+
+            folder_id = record.external_record_group_id or ""
+
+            is_updated = False
+            current_revision = attachment.last_modified_date_time.isoformat() if attachment.last_modified_date_time else None
+            if record.external_revision_id != current_revision:
+                is_updated = True
+                self.logger.info(f"Attachment {attachment_id} has changed at source (revision changed)")
+
+            if not is_updated:
+                self.logger.debug(f"Attachment {attachment_id} has not changed at source, skipping update")
+                return None
+
+            # message is a Pydantic Message object
+            email_permissions = await self._extract_email_permissions(message, None, user_email)
+            parent_weburl = message.web_link
+
+            parent_mail = await self._get_existing_record(org_id, parent_message_id)
+            if not parent_mail:
+                self.logger.warning(
+                    f"Parent mail record not found in database for attachment {attachment_id} "
+                    f"(parent message {parent_message_id}); sync the parent mail before reindexing attachments"
+                )
+                return None
+
+            attachment_record = await self._create_attachment_record(
+                org_id,
+                attachment,
+                parent_message_id,
+                folder_id,
+                parent_mail.id,
+                existing_record=record,
+                parent_weburl=parent_weburl,
+            )
+
+            # Return None if attachment was filtered out
+            if not attachment_record:
+                return None
+
+            return (attachment_record, email_permissions)
+
+        except Exception as e:
+            self.logger.error(f"Error fetching attachment {record.external_record_id}: {e}")
+            return None
+
+    def _extract_email_from_recipient(self, recipient: object) -> str:
+        """Extract email address from a Pydantic Recipient object."""
+        if not recipient:
+            return ''
+
+        # recipient is a Pydantic Recipient object with email_address property
+        if recipient.email_address and recipient.email_address.address:
+            return recipient.email_address.address
+
+        # Fallback to empty string
+        return ''
+
+
+    def _format_datetime_string(self, dt_obj: datetime | str | None) -> str:
+        """Format datetime object to ISO string."""
+        if not dt_obj:
+            return ""
+        try:
+            if isinstance(dt_obj, str):
+                return dt_obj
+            else:
+                return dt_obj.isoformat()
+        except Exception:
+            return ""
+
+    async def _construct_group_mail_weburl(self, group_id: str) -> str | None:
+        """
+        Construct web URL for group mail from cached group data or by fetching from API.
+        Format: https://outlook.office365.com/groups/{domain}/{mailNickname}/mail
+
+        Args:
+            group_id: Group ID to look up
+
+        Returns:
+            Constructed web URL or None if data not available
+        """
+        group_data = self._group_cache.get(group_id)
+
+        # If not cached, fetch from API
+        if not group_data:
+            if not self.external_users_client:
+                return None
+
+            try:
+                response = await self.external_users_client.groups_group_get_group(
+                    group_id=group_id,
+                    select=OutlookAPIFields.GROUP_INFO_SELECT_FIELDS
+                )
+
+                if not response.success or not response.data:
+                    return None
+
+                # Cache the result for future use - response.data is a Pydantic Group object
+                group_data = {
+                    'mail': response.data.mail,
+                    'mailNickname': response.data.mail_nickname
+                }
+
+                if group_data['mail'] and group_data['mailNickname']:
+                    self._group_cache[group_id] = group_data
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch group data for {group_id}: {e}")
+                return None
+
+        mail = group_data.get('mail')
+        mail_nickname = group_data.get('mailNickname')
+
+        if not mail or not mail_nickname:
+            return None
+
+        try:
+            # Extract domain from email address
+            if '@' not in mail:
+                return None
+            domain = mail.split('@')[1]
+
+            # Construct URL
+            return f"https://outlook.office365.com/groups/{domain}/{mail_nickname}/mail"
+        except Exception as e:
+            self.logger.warning(f"Failed to construct group mail weburl for group {group_id}: {e}")
+            return None
+
+    @classmethod
+    async def create_connector(
+        cls,
+        logger: Logger,
+        data_store_provider: DataStoreProvider,
+        config_service: ConfigurationService,
+        connector_id: str,
+        scope: str,
+        created_by: str,
+        data_entities_processor,
+        **kwargs,
+    ) -> 'OutlookConnector':
+        """Factory method to create and initialize OutlookConnector."""
+        return cls(
+            logger,
+            data_entities_processor,
+            data_store_provider,
+            config_service,
+            connector_id,
+            scope,
+            created_by,
+        )

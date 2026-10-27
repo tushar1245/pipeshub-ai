@@ -1,0 +1,401 @@
+import 'reflect-metadata';
+import { expect } from 'chai';
+import sinon from 'sinon';
+import { Types } from 'mongoose';
+import { Logger, LogLevel, getLogLevel } from '../../../src/libs/services/logger.service';
+import { envGuard } from '../../helpers/env-guard';
+
+describe('Logger', () => {
+  const env = envGuard();
+
+  // Reset the singleton between tests
+  beforeEach(() => {
+    env.snapshot();
+    (Logger as any).instance = null;
+  });
+
+  afterEach(() => {
+    env.restore();
+    sinon.restore();
+    (Logger as any).instance = null;
+  });
+
+  describe('getLogLevel', () => {
+    it('should return Info as default when LOG_LEVEL is not set', () => {
+      delete process.env.LOG_LEVEL;
+      expect(getLogLevel()).to.equal(LogLevel.Info);
+    });
+
+    it('should return the LOG_LEVEL when set to a valid value', () => {
+      process.env.LOG_LEVEL = 'debug';
+      expect(getLogLevel()).to.equal(LogLevel.Debug);
+    });
+
+    it('should be case insensitive', () => {
+      process.env.LOG_LEVEL = 'ERROR';
+      expect(getLogLevel()).to.equal(LogLevel.Error);
+    });
+
+    it('should return Info for invalid values', () => {
+      process.env.LOG_LEVEL = 'invalid';
+      expect(getLogLevel()).to.equal(LogLevel.Info);
+    });
+  });
+
+  describe('LogLevel enum', () => {
+    it('should have correct values', () => {
+      expect(LogLevel.Debug).to.equal('debug');
+      expect(LogLevel.Info).to.equal('info');
+      expect(LogLevel.Warning).to.equal('warning');
+      expect(LogLevel.Error).to.equal('error');
+    });
+  });
+
+  describe('constructor', () => {
+    it('should create a new Logger instance', () => {
+      const logger = new Logger({ service: 'test-service' });
+      expect(logger).to.be.instanceOf(Logger);
+    });
+
+    it('should return the same instance on subsequent calls (singleton)', () => {
+      const logger1 = new Logger({ service: 'service1' });
+      const logger2 = new Logger({ service: 'service2' });
+      expect(logger1).to.equal(logger2);
+    });
+
+    it('should use default service name when not provided', () => {
+      const logger = new Logger();
+      expect(logger).to.be.instanceOf(Logger);
+    });
+  });
+
+  describe('getInstance', () => {
+    it('should create instance if none exists', () => {
+      const logger = Logger.getInstance({ service: 'test' });
+      expect(logger).to.be.instanceOf(Logger);
+    });
+
+    it('should return existing instance', () => {
+      const logger1 = Logger.getInstance({ service: 'test' });
+      const logger2 = Logger.getInstance();
+      expect(logger1).to.equal(logger2);
+    });
+
+    it('should update config on existing instance', () => {
+      const logger = Logger.getInstance({ service: 'test', level: 'info' });
+      Logger.getInstance({ service: 'updated', level: 'debug' });
+      // The instance should be the same object
+      expect(logger).to.equal(Logger.getInstance());
+    });
+  });
+
+  describe('logging methods', () => {
+    let logger: Logger;
+    let logStub: sinon.SinonStub;
+
+    beforeEach(() => {
+      logger = new Logger({ service: 'test', level: 'debug' });
+      // Stub the internal winston logger's log method
+      logStub = sinon.stub((logger as any).logger, 'log');
+    });
+
+    it('should call info with correct level', () => {
+      logger.info('test message');
+      expect(logStub.calledOnce).to.be.true;
+      const call = logStub.firstCall.args[0];
+      expect(call.level).to.equal('info');
+      expect(call.message).to.equal('test message');
+    });
+
+    it('should call error with correct level', () => {
+      logger.error('error message');
+      expect(logStub.calledOnce).to.be.true;
+      const call = logStub.firstCall.args[0];
+      expect(call.level).to.equal('error');
+      expect(call.message).to.equal('error message');
+    });
+
+    it('should call warn with correct level', () => {
+      logger.warn('warning message');
+      expect(logStub.calledOnce).to.be.true;
+      const call = logStub.firstCall.args[0];
+      expect(call.level).to.equal('warning');
+      expect(call.message).to.equal('warning message');
+    });
+
+    it('should call debug with correct level', () => {
+      logger.debug('debug message');
+      expect(logStub.calledOnce).to.be.true;
+      const call = logStub.firstCall.args[0];
+      expect(call.level).to.equal('debug');
+      expect(call.message).to.equal('debug message');
+    });
+
+    it('should pass metadata to log', () => {
+      logger.info('test', { key: 'value' });
+      const call = logStub.firstCall.args[0];
+      expect(call.metadata).to.deep.equal({ key: 'value' });
+    });
+
+    it('should include caller info (filename and line)', () => {
+      logger.info('test');
+      const call = logStub.firstCall.args[0];
+      expect(call).to.have.property('filename');
+      expect(call).to.have.property('line');
+    });
+  });
+
+  describe('updateDefaultMeta', () => {
+    it('should update default metadata', () => {
+      const logger = new Logger({ service: 'test' });
+      logger.updateDefaultMeta({ environment: 'test' });
+      expect((logger as any).defaultMeta).to.have.property('environment', 'test');
+    });
+
+    it('should merge with existing metadata', () => {
+      const logger = new Logger({ service: 'test' });
+      logger.updateDefaultMeta({ key1: 'value1' });
+      logger.updateDefaultMeta({ key2: 'value2' });
+      expect((logger as any).defaultMeta).to.have.property('key1', 'value1');
+      expect((logger as any).defaultMeta).to.have.property('key2', 'value2');
+    });
+  });
+
+  describe('logRequest', () => {
+    it('should log request details', () => {
+      const logger = new Logger({ service: 'test' });
+      const logStub = sinon.stub((logger as any).logger, 'log');
+      const mockReq = {
+        method: 'GET',
+        path: '/api/v1/test',
+        query: { page: '1' },
+        params: { id: '123' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer token', cookie: 'session=abc' },
+      };
+      logger.logRequest(mockReq as any);
+      expect(logStub.calledOnce).to.be.true;
+      const logged = JSON.stringify(logStub.firstCall.args);
+      expect(logged).to.not.contain('Bearer token');
+      expect(logged).to.not.contain('session=abc');
+    });
+
+    it('should redact OAuth codes from the query and the referer', () => {
+      const logger = new Logger({ service: 'test' });
+      const logStub = sinon.stub((logger as any).logger, 'log');
+      logger.logRequest({
+        method: 'GET',
+        path: '/api/v1/connectors/oauth/callback',
+        query: { code: 'fake-code-value', page: '1' },
+        params: {},
+        headers: { referer: 'http://localhost:3001/cb?code=fake-code-value', 'x-session-token': 'fake-session' },
+      } as any);
+      const logged = JSON.stringify(logStub.firstCall.args);
+      expect(logged).to.not.contain('fake-code-value');
+      expect(logged).to.not.contain('fake-session');
+    });
+  });
+
+  describe('metadata redaction format', () => {
+    it('redacts URL-valued fields before any transport formats the line', () => {
+      const logger = new Logger({ service: 'test' });
+      const format = (logger as any).logger.format;
+      const info = format.transform(
+        {
+          level: 'error',
+          message: 'Application error',
+          metadata: {
+            context: {
+              request: {
+                path: '/api/v1/connectors/oauth/callback',
+                headers: {
+                  referer: 'http://localhost:3001/connectors/oauth/callback/Drive?state=fake-state-value&code=fake-code-value',
+                  authorization: 'Bearer fake-bearer-value',
+                },
+              },
+            },
+            redirectUrl: '/oauth/authorize?state=fake-state-value',
+          },
+        },
+        {},
+      );
+      const rendered = String(info[Symbol.for('message')]) + JSON.stringify(info.metadata);
+      for (const secret of ['fake-code-value', 'fake-state-value', 'fake-bearer-value']) {
+        expect(rendered).to.not.contain(secret);
+      }
+      expect(rendered).to.contain('/connectors/oauth/callback/Drive');
+    });
+  });
+
+  describe('sanitizeForLogging (private)', () => {
+    it('should handle circular references', () => {
+      const logger = new Logger({ service: 'test' });
+      const logStub = sinon.stub((logger as any).logger, 'log');
+
+      const circular: any = { name: 'test' };
+      circular.self = circular;
+
+      // Should not throw
+      logger.info('circular test', circular);
+      expect(logStub.calledOnce).to.be.true;
+    });
+
+    it('should handle null and undefined values', () => {
+      const logger = new Logger({ service: 'test' });
+      const logStub = sinon.stub((logger as any).logger, 'log');
+
+      logger.info('null test', { key: null, undef: undefined });
+      expect(logStub.calledOnce).to.be.true;
+    });
+
+    it('should skip parent, _readableState, and pipes properties', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      const obj = {
+        name: 'test',
+        parent: { circular: 'data' },
+        _readableState: { flowing: true },
+        pipes: [1, 2, 3],
+        safe: 'value',
+      };
+
+      const result = sanitize(obj);
+      expect(result).to.have.property('name', 'test');
+      expect(result).to.have.property('safe', 'value');
+      expect(result).to.not.have.property('parent');
+      expect(result).to.not.have.property('_readableState');
+      expect(result).to.not.have.property('pipes');
+    });
+
+    it('should redact credential-bearing keys regardless of separator or case', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      const result = sanitize({
+        Authorization: 'Bearer abc.def.ghi',
+        'api-key': 'sk-live-1',
+        api_key: 'sk-live-2',
+        apiKey: 'sk-live-3',
+        cookie: 'session=1',
+        refreshToken: 'rt-1',
+        clientSecret: 'cs-1',
+        'x-slack-signature': 'v0=deadbeef',
+        url: 'https://example.test/v1/chat',
+      });
+
+      expect(result.Authorization).to.equal('[REDACTED]');
+      expect(result['api-key']).to.equal('[REDACTED]');
+      expect(result.api_key).to.equal('[REDACTED]');
+      expect(result.apiKey).to.equal('[REDACTED]');
+      expect(result.cookie).to.equal('[REDACTED]');
+      expect(result.refreshToken).to.equal('[REDACTED]');
+      expect(result.clientSecret).to.equal('[REDACTED]');
+      expect(result['x-slack-signature']).to.equal('[REDACTED]');
+      expect(result.url).to.equal('https://example.test/v1/chat');
+    });
+
+    it('should redact credentials nested inside request options', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      const result = sanitize({
+        requestOptions: {
+          headers: { authorization: 'Bearer leaked' },
+          body: { password: 'hunter2', query: 'who owns the roadmap?' },
+        },
+      });
+
+      expect(result.requestOptions.headers.authorization).to.equal('[REDACTED]');
+      expect(result.requestOptions.body.password).to.equal('[REDACTED]');
+      expect(result.requestOptions.body.query).to.equal('who owns the roadmap?');
+    });
+
+    it('should keep dates, Mongo ids and errors as their logged values', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+      const orgId = new Types.ObjectId('64b7f0c2a1b2c3d4e5f60718');
+
+      const result = sanitize({
+        orgId,
+        at: new Date('2026-10-13T10:00:00.000Z'),
+        error: new Error('mongo down'),
+      });
+
+      expect(result.orgId).to.equal('64b7f0c2a1b2c3d4e5f60718');
+      expect(result.at).to.equal('2026-10-13T10:00:00.000Z');
+      expect(result.error.message).to.equal('mongo down');
+      expect(result.error.stack).to.be.a('string');
+    });
+
+    it('should redact secrets carried in an error message and stack', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      const result = sanitize({
+        callback: new Error('exchange failed for https://idp.example/cb?code=SECRETCODE&page=2'),
+        login: new Error('login failed password=hunter2'),
+        upstream: new Error('401 for header Authorization: Bearer eyJhbGciOi.secretjwt'),
+      });
+
+      const logged = JSON.stringify(result);
+      expect(logged).to.not.include('SECRETCODE');
+      expect(logged).to.not.include('hunter2');
+      expect(logged).to.not.include('secretjwt');
+      expect(result.callback.message).to.include('https://idp.example/cb');
+    });
+
+    it('should keep numeric token counters readable', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      const result = sanitize({ totalTokens: 1234, tokenScopes: ['kb:write'] });
+      expect(result.totalTokens).to.equal(1234);
+      expect(result.tokenScopes).to.deep.equal(['kb:write']);
+    });
+
+    it('should handle arrays inside objects', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      const result = sanitize({ items: [1, 'two', { nested: true }] });
+      expect(result.items).to.be.an('array');
+      expect(result.items).to.have.length(3);
+      expect(result.items[2]).to.deep.equal({ nested: true });
+    });
+
+    it('should return [Unable to serialize] when sanitizeForLogging throws on a property', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      // Create an object whose property value causes sanitizeForLogging to throw
+      // during recursive processing (inside the try-catch per key)
+      const badValue = Object.create(null);
+      Object.defineProperty(badValue, Symbol.toPrimitive, {
+        value: () => { throw new Error('cannot convert'); },
+      });
+      // Make Object.entries succeed but recursive sanitize fail:
+      // Use a value that is an object with a getter that throws during iteration
+      const inner: any = {};
+      Object.defineProperty(inner, 'x', {
+        get() { throw new Error('inner getter error'); },
+        enumerable: true,
+      });
+      const problematic: any = { good: 'ok', bad: inner };
+
+      const result = sanitize(problematic);
+      expect(result).to.have.property('good', 'ok');
+      expect(result).to.have.property('bad', '[Unable to serialize]');
+    });
+
+    it('should return primitive values as-is', () => {
+      const logger = new Logger({ service: 'test' });
+      const sanitize = (logger as any).sanitizeForLogging.bind(logger);
+
+      expect(sanitize(null)).to.be.null;
+      expect(sanitize(42)).to.equal(42);
+      expect(sanitize('hello')).to.equal('hello');
+      expect(sanitize(true)).to.be.true;
+      expect(sanitize(undefined)).to.be.undefined;
+    });
+  });
+});

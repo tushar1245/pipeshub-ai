@@ -1,0 +1,217 @@
+name: graph_record
+description: Base Record from graph (matches Record.model_dump mode=json).
+fields:
+  access_rule:
+    required: false
+    type: string
+    enum:
+      - OPEN
+      - STRICT
+      - RESTRICTED
+  block_containers:
+    type: object
+    required: false
+    properties:
+      blocks:
+        type: array
+        required: true
+      block_groups:
+        type: array
+        required: true
+      code_facts_version:
+        type: string
+        required: false
+  child_record_ids:
+    required: false
+    type: array
+  connector_id:
+    required: true
+    type: string
+  connector_name:
+    required: true
+    type: string
+  created_at:
+    required: false
+    type: integer
+  external_record_group_id:
+    required: false
+    type: string
+  external_record_id:
+    required: true
+    type: string
+  external_revision_id:
+    required: false
+    type: string
+  extraction_status:
+    required: false
+    type: string
+  hide_weburl:
+    required: false
+    type: boolean
+  id:
+    required: false
+    type: string
+  indexing_status:
+    required: false
+    type: string
+  parsing_status:
+    required: false
+    type: string
+  processing_started_at:
+    required: false
+    type: integer
+  queued_at:
+    required: false
+    type: integer
+  inherit_permissions:
+    required: false
+    type: boolean
+  # Write-time instructions to the processor (inherit from the group, replace the stored
+  # grants, the source listed every group it shares the record with); never stored.
+  inherit_permissions_from_group:
+    required: false
+    type: boolean
+  rewrite_permissions:
+    required: false
+    type: boolean
+  shared_groups_complete:
+    required: false
+    type: boolean
+  is_dependent_node:
+    required: false
+    type: boolean
+  is_internal:
+    required: false
+    type: boolean
+  is_placeholder:
+    required: false
+    type: boolean
+  is_shared:
+    required: false
+    type: boolean
+  is_vlm_ocr_processed:
+    required: false
+    type: boolean
+  is_deleted:
+    required: false
+    type: boolean
+  deleted_at:
+    required: false
+    type: integer
+  deleted_by_user_id:
+    required: false
+    type: string
+  delete_source:
+    required: false
+    type: string
+  delete_batch_id:
+    required: false
+    type: string
+  purge_attempts:
+    required: false
+    type: integer
+  purge_last_error:
+    required: false
+    type: string
+  md5_hash:
+    required: false
+    type: string
+  mime_type:
+    required: false
+    type: string
+  org_id:
+    required: false
+    type: string
+  origin:
+    required: true
+    type: string
+  parent_external_record_id:
+    required: false
+    type: string
+  parent_node_id:
+    required: false
+    type: string
+  parent_record_id:
+    required: false
+    type: string
+  parent_record_type:
+    required: false
+    type: string
+  preview_renderable:
+    required: false
+    type: boolean
+  reason:
+    required: false
+    type: string
+  record_group_id:
+    required: false
+    type: string
+  record_group_type:
+    required: false
+    type: string
+  record_name:
+    required: true
+    type: string
+  record_status:
+    required: false
+    type: string
+  record_type:
+    required: true
+    type: string
+  related_external_records:
+    required: false
+    type: array
+  related_record_ids:
+    required: false
+    type: array
+  root_record_group_id:
+    required: false
+    type: string
+  semantic_metadata:
+    required: false
+    type: object
+  shared_with_me_record_group_ids:
+    required: false
+    type: array
+  signed_url:
+    required: false
+    type: string
+  fetch_signed_url:
+    required: false
+    type: string
+  size_in_bytes:
+    required: false
+    type: integer
+  source_created_at:
+    required: false
+    type: integer
+  source_timestamp_origin:
+    required: false
+    type: string
+  source_updated_at:
+    required: false
+    type: integer
+  summary_document_id:
+    required: false
+    type: string
+  trashed_external_record_id:
+    required: false
+    type: string
+  updated_at:
+    required: false
+    type: integer
+  uploaded_by:
+    required: false
+    type: string
+  version:
+    required: true
+    type: integer
+  virtual_record_id:
+    required: false
+    type: string
+  weburl:
+    required: false
+    type: string
+  storage_document_id:
+    required: false
+    type: string

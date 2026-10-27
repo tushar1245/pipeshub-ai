@@ -1,0 +1,164 @@
+import { RedisConfig } from '../../../libs/types/messaging.types';
+import { ConfigService } from '../services/cm.service';
+import { passwordResetLinkLifetime } from '../../../libs/utils/createJwt';
+import { ParsedTrustProxy, parseTrustProxy } from '../../../libs/utils/trust-proxy';
+
+export interface AppConfig {
+  jwtSecret: string;
+  scopedJwtSecret: string;
+  cookieSecret: string;
+  rsAvailable: string;
+
+  communicationBackend: string;
+  frontendUrl: string;
+  iamBackend: string;
+  authBackend: string;
+  cmBackend: string;
+  kbBackend: string;
+  esBackend: string;
+  storageBackend: string;
+  tokenBackend: string;
+  aiBackend: string;
+  connectorBackend: string;
+  connectorPublicUrl: string;
+  indexingBackend: string;
+  kafka: {
+    brokers: string[];
+    ssl?: boolean;
+    sasl?: {
+      mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
+      username: string;
+      password: string;
+    };
+  };
+  redis: RedisConfig;
+  mongo: {
+    uri: string;
+    db: string;
+  };
+
+  qdrant: {
+    port: number;
+    apiKey: string;
+    host: string;
+    grpcPort: number;
+  };
+
+  arango: {
+    url: string;
+    db: string;
+    username: string;
+    password: string;
+  };
+  etcd: {
+    host: string;
+    port: number;
+    dialTimeout: number;
+  };
+
+  smtp: {
+    host: string;
+    port: number;
+    username?: string;
+    password?: string;
+    fromEmail: string;
+  } | null;
+  storage: {
+    storageType: string;
+    endpoint: string;
+  };
+
+  // OAuth Provider config
+  oauthIssuer: string;
+  oauthBackendUrl: string;
+  mcpScopes: string[];
+
+  // SAML SP Entity ID (issuer sent in AuthnRequests)
+  samlIssuer: string;
+
+  // Domain check config
+  skipDomainCheck: boolean;
+
+  // Rate limit config
+  maxRequestsPerMinute: number;
+  maxOAuthClientRequestsPerMinute: number;
+  maxAuthRequestsPerMinute: number;
+
+  // Express `trust proxy` setting, parsed from TRUST_PROXY
+  trustProxy: ParsedTrustProxy;
+
+  // Deployment config — which backing services are in use (read from KV store)
+  deployment: {
+    dataStoreType: string;
+    messageBrokerType: string;
+    kvStoreType: string;
+    vectorDbType: string;
+  };
+}
+
+export const loadAppConfig = async (): Promise<AppConfig> => {
+  // Fails startup on an unusable PASSWORD_RESET_LINK_EXPIRY, rather than
+  // letting every reset link be issued already expired.
+  passwordResetLinkLifetime();
+  const configService = ConfigService.getInstance();
+
+  return {
+    jwtSecret: await configService.getJwtSecret(),
+    scopedJwtSecret: await configService.getScopedJwtSecret(),
+    cookieSecret: await configService.getCookieSecret(),
+    rsAvailable: await configService.getRsAvailable(),
+
+    frontendUrl: await configService.getFrontendUrl(),
+    communicationBackend: await configService.getCommunicationBackendUrl(),
+    kbBackend: await configService.getKbBackendUrl(),
+    esBackend: await configService.getEsBackendUrl(),
+    iamBackend: await configService.getIamBackendUrl(),
+    authBackend: await configService.getAuthBackendUrl(),
+    cmBackend: await configService.getCmBackendUrl(),
+    connectorBackend: await configService.getConnectorUrl(),
+    connectorPublicUrl: await configService.getConnectorPublicUrl(),
+    indexingBackend: await configService.getIndexingUrl(),
+    aiBackend: await configService.getAiBackendUrl(),
+    storageBackend: await configService.getStorageBackendUrl(),
+    tokenBackend: await configService.getTokenBackendUrl(),
+    kafka: await configService.getKafkaConfig(),
+    redis: await configService.getRedisConfig(),
+    arango: await configService.getArangoConfig(),
+    qdrant: await configService.getQdrantConfig(),
+    mongo: await configService.getMongoConfig(),
+    smtp: await configService.getSmtpConfig(),
+
+    etcd: {
+      host: process.env.ETCD_HOST!,
+      port: parseInt(process.env.ETCD_PORT!, 10),
+      dialTimeout: parseInt(process.env.ETCD_DIAL_TIMEOUT!, 10),
+    },
+    storage: await configService.getStorageConfig(),
+
+    // OAuth Provider config - initialize first, then get
+    oauthIssuer: (await configService.initializeOAuthIssuer(), await configService.getOAuthIssuer()),
+    oauthBackendUrl: await configService.getOAuthBackendUrl(),
+    mcpScopes: await configService.getMcpScopes(),
+
+    // SAML SP Entity ID — falls back to FRONTEND_PUBLIC_URL, then 'pipeshub'
+    samlIssuer: process.env.SAML_SP_ENTITY_ID || process.env.FRONTEND_PUBLIC_URL || 'pipeshub',
+
+    // Domain check config - when true, skip domain matching and use first available org
+    skipDomainCheck: process.env.SKIP_DOMAIN_CHECK === 'true',
+
+    // Rate limit config
+    maxRequestsPerMinute: process.env.MAX_REQUESTS_PER_MINUTE
+      ? parseInt(process.env.MAX_REQUESTS_PER_MINUTE, 10)
+      : 1000,
+    maxOAuthClientRequestsPerMinute: process.env.MAX_OAUTH_CLIENT_REQUESTS_PER_MINUTE
+      ? parseInt(process.env.MAX_OAUTH_CLIENT_REQUESTS_PER_MINUTE, 10)
+      : 1000,
+    maxAuthRequestsPerMinute: process.env.MAX_AUTH_REQUESTS_PER_MINUTE
+      ? parseInt(process.env.MAX_AUTH_REQUESTS_PER_MINUTE, 10)
+      : 10,
+
+    trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+
+    deployment: await configService.getDeploymentConfig() as AppConfig['deployment'],
+  };
+};

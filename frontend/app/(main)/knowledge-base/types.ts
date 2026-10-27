@@ -1,0 +1,641 @@
+// Knowledge Base Types
+
+import type { FileType, ItemStatus, SourceType, SortOrder, ViewMode } from '@/types';
+
+// Re-export common types for convenience
+export type { FileType, ItemStatus, SourceType, SortOrder, ViewMode };
+
+export type KnowledgeBaseItemType = 'folder' | 'file';
+
+export interface KnowledgeBase {
+  id: string;
+  name: string;
+  description?: string;
+  createdAt: string;
+  updatedAt: string;
+  itemCount: number;
+  ownerId: string;
+  isShared: boolean;
+}
+
+export interface KnowledgeBaseItem {
+  id: string;
+  name: string;
+  type: KnowledgeBaseItemType;
+  fileType?: FileType;
+  status?: ItemStatus;
+  source?: SourceType;
+  size?: number;
+  createdAt: string;
+  updatedAt: string;
+  parentId: string | null;
+  knowledgeBaseId: string;
+  hasChildren: boolean;
+  nodeType?: string;
+  sourceType?: string;
+  connector?: string;
+  reason?: string | null;
+}
+
+export interface FolderTreeNode {
+  id: string;
+  name: string;
+  children: FolderTreeNode[];
+  isExpanded: boolean;
+  depth: number;
+  parentId: string | null;
+  hasChildren?: boolean;
+}
+
+// Size range options for filtering
+export type SizeRange = 'lt1mb' | '1to10mb' | '10to100mb';
+
+export interface KnowledgeBaseFilter {
+  nodeTypes?: string[];           // Aligned with API: nodeTypes parameter
+  recordTypes?: RecordType[];     // NEW: for filtering by record type
+  indexingStatus?: IndexingStatus[]; // Aligned with API: was 'statuses'
+  origins?: NodeOrigin[];         // Aligned with API: was 'sources'
+  connectorIds?: string[];        // Collections too: a collection is an App, and
+                                  // connectorIds matches an App or anything under it
+  sizeRange?: SizeRange;         // Single size range (radio select)
+  createdAfter?: string;         // Keep as-is
+  createdBefore?: string;        // Keep as-is
+  createdDateType?: DateFilterType; // Date filter type for created date
+  updatedAfter?: string;         // Keep as-is
+  updatedBefore?: string;        // Keep as-is
+  updatedDateType?: DateFilterType; // Date filter type for updated date
+  searchQuery?: string;          // NEW: for search query
+}
+
+export type SortField = 'name' | 'createdAt' | 'updatedAt' | 'size' | 'nodeType';
+
+export interface SortConfig {
+  field: SortField;
+  order: SortOrder;
+}
+
+// API Response types
+export interface GetKnowledgeBasesResponse {
+  knowledgeBases: KnowledgeBase[];
+  total: number;
+}
+
+export interface GetKnowledgeBaseItemsResponse {
+  items: KnowledgeBaseItem[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface CreateFolderPayload {
+  name: string;
+  description?: string;
+  parentId: string | null;
+  knowledgeBaseId: string;
+}
+
+export interface UploadFilePayload {
+  file: File;
+  parentId: string | null;
+  knowledgeBaseId: string;
+}
+
+// ============================================================================
+// KNOWLEDGE HUB GET OPERATIONS TYPES
+// ============================================================================
+
+export type NodeType = 'kb' | 'app' | 'recordGroup' | 'folder' | 'record';
+
+/** Sidebar folder-tree reindex callback (id + type from the row that was clicked). */
+export type SidebarReindexHandler = (
+  nodeId: string,
+  nodeType: NodeType,
+  name: string,
+  statusFilters?: IndexingStatus[],
+  indexingStatus?: string | null,
+  hasChildren?: boolean,
+) => void;
+
+export type NodeOrigin = 'COLLECTION' | 'CONNECTOR';
+export type PermissionRole = 'OWNER' | 'READER' | 'WRITER';
+export type RecordType =
+  | 'FILE'
+  | 'DRIVE'
+  | 'WEBPAGE'
+  | 'DATABASE'
+  | 'DATASOURCE'
+  | 'MESSAGE'
+  | 'MAIL'
+  | 'GROUP_MAIL'
+  | 'EMAIL'
+  | 'TICKET'
+  | 'COMMENT'
+  | 'INLINE_COMMENT'
+  | 'CONFLUENCE_PAGE'
+  | 'CONFLUENCE_BLOGPOST'
+  | 'SHAREPOINT_PAGE'
+  | 'SHAREPOINT_LIST'
+  | 'SHAREPOINT_LIST_ITEM'
+  | 'SHAREPOINT_DOCUMENT_LIBRARY'
+  | 'LINK'
+  | 'PROJECT'
+  | 'PULL_REQUEST'
+  | 'MEETING'
+  | 'PRODUCT'
+  | 'DEAL'
+  | 'CASE'
+  | 'TASK'
+  | 'ARTIFACT'
+  | 'CODE_FILE'
+  | 'SQL_TABLE'
+  | 'SQL_VIEW'
+  | 'OTHERS';
+export type IndexingStatus =
+  | 'COMPLETED'
+  | 'IN_PROGRESS'
+  | 'FAILED'
+  | 'FILE_TYPE_NOT_SUPPORTED'
+  | 'NOT_STARTED'
+  | 'AUTO_INDEX_OFF'
+  | 'QUEUED'
+  | 'EMPTY'
+  | 'PAUSED'
+  | 'ENABLE_MULTIMODAL_MODELS'
+  | 'SKIPPED'
+  | 'PASSWORD_PROTECTED';
+export type SharingStatus = 'private' | 'team' | 'personal' | 'shared';
+
+/**
+ * Date filter type for the DateRangePicker component
+ * - 'on': Exact date match
+ * - 'between': Date range (from-to)
+ * - 'before': Dates before the selected date
+ * - 'after': Dates after the selected date
+ */
+export type DateFilterType = 'on' | 'between' | 'before' | 'after';
+
+export interface NodePermission {
+  role: PermissionRole;
+  canEdit: boolean;
+  canDelete: boolean;
+}
+
+/**
+ * Knowledge Hub Query Parameters
+ * 
+ * Unified query params for both getKnowledgeHubNodes and getNodeItems APIs.
+ * All parameters are optional and can be combined for flexible filtering.
+ */
+export interface KnowledgeHubQueryParams {
+  // Pagination is keyset: `cursor` is the token from a previous response, and
+  // its absence means "first page". `page` is sent only when that response
+  // says another page exists but does not include a cursor.
+  cursor?: string;
+  page?: number;
+  limit?: number;             // Items per page (1-200)
+  
+  // Response includes (comma-separated string)
+  include?: string;           // 'counts', 'permissions', 'breadcrumbs', 'availableFilters'
+  
+  // Container filter (sidebar use)
+  onlyContainers?: boolean;   // Return only folders/groups with children
+
+  // Force flattened/recursive search (true) or direct listing (false).
+  // When omitted, the backend computes it from which filters are present.
+  flattened?: boolean;
+
+  // Sorting
+  sortBy?: string;            // 'name', 'createdAt', 'updatedAt', 'size', 'type'
+  sortOrder?: 'asc' | 'desc'; // Sort direction
+  
+  // Search
+  q?: string;                 // Full-text search (2-500 chars)
+  
+  // Node filters (comma-separated)
+  nodeTypes?: string;         // Filter by node types (max 100 items)
+  recordTypes?: string;       // 'FILE', 'WEBPAGE', 'MESSAGE', 'EMAIL', 'TICKET' (max 100)
+  origins?: string;           // 'COLLECTION', 'CONNECTOR' (max 100)
+  connectorIds?: string;      // Connector *or collection* UUIDs (max 100)
+  indexingStatus?: string;    // 'COMPLETED', 'IN_PROGRESS', 'FAILED' (max 100)
+  
+  // Date range filters (epoch ms format: "gte:X,lte:Y")
+  createdAt?: string;         // Filter by creation date range
+  updatedAt?: string;         // Filter by update date range
+  
+  // Size filter (bytes format: "gte:X,lte:Y")
+  size?: string;              // Filter by file size range
+}
+
+/**
+ * The parent a node is listed under.
+ *
+ * The type is what makes it addressable — browsing to it needs
+ * `/nodes/{nodeType}/{id}`, and an id alone would have to be guessed. This is
+ * the node's *placement* parent, which is not always its storage parent: an
+ * ancestor the user cannot open is replaced rather than named.
+ */
+export interface ParentRef {
+  id: string;
+  nodeType: string;
+  name?: string;
+}
+
+/**
+ * Knowledge Hub Node (used in API responses)
+ */
+export interface KnowledgeHubNode {
+  id: string;
+  name: string;
+  nodeType: NodeType;
+  parentId: string | null;
+  parent?: ParentRef;
+  origin: NodeOrigin;
+  connector?: string;
+  /** Connector instance a CONNECTOR-origin node belongs to; marks demo records. `null` otherwise. */
+  connectorId?: string | null;
+  hasChildren: boolean;
+  permission: NodePermission;
+  sharingStatus: SharingStatus;
+  createdAt?: number;
+  updatedAt?: number;
+  webUrl?: string;
+  recordType?: RecordType | null;
+  recordGroupType?: string | null;
+  indexingStatus?: IndexingStatus | null;
+  reason?: string | null;
+  sizeInBytes?: number | null;
+  mimeType?: string | null;
+  extension?: string | null;
+  subType?: string;
+  sourceType?: string;
+  isInternal?: boolean;
+  isPlaceholder?: boolean;
+  previewRenderable?: boolean;
+}
+
+/**
+ * Breadcrumb navigation item
+ */
+export interface Breadcrumb {
+  id: string;
+  name: string;
+  nodeType: string;
+  subType?: string;
+}
+
+/**
+ * Filter option for dropdowns
+ */
+export interface FilterOption {
+  id: string;
+  label: string;
+  type?: string | null;
+  /** Sources only: the connector type, or the origin (`KB` / `COLLECTION` for a collection). */
+  connectorType?: string | null;
+}
+
+/**
+ * Node counts summary
+ */
+export interface NodeCounts {
+  items: Array<{
+    label: string;
+    count: number;
+  }>;
+  total: number;
+}
+
+/**
+ * Node permissions (what user can do)
+ */
+export interface NodePermissions {
+  role: PermissionRole;
+  canUpload: boolean;
+  canCreateFolders: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  canManagePermissions: boolean;
+  /** The user's own role on the collection this node is in, the same at every level inside it; null outside a collection. */
+  collectionRole?: string | null;
+}
+
+/**
+ * Available filter options (from API response)
+ */
+export interface AvailableFilters {
+  nodeTypes: FilterOption[];
+  recordTypes: FilterOption[];
+  origins: FilterOption[];
+  /** Every source the user can open — connectors *and* collections. */
+  connectors: FilterOption[];
+  indexingStatus: FilterOption[];
+}
+
+/**
+ * Applied filters (current state)
+ */
+export interface AppliedFilters {
+  q: string | null;
+  nodeTypes: string | null;
+  recordTypes: string | null;
+  origins: string | null;
+  connectorIds: string | null;
+  indexingStatus: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  size: string | null;
+  sortBy: string;
+  sortOrder: 'asc' | 'desc';
+}
+
+/**
+ * Unified API Response for Knowledge Hub operations
+ * Used for both root-level and node-specific queries
+ */
+export interface KnowledgeHubApiResponse {
+  success: boolean;
+  error: string | null;
+  id: string | null;
+  currentNode: {
+    id: string;
+    name: string;
+    nodeType: string;
+    subType?: string;
+    origin?: string;
+    indexingStatus?: string;
+    version?: number;
+    createdAt?: number;
+    updatedAt?: number;
+  } | null;
+  parentNode: {
+    id: string;
+    name: string;
+    nodeType: string;
+  } | null;
+  items: KnowledgeHubNode[];
+  pagination: {
+    limit: number;
+    totalItems: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+    /** 1-based position of this page's first and last item. */
+    startIndex?: number;
+    endIndex?: number;
+    currentPageItems?: number;
+    /** Opaque tokens; absent when there is nothing in that direction. */
+    nextCursor?: string | null;
+    prevCursor?: string | null;
+    /** Legacy offset fields — sent only while a request still uses `page`. */
+    page?: number;
+    totalPages?: number;
+  };
+  filters?: {
+    applied: AppliedFilters;
+    available: AvailableFilters;
+  };
+  breadcrumbs?: Breadcrumb[];
+  counts?: NodeCounts;
+  permissions?: NodePermissions;
+  /** Deepest a collection folder may be nested; a folder directly in the collection is depth 1. */
+  maxFolderDepth?: number;
+}
+
+/**
+ * Enhanced folder tree node for sidebar
+ */
+export interface EnhancedFolderTreeNode extends FolderTreeNode {
+  nodeType: NodeType;
+  /** Sidebar expand chevron — container children visible in the tree. */
+  hasChildren: boolean;
+  /** Any descendants (including leaf records) — used for reindex eligibility. */
+  hasDescendants?: boolean;
+  isLoading?: boolean;
+  permission?: NodePermission;
+  origin?: NodeOrigin;
+  connector?: string;
+  subType?: string;
+  extension?: string | null;
+  mimeType?: string | null;
+  indexingStatus?: IndexingStatus | null;
+}
+
+export type SidebarSection = 'shared' | 'private';
+
+export interface CategorizedNodes {
+  shared: EnhancedFolderTreeNode[];
+  private: EnhancedFolderTreeNode[];
+}
+
+// ============================================================================
+// ALL RECORDS VIEW TYPES (for future implementation)
+// ============================================================================
+
+// Page view mode for switching between collections and all-records
+export type PageViewMode = 'collections' | 'all-records';
+
+// Connector types — single source of truth in ConnectorIcon.tsx
+import type { ConnectorType as _ConnectorType } from '@/app/components/ui/ConnectorIcon';
+export type ConnectorType = _ConnectorType;
+
+export interface ConnectorItem {
+  id: string;
+  name: string;
+  itemType: string; // 'channel', 'workspace', 'project', 'drive', etc.
+}
+
+export interface Connector {
+  id: string;
+  name: string;
+  type: ConnectorType;
+  icon: string; // Material icon name
+  isConnected: boolean;
+  items: ConnectorItem[];
+}
+
+/**
+ * App node group for sidebar display
+ * Groups app nodes by their connector (e.g., "Google Workspace", "Microsoft 365")
+ */
+export interface AppNodeGroup {
+  id: string;                    // Normalized connector name (e.g., "google-workspace")
+  connectorName: string;         // Raw API connector field (e.g., "Google Workspace")
+  displayName: string;           // User-facing name
+  type: ConnectorType;           // For icons
+  apps: KnowledgeHubNode[];      // App nodes in this group
+}
+
+// Source type for filtering (collection vs connector)
+export type SourceFilter = 'all' | 'collection' | ConnectorType;
+
+// All Records filter - extends base filter with source filtering
+export interface AllRecordsFilter {
+  // Type filters
+  nodeTypes?: string[];           // Aligned with API: was 'types'
+  recordTypes?: RecordType[];
+
+  // Status filter
+  indexingStatus?: IndexingStatus[];
+
+  // Source filters (specific to All Records mode)
+  origins?: NodeOrigin[];         // Aligned with API: replaces 'sources'
+  connectorIds?: string[];
+
+  // Size filter
+  sizeRange?: SizeRange;
+
+  // Date filters
+  createdAfter?: string;
+  createdBefore?: string;
+  createdDateType?: DateFilterType; // Date filter type for created date
+  updatedAfter?: string;
+  updatedBefore?: string;
+  updatedDateType?: DateFilterType; // Date filter type for updated date
+
+  // Search
+  searchQuery?: string;
+}
+
+// Selection state for All Records sidebar
+export type AllRecordsSidebarSelection =
+  | { type: 'all' }
+  | { type: 'collection'; id: string; name: string }
+  | { type: 'connector'; connectorType: ConnectorType; itemId?: string; itemName?: string }
+  /** Browsing a connector/KB tree by URL or folder row — not "All", not a legacy connector list row */
+  | { type: 'explorer' };
+
+// All Record item (extends table node with source info for display)
+export interface AllRecordItem extends KnowledgeHubNode {
+  sourceName: string; // Collection name or Connector name
+  sourceType: 'collection' | ConnectorType;
+  sourceIcon?: string; // Icon for the source
+}
+
+// Sort configuration for All Records
+export type AllRecordsSortField = 'name' | 'size' | 'createdAt' | 'updatedAt' | 'indexingStatus' | 'origin';
+
+export interface AllRecordsSortConfig {
+  field: AllRecordsSortField;
+  order: 'asc' | 'desc';
+}
+
+/**
+ * Table pagination state, for both modes.
+ *
+ * `cursor` is the position the current page was fetched at (null = first page);
+ * `nextCursor`/`prevCursor` are where the arrows go. There is no page number,
+ * because keyset paging has no concept of one — `startIndex`/`endIndex` carry
+ * what the footer needs to say instead.
+ */
+export interface AllRecordsPagination {
+  cursor: string | null;
+  limit: number;
+  totalItems: number;
+  startIndex: number;
+  endIndex: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+  nextCursor: string | null;
+  prevCursor: string | null;
+}
+
+// More Connectors link item (navigates to connectors page with the connector panel open)
+export interface MoreConnectorLink {
+  id: string;
+  name: string;
+  type: ConnectorType;
+  connectorTypeParam: string;
+}
+
+// ============================================================================
+// RECORD DETAILS API RESPONSE
+// ============================================================================
+
+export interface RecordDetailsResponse {
+  record: {
+    id: string;
+    orgId: string;
+    recordName: string;
+    externalRecordId: string;
+    recordType: RecordType;
+    origin: 'UPLOAD' | 'CONNECTOR';
+    createdAtTimestamp: number;
+    updatedAtTimestamp: number;
+    sourceCreatedAtTimestamp: number;
+    sourceLastModifiedTimestamp: number;
+    isDeleted: boolean;
+    isArchived: boolean;
+    indexingStatus: IndexingStatus;
+    reason?: string;
+    // Set while the record waits out its source's rate limit (epoch ms).
+    retryNotBefore?: number | null;
+    connectorName?: string;
+    hideWeburl?: boolean;
+    previewRenderable?: boolean;
+    version: number;
+    webUrl: string;
+    mimeType: string;
+    connectorId: string;
+    sizeInBytes?: number | null;
+    md5Checksum: string;
+    extractionStatus: IndexingStatus;
+    isDirty: boolean;
+    lastIndexTimestamp: number;
+    virtualRecordId: string;
+    lastExtractionTimestamp: number;
+    parsingStatus?: IndexingStatus | null;
+    fileRecord: {
+      _key: string;
+      _id: string;
+      _rev: string;
+      orgId: string;
+      name: string;
+      isFile: boolean;
+      extension: string;
+      mimeType: string;
+      sizeInBytes: number;
+      webUrl: string;
+      path?: string | null;
+      localFsRelativePath?: string | null;
+    } | null;
+    mailRecord: Record<string, unknown> | null;
+    ticketRecord: Record<string, unknown> | null;
+  };
+  knowledgeBase: {
+    id: string;
+    name: string;
+    orgId: string;
+  } | null;
+  folder: {
+    id: string;
+    name: string;
+  } | null;
+  metadata: {
+    departments: Array<{ id: string; name: string }>;
+    categories: Array<{ id: string; name: string }>;
+    subcategories1: Array<{ id: string; name: string }>;
+    subcategories2: Array<{ id: string; name: string }>;
+    subcategories3: Array<{ id: string; name: string }>;
+    topics: Array<{ id: string; name: string }>;
+    languages: Array<{ id: string; name: string }>;
+  };
+  permissions: Array<{
+    id: string;
+    name: string;
+    type: string;
+    relationship: 'OWNER' | 'READER' | 'WRITER';
+    accessType: string;
+  }>;
+  /** Empty or absent for records indexed before pipeline stages existed. */
+  stageStates?: StageStateSummary[];
+}
+
+/** Status of one pipeline stage for the record's current content revision. */
+export interface StageStateSummary {
+  stage: string;
+  status: IndexingStatus;
+  reason: string | null;
+  attempt: number;
+  startedAtMs: number | null;
+  finishedAtMs: number | null;
+  updatedAtMs: number | null;
+}

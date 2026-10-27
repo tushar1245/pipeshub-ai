@@ -1,0 +1,586 @@
+import asyncio
+import json
+import logging
+import threading
+from typing import Optional, Tuple, List
+
+from dropbox.files import SearchOptions
+
+from app.agent_loop_lib.tools.base import ParameterType, Tag, ToolParameter
+from app.agent_loop_lib.tools.decorators import tool
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.constants import IconPaths
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolDefinition,
+    ToolsetBuilder,
+    ToolsetCategory,
+)
+from app.sources.client.dropbox.dropbox_ import DropboxClient
+from app.sources.client.http.http_response import HTTPResponse
+from app.sources.external.dropbox.dropbox_ import DropboxDataSource
+
+logger = logging.getLogger(__name__)
+
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="get_account_info",
+        description="Get Dropbox account information",
+        parameters=[],
+        tags=["account", "info"]
+    ),
+    ToolDefinition(
+        name="list_folder",
+        description="List files and folders",
+        parameters=[
+            {"name": "path", "type": "string", "description": "Folder path", "required": False}
+        ],
+        tags=["files", "list"]
+    ),
+    ToolDefinition(
+        name="get_metadata",
+        description="Get file or folder metadata",
+        parameters=[
+            {"name": "path", "type": "string", "description": "File or folder path", "required": True}
+        ],
+        tags=["files", "read"]
+    ),
+    ToolDefinition(
+        name="download_file",
+        description="Download a file",
+        parameters=[
+            {"name": "path", "type": "string", "description": "File path", "required": True}
+        ],
+        tags=["files", "download"]
+    ),
+    ToolDefinition(
+        name="upload_file",
+        description="Upload a file",
+        parameters=[
+            {"name": "path", "type": "string", "description": "File path", "required": True},
+            {"name": "content", "type": "string", "description": "File content", "required": True}
+        ],
+        tags=["files", "upload"]
+    ),
+    ToolDefinition(
+        name="delete_file",
+        description="Delete a file or folder",
+        parameters=[
+            {"name": "path", "type": "string", "description": "File or folder path", "required": True}
+        ],
+        tags=["files", "delete"]
+    ),
+    ToolDefinition(
+        name="create_folder",
+        description="Create a folder",
+        parameters=[
+            {"name": "path", "type": "string", "description": "Folder path", "required": True}
+        ],
+        tags=["folders", "create"]
+    ),
+    ToolDefinition(
+        name="search",
+        description="Search files and folders",
+        parameters=[
+            {"name": "query", "type": "string", "description": "Search query", "required": True}
+        ],
+        tags=["search"]
+    ),
+    ToolDefinition(
+        name="get_shared_link",
+        description="Get or create a shared link",
+        parameters=[
+            {"name": "path", "type": "string", "description": "File or folder path", "required": True}
+        ],
+        tags=["sharing"]
+    ),
+]
+
+
+# Register Dropbox toolset
+@ToolsetBuilder("Dropbox")\
+    .in_group("Storage")\
+    .with_description("Dropbox integration for file storage and management")\
+    .with_category(ToolsetCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Dropbox",
+            authorize_url="https://www.dropbox.com/oauth2/authorize",
+            token_url="https://api.dropboxapi.com/oauth2/token",
+            redirect_uri="toolsets/oauth/callback/dropbox",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "files.content.read",
+                    "files.content.write",
+                    "files.metadata.read",
+                    "sharing.read",
+                    "sharing.write"
+                ]
+            ),
+            fields=[
+                CommonFields.client_id("Dropbox App Console"),
+                CommonFields.client_secret("Dropbox App Console")
+            ],
+            icon_path=IconPaths.connector_icon("dropbox"),
+            app_group="Storage",
+            app_description="Dropbox OAuth application for agent integration"
+        ),
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("Dropbox Access Token", "sl.your-token-here")
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder
+               .with_icon(IconPaths.connector_icon("dropbox")))\
+    .build_decorator()
+class Dropbox:
+    """Dropbox tool exposed to the agents"""
+    def __init__(self, client: DropboxClient) -> None:
+        """Initialize the Dropbox tool"""
+        """
+        Args:
+            client: Dropbox client object
+        Returns:
+            None
+        """
+        self.client = DropboxDataSource(client)
+        # Dedicated background event loop for running coroutines from sync context
+        self._bg_loop = asyncio.new_event_loop()
+        self._bg_loop_thread = threading.Thread(target=self._start_background_loop, daemon=True)
+        self._bg_loop_thread.start()
+
+    def _start_background_loop(self) -> None:
+        """Start the background event loop"""
+        asyncio.set_event_loop(self._bg_loop)
+        self._bg_loop.run_forever()
+
+    def _run_async(self, coro) -> HTTPResponse: # type: ignore [valid method]
+        """Run a coroutine safely from sync or async contexts via a dedicated loop."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
+        return future.result()
+
+    def shutdown(self) -> None:
+        """Gracefully stop the background event loop and thread."""
+        try:
+            if getattr(self, "_bg_loop", None) is not None and self._bg_loop.is_running():
+                self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+            if getattr(self, "_bg_loop_thread", None) is not None:
+                self._bg_loop_thread.join()
+            if getattr(self, "_bg_loop", None) is not None:
+                self._bg_loop.close()
+        except Exception as exc:
+            logger.warning(f"Dropbox shutdown encountered an issue: {exc}")
+
+    @tool(
+        path="/tools/dropbox/get_account_info",
+        short_description="Get current Dropbox account information",
+        description="Get the current authenticated Dropbox account information.",
+        parameters=[],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="read")],
+    )
+    async def get_account_info(self) -> Tuple[bool, str]:
+        """Get current account information"""
+        """
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.users_get_current_account())
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error getting account info: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/list_folder",
+        short_description="List contents of a Dropbox folder",
+        description="List files and folders in a Dropbox folder with optional recursive listing.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path of the folder to list",
+            ),
+            ToolParameter(
+                name="recursive",
+                type=ParameterType.BOOLEAN,
+                description="Whether to list recursively",
+                required=False,
+            ),
+            ToolParameter(
+                name="include_media_info",
+                type=ParameterType.BOOLEAN,
+                description="Whether to include media info",
+                required=False,
+            ),
+            ToolParameter(
+                name="include_deleted",
+                type=ParameterType.BOOLEAN,
+                description="Whether to include deleted files",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="read")],
+    )
+    async def list_folder(
+        self,
+        path: str,
+        recursive: Optional[bool] = None,
+        include_media_info: Optional[bool] = None,
+        include_deleted: Optional[bool] = None
+    ) -> Tuple[bool, str]:
+        """List contents of a folder"""
+        """
+        Args:
+            path: Path of the folder to list
+            recursive: Whether to list recursively
+            include_media_info: Whether to include media info
+            include_deleted: Whether to include deleted files
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.files_list_folder(
+                path=path,
+                recursive=recursive,
+                include_media_info=include_media_info,
+                include_deleted=include_deleted
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error listing folder: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/get_metadata",
+        short_description="Get metadata for a Dropbox file or folder",
+        description="Get metadata for a file or folder in Dropbox.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path of the file or folder",
+            ),
+            ToolParameter(
+                name="include_media_info",
+                type=ParameterType.BOOLEAN,
+                description="Whether to include media info",
+                required=False,
+            ),
+            ToolParameter(
+                name="include_deleted",
+                type=ParameterType.BOOLEAN,
+                description="Whether to include deleted files",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="read")],
+    )
+    async def get_metadata(
+        self,
+        path: str,
+        include_media_info: Optional[bool] = None,
+        include_deleted: Optional[bool] = None
+    ) -> Tuple[bool, str]:
+        """Get metadata for a file or folder"""
+        """
+        Args:
+            path: Path of the file or folder
+            include_media_info: Whether to include media info
+            include_deleted: Whether to include deleted files
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.files_get_metadata(
+                path=path,
+                include_media_info=include_media_info,
+                include_deleted=include_deleted
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error getting metadata: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/download_file",
+        short_description="Download a file from Dropbox",
+        description="Download a file from Dropbox by its path.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path of the file to download",
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="read")],
+    )
+    async def download_file(self, path: str) -> Tuple[bool, str]:
+        """Download a file from Dropbox"""
+        """
+        Args:
+            path: Path of the file to download
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.files_download(path=path))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error downloading file: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/upload_file",
+        short_description="Upload a file to Dropbox",
+        description="Upload a file to Dropbox with configurable write mode.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path where to upload the file",
+            ),
+            ToolParameter(
+                name="content",
+                type=ParameterType.STRING,
+                description="Content of the file to upload",
+            ),
+            ToolParameter(
+                name="mode",
+                type=ParameterType.STRING,
+                description="Write mode (add, overwrite, update)",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="create")],
+    )
+    async def upload_file(
+        self,
+        path: str,
+        content: str,
+        mode: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Upload a file to Dropbox"""
+        """
+        Args:
+            path: Path where to upload the file
+            content: Content of the file to upload
+            mode: Write mode (add, overwrite, update)
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Convert textual content to bytes as required by DataSource
+            file_bytes = content.encode('utf-8')
+
+            # Use DropboxDataSource method (expects bytes in 'f' argument)
+            response = self._run_async(self.client.files_upload(
+                f=file_bytes,
+                path=path,
+                mode=mode if mode is not None else 'add'
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/delete_file",
+        short_description="Delete a file or folder from Dropbox",
+        description="Delete a file or folder from Dropbox by its path.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path of the file or folder to delete",
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="delete")],
+    )
+    async def delete_file(self, path: str) -> Tuple[bool, str]:
+        """Delete a file or folder from Dropbox"""
+        """
+        Args:
+            path: Path of the file or folder to delete
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.files_delete_v2(path=path))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error deleting file: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/create_folder",
+        short_description="Create a folder in Dropbox",
+        description="Create a new folder in Dropbox at the specified path.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path where to create the folder",
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="create")],
+    )
+    async def create_folder(self, path: str) -> Tuple[bool, str]:
+        """Create a folder in Dropbox"""
+        """
+        Args:
+            path: Path where to create the folder
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.files_create_folder_v2(path=path))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error creating folder: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/search",
+        short_description="Search for files and folders in Dropbox",
+        description="Search for files and folders in Dropbox by query string.",
+        parameters=[
+            ToolParameter(
+                name="query",
+                type=ParameterType.STRING,
+                description="Search query",
+            ),
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path to search in",
+                required=False,
+            ),
+            ToolParameter(
+                name="max_results",
+                type=ParameterType.INTEGER,
+                description="Maximum number of results",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="read")],
+    )
+    async def search(
+        self,
+        query: str,
+        path: Optional[str] = None,
+        max_results: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """Search for files and folders"""
+        """
+        Args:
+            query: Search query
+            path: Path to search in
+            max_results: Maximum number of results
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            # The SDK's files_search_v2 takes path and max_results inside SearchOptions.
+            options = SearchOptions(path=path, max_results=max_results)
+            response = self._run_async(self.client.files_search_v2(
+                query=query,
+                options=options
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error searching: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/dropbox/get_shared_link",
+        short_description="Get a shared link for a Dropbox file or folder",
+        description="Get or create a shared link for a file or folder in Dropbox.",
+        parameters=[
+            ToolParameter(
+                name="path",
+                type=ParameterType.STRING,
+                description="Path of the file or folder",
+            ),
+            ToolParameter(
+                name="settings",
+                type=ParameterType.STRING,
+                description="Settings for the shared link",
+                required=False,
+            ),
+        ],
+        tags=[Tag(key="category", value="storage"), Tag(key="type", value="read")],
+    )
+    async def get_shared_link(
+        self,
+        path: str,
+        settings: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Get a shared link for a file or folder"""
+        """
+        Args:
+            path: Path of the file or folder
+            settings: Settings for the shared link
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use DropboxDataSource method
+            response = self._run_async(self.client.sharing_create_shared_link_with_settings(
+                path=path,
+                settings=settings
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error getting shared link: {e}")
+            return False, json.dumps({"error": str(e)})

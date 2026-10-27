@@ -1,0 +1,1266 @@
+'use client';
+
+import React, { useEffect, useLayoutEffect, useRef, useMemo, useCallback, useState } from 'react';
+import { useAui, useAuiState } from '@assistant-ui/react';
+import { Flex, Box, IconButton } from '@radix-ui/themes';
+import { useTranslation } from 'react-i18next';
+import { ChatResponse } from './chat-response';
+import { useChatStore } from '../../store';
+import { debugLog } from '../../debug-logger';
+import { ASK_MORE_QUESTION_SETS, chatContentColumnStyle } from '../../constants';
+import { useIsMobile } from '@/lib/hooks/use-is-mobile';
+import type { ChatArtifact, MessagePart } from '../../types';
+import type { CitationMaps } from './response-tabs/citations';
+import { emptyCitationMaps, useCitationActions, isCitationPopoverKeyStillValid } from './response-tabs/citations';
+import { useInlineCitationPopoverStore } from './response-tabs/citations/citation-popover-store';
+import { InlineCitationPopoverHost } from './response-tabs/citations/inline-citation-popover-host';
+import { LottieLoader } from '@/app/components/ui/lottie-loader';
+import { ProgressiveBlur } from '@/app/components/ui/progressive-blur';
+import { loadOlderMessagesForSlot } from '../../streaming';
+import { extractAnswerMarkers } from '../../utils/parse-download-markers';
+import { buildMessagePairs } from './message-pairs';
+import type { MessagePair } from './message-pairs';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { ErrorBoundary, ErrorFallback } from '@/app/components/ui/error-boundary';
+import { shouldShowJumpToNewest } from './jump-to-newest';
+
+// Stable empty references to avoid re-renders from selector fallbacks.
+// `?? []` or `?? null` in a selector body creates a new ref every call,
+// defeating Object.is comparison.
+const EMPTY_ARRAY: never[] = [];
+const STABLE_EMPTY_ARTIFACTS: ChatArtifact[] = [];
+const STABLE_EMPTY_PARTS: MessagePart[] = [];
+/** Streaming: distance from bottom (px) to count as flush for resuming tail-follow */
+const STREAMING_RESUME_DIST_FLUSH_PX = 4;
+/** Streaming: wheel deltaY must be more negative than this to opt out (avoids trackpad jitter) */
+const STREAMING_WHEEL_UP_OPT_OUT_MIN_DELTA = 2;
+/** Streaming: opt out when scrollTop falls this far below last tail-sync anchor */
+const STREAMING_OPT_OUT_ANCHOR_PX = 4;
+/** Touch: min upward scroll (read older) during SSE to stop tail-follow */
+const STREAMING_TOUCH_SCROLL_UP_THRESHOLD_PX = 8;
+/** Idle (non-streaming): near-bottom band for scroll-lock hysteresis */
+const IDLE_TAIL_BOTTOM_ZONE_PX = 80;
+const IDLE_SCROLLED_UP_ZONE_PX = 96;
+/** Idle: ms after hitting bottom before "scrolled up" can latch */
+const IDLE_SCROLL_LOCK_GRACE_MS = 160;
+/** Distance from top (px) at which we trigger loading older messages */
+const LOAD_OLDER_THRESHOLD_PX = 120;
+
+function isStreamingFlushWithBottom(el: HTMLElement): boolean {
+  const { scrollTop, scrollHeight, clientHeight } = el;
+  const dist = scrollHeight - scrollTop - clientHeight;
+  return dist <= STREAMING_RESUME_DIST_FLUSH_PX;
+}
+
+const EMPTY_STRING = '';
+const EMPTY_CITATION_MAPS: CitationMaps = emptyCitationMaps();
+
+/** Same band the design hangs behind its composer group; a taller one stretches the ramp thin. */
+const COMPOSER_BLUR_HEIGHT_PX = 180;
+
+export function MessageList({ composer }: { composer?: React.ReactNode } = {}) {
+  // ── Slot-scoped selectors (narrow — only active slot fields) ──
+  const isStreaming = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.isStreaming ?? false : false
+  );
+  const streamingQuestion = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.streamingQuestion || EMPTY_STRING : EMPTY_STRING
+  );
+  const streamingCitationMaps = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.streamingCitationMaps ?? null : null
+  );
+  const pendingCollections = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.pendingCollections || EMPTY_ARRAY : EMPTY_ARRAY
+  );
+  const regenerateMessageId = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.regenerateMessageId ?? null : null
+  );
+  const isInitialized = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.isInitialized ?? false : false
+  );
+  const isLoadingConversation = useChatStore((s) =>
+    s.activeSlotId ? !s.slots[s.activeSlotId]?.isInitialized : false
+  );
+  // streamingContent + currentStatusMessage are now passed as props to ChatResponse
+  // (only the streaming instance gets non-empty values). Previously ChatResponse
+  // subscribed to these directly, causing ALL instances to re-render on every rAF flush.
+  const streamingContent = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.streamingContent || EMPTY_STRING : EMPTY_STRING
+  );
+  const currentStatusMessage = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.currentStatusMessage ?? null : null
+  );
+  const streamingArtifacts = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.artifacts ?? STABLE_EMPTY_ARTIFACTS : STABLE_EMPTY_ARTIFACTS
+  );
+  const streamingParts = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.streamingParts ?? STABLE_EMPTY_PARTS : STABLE_EMPTY_PARTS
+  );
+  const messagePagination = useChatStore((s) =>
+    s.activeSlotId ? s.slots[s.activeSlotId]?.messagePagination ?? null : null
+  );
+  const hasOlderMessages = messagePagination?.hasOlderMessages ?? false;
+  const isLoadingOlder = messagePagination?.isLoadingOlder ?? false;
+  // ── Render-reason tracking ──────────────────────────────────────
+  debugLog.tick('[chat] [MessageList]');
+  const prevMsgListRef = useRef<Record<string, unknown>>({});
+  const currentMsgListVals: Record<string, unknown> = {
+    isStreaming, streamingQuestion, streamingCitationMaps,
+    pendingCollections, regenerateMessageId, isInitialized, isLoadingConversation,
+    streamingContent, currentStatusMessage, streamingParts,
+  };
+  const msgListReasons: string[] = [];
+  for (const [k, v] of Object.entries(currentMsgListVals)) {
+    if (!Object.is(v, prevMsgListRef.current[k])) msgListReasons.push(k);
+  }
+  if (msgListReasons.length > 0) {
+    debugLog.reason('[chat] [MessageList]', msgListReasons);
+  }
+  prevMsgListRef.current = currentMsgListVals;
+
+  // ── Active slot ID (needed for save/restore on conversation switch) ──
+  const activeSlotId = useChatStore((s) => s.activeSlotId);
+
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const spacerRef = useRef<HTMLDivElement>(null);
+  const composerDockRef = useRef<HTMLDivElement>(null);
+  const citationCallbacks = useCitationActions();
+  const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const prevPairCountRef = useRef(0);
+  const lastMessageObserverRef = useRef<ResizeObserver | null>(null);
+  const lastMessageKeyRef = useRef<string | null>(null);
+  // Tracks the last scroll position during streaming so we can restore it
+  // if the atomic content replacement (streaming→final) causes a position jump.
+  const streamingScrollTopRef = useRef<number>(0);
+
+  // ── Load-older refs ────────────────────────────────────────────────
+  // Stale-closure-safe mirrors for the scroll handler (no re-render on change)
+  const hasOlderMessagesRef = useRef(hasOlderMessages);
+  hasOlderMessagesRef.current = hasOlderMessages;
+  const isLoadingOlderRef = useRef(isLoadingOlder);
+  isLoadingOlderRef.current = isLoadingOlder;
+  /** True while an async loadOlderMessagesForSlot call is in-flight. */
+  const loadOlderInFlightRef = useRef(false);
+  /**
+   * Key of the first message pair from the previous render.
+   * Compared in Effect #4 to distinguish a prepend (first key changes)
+   * from a user-send append (first key stays the same).
+   */
+  const prevFirstPairKeyRef = useRef<string | null>(null);
+
+  // ── Scroll infrastructure ──────────────────────────────────────────
+  // All scroll actions flow through `executeScroll` (the single source of
+  // truth). Refs are used instead of state to avoid rerenders on every
+  // scroll event or programmatic animation.
+  const isScrolledUpRef = useRef(false);
+  const isAutoScrollingRef = useRef(false);
+  const autoScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasPerformedInitialScrollRef = useRef(false);
+  const prevActiveSlotIdRef = useRef<string | null>(null);
+  const wasStreamingRef = useRef(isStreaming);
+  /** Detects isStreaming false→true so we clear scroll lock before tail sync (layout phase). */
+  const prevIsStreamingForLockRef = useRef(false);
+  // Render-time sync (not useEffect) so the value is current when
+  // synchronous ResizeObserver callbacks fire in the same commit phase.
+  const isStreamingRef = useRef(isStreaming);
+  isStreamingRef.current = isStreaming;
+  // Idle (non-streaming) only: timestamp of last "at bottom" hit for hysteresis.
+  // The streaming path uses `lastTailSyncScrollTopRef` + flush / anchor checks instead.
+  const lockClearedAtMsRef = useRef<number>(0);
+  /**
+   * Last `scrollTop` applied by `syncStreamingMessageTail` while following SSE.
+   * Comparing the live `scrollTop` to this catches even small user nudges upward;
+   * a large "distance from bottom" zone alone wrongly treats those as still
+   * pinned and keeps snapping the viewport down.
+   * -1 = no tail sync applied yet for this streaming session.
+   */
+  const lastTailSyncScrollTopRef = useRef<number>(-1);
+  /** Coalesces ResizeObserver bursts to one layout pass per animation frame */
+  const streamingLayoutRafRef = useRef<number | null>(null);
+  /** Coalesces resume tail-sync from scroll/wheel so at most one rAF runs at a time */
+  const resumeTailSyncRafRef = useRef<number | null>(null);
+
+  // Render-time: record scroll position on every render during streaming so
+  // the useLayoutEffect below always has the freshest value to restore from.
+  if (isStreaming && scrollContainerRef.current) {
+    streamingScrollTopRef.current = scrollContainerRef.current.scrollTop;
+  }
+
+  const { t, i18n } = useTranslation();
+  const isMobile = useIsMobile();
+
+  // Reactive thread messages plus the client used to append follow-up messages
+  const threadMessages = useAuiState((s) => s.thread.messages);
+  const aui = useAui();
+
+  // Track threadMessages changes as a render reason
+  const prevThreadMsgsRef = useRef(threadMessages);
+  if (threadMessages !== prevThreadMsgsRef.current) {
+    debugLog.reason('[chat] [MessageList]', ['threadMessages']);
+    prevThreadMsgsRef.current = threadMessages;
+  }
+
+  // Callback ref setter for message elements
+  const setMessageRef = useCallback((key: string, el: HTMLDivElement | null) => {
+    if (el) {
+      messageRefs.current.set(key, el);
+    } else {
+      messageRefs.current.delete(key);
+    }
+  }, []);
+
+  // Build message pairs (user question + assistant answer) in chronological order
+  const messagePairs = useMemo<MessagePair[]>(
+    () =>
+      buildMessagePairs(threadMessages, {
+        isStreaming,
+        streamingQuestion,
+        pendingCollections,
+        regenerateMessageId,
+        emptyCitationMaps: EMPTY_CITATION_MAPS,
+      }),
+    [threadMessages, isStreaming, streamingQuestion, pendingCollections, regenerateMessageId]
+  );
+
+  // The highest version any message in this conversation has shown for a
+  // given artifact `recordId`. Every version bump re-registers the SAME
+  // recordId, so an older message's card can compare its own `version`
+  // against this map to know a later turn has since produced a newer copy —
+  // derived entirely from markers already persisted on each message, no extra
+  // API call. The row still streaming has no saved answer yet (its text is
+  // model output, see `MarkerSource`), so only its live SSE `artifacts` count.
+  const latestArtifactVersions = useMemo(() => {
+    const versions = new Map<string, number>();
+    const record = (recordId: string | undefined, version: number | undefined) => {
+      if (!recordId || version === undefined) return;
+      const current = versions.get(recordId);
+      if (current === undefined || version > current) versions.set(recordId, version);
+    };
+    for (const pair of messagePairs) {
+      if (pair.isStreaming || !pair.answer.includes('::artifact[')) continue;
+      const { artifacts } = extractAnswerMarkers(pair.answer, 'persisted');
+      for (const artifact of artifacts) record(artifact.recordId, artifact.version);
+    }
+    if (isStreaming) {
+      for (const artifact of streamingArtifacts) record(artifact.recordId, artifact.version);
+    }
+    return versions;
+  }, [messagePairs, isStreaming, streamingArtifacts]);
+
+  const lastPairKey = messagePairs[messagePairs.length - 1]?.key ?? null;
+
+  // Ref-mirror of messagePairs — lets scroll effects read the latest pairs
+  // without having the full array in their dependency list (which would cause
+  // effect #2 to re-run and cancel its rAF on every render during streaming).
+  const messagePairsRef = useRef(messagePairs);
+  messagePairsRef.current = messagePairs;
+
+  // ── Jump to newest ─────────────────────────────────────────────────
+  const [showJumpToNewest, setShowJumpToNewest] = useState(false);
+  // Height of the sticky composer dock, so the jump button sits above it, not on it.
+  const [composerDockHeight, setComposerDockHeight] = useState(0);
+  const updateJumpToNewestVisibility = useCallback(() => {
+    const container = scrollContainerRef.current;
+    const key = lastMessageKeyRef.current;
+    const lastEl = key ? messageRefs.current.get(key) : null;
+    if (!container || !lastEl) {
+      setShowJumpToNewest(false);
+      return;
+    }
+    setShowJumpToNewest(
+      shouldShowJumpToNewest(
+        lastEl.getBoundingClientRect().bottom,
+        container.getBoundingClientRect().bottom,
+      ),
+    );
+  }, []);
+
+  // Clear orphaned inline-citation key when a message row is replaced (e.g. after stream complete)
+  const citationOpenKey = useInlineCitationPopoverStore((s) => s.activeKey);
+  const setCitationKey = useInlineCitationPopoverStore((s) => s.setActiveKey);
+  useEffect(() => {
+    if (!citationOpenKey) return;
+    const rowKeys = messagePairsRef.current.map((p) => p.key);
+    if (!isCitationPopoverKeyStillValid(citationOpenKey, rowKeys)) {
+      setCitationKey(null);
+    }
+  }, [citationOpenKey, messagePairs, setCitationKey]);
+
+  // Stale-closure-safe mirror of isMobile for use in useCallback/useMemo
+  // functions that intentionally have empty (or non-isMobile) dep arrays.
+  // Updated synchronously on every render so it's always current.
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+
+  // ── Diagnostic: log message pair count for rendering pipeline debugging ──
+  if (process.env.NODE_ENV === 'development') {
+    const assistantMsgs = threadMessages.filter(m => m.role === 'assistant').length;
+    const userMsgs = threadMessages.filter(m => m.role === 'user').length;
+    if (messagePairs.length === 0 && threadMessages.length > 0) {
+      console.warn(
+        '[debugging] [MessageList] 0 pairs but',
+        threadMessages.length, 'thread msgs (user:', userMsgs, ', assistant:', assistantMsgs, ')',
+        'isStreaming:', isStreaming
+      );
+    }
+  }
+
+  // ── Spacer recalculation (direct DOM mutation — no React state) ────
+  // During streaming, ResizeObserver fires ~60/sec. Writing to a ref
+  // avoids a React rerender on every frame. The spacer div always exists
+  // in the DOM (never conditionally rendered) so the ref is stable.
+  const recalcSpacerHeight = useCallback((measured?: {
+    containerHeight: number;
+    lastMessageHeight: number;
+    scrollHeight: number;
+    scrollTop: number;
+    composerHeight: number;
+  }) => {
+    if (messageRefs.current.size === 0 || !lastMessageKeyRef.current || !scrollContainerRef.current) {
+      if (spacerRef.current) spacerRef.current.style.minHeight = '0';
+      debugLog.spacer('no messages or no container → height=0');
+      return;
+    }
+
+    const element = messageRefs.current.get(lastMessageKeyRef.current);
+    const container = scrollContainerRef.current;
+
+    if (!element) {
+      if (spacerRef.current) spacerRef.current.style.minHeight = '0';
+      debugLog.spacer('no element for last message → height=0');
+      return;
+    }
+
+    // A caller that already measured this frame (e.g. `syncStreamingMessageTail`)
+    // passes its numbers in so this doesn't force a second synchronous layout
+    // pass for the same geometry — a write (the minHeight assignment below)
+    // sandwiched between two independent read passes is what causes thrashing.
+    const containerHeight = measured?.containerHeight ?? container.clientHeight;
+    const lastMessageHeight = measured?.lastMessageHeight ?? element.getBoundingClientRect().height;
+    const totalScrollHeight = measured?.scrollHeight ?? container.scrollHeight;
+    const scrollTop = measured?.scrollTop ?? container.scrollTop;
+    // The composer dock is in this scroller's flow (sticky at the bottom), so
+    // it already pads the tail; the spacer only makes up the rest.
+    const composerHeight = measured?.composerHeight ?? composerDockRef.current?.offsetHeight ?? 0;
+    const isOverflowing = totalScrollHeight > containerHeight;
+
+    let needed = 0;
+    // On mobile: skip the spacer entirely. The mobile chat area is small enough
+    // that the "scroll last message to top" affordance adds far more blank space
+    // than it saves — the Figma mobile spec shows content flush against the input.
+    // On desktop: add spacer only when content overflows or user has scrolled
+    // away from the top (avoids unnecessary scrollbar on short conversations).
+    if (!isMobileRef.current && (isOverflowing || scrollTop > 0)) {
+      needed = Math.max(0, containerHeight - composerHeight - lastMessageHeight);
+    }
+
+    if (spacerRef.current) {
+      const next = `${needed}px`;
+      if (spacerRef.current.style.minHeight !== next) {
+        spacerRef.current.style.minHeight = next;
+      }
+    }
+    debugLog.spacer(`containerH=${containerHeight} composerH=${composerHeight} lastMsgH=${Math.round(lastMessageHeight)} overflow=${isOverflowing} → spacer=${needed}`);
+  }, []);
+
+  /**
+   * ══════════════════════════════════════════════════════════════════
+   * executeScroll — Single Source of Truth for all scroll actions.
+   * ══════════════════════════════════════════════════════════════════
+   *
+   * All scroll operations in the message list MUST go through this
+   * function. It handles:
+   *   • Target calculation (top-of-last-message vs bottom-of-container)
+   *   • User scroll-lock bypass (`chatBecameActive`)
+   *   • 80/20 jump animation (instant 80%, smooth 20%)
+   *   • Protection against smooth-scroll animations false-triggering
+   *     the user scroll-lock detector
+   *
+   * @param options.target           Where to scroll
+   * @param options.behavior         How to animate
+   * @param options.chatBecameActive If true, resets isScrolledUp (new context)
+   */
+  const executeScroll = useCallback((options: {
+    target: 'top-of-last-message' | 'bottom-of-container';
+    behavior: 'auto' | 'smooth' | '80/20-jump';
+    chatBecameActive?: boolean;
+  }) => {
+    if (!scrollContainerRef.current) {
+      return;
+    }
+
+    // chatBecameActive resets the user scroll lock — new context
+    if (options.chatBecameActive) {
+      isScrolledUpRef.current = false;
+    } else if (isScrolledUpRef.current) {
+      return; // user has scrolled up — don't interfere
+    }
+
+    const container = scrollContainerRef.current;
+    let targetScrollTop = 0;
+
+    if (options.target === 'top-of-last-message') {
+      if (messageRefs.current.size === 0 || !lastMessageKeyRef.current) return;
+      const element = messageRefs.current.get(lastMessageKeyRef.current);
+      if (!element) return;
+
+      const containerRect = container.getBoundingClientRect();
+      const elementRect = element.getBoundingClientRect();
+      const topBuffer = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
+      targetScrollTop = Math.max(0, elementRect.top - containerRect.top + container.scrollTop - topBuffer);
+    } else {
+      // bottom-of-container
+      targetScrollTop = container.scrollHeight - container.clientHeight;
+    }
+
+    // Guard programmatic scrolls so handleScroll does not treat them as the user
+    // leaving the tail. Smooth / 80-20 need a long window (500ms) for in-flight
+    // animation events. Instant tail-follow runs every rAF during streaming — a
+    // 100ms timeout kept isAutoScrollingRef true almost continuously and made
+    // scroll feel sticky; a macrotask deferral is enough for sync scroll events.
+    if (options.behavior === 'smooth' || options.behavior === '80/20-jump') {
+      if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
+      isAutoScrollingRef.current = true;
+      autoScrollTimeoutRef.current = setTimeout(() => {
+        isAutoScrollingRef.current = false;
+        autoScrollTimeoutRef.current = null;
+      }, 500);
+    } else {
+      if (autoScrollTimeoutRef.current) {
+        clearTimeout(autoScrollTimeoutRef.current);
+        autoScrollTimeoutRef.current = null;
+      }
+      isAutoScrollingRef.current = true;
+      autoScrollTimeoutRef.current = setTimeout(() => {
+        isAutoScrollingRef.current = false;
+        autoScrollTimeoutRef.current = null;
+      }, 0);
+    }
+
+    // Execute the scroll
+    if (options.behavior === '80/20-jump') {
+      // Instant jump to 80%, then smooth glide to 100%
+      container.scrollTo({ top: targetScrollTop * 0.8, behavior: 'auto' });
+      requestAnimationFrame(() => {
+        container.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+      });
+    } else if (options.behavior === 'auto') {
+      // Direct assignment: avoids global `scroll-behavior: smooth` affecting scrollTo
+      container.scrollTop = targetScrollTop;
+    } else {
+      container.scrollTo({ top: targetScrollTop, behavior: options.behavior });
+    }
+  }, []);
+
+  /**
+   * Instant tail-follow while SSE is active: runs after DOM/layout knows the new
+   * message height, without going through executeScroll’s timers. Paired with
+   * useLayoutEffect (same frame as streaming markdown commit) so the viewport
+   * does not paint one frame “behind” the growing answer.
+   */
+  const syncStreamingMessageTail = useCallback(() => {
+    if (!isStreamingRef.current || isScrolledUpRef.current) return;
+
+    const container = scrollContainerRef.current;
+    const key = lastMessageKeyRef.current;
+    const lastEl = key ? messageRefs.current.get(key) : null;
+    if (!container || !lastEl) return;
+
+    // One read pass for this frame, shared with `recalcSpacerHeight` below —
+    // avoids two independent getBoundingClientRect()/scrollHeight passes
+    // (with the spacer's minHeight write forcing a reflow in between) on
+    // every streaming flush.
+    const containerRect = container.getBoundingClientRect();
+    const elementRect = lastEl.getBoundingClientRect();
+    const containerHeight = container.clientHeight;
+    const scrollTop = container.scrollTop;
+    const scrollHeight = container.scrollHeight;
+    const composerHeight = composerDockRef.current?.offsetHeight ?? 0;
+
+    recalcSpacerHeight({
+      containerHeight,
+      lastMessageHeight: elementRect.height,
+      scrollHeight,
+      scrollTop,
+      composerHeight,
+    });
+
+    // The composer dock overlays the bottom of this scroller.
+    const visibleHeight = containerHeight - composerHeight;
+
+    let nextTop: number;
+    if (elementRect.height <= visibleHeight) {
+      const topBuffer = parseFloat(window.getComputedStyle(container).paddingTop) || 0;
+      nextTop = Math.max(0, elementRect.top - containerRect.top + scrollTop - topBuffer);
+    } else {
+      nextTop = scrollHeight - containerHeight;
+    }
+
+    // Already at the target position — skip the write (and the scroll-event
+    // churn / layout it triggers).
+    if (Math.abs(nextTop - scrollTop) < 1) {
+      lastTailSyncScrollTopRef.current = scrollTop;
+      return;
+    }
+
+    isAutoScrollingRef.current = true;
+    container.scrollTop = nextTop;
+    lastTailSyncScrollTopRef.current = container.scrollTop;
+    queueMicrotask(() => {
+      isAutoScrollingRef.current = false;
+    });
+  }, [recalcSpacerHeight]);
+
+  const scheduleResumeTailSync = useCallback(() => {
+    if (resumeTailSyncRafRef.current !== null) return;
+    resumeTailSyncRafRef.current = requestAnimationFrame(() => {
+      resumeTailSyncRafRef.current = null;
+      if (!isStreamingRef.current || isScrolledUpRef.current) return;
+      syncStreamingMessageTail();
+    });
+  }, [syncStreamingMessageTail]);
+
+  /** Shared by `handleScroll` and passive `wheel` — single place for flush + resume. */
+  const runStreamingBottomResume = useCallback(
+    (scrollTop: number) => {
+      const wasScrolledUp = isScrolledUpRef.current;
+      isScrolledUpRef.current = false;
+      lastTailSyncScrollTopRef.current = scrollTop;
+      if (wasScrolledUp) {
+        scheduleResumeTailSync();
+      }
+    },
+    [scheduleResumeTailSync],
+  );
+
+  // ── Load older messages trigger ────────────────────────────────────
+  // Fires the async load. The browser's native CSS scroll anchoring
+  // (overflow-anchor: auto) keeps the viewport stable when messages are
+  // prepended — no manual scrollTop adjustment needed.
+  const triggerLoadOlderMessages = useCallback(() => {
+    if (loadOlderInFlightRef.current) return;
+    if (!hasOlderMessagesRef.current || isLoadingOlderRef.current) return;
+    const targetSlotId = useChatStore.getState().activeSlotId;
+    if (!targetSlotId) return;
+
+    loadOlderInFlightRef.current = true;
+    loadOlderMessagesForSlot(targetSlotId).finally(() => {
+      loadOlderInFlightRef.current = false;
+    });
+  }, []);
+
+  // ── User scroll detection ─────────────────────────────────────────
+  // Streaming: opt out when `scrollTop` drops meaningfully below the last
+  // tail-sync position; resume when flush with the doc bottom (`dist` only —
+  // equivalent to near-max for non-subpixel cases). Resume MUST run before the
+  // opt-out check so a stale anchor cannot block "scroll back down to follow."
+  const handleScroll = useCallback(() => {
+    if (!scrollContainerRef.current) return;
+
+    const container = scrollContainerRef.current;
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    const distFromBottom = scrollHeight - scrollTop - clientHeight;
+
+    updateJumpToNewestVisibility();
+
+    if (isStreamingRef.current) {
+      const flushWithBottom = isStreamingFlushWithBottom(container);
+
+      // User can reach the bottom while programmatic tail-sync still holds the
+      // guard flag; always evaluate resume so follow turns back on.
+      if (isAutoScrollingRef.current && !flushWithBottom) return;
+
+      if (flushWithBottom) {
+        runStreamingBottomResume(scrollTop);
+        return;
+      }
+
+      if (isAutoScrollingRef.current) return;
+
+      const anchor = lastTailSyncScrollTopRef.current;
+      if (anchor >= 0 && scrollTop < anchor - STREAMING_OPT_OUT_ANCHOR_PX) {
+        isScrolledUpRef.current = true;
+      }
+      return;
+    }
+
+    if (isAutoScrollingRef.current) return;
+
+    if (distFromBottom <= IDLE_TAIL_BOTTOM_ZONE_PX) {
+      isScrolledUpRef.current = false;
+      lockClearedAtMsRef.current = Date.now();
+      return;
+    }
+
+    if (distFromBottom >= IDLE_SCROLLED_UP_ZONE_PX) {
+      const msSinceClear = Date.now() - lockClearedAtMsRef.current;
+      if (msSinceClear > IDLE_SCROLL_LOCK_GRACE_MS) {
+        isScrolledUpRef.current = true;
+      }
+    }
+
+    // Load older messages when scrolled near the top (after initial scroll done)
+    if (
+      scrollTop < LOAD_OLDER_THRESHOLD_PX &&
+      hasPerformedInitialScrollRef.current &&
+      !isStreamingRef.current
+    ) {
+      triggerLoadOlderMessages();
+    }
+  }, [runStreamingBottomResume, triggerLoadOlderMessages, updateJumpToNewestVisibility]);
+
+  // Stream start: clear scroll lock in layout phase (before paint), not in useEffect,
+  // so the first tail sync is not skipped. On every streaming commit, pin the tail
+  // before paint so the viewport never lags one frame behind the markdown.
+  useLayoutEffect(() => {
+    if (isStreaming && !prevIsStreamingForLockRef.current) {
+      isScrolledUpRef.current = false;
+      lastTailSyncScrollTopRef.current = -1;
+    }
+    prevIsStreamingForLockRef.current = isStreaming;
+
+    if (!isStreaming) return;
+    syncStreamingMessageTail();
+  }, [
+    isStreaming,
+    streamingContent,
+    currentStatusMessage?.id,
+    currentStatusMessage?.message,
+    streamingCitationMaps,
+    streamingParts,
+    syncStreamingMessageTail,
+  ]);
+
+  // ── rAF-coalesced resize handler for ResizeObserver ───────────────
+  // Spacer + tail on size changes that are not always tied to store updates
+  // (code blocks, images, fonts). While streaming, tail sync also runs from
+  // useLayoutEffect above; this path catches layout-only growth the same frame.
+  //
+  // Streaming Tracker: short message → title at top; tall → bottom edge.
+  const throttledResize = useMemo(() => {
+    return () => {
+      if (streamingLayoutRafRef.current !== null) return;
+      streamingLayoutRafRef.current = requestAnimationFrame(() => {
+        streamingLayoutRafRef.current = null;
+        if (isStreamingRef.current) {
+          syncStreamingMessageTail();
+        } else {
+          recalcSpacerHeight();
+        }
+        updateJumpToNewestVisibility();
+      });
+    };
+  }, [recalcSpacerHeight, syncStreamingMessageTail, updateJumpToNewestVisibility]);
+
+  // ── Cleanup auto-scroll timeout on unmount ──
+  useEffect(() => {
+    return () => {
+      if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
+      if (streamingLayoutRafRef.current !== null) {
+        cancelAnimationFrame(streamingLayoutRafRef.current);
+        streamingLayoutRafRef.current = null;
+      }
+      if (resumeTailSyncRafRef.current !== null) {
+        cancelAnimationFrame(resumeTailSyncRafRef.current);
+        resumeTailSyncRafRef.current = null;
+      }
+    };
+  }, []);
+
+  // Passive wheel + touch on the scroll container so tail-follow stops as soon as
+  // the user moves to read up-thread (wheel / touch), not only after `scroll` hysteresis.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const onWheel = (ev: WheelEvent) => {
+      if (!isStreamingRef.current) return;
+      if (
+        ev.deltaY < -STREAMING_WHEEL_UP_OPT_OUT_MIN_DELTA &&
+        el.scrollTop > 0
+      ) {
+        isScrolledUpRef.current = true;
+        return;
+      }
+      if (ev.deltaY > 0 && isStreamingFlushWithBottom(el)) {
+        runStreamingBottomResume(el.scrollTop);
+      }
+    };
+    let touchScrollTop0 = 0;
+    const onTouchStart = () => {
+      touchScrollTop0 = el.scrollTop;
+    };
+    const onTouchEnd = () => {
+      if (!isStreamingRef.current) return;
+      if (el.scrollTop < touchScrollTop0 - STREAMING_TOUCH_SCROLL_UP_THRESHOLD_PX) {
+        isScrolledUpRef.current = true;
+      }
+    };
+    el.addEventListener('wheel', onWheel, { passive: true });
+    el.addEventListener('touchstart', onTouchStart, { passive: true });
+    el.addEventListener('touchend', onTouchEnd, { passive: true });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchend', onTouchEnd);
+    };
+  }, [runStreamingBottomResume]);
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  SCROLL EFFECTS — Ordered by lifecycle priority
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ── 0. Slot switch: save outgoing state, reset incoming ───────────
+  // MUST be declared before the init-scroll effect so that
+  // `hasPerformedInitialScrollRef` is reset before init checks it.
+  useEffect(() => {
+    const currentSlotId = activeSlotId;
+    const prevSlotId = prevActiveSlotIdRef.current;
+
+    // Save outgoing slot's scroll position + user lock
+    if (prevSlotId && prevSlotId !== currentSlotId && scrollContainerRef.current) {
+      useChatStore.getState().updateSlot(prevSlotId, {
+        savedScrollTop: scrollContainerRef.current.scrollTop,
+        userScrollOverride: isScrolledUpRef.current,
+        // Record whether the slot was actively streaming at save-time.
+        // Effect #1 uses this to decide whether to restore the position or
+        // treat the chat as historical when we come back.
+        savedScrollWasStreaming: isStreamingRef.current,
+      });
+    }
+
+    // Reset scroll tracking for the incoming slot
+    if (currentSlotId !== prevSlotId) {
+      useInlineCitationPopoverStore.getState().setActiveKey(null);
+      hasPerformedInitialScrollRef.current = false;
+      isScrolledUpRef.current = false;
+      lockClearedAtMsRef.current = 0;
+      lastTailSyncScrollTopRef.current = -1;
+      // Align wasStreamingRef with the incoming slot's current streaming state
+      // so Effect #5 (streaming-completion handler) doesn't fire spuriously.
+      // Without this, wasStreamingRef retains the outgoing slot's value and
+      // can trigger a completion scroll on the wrong chat — or miss the real
+      // completion when we navigate back to a chat that finished while away.
+      wasStreamingRef.current = isStreamingRef.current;
+    }
+
+    prevActiveSlotIdRef.current = currentSlotId;
+  }, [activeSlotId]);
+
+  // ── 1. Initialization & Activation: first scroll for a slot ───────
+  // Fires when messages become available (isInitialized + pairs > 0)
+  // after `hasPerformedInitialScrollRef` was reset by the slot-switch
+  // effect above. Handles: historic load, switch to cached slot,
+  // and switch into an actively streaming slot.
+  useEffect(() => {
+    if (!isInitialized || messagePairs.length === 0) return;
+    if (hasPerformedInitialScrollRef.current) return;
+
+    hasPerformedInitialScrollRef.current = true;
+
+    // Check for saved scroll position (returning to a previously viewed chat)
+    const store = useChatStore.getState();
+    const slot = activeSlotId ? store.slots[activeSlotId] : null;
+    const savedTop = slot?.savedScrollTop;
+
+    // Determine whether the last message is actively streaming RIGHT NOW.
+    // Hoisted above the savedTop block so it can be used in both branches.
+    const lastPair = messagePairs[messagePairs.length - 1];
+    const isCurrentlyStreaming = lastPair?.isStreaming ?? false;
+
+    if (savedTop !== null && savedTop !== undefined) {
+      // If the slot was streaming when we left but has since finished, the
+      // savedTop is a mid-stream position that is now stale. Scroll to the
+      // bottom of the container so the user sees the completed answer and
+      // Ask More / action bar — matching where they'd be if they had stayed.
+      const wasStreamingWhenSaved = slot?.savedScrollWasStreaming ?? false;
+      if (wasStreamingWhenSaved && !isCurrentlyStreaming) {
+        recalcSpacerHeight();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          executeScroll({
+            target: 'bottom-of-container',
+            behavior: 'smooth',
+            chatBecameActive: true,
+          });
+        }));
+        return;
+      } else {
+        // Restore exact position without animation
+        recalcSpacerHeight();
+        requestAnimationFrame(() => {
+          if (scrollContainerRef.current) {
+            scrollContainerRef.current.scrollTo({ top: savedTop, behavior: 'auto' });
+          }
+          // Restore the user scroll-lock state from the slot
+          isScrolledUpRef.current = slot?.userScrollOverride ?? false;
+        });
+        return;
+      }
+    }
+
+    // No saved position (or stale mid-stream position discarded above) —
+    // do initial scroll.
+
+    recalcSpacerHeight();
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      executeScroll({
+        target: isCurrentlyStreaming ? 'bottom-of-container' : 'top-of-last-message',
+        behavior: isCurrentlyStreaming ? 'auto' : '80/20-jump',
+        chatBecameActive: true,
+      });
+    }));
+  }, [isInitialized, messagePairs.length, activeSlotId, recalcSpacerHeight, executeScroll]);
+
+  // ── 2. ResizeObserver on last message element ─────────────────────
+  // Tracks the last message's DOM size changes (streaming content growing,
+  // Ask More appearing, etc.) and runs the throttled spacer recalc +
+  // bottom-tracking scroll.
+  //
+  // IMPORTANT: `messagePairs` (the full array) is intentionally NOT in the
+  // deps — only `messagePairs.length` is. During streaming, `useAuiState()` may
+  // return a new `threadMessages` reference on every render (even with the
+  // same logical content), which would invalidate the `messagePairs` useMemo
+  // and produce a new array reference ~60fps. If the full array were a dep,
+  // this effect would re-run on every render, its cleanup would cancel the
+  // pending rAF each time, and the ResizeObserver would never be connected.
+  // We read the latest pairs via `messagePairsRef.current` inside the effect.
+  //
+  // The last pair's key IS a dep, and by value, so it costs nothing during
+  // streaming (the placeholder assistant's key does not change while it
+  // streams). It is needed because the last row can be replaced without the
+  // count moving: Stop before the first token swaps the placeholder row for
+  // the unanswered-question row, and without this the observer would stay on
+  // the element that just left the DOM.
+  useEffect(() => {
+    // Clean up previous observer
+    if (lastMessageObserverRef.current) {
+      lastMessageObserverRef.current.disconnect();
+      lastMessageObserverRef.current = null;
+    }
+
+    const pairs = messagePairsRef.current;
+
+    if (pairs.length === 0) {
+      lastMessageKeyRef.current = null;
+      // Do NOT zero the spacer here. When the streaming→final message swap
+      // happens, assistant-ui briefly produces 0 pairs then immediately
+      // recovers to 1. If we zero the spacer in that window, scrollHeight
+      // shrinks, the browser clamps scrollTop to 0, and the user sees a
+      // jarring snap-to-top before effect #5 smooth-scrolls back down.
+      // The spacer will be correctly recalculated by recalcSpacerHeight()
+      // once pairs recover. On a genuine fresh conversation the spacer
+      // starts at 0 already, so this omission is safe.
+      return;
+    }
+
+    const lastPair = pairs[pairs.length - 1];
+    lastMessageKeyRef.current = lastPair.key;
+
+    // Wait a frame for the element to be in the DOM
+    const rafId = requestAnimationFrame(() => {
+      const element = messageRefs.current.get(lastPair.key);
+      if (!element) {
+        return;
+      }
+
+      // Initial calculation
+      recalcSpacerHeight();
+
+      // Observe size changes (streaming content growing) — throttled
+      const observer = new ResizeObserver(() => {
+        throttledResize();
+      });
+      observer.observe(element);
+      lastMessageObserverRef.current = observer;
+    });
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (streamingLayoutRafRef.current !== null) {
+        cancelAnimationFrame(streamingLayoutRafRef.current);
+        streamingLayoutRafRef.current = null;
+      }
+      if (lastMessageObserverRef.current) {
+        lastMessageObserverRef.current.disconnect();
+        lastMessageObserverRef.current = null;
+      }
+    };
+  }, [messagePairs.length, lastPairKey, recalcSpacerHeight, throttledResize]);
+
+  useEffect(() => {
+    if (messagePairs.length === 0) setShowJumpToNewest(false);
+  }, [messagePairs.length]);
+
+  // ── 3. ResizeObserver on scroll container (window resize) and composer dock ──
+  const hasComposer = composer != null;
+  // Measured before paint: the blur is capped at this height, so a first frame at 0 would show
+  // the last lines of the transcript unblurred until the effect below ran.
+  useLayoutEffect(() => {
+    setComposerDockHeight(composerDockRef.current?.offsetHeight ?? 0);
+  }, [hasComposer]);
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const measureDock = () => setComposerDockHeight(composerDockRef.current?.offsetHeight ?? 0);
+    measureDock();
+    const observer = new ResizeObserver(() => {
+      recalcSpacerHeight();
+      measureDock();
+    });
+    observer.observe(container);
+    if (composerDockRef.current) observer.observe(composerDockRef.current);
+
+    return () => observer.disconnect();
+  }, [recalcSpacerHeight, hasComposer]);
+
+  // ── 3b. Streaming→final scroll-position guard ────────────────────
+  // When the assistant-ui runtime atomically swaps the streaming message for
+  // the final thread message, React may briefly see 0 pairs then 1 pair again.
+  //
+  // During that transient 0-pairs state the message DOM disappears,
+  // scrollHeight shrinks, and the browser clamps scrollTop to a lower
+  // value (often 0). A plain `container.scrollTop = saved` would just
+  // get re-clamped if scrollHeight is too small.
+  //
+  // Strategy:
+  //   1. Temporarily inflate the spacer so scrollHeight stays large
+  //      enough to support the target scrollTop.
+  //   2. Restore scrollTop before the browser paints.
+  //   3. Depend on BOTH isStreaming AND messagePairs.length so this
+  //      fires for the initial 0-pairs render AND the recovery render.
+  //   4. Effect #5 resets streamingScrollTopRef and recalcs the spacer
+  //      once the transition has fully settled.
+  useLayoutEffect(() => {
+    const container = scrollContainerRef.current;
+    const spacer = spacerRef.current;
+    if (!container || !spacer) return;
+
+    const targetTop = streamingScrollTopRef.current;
+    if (isStreaming || targetTop <= 0) return;
+
+    // Ensure scrollHeight is large enough so scrollTop won't be clamped
+    const neededScrollHeight = targetTop + container.clientHeight;
+    const deficit = neededScrollHeight - container.scrollHeight;
+    if (deficit > 0) {
+      const currentSpacer = parseFloat(spacer.style.minHeight) || 0;
+      spacer.style.minHeight = `${currentSpacer + deficit + 50}px`;
+    }
+
+    // Restore exact scroll position before paint
+    container.scrollTop = targetTop;
+  }, [isStreaming, messagePairs.length]);
+
+
+  // ── 4. New message pair added (user sends a message) ──────────────
+  useEffect(() => {
+    // Read current first pair key via the ref-mirror (always current in effects)
+    const currentFirstKey = messagePairsRef.current[0]?.key ?? null;
+
+    if (!hasPerformedInitialScrollRef.current) {
+      // Haven't done initial scroll yet — skip to avoid double-scrolling
+      prevPairCountRef.current = messagePairs.length;
+      prevFirstPairKeyRef.current = currentFirstKey;
+      return;
+    }
+
+    const pairsIncreased =
+      messagePairs.length > prevPairCountRef.current &&
+      // Guard: prevPairCount > 0 prevents a transient 0-pairs state (caused by
+      // assistant-ui's streaming→final message replacement) from being mistaken
+      // for a freshly sent message, which would incorrectly snap scroll to top.
+      prevPairCountRef.current > 0 &&
+      messagePairs.length > 0;
+
+    if (pairsIncreased) {
+      // Distinguish user-send (append) from load-older (prepend):
+      // - Append: first pair key is UNCHANGED (new pair went to the end)
+      // - Prepend: first pair key CHANGED (older pairs inserted at the front)
+      const isAppend = currentFirstKey === prevFirstPairKeyRef.current;
+
+      if (isAppend) {
+        recalcSpacerHeight();
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            // User actively sent a message → bypass scroll lock
+            executeScroll({
+              target: 'top-of-last-message',
+              behavior: 'smooth',
+              chatBecameActive: true,
+            });
+          });
+        });
+      }
+      // Prepend: browser's native overflow-anchor preserves the viewport position.
+    }
+
+    prevPairCountRef.current = messagePairs.length;
+    prevFirstPairKeyRef.current = currentFirstKey;
+  }, [messagePairs.length, executeScroll, recalcSpacerHeight]);
+
+  // ── 5. Streaming completion ───────────────────────────────────────
+  // ChatGPT/Claude-style: after the last token, do **not** auto smooth-scroll
+  // to the bottom. Users who were reading up-thread or viewing a citation
+  // would be jumped away from that context. 3b+layout already preserve
+  // scroll through the final message replace; we just refresh spacer + reset
+  // the scroll-position ref used by 3b.
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) {
+      const raf = requestAnimationFrame(() => {
+        recalcSpacerHeight();
+        streamingScrollTopRef.current = 0;
+      });
+      wasStreamingRef.current = isStreaming;
+      return () => cancelAnimationFrame(raf);
+    }
+    wasStreamingRef.current = isStreaming;
+  }, [isStreaming, recalcSpacerHeight]);
+
+  // ── Ask More: randomly pick one question set per new message pair ──
+  // TODO: Move this to the backend, also remove from il8n jsons since it's meant to be dynamic content
+  const askMoreSetIndexRef = useRef<{ count: number; index: number }>({ count: -1, index: 0 });
+  if (askMoreSetIndexRef.current.count !== messagePairs.length) {
+    askMoreSetIndexRef.current = {
+      count: messagePairs.length,
+      // eslint-disable-next-line react-hooks/purity -- intentional render-time ref update: pick a stable random set per message-pair count change
+      index: Math.floor(Math.random() * 1_000_000),
+    };
+  }
+  const askMoreQuestions = useMemo(() => {
+    if (messagePairs.length === 0) return [];
+    // t() with returnObjects:true is unreliable for nested arrays in strict TS —
+    // read the resource bundle directly to get the raw JSON array.
+    const bundle = i18n.getResourceBundle(i18n.language, 'translation') as Record<string, unknown> | undefined;
+    const sets = (bundle?.chat as Record<string, unknown> | undefined)?.askMoreQuestionSets as string[][] | undefined;
+    const activeSets = Array.isArray(sets) && sets.length > 0 ? sets : ASK_MORE_QUESTION_SETS;
+    const setIndex = askMoreSetIndexRef.current.index % activeSets.length;
+    return activeSets[setIndex];
+  }, [messagePairs.length, i18n.language]);
+
+  // Whether to show Ask More suggestions
+  const showAskMore = messagePairs.length > 0 && !isStreaming && !isLoadingConversation;
+
+  // Handle Ask More question click — send through runtime
+  const handleAskMoreClick = useCallback(
+    (question: string) => {
+      aui.thread().append({
+        role: 'user',
+        content: [{ type: 'text', text: question }],
+        startRun: true,
+      });
+    },
+    [aui]
+  );
+
+  // Lands on the end of the latest message and, if an answer is streaming, re-arms tail-follow.
+  const handleJumpToNewest = useCallback(() => {
+    lastTailSyncScrollTopRef.current = -1;
+    executeScroll({
+      target: 'bottom-of-container',
+      behavior: 'smooth',
+      chatBecameActive: true,
+    });
+  }, [executeScroll]);
+
+  // The button belongs to the viewport, so it sits beside the scroller, not inside it.
+  return (
+    <Box style={{ position: 'relative', flex: 1, minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column' }}>
+    <Box
+      ref={scrollContainerRef}
+      onScroll={handleScroll}
+      className="chat-message-scroll"
+      style={{
+        // Full chat-panel width so the scrollbar sits on the pane edge, not
+        // against the message column. Content is centered in the shared column.
+        flex: 1,
+        minHeight: 0,
+        width: '100%',
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        overscrollBehavior: 'contain',
+        scrollBehavior: isStreaming ? 'auto' : 'smooth',
+        // The tail is pinned manually during streaming (syncStreamingMessageTail
+        // writes scrollTop every frame) — native scroll anchoring would otherwise
+        // fight those writes whenever streamed table/content geometry shifts.
+        overflowAnchor: isStreaming ? 'none' : 'auto',
+        // Column so the composer dock can sit at the bottom of a short transcript.
+        display: 'flex',
+        flexDirection: 'column',
+      }}
+    >
+      <Box
+        style={{
+          ...chatContentColumnStyle(),
+          flexShrink: 0,
+          margin: '0 auto',
+          paddingTop: 'var(--space-4)',
+          paddingBottom: isMobile ? 'var(--space-4)' : 'var(--space-5)',
+        }}
+      >
+        <Flex direction="column" gap="6">
+          {/* Loading older messages indicator — shown at the very top while fetching */}
+          {isLoadingOlder && (
+            <Flex align="center" justify="center" style={{ padding: 'var(--space-4)', flexShrink: 0 }}>
+              <LottieLoader variant="loader" size={32} />
+            </Flex>
+          )}
+
+          {isLoadingConversation && (
+            <Flex align="center" justify="center" style={{ padding: 'var(--space-6)' }}>
+              <LottieLoader variant="loader" size={48} showLabel />
+            </Flex>
+          )}
+
+          {messagePairs.map((pair, index) => {
+            const isLast = index === messagePairs.length - 1;
+            return (
+              <div
+                key={pair.key}
+                ref={(el) => setMessageRef(pair.key, el)}
+              >
+                <ErrorBoundary
+                  resetKeys={[pair.key, pair.messageId]}
+                  fallback={(error, reset) => <ErrorFallback error={error} reset={reset} compact />}
+                >
+                  <ChatResponse
+                    question={pair.question}
+                    answer={pair.answer}
+                    citationMaps={pair.citationMaps}
+                    citationCallbacks={citationCallbacks}
+                    confidence={pair.confidence}
+                    isStreaming={pair.isStreaming}
+                    modelInfo={pair.modelInfo}
+                    collections={pair.collections}
+                    appliedFilters={pair.appliedFilters}
+                    attachments={pair.attachments}
+                    messageId={pair.messageId}
+                    isLastMessage={isLast}
+                    rowId={pair.key}
+                    citationMessageRowKey={pair.key}
+                    createdAt={pair.createdAt}
+                    streamingContent={pair.isStreaming ? streamingContent : undefined}
+                    currentStatusMessage={pair.isStreaming ? currentStatusMessage : undefined}
+                    streamingCitationMaps={pair.isStreaming ? streamingCitationMaps : undefined}
+                    streamingArtifacts={pair.isStreaming ? streamingArtifacts : undefined}
+                    streamingParts={pair.isStreaming ? streamingParts : undefined}
+                    latestArtifactVersions={latestArtifactVersions}
+                    persistedParts={pair.persistedParts}
+                    persistedAskUserQuestion={pair.persistedAskUserQuestion}
+                    persistedAskUserQuestionAnswers={pair.persistedAskUserQuestionAnswers}
+                    feedbackInfo={pair.feedbackInfo}
+                    status={pair.status}
+                    streamError={pair.streamError}
+                    unanswered={pair.unanswered}
+                  />
+                </ErrorBoundary>
+
+                {/* Ask More — follow-up suggestions after the last bot response.
+                    Placed inside the last message wrapper so the ResizeObserver
+                    accounts for its height in the spacer calculation.
+
+                    TEMPORARILY DISABLED: the follow-up questions are hardcoded
+                    (see `ASK_MORE_QUESTION_SETS` in ../../constants) and are not
+                    yet generated from the actual conversation. Re-enable once
+                    the suggestions are dynamically produced by the backend. */}
+                {/*
+                {isLast && showAskMore && (
+                  <Box style={{ marginTop: 'var(--space-6)' }}>
+                    <AskMore
+                      questions={askMoreQuestions}
+                      onQuestionClick={handleAskMoreClick}
+                    />
+                  </Box>
+                )}
+                */}
+              </div>
+            );
+          })}
+        </Flex>
+      </Box>
+
+      {/* Dynamic bottom spacer: ensures the last message can always be scrolled to
+          the top even when its content is shorter than the viewport.
+          Always rendered (never conditional) so the ref is stable for direct
+          DOM mutation by recalcSpacerHeight — avoids React rerenders. */}
+      <div
+        ref={spacerRef}
+        style={{
+          minHeight: 0,
+          flexShrink: 0,
+        }}
+        aria-hidden="true"
+      />
+
+      {/* Inside the scroller, not a sibling: the scrollbar runs to the bottom of
+          the pane, the transcript passes behind the composer, and a wheel over
+          the composer scrolls the transcript. */}
+      {hasComposer && (
+        <Box
+          ref={composerDockRef}
+          style={{
+            position: 'sticky',
+            bottom: 0,
+            marginTop: 'auto',
+            flexShrink: 0,
+            zIndex: 2,
+            overflowAnchor: 'none',
+            // Only the composer column takes clicks; the gutters on either side
+            // leave the transcript underneath selectable.
+            pointerEvents: 'none',
+          }}
+        >
+          {/* Capped at the dock: a viewer with no input has only the footer links here, and a
+              taller blur would sit over the last lines of the transcript, which cannot scroll
+              clear of it. */}
+          <ProgressiveBlur height={Math.min(COMPOSER_BLUR_HEIGHT_PX, composerDockHeight)} />
+          <Flex
+            direction="column"
+            align="center"
+            style={{
+              position: 'relative',
+              paddingBottom: isMobile ? 'max(var(--space-2), env(safe-area-inset-bottom, 0px))' : 0,
+            }}
+          >
+            {composer}
+          </Flex>
+        </Box>
+      )}
+
+      {/* Single inline-citation popover host for the whole message list. It's
+          driven by the zustand store so only one popover is ever rendered,
+          even when the answer contains many citation badges. */}
+      <InlineCitationPopoverHost />
+    </Box>
+
+    {showJumpToNewest && (
+      <Box
+        style={{
+          position: 'absolute',
+          bottom: composerDockHeight + 12,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          zIndex: 2,
+        }}
+      >
+        <IconButton
+          type="button"
+          variant="soft"
+          color="gray"
+          radius="full"
+          size="3"
+          title={t('chat.jumpToNewest')}
+          aria-label={t('chat.jumpToNewest')}
+          onClick={handleJumpToNewest}
+          style={{
+            cursor: 'pointer',
+            background: 'var(--color-panel-solid)',
+            boxShadow: 'var(--shadow-3)',
+            ...(isMobile ? { minWidth: 44, minHeight: 44 } : {}),
+          }}
+        >
+          <MaterialIcon name="arrow_downward" size={20} />
+        </IconButton>
+      </Box>
+    )}
+    </Box>
+  );
+}

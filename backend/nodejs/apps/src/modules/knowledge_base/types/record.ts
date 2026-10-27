@@ -1,0 +1,78 @@
+// Enumerations for the RecordDocument model
+export type RecordType = 'FILE' | 'WEBPAGE' | 'COMMENT' | 'MESSAGE' | 'EMAIL' | 'TICKET' | 'OTHERS';
+export type OriginType = 'UPLOAD' | 'CONNECTOR';
+export type ConnectorName =
+  | 'ONEDRIVE'
+  | 'GOOGLE_DRIVE'
+  | 'CONFLUENCE'
+  | 'JIRA'
+  | 'SLACK'
+  | 'SHAREPOINT ONLINE'
+  | 'GMAIL'
+  | 'NOTION';
+export type IndexingStatus =
+  | 'NOT_STARTED'
+  | 'PAUSED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'FILE_TYPE_NOT_SUPPORTED'
+  | 'AUTO_INDEX_OFF'
+  | 'EMPTY'
+  | 'ENABLE_MULTIMODAL_MODELS'
+  | 'QUEUED'
+  | 'SKIPPED'
+  | 'PASSWORD_PROTECTED';
+
+// Interface for a generic record document.
+export interface IRecordDocument {
+  _key: string;
+  // Optional properties can be omitted on document creation
+  orgId: string;
+  sizeInBytes?: number;
+  
+  // Required fields
+  recordName: string;
+  externalRecordId: string;
+  externalRevisionId?: string;
+  recordType: RecordType;
+  origin: OriginType;
+  createdAtTimestamp: number;
+
+  // Optional properties with defaults on the backend (if not provided)
+  version?: number; // default: 0
+  connectorName?: ConnectorName;
+  updatedAtTimestamp?: number;
+  lastSyncTimestamp?: number;
+  connectorId: string;
+
+  // Flags and timestamps
+  isDeletedAtSource?: boolean; // default: false
+  deletedAtSourceTimestamp?: number;
+  sourceCreatedAtTimestamp?: number;
+  sourceLastModifiedTimestamp?: number;
+
+  isDeleted?: boolean; // default: false
+  isArchived?: boolean; // default: false
+  deletedByUserId?: string;
+  isVLMOcrProcessed?: boolean; // default: false
+
+  lastIndexTimestamp?: number;
+  lastExtractionTimestamp?: number;
+  indexingStatus?: IndexingStatus;
+  isLatestVersion?: boolean; // default: false
+  isDirty?: boolean; // default: false, indicates need for re-indexing
+  reason?: string;
+  virtualRecordId?: string;
+  summaryDocumentId?:string;
+  webUrl?: string;
+  mimeType?: string;
+}
+
+export interface IFileBuffer {
+  originalname: string;
+  mimetype: string;
+  size: number;
+  buffer: Buffer;
+  encoding?: string;
+}

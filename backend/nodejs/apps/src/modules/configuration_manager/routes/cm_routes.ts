@@ -1,0 +1,1177 @@
+import { Router, Request, Response, NextFunction } from 'express';
+import { Container } from 'inversify';
+import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
+import {
+  createAIModelsConfig,
+  createGoogleWorkspaceCredentials,
+  createSmtpConfig,
+  createStorageConfig,
+  getAIModelsConfig,
+  getInternalAIModelsConfig,
+  getGoogleAuthConfig,
+  getGoogleWorkspaceOauthConfig,
+  getGoogleWorkspaceCredentials,
+  getMicrosoftAuthConfig,
+  getSmtpConfig,
+  getSmtpConfigStatus,
+  getStorageConfig,
+  setGoogleAuthConfig,
+  setMicrosoftAuthConfig,
+  setGoogleWorkspaceOauthConfig,
+  deleteGoogleWorkspaceCredentials,
+  getGoogleWorkspaceBusinessCredentials,
+  getFrontendUrl,
+  getDesktopFrontendUrl,
+  setFrontendUrl,
+  getConnectorPublicUrl,
+  setConnectorPublicUrl,
+  toggleMetricsCollection,
+  getMetricsCollection,
+  setMetricsCollectionPushInterval,
+  setMetricsCollectionRemoteServer,
+  getAvailableModelsByType,
+  addAIModelProvider,
+  prepareEmbeddingModel,
+  streamEmbeddingDownloadProgress,
+  updateAIModelProvider,
+  deleteAIModelProvider,
+  updateDefaultAIModel,
+  getAIModelsProviders,
+  getModelsByType,
+  getAtlassianOauthConfig,
+  setAtlassianOauthConfig,
+  getOneDriveCredentials,
+  getSharePointCredentials,
+  setSharePointCredentials,
+  setOneDriveCredentials,
+  getConnectorConfig,
+  getPlatformSettings,
+  setPlatformSettings,
+  getAvailablePlatformFeatureFlags,
+  getEffectivePlatformFeatureFlags,
+  getSecretRevealStatus,
+  getCustomSystemPrompt,
+  setCustomSystemPrompt,
+  getWebSearchProviders,
+  updateWebSearchSettings,
+  addWebSearchProvider,
+  updateWebSearchProvider,
+  deleteWebSearchProvider,
+  updateDefaultWebSearchProvider,
+  getSlackBotConfigs,
+  getInternalSlackBotConfigs,
+  createSlackBotConfig,
+  updateSlackBotConfig,
+  deleteSlackBotConfig,
+  getAIModelRegistry,
+  getAIModelRegistryCapabilities,
+  getAIModelProviderSchema,
+  getModelRoles,
+  updateModelRoles,
+} from '../controller/cm_controller';
+import {
+  batchAddAIModels,
+  discoverAIModels,
+  rotateConnectionCredentials,
+} from '../controller/ai_models_batch.controller';
+import {
+  getIdentityPolicy,
+  previewIdentityForwarding,
+  putIdentityPolicy,
+  setConnectionIdentityForwarding,
+} from '../controller/ai_gateway_identity.controller';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
+import {
+  smtpConfigSchema,
+  aiModelsConfigSchema,
+  storageValidationSchema,
+  azureAdConfigSchema,
+  googleAuthConfigSchema,
+  googleWorkspaceConfigSchema,
+  platformSettingsSchema,
+  urlSchema,
+  metricsCollectionPushIntervalSchema,
+  metricsCollectionToggleSchema,
+  metricsCollectionRemoteServerSchema,
+  modelTypeSchema,
+  updateDefaultModelSchema,
+  deleteProviderSchema,
+  addProviderRequestSchema,
+  batchAddModelsRequestSchema,
+  discoverModelsRequestSchema,
+  rotateConnectionCredentialsSchema,
+  connectionIdentityForwardingSchema,
+  identityPolicySchema,
+  identityPreviewSchema,
+  updateProviderRequestSchema,
+  atlassianCredentialsSchema,
+  onedriveCredentialsSchema,
+  sharepointCredentialsSchema,
+  addWebSearchProviderSchema,
+  updateWebSearchSettingsSchema,
+  updateWebSearchProviderSchema,
+  deleteWebSearchProviderSchema,
+  updateDefaultWebSearchProviderSchema,
+  createSlackBotConfigSchema,
+  updateSlackBotConfigSchema,
+  deleteSlackBotConfigSchema,
+} from '../validator/validators';
+import { FileProcessorFactory } from '../../../libs/middlewares/file_processor/fp.factory';
+import { FileProcessingType } from '../../../libs/middlewares/file_processor/fp.constant';
+
+import { userAdminCheck } from '../../user_management/middlewares/userAdminCheck';
+import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
+import { requireScopes } from '../../../libs/middlewares/require-scopes.middleware';
+import { OAuthScopeNames } from '../../../libs/enums/oauth-scopes.enum';
+import { AppConfig } from '../../tokens_manager/config/config';
+import {
+  AuthenticatedUserRequest,
+  AuthenticatedServiceRequest,
+} from '../../../libs/middlewares/types';
+import { NotFoundError } from '../../../libs/errors/http.errors';
+import { ConfigService } from '../services/updateConfig.service';
+import {
+  AiConfigEventProducer,
+  SyncEventProducer,
+} from '../services/kafka_events.service';
+import { guardPathParams } from '../../../libs/middlewares/safe-path-params.middleware';
+
+export function createConfigurationManagerRouter(container: Container): Router {
+  const router = Router();
+  // Settings answers depend on who is asking and can carry secrets, so no
+  // browser or proxy cache may keep a copy to hand to the next user.
+  router.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+  guardPathParams(router, 'providerId');
+  const keyValueStoreService = container.get<KeyValueStoreService>(
+    'KeyValueStoreService',
+  );
+  const appConfig = container.get<AppConfig>('AppConfig');
+  const syncEventService =
+    container.get<SyncEventProducer>('SyncEventProducer');
+  const aiConfigEventService = container.get<AiConfigEventProducer>(
+    'AiConfigEventProducer',
+  );
+  const configService = container.get<ConfigService>('ConfigService');
+  const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
+  // storage config routes
+
+  /**
+   * POST /storageConfig
+   * Creates or updates storage configuration in the key-value store
+   * Requires authentication
+   * @param {Object} req.body.storageConfig - Storage configuration object to store
+   * @returns {Object} The stored configuration object
+   */
+  router.post(
+    '/storageConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(storageValidationSchema),
+    createStorageConfig(keyValueStoreService, appConfig.storage),
+  );
+
+  /**
+   * GET /storageConfig
+   * Retrieves the current storage configuration from key-value store
+   * Requires authentication
+   * @returns {Object} The stored configuration object or null if not found
+   */
+  router.get(
+    '/storageConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getStorageConfig(keyValueStoreService),
+  );
+
+  router.get(
+    '/internal/storageConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.STORAGE_TOKEN),
+    getStorageConfig(keyValueStoreService),
+  );
+
+  // SMTP Config Routes
+  /**
+   * POST /smtpConfig
+   * Creates or updates SMTP configuration in the key-value store
+   * Requires authentication
+   * @param {Object} req.body.smtpConfig - SMTP configuration object to store
+   * @returns {Object} The stored configuration object
+   */
+  router.post(
+    '/smtpConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(smtpConfigSchema),
+    createSmtpConfig(
+      keyValueStoreService,
+      appConfig.communicationBackend,
+      appConfig.scopedJwtSecret,
+    ),
+  );
+
+  router.get(
+    '/internal/connectors/atlassian/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return getAtlassianOauthConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.get(
+    '/connectors/atlassian/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return getAtlassianOauthConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/connectors/atlassian/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(atlassianCredentialsSchema),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return setAtlassianOauthConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/internal/connectors/atlassian/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    ValidationMiddleware.validate(atlassianCredentialsSchema),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return setAtlassianOauthConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.get(
+    '/connectors/onedrive/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return getOneDriveCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/internal/connectors/onedrive/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    ValidationMiddleware.validate(onedriveCredentialsSchema),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return setOneDriveCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.get(
+    '/connectors/sharepoint/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return getSharePointCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/internal/connectors/sharepoint/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    ValidationMiddleware.validate(sharepointCredentialsSchema),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return setSharePointCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  // Generic internal connector config fetch: /internal/connectors/:connector/config
+  router.get(
+    '/internal/connectors/:connector/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return getConnectorConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/connectors/sharepoint/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(sharepointCredentialsSchema),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return setSharePointCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/connectors/onedrive/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(onedriveCredentialsSchema),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return setOneDriveCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  /**
+   * GET /smtpConfig
+   * Retrieves the current SMTP configuration from key-value store
+   * Requires authentication
+   * @returns {Object} The stored configuration object or null if not found
+   */
+  router.get(
+    '/smtpConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getSmtpConfig(keyValueStoreService),
+  );
+
+  router.get(
+    '/internal/smtpConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    getSmtpConfig(keyValueStoreService, false),
+  );
+
+  /**
+   * GET /smtpConfig/status
+   * Boolean-only SMTP status, no secrets or host/port details — safe for any
+   * authenticated org member. Non-admins can invite users but cannot read
+   * `/smtpConfig` (admin-gated), so the Users page uses this to decide
+   * whether to disable Invite instead of hitting a 403 on the full config.
+   */
+  router.get(
+    '/smtpConfig/status',
+    authMiddleware.authenticate,
+    getSmtpConfigStatus(keyValueStoreService),
+  );
+
+  // auth config routes
+
+  router.get(
+    '/authConfig/microsoft',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getMicrosoftAuthConfig(keyValueStoreService),
+  );
+  router.get(
+    '/internal/authConfig/microsoft',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    getMicrosoftAuthConfig(keyValueStoreService, false),
+  );
+
+  router.post(
+    '/authConfig/microsoft',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(azureAdConfigSchema),
+    setMicrosoftAuthConfig(keyValueStoreService),
+  );
+
+  router.get(
+    '/authConfig/google',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getGoogleAuthConfig(keyValueStoreService),
+  );
+
+  router.get(
+    '/internal/authConfig/google',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    getGoogleAuthConfig(keyValueStoreService, false),
+  );
+  router.post(
+    '/authConfig/google',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(googleAuthConfigSchema),
+    setGoogleAuthConfig(keyValueStoreService),
+  );
+
+  // Platform settings
+  router.post(
+    '/platform/settings',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(platformSettingsSchema),
+    setPlatformSettings(keyValueStoreService),
+  );
+
+  router.get(
+    '/platform/settings',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getPlatformSettings(keyValueStoreService),
+  );
+
+  router.get(
+    '/platform/feature-flags/available',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getAvailablePlatformFeatureFlags(),
+  );
+
+  // Effective feature flag values — every authenticated user (not just admins)
+  // needs these to decide whether to render flag-gated UI (e.g. MCP).
+  router.get(
+    '/platform/feature-flags/effective',
+    authMiddleware.authenticate,
+    getEffectivePlatformFeatureFlags(keyValueStoreService),
+  );
+
+  router.get(
+    '/secretReveal',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getSecretRevealStatus,
+  );
+
+  // Slack Bot configuration
+  router.get(
+    '/slack-bot',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    getSlackBotConfigs(keyValueStoreService),
+  );
+  router.get(
+    '/internal/slack-bot',
+    authMiddleware.scopedTokenValidator(TokenScopes.SLACK_BOT_VERIFY),
+    getInternalSlackBotConfigs(keyValueStoreService),
+  );
+
+  router.post(
+    '/slack-bot',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(createSlackBotConfigSchema),
+    createSlackBotConfig(keyValueStoreService),
+  );
+
+  router.put(
+    '/slack-bot/:configId',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(updateSlackBotConfigSchema),
+    updateSlackBotConfig(keyValueStoreService),
+  );
+
+  router.delete(
+    '/slack-bot/:configId',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(deleteSlackBotConfigSchema),
+    deleteSlackBotConfig(keyValueStoreService),
+  );
+
+  // Custom System Prompt routes
+  router.get(
+    '/prompts/system',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getCustomSystemPrompt(keyValueStoreService),
+  );
+
+  router.put(
+    '/prompts/system',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    setCustomSystemPrompt(keyValueStoreService),
+  );
+
+  // Google Workspace Config Routes
+  /**
+   * POST /googleWorkspaceConfig
+   * Creates or updates Google Workspace configuration in the key-value store
+   * Requires authentication
+   * @param {Object} req.body.googleWorkspaceConfig - Google Workspace configuration object to store
+   * @returns {Object} The stored configuration object
+   */
+  router.post(
+    '/connectors/googleWorkspaceCredentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ...FileProcessorFactory.createJSONUploadProcessor({
+      fieldName: 'googleWorkspaceCredentials',
+      allowedMimeTypes: ['application/json'],
+      maxFilesAllowed: 1,
+      isMultipleFilesAllowed: false,
+      processingType: FileProcessingType.JSON,
+      maxFileSize: 1024 * 1024 * 5,
+      strictFileUpload: false,
+    }).getMiddleware,
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return createGoogleWorkspaceCredentials(
+        keyValueStoreService,
+        req.user.userId,
+        req.user.orgId,
+        syncEventService,
+      )(req, res, next);
+    },
+  );
+
+  router.post(
+    '/internal/connectors/googleWorkspaceCredentials',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+
+    ...FileProcessorFactory.createJSONUploadProcessor({
+      fieldName: 'googleWorkspaceCredentials',
+      allowedMimeTypes: ['application/json'],
+      maxFilesAllowed: 1,
+      isMultipleFilesAllowed: false,
+      processingType: FileProcessingType.JSON,
+      maxFileSize: 1024 * 1024 * 5,
+      strictFileUpload: false,
+    }).getMiddleware,
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return createGoogleWorkspaceCredentials(
+        keyValueStoreService,
+        req.tokenPayload.userId,
+        req.tokenPayload.orgId,
+        syncEventService,
+      )(req, res, next);
+    },
+  );
+  /**
+   * GET /googleWorkspaceConfig
+   * Retrieves the current Google Workspace configuration from key-value store
+   * Requires authentication
+   * @returns {Object} The stored configuration object or null if not found
+   */
+  router.get(
+    '/connectors/googleWorkspaceCredentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return getGoogleWorkspaceCredentials(
+        keyValueStoreService,
+        req.user.userId,
+        req.user.orgId,
+      )(req, res, next);
+    },
+  );
+
+  router.get(
+    '/internal/connectors/individual/googleWorkspaceCredentials',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return getGoogleWorkspaceCredentials(
+        keyValueStoreService,
+        req.tokenPayload.userId,
+        req.tokenPayload.orgId,
+      )(req, res, next);
+    },
+  );
+  router.get(
+    '/internal/connectors/business/googleWorkspaceCredentials',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return getGoogleWorkspaceBusinessCredentials(
+        keyValueStoreService,
+        req.tokenPayload.orgId,
+      )(req, res, next);
+    },
+  );
+
+  router.delete(
+    '/internal/connectors/business/googleWorkspaceCredentials',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return deleteGoogleWorkspaceCredentials(
+        keyValueStoreService,
+        req.tokenPayload.orgId,
+      )(req, res, next);
+    },
+  );
+
+  router.get(
+    '/connectors/googleWorkspaceOauthConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getGoogleWorkspaceOauthConfig(keyValueStoreService),
+  );
+
+  router.post(
+    '/connectors/googleWorkspaceOauthConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(googleWorkspaceConfigSchema),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return setGoogleWorkspaceOauthConfig(
+        keyValueStoreService,
+        syncEventService,
+        req.user.orgId,
+      )(req, res, next);
+    },
+  );
+
+  router.get(
+    '/internal/connectors/googleWorkspaceOauthConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    getGoogleWorkspaceOauthConfig(keyValueStoreService),
+  );
+
+  router.post(
+    '/internal/connectors/googleWorkspaceOauthConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    ValidationMiddleware.validate(googleWorkspaceConfigSchema),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return setGoogleWorkspaceOauthConfig(
+        keyValueStoreService,
+        syncEventService,
+        req.tokenPayload?.orgId,
+      )(req, res, next);
+    },
+  );
+
+  // ai models config routes
+  /**
+   * POST /aiModelsConfig
+   * Creates or updates ai models configuration in the key-value store
+   * Requires authentication
+   * @param {Object} req.body.aiModelsConfig - Ai models configuration object to store
+   * @returns {Object} The stored configuration object
+   */
+  router.post(
+    '/aiModelsConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(aiModelsConfigSchema),
+    createAIModelsConfig(keyValueStoreService, aiConfigEventService, appConfig),
+  );
+
+  /**
+   * GET /aiModelsConfig
+   * Retrieves the current ai models configuration from key-value store. Each
+   * entry's configuration includes only model, modelFriendlyName, and
+   * dimensions when stored. Requires authentication.
+   * @returns {Object} The stored configuration object or null if not found
+   */
+  router.get(
+    '/aiModelsConfig',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getAIModelsConfig(keyValueStoreService),
+  );
+
+  router.get(
+    '/internal/aiModelsConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    getInternalAIModelsConfig(keyValueStoreService),
+  );
+
+  /**
+   * @route GET /api/v1/configurationManager/ai-models/registry
+   * @desc Get all registered AI model providers from the Python backend registry
+   * @access Private (admin)
+   */
+  router.get(
+    '/ai-models/registry/capabilities',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getAIModelRegistryCapabilities(appConfig),
+  );
+
+  router.get(
+    '/ai-models/registry/:providerId/schema',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getAIModelProviderSchema(appConfig),
+  );
+
+  router.get(
+    '/ai-models/registry',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getAIModelRegistry(appConfig),
+  );
+
+  /**
+   * @route GET /api/v1/configurationManager/ai-models
+   * @desc Get all AI models providers
+   * @access Private (admin)
+   */
+  router.get(
+    '/ai-models',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getAIModelsProviders(keyValueStoreService),
+  );
+
+  /**
+   * @route GET /api/v1/configurationManager/ai-models/roles
+   * @desc Get all model role assignments (e.g. indexing role)
+   * @access Private (admin)
+   * NOTE: Must be registered before /ai-models/:modelType to avoid Express
+   * matching "roles" as the :modelType param.
+   */
+  router.get(
+    '/ai-models/roles',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getModelRoles(keyValueStoreService),
+  );
+
+  /**
+   * @route PUT /api/v1/configurationManager/ai-models/roles
+   * @desc Assign models to named roles (e.g. indexing)
+   * @access Private (admin)
+   * @body { roles: Record<string, { modelType: string; modelKey: string }> }
+   * NOTE: Must be registered before /ai-models/default/:modelType/:modelKey.
+   */
+  router.put(
+    '/ai-models/roles',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    updateModelRoles(keyValueStoreService),
+  );
+
+  /**
+   * @route GET /api/v1/configurationManager/ai-models/download-progress
+   * @desc Server-Sent Events stream of embedding model download progress.
+   * @access Private (admin)
+   * @query {string} model - Model name being downloaded
+   * NOTE: Must be registered before /ai-models/:modelType, otherwise Express
+   * matches "download-progress" as the :modelType param and the enum
+   * validator on that route rejects it with a 400.
+   */
+  router.get(
+    '/ai-models/download-progress',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    streamEmbeddingDownloadProgress(),
+  );
+
+  // Literal paths before /ai-models/:modelType. Express matches the param
+  // route first otherwise, and the enum validator rejects the literal segment.
+  router.post(
+    '/ai-models/discover',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(discoverModelsRequestSchema),
+    discoverAIModels(keyValueStoreService, appConfig),
+  );
+
+  router.post(
+    '/ai-models/providers/batch',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(batchAddModelsRequestSchema),
+    batchAddAIModels(keyValueStoreService, aiConfigEventService, appConfig),
+  );
+
+  router.put(
+    '/ai-models/connections/:connectionId/credentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(rotateConnectionCredentialsSchema),
+    rotateConnectionCredentials(keyValueStoreService, appConfig),
+  );
+
+  // AuthMiddleware binds `authenticate` in its constructor, so passing the
+  // reference is safe; the route guard test also needs that exact reference.
+  /* eslint-disable @typescript-eslint/unbound-method */
+  router.put(
+    '/ai-models/connections/:connectionId/identity-forwarding',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(connectionIdentityForwardingSchema),
+    setConnectionIdentityForwarding(
+      keyValueStoreService,
+      aiConfigEventService,
+      appConfig,
+    ),
+  );
+
+  router.get(
+    '/ai-models/identity-policy',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getIdentityPolicy(keyValueStoreService),
+  );
+
+  router.put(
+    '/ai-models/identity-policy',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(identityPolicySchema),
+    putIdentityPolicy(keyValueStoreService),
+  );
+
+  router.post(
+    '/ai-models/identity/preview',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    ValidationMiddleware.validate(identityPreviewSchema),
+    previewIdentityForwarding(keyValueStoreService, appConfig),
+  );
+  /* eslint-enable @typescript-eslint/unbound-method */
+
+  /**
+   * @route GET /api/v1/configurationManager/ai-models/:modelType
+   * @desc Get all AI models of a specific type
+   * @access Private (admin)
+   * @param {string} modelType - Type of model (llm, embedding, ocr, slm, reasoning, multiModal)
+   */
+
+  router.get(
+    '/ai-models/:modelType',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    ValidationMiddleware.validate(modelTypeSchema),
+    getModelsByType(keyValueStoreService),
+  );
+
+  /**
+   * @route GET /api/v1/configurationManager/ai-models/available/:modelType
+   * @desc Get available models of a specific type in flattened format
+   * @access Private
+   * @param {string} modelType - Type of model (llm, embedding, ocr, slm, reasoning, multiModal)
+   */
+  router.get(
+    '/ai-models/available/:modelType',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    ValidationMiddleware.validate(modelTypeSchema),
+    getAvailableModelsByType(keyValueStoreService),
+  );
+
+  router.post(
+    '/ai-models/providers',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(addProviderRequestSchema),
+    addAIModelProvider(keyValueStoreService, aiConfigEventService, appConfig),
+  );
+
+  /**
+   * @route POST /api/v1/configurationManager/ai-models/prepare-model
+   * @desc Kick off a non-blocking download/load of a local embedding model
+   *       on the embedding server. Returns immediately; poll
+   *       /ai-models/download-progress for status.
+   * @access Private (admin)
+   */
+  router.post(
+    '/ai-models/prepare-model',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    prepareEmbeddingModel(),
+  );
+
+  /**
+   * @route PUT /api/v1/configurationManager/ai-models/providers/:modelType/:modelKey
+   * @desc Update an AI model provider
+   * @access Private (admin)
+   * @param {string} modelType - Type of model (llm, embedding, ocr, slm, reasoning, multiModal)
+   * @param {string} modelKey - Unique key for the model configuration
+   */
+  router.put(
+    '/ai-models/providers/:modelType/:modelKey',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(updateProviderRequestSchema),
+    updateAIModelProvider(keyValueStoreService, aiConfigEventService, appConfig),
+  );
+
+  /**
+   * @route DELETE /api/v1/configurationManager/ai-models/providers/:modelType/:modelKey
+   * @desc Delete an AI model provider
+   * @access Private (admin)
+   * @param {string} modelType - Type of model (llm, embedding, ocr, slm, reasoning, multiModal)
+   * @param {string} modelKey - Unique key for the model configuration
+   */
+  router.delete(
+    '/ai-models/providers/:modelType/:modelKey',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(deleteProviderSchema),
+    deleteAIModelProvider(keyValueStoreService, aiConfigEventService, appConfig),
+  );
+
+  /**
+   * @route PUT /api/v1/configurationManager/ai-models/default/:modelType/:modelKey
+   * @desc Update the default AI model
+   * @access Private (admin)
+   * @param {string} modelType - Type of model (llm, embedding, ocr, slm, reasoning, multiModal)
+   * @param {string} modelKey - Unique key for the model configuration
+   */
+  router.put(
+    '/ai-models/default/:modelType/:modelKey',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(updateDefaultModelSchema),
+    updateDefaultAIModel(keyValueStoreService, aiConfigEventService, appConfig),
+  );
+
+  // Web Search provider routes
+  /**
+   * @route GET /api/v1/configurationManager/web-search
+   * @desc Get all web search providers
+   * @access Private
+   */
+  router.get(
+    '/web-search',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    getWebSearchProviders(keyValueStoreService),
+  );
+
+  /**
+   * @route PUT /api/v1/configurationManager/web-search/settings
+   * @desc Update web search settings
+   * @access Private
+   */
+  router.put(
+    '/web-search/settings',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(updateWebSearchSettingsSchema),
+    updateWebSearchSettings(keyValueStoreService),
+  );
+
+  /**
+   * @route POST /api/v1/configurationManager/web-search/providers
+   * @desc Add a new web search provider
+   * @access Private
+   */
+  router.post(
+    '/web-search/providers',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(addWebSearchProviderSchema),
+    addWebSearchProvider(keyValueStoreService, appConfig),
+  );
+
+  /**
+   * @route PUT /api/v1/configurationManager/web-search/providers/:providerKey
+   * @desc Update a web search provider
+   * @access Private
+   * @param {string} providerKey - Unique key for the provider configuration
+   */
+  router.put(
+    '/web-search/providers/:providerKey',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(updateWebSearchProviderSchema),
+    updateWebSearchProvider(keyValueStoreService, appConfig),
+  );
+
+  /**
+   * @route DELETE /api/v1/configurationManager/web-search/providers/:providerKey
+   * @desc Delete a web search provider
+   * @access Private
+   * @param {string} providerKey - Unique key for the provider configuration
+   */
+  router.delete(
+    '/web-search/providers/:providerKey',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(deleteWebSearchProviderSchema),
+    deleteWebSearchProvider(keyValueStoreService, appConfig),
+  );
+
+  /**
+   * @route PUT /api/v1/configurationManager/web-search/default/:providerKey
+   * @desc Update the default web search provider
+   * @access Private
+   * @param {string} providerKey - Unique key for the provider configuration
+   */
+  router.put(
+    '/web-search/default/:providerKey',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    ValidationMiddleware.validate(updateDefaultWebSearchProviderSchema),
+    updateDefaultWebSearchProvider(keyValueStoreService, appConfig),
+  );
+
+  router.get(
+    '/frontendPublicUrl',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    getFrontendUrl(keyValueStoreService),
+  );
+
+  // The only unauthenticated route in this router: the desktop app calls it
+  // from the sign-in screen before any session exists. Do not put router-wide
+  // auth in front of it.
+  router.get(
+    '/public/desktopFrontendUrl',
+    getDesktopFrontendUrl(keyValueStoreService),
+  );
+
+  router.post(
+    '/frontendPublicUrl',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(urlSchema),
+    setFrontendUrl(
+      keyValueStoreService,
+      appConfig.scopedJwtSecret,
+      configService,
+    ),
+  );
+
+  router.get(
+    '/connectorPublicUrl',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    getConnectorPublicUrl(keyValueStoreService),
+  );
+
+  router.post(
+    '/connectorPublicUrl',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(urlSchema),
+    setConnectorPublicUrl(keyValueStoreService, syncEventService),
+  );
+
+  // metrics collection routes
+  router.put(
+    '/metricsCollection/toggle',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(metricsCollectionToggleSchema),
+    toggleMetricsCollection(keyValueStoreService),
+  );
+
+  router.post(
+    '/internal/metricsCollection/toggle',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    ValidationMiddleware.validate(metricsCollectionToggleSchema),
+    toggleMetricsCollection(keyValueStoreService),
+  );
+
+  router.get(
+    '/metricsCollection',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_READ),
+    userAdminCheck,
+    getMetricsCollection(keyValueStoreService),
+  );
+
+  router.patch(
+    '/metricsCollection/pushInterval',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(metricsCollectionPushIntervalSchema),
+    setMetricsCollectionPushInterval(keyValueStoreService),
+  );
+
+  router.patch(
+    '/metricsCollection/serverUrl',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.CONFIG_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(metricsCollectionRemoteServerSchema),
+    setMetricsCollectionRemoteServer(keyValueStoreService),
+  );
+
+  return router;
+}

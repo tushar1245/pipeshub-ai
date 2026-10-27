@@ -1,0 +1,1321 @@
+"""
+Neo4j Test Provider
+
+Extended Neo4jProvider for integration tests with additional test-specific methods.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.arangodb import HIERARCHY_RELATION_TYPES, CollectionNames
+from app.config.constants.neo4j import collection_to_label
+from app.config.constants.arangodb import Connectors
+from app.models.entities import AppMetadata, AppRole, Record
+from app.services.graph_db.neo4j.neo4j_provider import Neo4jProvider
+
+logger = logging.getLogger("test-graph-provider")
+
+
+def _relation_edge(relation_type: str) -> str:
+    """Hierarchy is on NODE_RELATION; every other relation type is a link."""
+    return "NODE_RELATION" if relation_type in HIERARCHY_RELATION_TYPES else "RECORD_LINK"
+
+
+def _app_role_from_arango(doc: dict, connector_id: str) -> AppRole:
+    """Build an :class:`AppRole` from a ``roles`` document (inverse of ``to_arango_base_role``)."""
+    conn_name = doc.get("connectorName")
+    try:
+        app_name = Connectors(conn_name) if conn_name else Connectors.JIRA
+    except ValueError:
+        app_name = Connectors.JIRA
+    return AppRole(
+        id=str(doc.get("_key") or doc.get("id") or ""),
+        org_id=doc.get("orgId", "") or "",
+        app_name=app_name,
+        connector_id=doc.get("connectorId", connector_id),
+        source_role_id=doc.get("externalRoleId", "") or "",
+        name=doc.get("name", "") or "",
+        created_at=doc.get("createdAtTimestamp", 0) or 0,
+        updated_at=doc.get("updatedAtTimestamp", 0) or 0,
+        source_created_at=doc.get("sourceCreatedAtTimestamp"),
+        source_updated_at=doc.get("sourceLastModifiedTimestamp"),
+    )
+
+
+class TestNeo4jProvider(Neo4jProvider):
+    """
+    Extended Neo4j provider for integration tests.
+    
+    Inherits all methods from Neo4jProvider (get_document, batch_upsert_records, etc.)
+    and adds test-specific helper methods for assertions and queries.
+    
+    Usage:
+        provider = TestNeo4jProvider(config_service)
+        await provider.connect()
+        
+        # Use inherited methods
+        doc = await provider.get_document("key", "collection")
+        
+        # Use test-specific methods
+        count = await provider.count_records("connector-id")
+        await provider.assert_min_records("connector-id", 5)
+    """
+    
+    def __init__(
+        self, 
+        config_service: ConfigurationService,
+        custom_logger: logging.Logger | None = None
+    ) -> None:
+        """
+        Initialize test provider.
+        
+        Args:
+            config_service: ConfigurationService instance
+            custom_logger: Optional custom logger. Uses default if not provided.
+        """
+        super().__init__(
+            logger=custom_logger or logger,
+            config_service=config_service,
+        )
+
+    # =========================================================================
+    # Test Helper Methods - Counts
+    # =========================================================================
+    
+    async def count_records(self, connector_id: str, *, scoped: bool = False) -> int:
+        """Return the number of Record nodes for a connector.
+
+        With ``scoped=True`` only records with a live ``BELONGS_TO`` → RecordGroup edge are
+        counted (not ``IS_OF_TYPE``): a full sync wipes and recreates sync edges
+        (``delete_connector_sync_edges``) but leaves nodes and ``IS_OF_TYPE`` intact, so records
+        for a project that left the filter scope keep ``IS_OF_TYPE`` yet lose ``BELONGS_TO``.
+        This does *not* exclude placeholder stubs — connectors that anchor stubs to a RecordGroup
+        (e.g. Linear) leave them with a live ``BELONGS_TO``; use :meth:`get_placeholder_records`
+        to isolate those. Default (``False``) counts every record
+        for the connector — required by suites whose records have no RecordGroup (e.g. KB uploads).
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if scoped:
+            cypher = (
+                "MATCH (r:Record {connectorId: $cid})-[:BELONGS_TO]->(:RecordGroup) "
+                "RETURN count(DISTINCT r) AS c"
+            )
+        else:
+            cypher = "MATCH (r:Record {connectorId: $cid}) RETURN count(DISTINCT r) AS c"
+        result = await self.client.execute_query(cypher, {"cid": connector_id})
+        return int(result[0]["c"]) if result else 0
+
+    async def count_record_groups(self, connector_id: str, *, scoped: bool = False) -> int:
+        """Return the number of RecordGroup nodes for a connector.
+
+        With ``scoped=True`` only RecordGroups with a live ``BELONGS_TO`` → App edge are counted
+        (same full-sync-wipe reasoning as :meth:`count_records`), so a project that left the filter
+        scope, whose RecordGroup node still exists but lost its App edge, is not counted. Default
+        counts every RecordGroup for the connector.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if scoped:
+            cypher = (
+                "MATCH (g:RecordGroup {connectorId: $cid})-[:BELONGS_TO]->(:App) "
+                "RETURN count(DISTINCT g) AS c"
+            )
+        else:
+            cypher = "MATCH (g:RecordGroup {connectorId: $cid}) RETURN count(DISTINCT g) AS c"
+        result = await self.client.execute_query(cypher, {"cid": connector_id})
+        return int(result[0]["c"]) if result else 0
+
+    async def fetch_record_group_names(
+        self, connector_id: str, group_type: str | None = None
+    ) -> List[str]:
+        """Names of a connector's RecordGroups, optionally of one type.
+
+        A source's containers — SharePoint sites, Drive shared drives, Jira
+        projects — become RecordGroups, so this is how a test asks "did site X
+        sync" by the site's own name rather than by searching record names for
+        a substring, which can match a file called after the site instead.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        params: Dict[str, Any] = {"cid": connector_id}
+        type_filter = ""
+        if group_type:
+            type_filter = " AND g.groupType = $gtype"
+            params["gtype"] = group_type
+        result = await self.client.execute_query(
+            f"MATCH (g:RecordGroup) WHERE g.connectorId = $cid{type_filter} "
+            "RETURN coalesce(g.name, g.groupName) AS name",
+            params,
+        )
+        return [str(row["name"]) for row in result if row.get("name")]
+
+    async def count_user_groups(self, connector_id: str) -> int:
+        """Count ``Group`` (Jira site user-group) nodes for this connector."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (g:Group {connectorId: $cid}) RETURN count(g) AS c",
+            {"cid": connector_id},
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_record_group_edges(self, connector_id: str) -> int:
+        """Count Record -> RecordGroup BELONGS_TO edges."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (r:Record {connectorId: $cid})-[:BELONGS_TO]->(g:RecordGroup) RETURN count(*) AS c",
+            {"cid": connector_id}
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_group_hierarchy_edges(self, connector_id: str) -> int:
+        """Count RecordGroup -> RecordGroup BELONGS_TO edges."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (child:RecordGroup {connectorId: $cid})-[:BELONGS_TO]->(parent:RecordGroup) RETURN count(*) AS c",
+            {"cid": connector_id}
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_parent_child_edges(self, connector_id: str) -> int:
+        """Count parent/child edges between records (NODE_RELATION with relationshipType PARENT_CHILD).
+
+        A record group holds its top-level records through the same edge; those
+        are not counted.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (p {connectorId: $cid})-[r:NODE_RELATION {relationshipType: 'PARENT_CHILD'}]->(c {connectorId: $cid})
+            WHERE NOT p:RecordGroup
+            RETURN count(*) AS c
+            """,
+            {"cid": connector_id}
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_permission_edges(self, connector_id: str) -> int:
+        """Count permission-related edges touching Records for a connector."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        inherit_result = await self.client.execute_query(
+            "MATCH (r:Record {connectorId: $cid})-[:INHERIT_PERMISSIONS]->() RETURN count(*) AS c",
+            {"cid": connector_id}
+        )
+        direct_result = await self.client.execute_query(
+            "MATCH ()-[:PERMISSION]->(r:Record {connectorId: $cid}) RETURN count(*) AS c",
+            {"cid": connector_id}
+        )
+        inherit = int(inherit_result[0]["c"]) if inherit_result else 0
+        direct = int(direct_result[0]["c"]) if direct_result else 0
+        return inherit + direct
+
+    async def count_user_to_group_permission_edges(
+        self, connector_id: str, group_external_id: Optional[str] = None,
+    ) -> int:
+        """Count User -[:PERMISSION]-> Group for this connector's groups.
+
+        When ``group_external_id`` is set, only edges to that Group
+        (``externalGroupId``) are counted.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if group_external_id is None:
+            result = await self.client.execute_query(
+                """
+                MATCH (u:User)-[:PERMISSION]->(g:Group {connectorId: $cid})
+                RETURN count(*) AS c
+                """,
+                {"cid": connector_id},
+            )
+        else:
+            result = await self.client.execute_query(
+                """
+                MATCH (u:User)-[:PERMISSION]->(g:Group {connectorId: $cid, externalGroupId: $gid})
+                RETURN count(*) AS c
+                """,
+                {"cid": connector_id, "gid": str(group_external_id)},
+            )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_user_to_role_permission_edges(
+        self, connector_id: str, role_external_id: Optional[str] = None,
+    ) -> int:
+        """Count User -[:PERMISSION]-> Role (Jira project AppRole) for this connector.
+
+        When ``role_external_id`` is set, only edges to that Role
+        (``externalRoleId``) are counted.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if role_external_id is None:
+            result = await self.client.execute_query(
+                """
+                MATCH (u:User)-[:PERMISSION]->(role:Role {connectorId: $cid})
+                RETURN count(*) AS c
+                """,
+                {"cid": connector_id},
+            )
+        else:
+            result = await self.client.execute_query(
+                """
+                MATCH (u:User)-[:PERMISSION]->(role:Role {connectorId: $cid, externalRoleId: $rid})
+                RETURN count(*) AS c
+                """,
+                {"cid": connector_id, "rid": str(role_external_id)},
+            )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_permission_edges_to_record_groups(
+        self, connector_id: str, record_group_external_id: Optional[str] = None,
+    ) -> int:
+        """Count PERMISSION edges whose target is a RecordGroup (scheme / ACL holders).
+
+        When ``record_group_external_id`` is set, only edges into that RecordGroup
+        (``externalGroupId`` on the node — same id as :meth:`get_record_group_by_external_id`)
+        are counted.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if record_group_external_id is None:
+            result = await self.client.execute_query(
+                """
+                MATCH ()-[e:PERMISSION]->(rg:RecordGroup {connectorId: $cid})
+                RETURN count(e) AS c
+                """,
+                {"cid": connector_id},
+            )
+        else:
+            result = await self.client.execute_query(
+                """
+                MATCH ()-[e:PERMISSION]->(rg:RecordGroup {connectorId: $cid, externalGroupId: $rgid})
+                RETURN count(e) AS c
+                """,
+                {"cid": connector_id, "rgid": str(record_group_external_id)},
+            )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_app_record_group_edges(self, connector_id: str) -> int:
+        """Count BELONGS_TO edges from RecordGroup to App for a connector."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (g:RecordGroup {connectorId: $cid})-[:BELONGS_TO]->(a:App) RETURN count(*) AS c",
+            {"cid": connector_id}
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_any_nodes_with_connector_id(self, connector_id: str) -> int:
+        """Count any node that still carries this connectorId."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (n {connectorId: $cid}) RETURN count(n) AS c",
+            {"cid": connector_id}
+        )
+        return int(result[0]["c"]) if result else 0
+
+    # =========================================================================
+    # Test Helper Methods - Record Lookups
+    # =========================================================================
+
+    async def fetch_record_paths(
+        self, connector_id: str, limit: int = 200
+    ) -> List[Tuple[Optional[str], Optional[str]]]:
+        """Return up to *limit* (path, record_name) tuples."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            OPTIONAL MATCH (r)-[:IS_OF_TYPE]->(f:File)
+            RETURN f.path AS path, coalesce(r.recordName, r.name) AS record_name
+            LIMIT $limit
+            """,
+            {"cid": connector_id, "limit": limit}
+        )
+        return [(rec.get("path"), rec.get("record_name")) for rec in result]
+
+    async def fetch_record_names(self, connector_id: str) -> List[str]:
+        """Return all record_name values for a connector."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            RETURN coalesce(r.recordName, r.name) AS name
+            """,
+            {"cid": connector_id}
+        )
+        return [rec["name"] for rec in result if rec.get("name")]
+
+    async def get_record_by_name(
+        self, connector_id: str, name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve a single Record by record_name. Returns None if not found."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE coalesce(r.recordName, r.name) = $name
+            RETURN r AS record
+            LIMIT 1
+            """,
+            {"cid": connector_id, "name": name}
+        )
+        return dict(result[0]["record"]) if result else None
+
+    async def get_record_parent_group(
+        self, connector_id: str, record_name: str
+    ) -> Optional[str]:
+        """Get the name of the RecordGroup that a Record BELONGS_TO."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE coalesce(r.recordName, r.name) = $name
+            MATCH (r)-[:BELONGS_TO]->(g:RecordGroup)
+            RETURN g.groupName AS group_name
+            LIMIT 1
+            """,
+            {"cid": connector_id, "name": record_name}
+        )
+        return result[0]["group_name"] if result else None
+
+    async def record_path_or_name_contains(
+        self, connector_id: str, substring: str
+    ) -> bool:
+        """Return True if at least one Record has path or name containing substring."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            OPTIONAL MATCH (r)-[:IS_OF_TYPE]->(f:File)
+            WITH r, coalesce(r.recordName, r.name) AS name, f.path AS path
+            WHERE (path IS NOT NULL AND path CONTAINS $sub) OR (name IS NOT NULL AND name CONTAINS $sub)
+            RETURN count(*) AS c
+            """,
+            {"cid": connector_id, "sub": substring}
+        )
+        return int(result[0]["c"]) > 0 if result else False
+
+    async def record_name_path_contains(
+        self, connector_id: str, record_name: str, path_substring: str
+    ) -> bool:
+        """True if some Record named *record_name* has a File.path containing *path_substring*."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE coalesce(r.recordName, r.name) = $name
+            OPTIONAL MATCH (r)-[:IS_OF_TYPE]->(f:File)
+            WITH r, f
+            WHERE f.path IS NOT NULL AND f.path CONTAINS $sub
+            RETURN count(*) AS c
+            """,
+            {"cid": connector_id, "name": record_name, "sub": path_substring}
+        )
+        return int(result[0]["c"]) > 0 if result else False
+
+    # =========================================================================
+    # Test Helper Methods - Assertions
+    # =========================================================================
+
+    async def assert_min_records(self, connector_id: str, expected_min: int) -> None:
+        """Assert that the connector has at least *expected_min* Record nodes."""
+        actual = await self.count_records(connector_id)
+        assert actual >= expected_min, (
+            f"Expected at least {expected_min} Record nodes for connector {connector_id}, "
+            f"found {actual}"
+        )
+
+    async def assert_record_groups_and_edges(
+        self,
+        connector_id: str,
+        min_groups: int | None = None,
+        min_record_edges: int | None = None,
+    ) -> None:
+        """Sanity checks on RecordGroup nodes and BELONGS_TO edges."""
+        groups = await self.count_record_groups(connector_id)
+        record_edges = await self.count_record_group_edges(connector_id)
+
+        if min_groups is not None:
+            assert groups >= min_groups, (
+                f"Expected at least {min_groups} RecordGroup nodes, found {groups}"
+            )
+        if min_record_edges is not None:
+            assert record_edges >= min_record_edges, (
+                f"Expected at least {min_record_edges} Record->RecordGroup BELONGS_TO edges, "
+                f"found {record_edges}"
+            )
+
+    async def assert_no_orphan_records(
+        self, connector_id: str, max_orphans: int = 1
+    ) -> None:
+        """Assert every Record has at least one BELONGS_TO edge to a RecordGroup."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE NOT (r)-[:BELONGS_TO]->(:RecordGroup)
+            RETURN count(r) AS c
+            """,
+            {"cid": connector_id}
+        )
+        orphans = int(result[0]["c"]) if result else 0
+        if orphans > max_orphans:
+            raise AssertionError(
+                f"Found {orphans} orphan Record(s) with no BELONGS_TO edge for connector {connector_id} "
+                f"(allowed up to {max_orphans})"
+            )
+
+    async def assert_app_record_group_edges(
+        self, connector_id: str, min_edges: int = 1
+    ) -> None:
+        """Assert at least *min_edges* RecordGroup → App BELONGS_TO edges."""
+        edges = await self.count_app_record_group_edges(connector_id)
+        assert edges >= min_edges, (
+            f"Expected at least {min_edges} RecordGroup→App BELONGS_TO edges for connector {connector_id}, "
+            f"found {edges}"
+        )
+
+    async def assert_record_paths_or_names_contain(
+        self, connector_id: str, expected_substrings: Iterable[str]
+    ) -> None:
+        """Assert that for each substring, at least one Record's path or name contains it."""
+        for substring in expected_substrings:
+            if not await self.record_path_or_name_contains(connector_id, substring):
+                n = await self.count_records(connector_id)
+                raise AssertionError(
+                    f"No Record path or name for connector {connector_id} contained the expected "
+                    f"substring '{substring}' (Record count: {n})"
+                )
+
+    async def assert_record_not_exists(self, connector_id: str, name: str) -> None:
+        """Assert a record with this name does NOT exist."""
+        rec = await self.get_record_by_name(connector_id, name)
+        assert rec is None, (
+            f"Record '{name}' should not exist for connector {connector_id}, but was found"
+        )
+
+    # =========================================================================
+    # Test Helper Methods - Summaries
+    # =========================================================================
+
+    async def graph_summary(self, connector_id: str) -> Dict[str, int]:
+        """Return a dict of graph stats for quick debugging."""
+        return {
+            "records": await self.count_records(connector_id),
+            "record_groups": await self.count_record_groups(connector_id),
+            "user_groups": await self.count_user_groups(connector_id),
+            "belongs_to_edges": await self.count_record_group_edges(connector_id),
+            "group_hierarchy_edges": await self.count_group_hierarchy_edges(connector_id),
+            "parent_child_edges": await self.count_parent_child_edges(connector_id),
+            "permission_edges": await self.count_permission_edges(connector_id),
+            "permission_user_group_edges": await self.count_user_to_group_permission_edges(connector_id),
+            "permission_user_role_edges": await self.count_user_to_role_permission_edges(connector_id),
+            "permission_to_record_group_edges": await self.count_permission_edges_to_record_groups(connector_id),
+            "app_record_group_edges": await self.count_app_record_group_edges(connector_id),
+        }
+
+    async def assert_connector_graph_fully_cleaned(
+        self, connector_id: str, timeout: int = 180
+    ) -> None:
+        """
+        Strict cleanup assertion after connector delete.
+        Polls until every graph metric for this connector is zero.
+        """
+        poll_interval = 5
+        deadline = time.time() + timeout
+        last_summary: Dict[str, int] = {}
+
+        while time.time() < deadline:
+            last_summary = await self.graph_summary(connector_id)
+            last_summary["any_nodes_with_connector_id"] = await self.count_any_nodes_with_connector_id(
+                connector_id
+            )
+            if all(v == 0 for v in last_summary.values()):
+                logger.info(
+                    "Graph fully cleaned for connector %s (all counts zero).",
+                    connector_id,
+                )
+                return
+            await asyncio.sleep(poll_interval)
+
+        raise AssertionError(
+            f"Connector {connector_id} graph not fully cleaned after {timeout}s. "
+            f"All counts must be zero after delete. Remaining: {last_summary}. "
+            "Fix backend cleanup or increase timeout."
+        )
+
+    async def assert_all_records_cleaned(
+        self, connector_id: str, timeout: int = 180
+    ) -> None:
+        """Alias for strict post-delete graph cleanup (same as graph_assertions)."""
+        await self.assert_connector_graph_fully_cleaned(connector_id, timeout=timeout)
+
+    async def assert_record_count_unchanged(
+        self, connector_id: str, expected: int, tolerance: int = 0
+    ) -> None:
+        """Assert record count equals expected ± tolerance."""
+        actual = await self.count_records(connector_id)
+        assert abs(actual - expected) <= tolerance, (
+            f"Expected ~{expected} records (±{tolerance}), found {actual}"
+        )
+
+    async def get_record_parent_path(
+        self, connector_id: str, record_name: str
+    ) -> Optional[str]:
+        """Build folder path via BELONGS_TO (pure Cypher, no APOC required)."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE coalesce(r.recordName, r.name) = $name
+            MATCH (r)-[:BELONGS_TO]->(g:RecordGroup)
+            OPTIONAL MATCH path = (g)-[:BELONGS_TO*0..5]->(root:RecordGroup)
+            WITH r, g, root, nodes(path) AS ns
+            WITH r, [x IN ns | coalesce(x.groupName, '')] AS parts
+            WITH r, reduce(s = '', p IN [p IN parts WHERE p <> ''] | 
+                CASE WHEN s = '' THEN p ELSE s + '/' + p END
+            ) AS parent_path
+            RETURN parent_path
+            LIMIT 1
+            """,
+            {"cid": connector_id, "name": record_name},
+        )
+        return result[0]["parent_path"] if result else None
+
+    async def assert_record_paths_contain(
+        self, connector_id: str, expected_substrings: Iterable[str]
+    ) -> None:
+        """Assert each substring appears in at least one Record File.path."""
+        paths = [p for p, _ in await self.fetch_record_paths(connector_id, limit=500) if p]
+        for substring in expected_substrings:
+            if not any(substring in p for p in paths):
+                raise AssertionError(
+                    f"No Record.path for connector {connector_id} contained substring {substring!r}"
+                )
+
+    async def record_file_path_for_name(
+        self, connector_id: str, record_name: str
+    ) -> Optional[str]:
+        """Return File.path for the Record with the given display name, if any."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE coalesce(r.recordName, r.name) = $name
+            OPTIONAL MATCH (r)-[:IS_OF_TYPE]->(f:File)
+            RETURN f.path AS path
+            LIMIT 1
+            """,
+            {"cid": connector_id, "name": record_name},
+        )
+        if not result or result[0].get("path") is None:
+            return None
+        return str(result[0]["path"])
+
+    async def record_paths_or_names_contain(
+        self, connector_id: str, substrings: Iterable[str]
+    ) -> bool:
+        """True if each substring matches some Record path or name (wait-condition helper)."""
+        for substring in substrings:
+            if not await self.record_path_or_name_contains(connector_id, substring):
+                return False
+        return True
+
+    async def assert_record_names_contain(
+        self, connector_id: str, expected_names: Iterable[str]
+    ) -> None:
+        """Assert each expected name exists as a record_name."""
+        names = set(await self.fetch_record_names(connector_id))
+        for name in expected_names:
+            assert name in names, (
+                f"Expected record_name not found in graph for connector {connector_id} "
+                f"(distinct names: {len(names)})."
+            )
+
+    # -------------------------------------------------------------------------
+    # User / Organization (e2e user pipeline)
+    # -------------------------------------------------------------------------
+
+    async def graph_find_user_by_email(self, email: str) -> dict[str, Any] | None:
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (u:User) WHERE toLower(u.email) = toLower($email) RETURN u",
+            {"email": email},
+        )
+        if not result:
+            return None
+        u = result[0]["u"]
+        return dict(u) if u is not None else None
+
+    async def graph_find_user_by_user_id(self, user_id: str) -> dict[str, Any] | None:
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (u:User {userId: $userId}) RETURN u",
+            {"userId": user_id},
+        )
+        if not result:
+            return None
+        u = result[0]["u"]
+        return dict(u) if u is not None else None
+
+    async def graph_find_org(self, org_id: str) -> dict[str, Any] | None:
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (o:Organization {id: $orgId}) RETURN o",
+            {"orgId": org_id},
+        )
+        if not result:
+            return None
+        o = result[0]["o"]
+        return dict(o) if o is not None else None
+
+    async def graph_org_exists(self, org_id: str) -> bool:
+        return await self.graph_find_org(org_id) is not None
+    
+    # =========================================================================
+    # Entity Lookup Methods (for assertions framework)
+    # =========================================================================
+
+    async def record_inherits_permissions(
+        self, connector_id: str, external_record_id: str
+    ) -> bool:
+        """Check if record has INHERIT_PERMISSIONS edge."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid, externalRecordId: $eid})
+            RETURN exists((r)-[:INHERIT_PERMISSIONS]->()) AS inherits
+            """,
+            {"cid": connector_id, "eid": external_record_id}
+        )
+        return bool(result[0]["inherits"]) if result else False
+
+    async def record_belongs_to_external_group(
+        self,
+        connector_id: str,
+        external_record_id: str,
+        external_group_id: str,
+    ) -> bool:
+        """True if Record has BELONGS_TO → RecordGroup with the given externalGroupId."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid, externalRecordId: $eid})
+                  -[:BELONGS_TO]->
+                  (g:RecordGroup {connectorId: $cid, externalGroupId: $gid})
+            RETURN count(*) AS c
+            """,
+            {
+                "cid": connector_id,
+                "eid": str(external_record_id),
+                "gid": str(external_group_id),
+            },
+        )
+        return int(result[0]["c"]) > 0 if result else False
+
+    async def user_has_direct_record_permission(
+        self,
+        connector_id: str,
+        user_email: str,
+        external_record_id: str,
+    ) -> bool:
+        """True if User -[:PERMISSION]-> Record for this connector external id."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (u:User)-[:PERMISSION]->(r:Record {
+                connectorId: $cid,
+                externalRecordId: $eid
+            })
+            WHERE toLower(u.email) = toLower($email)
+            RETURN count(*) AS c
+            """,
+            {
+                "cid": connector_id,
+                "eid": str(external_record_id),
+                "email": user_email,
+            },
+        )
+        return int(result[0]["c"]) > 0 if result else False
+
+    async def group_has_record_permission(
+        self,
+        connector_id: str,
+        external_group_id: str,
+        external_record_id: str,
+    ) -> bool:
+        """True if the connector's Group (by externalGroupId, e.g. a group email) has PERMISSION on the record."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (g:Group {connectorId: $cid})-[:PERMISSION]->(r:Record {connectorId: $cid, externalRecordId: $eid})
+            WHERE toLower(g.externalGroupId) = toLower($gid)
+            RETURN count(*) AS c
+            """,
+            {"cid": connector_id, "eid": str(external_record_id), "gid": str(external_group_id)},
+        )
+        return int(result[0]["c"]) > 0 if result else False
+
+    async def principal_record_permission_label(
+        self,
+        connector_id: str,
+        email: str,
+        external_record_id: str,
+    ) -> Optional[str]:
+        """``"User"`` or ``"Person"`` when that email holds a direct PERMISSION on the record, else None.
+
+        A share to an address outside the source directory lands on a ``:Person``; the same
+        address becomes a ``:User`` once it signs up, so the label is what the test asserts.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (p)-[:PERMISSION]->(r:Record {connectorId: $cid, externalRecordId: $eid})
+            WHERE (p:User OR p:Person) AND toLower(p.email) = toLower($email)
+            RETURN CASE WHEN p:User THEN 'User' ELSE 'Person' END AS label
+            LIMIT 1
+            """,
+            {"cid": connector_id, "eid": str(external_record_id), "email": email},
+        )
+        return str(result[0]["label"]) if result else None
+
+    async def principal_app_relation(
+        self,
+        connector_id: str,
+        email: str,
+    ) -> Optional[Dict[str, Any]]:
+        """The USER_APP_RELATION from this email's User/Person to the connector's App, or None.
+
+        Returns ``{"label": "User"|"Person", "isExternalUser": bool}``.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (p)-[e:USER_APP_RELATION]->(app:App {id: $cid})
+            WHERE (p:User OR p:Person) AND toLower(p.email) = toLower($email)
+            RETURN CASE WHEN p:User THEN 'User' ELSE 'Person' END AS label,
+                   coalesce(e.isExternalUser, false) AS isExternalUser
+            LIMIT 1
+            """,
+            {"cid": connector_id, "email": email},
+        )
+        if not result:
+            return None
+        return {"label": result[0]["label"], "isExternalUser": bool(result[0]["isExternalUser"])}
+
+    async def count_group_members(
+        self, connector_id: str, external_group_id: str
+    ) -> int:
+        """Count users in a group."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (g:Group {connectorId: $cid, externalGroupId: $gid})
+            MATCH (u:User)-[:PERMISSION]->(g)
+            RETURN count(u) AS count
+            """,
+            {"cid": connector_id, "gid": external_group_id}
+        )
+        return int(result[0]["count"]) if result else 0
+
+    async def group_has_member(
+        self, connector_id: str, external_group_id: str, user_email: str
+    ) -> bool:
+        """Whether this user has the connector's group-membership PERMISSION edge to the group."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (u:User)-[:PERMISSION]->(g:Group {connectorId: $cid, externalGroupId: $gid})
+            WHERE toLower(u.email) = toLower($email)
+            RETURN count(*) AS c
+            """,
+            {"cid": connector_id, "gid": external_group_id, "email": user_email},
+        )
+        return int(result[0]["c"]) > 0 if result else False
+
+    async def get_sync_point(
+        self, connector_id: str, sync_point_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load a connector sync checkpoint from ``SyncPoint`` nodes.
+
+        Matches on the suffix of ``syncPointKey`` because the stored key is prefixed with
+        ``{orgId}/{connectorId}/{syncDataPointType}/`` (see backend ``SyncPoint``), and tests
+        only know the unqualified key.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (sp:SyncPoint {connectorId: $cid})
+            WHERE sp.syncPointKey IS NOT NULL
+              AND sp.syncPointKey ENDS WITH $suffix
+            RETURN sp
+            LIMIT 1
+            """,
+            {"cid": connector_id, "suffix": sync_point_key},
+        )
+        if not result:
+            return None
+        node = result[0].get("sp")
+        if node is None:
+            return None
+        return dict(node)
+
+    async def get_app_metadata_by_connector_id(
+        self, connector_id: str
+    ) -> Optional[AppMetadata]:
+        """Load the connector app node as :class:`AppMetadata` (parity with Arango ``apps``)."""
+        raw = await self.get_document(connector_id, CollectionNames.APPS.value)
+        if not raw:
+            return None
+        doc = dict(raw)
+        if "_key" not in doc and doc.get("id") is not None:
+            doc["_key"] = str(doc["id"])
+        return AppMetadata.from_db_document(doc)
+
+    async def get_app_role_by_external_id(
+        self, connector_id: str, role_external_id: str
+    ) -> Optional[AppRole]:
+        """Load a Jira project ``Role`` node (by ``externalRoleId``) as :class:`AppRole`."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (role:Role {connectorId: $cid, externalRoleId: $rid}) RETURN role LIMIT 1",
+            {"cid": connector_id, "rid": str(role_external_id)},
+        )
+        if not result:
+            return None
+        doc = self._neo4j_to_arango_node(dict(result[0]["role"]), CollectionNames.ROLES.value)
+        return _app_role_from_arango(doc, connector_id)
+
+    async def fetch_records_by_type(
+        self, connector_id: str, record_type: str, *, scoped: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Fetch records for a connector; ``record_type`` empty string means all types.
+
+        With ``scoped=True`` requires a live ``BELONGS_TO`` edge to a RecordGroup, matching
+        :meth:`count_records_by_type`.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        scope_clause = (
+            "MATCH (r)-[:BELONGS_TO]->(:RecordGroup)"
+            if scoped else ""
+        )
+        result = await self.client.execute_query(
+            f"""
+            MATCH (r:Record {{connectorId: $cid}})
+            WHERE $rtype = '' OR r.recordType = $rtype
+            {scope_clause}
+            RETURN DISTINCT r
+            LIMIT 10000
+            """,
+            {"cid": connector_id, "rtype": record_type},
+        )
+        return [dict(r["r"]) for r in result] if result else []
+
+    # =========================================================================
+    # Edge-coverage helpers (Jira test plan)
+    # =========================================================================
+
+    async def count_records_by_type(self, connector_id: str, record_type: str, *, scoped: bool = False) -> int:
+        """Count Record nodes filtered by recordType (e.g. TICKET, FILE).
+
+        With ``scoped=True`` applies the same live ``BELONGS_TO`` → RecordGroup guard as
+        :meth:`count_records`. Default counts every record of that type for the connector.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if scoped:
+            cypher = (
+                "MATCH (r:Record {connectorId: $cid, recordType: $rtype})-[:BELONGS_TO]->(:RecordGroup) "
+                "RETURN count(DISTINCT r) AS c"
+            )
+        else:
+            cypher = (
+                "MATCH (r:Record {connectorId: $cid, recordType: $rtype}) "
+                "RETURN count(DISTINCT r) AS c"
+            )
+        result = await self.client.execute_query(cypher, {"cid": connector_id, "rtype": record_type})
+        return int(result[0]["c"]) if result else 0
+
+    async def count_inherit_permissions_edges(self, connector_id: str) -> int:
+        """Aggregate count of INHERIT_PERMISSIONS edges (Record -> RecordGroup)."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            "MATCH (r:Record {connectorId: $cid})-[:INHERIT_PERMISSIONS]->() RETURN count(*) AS c",
+            {"cid": connector_id},
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_record_relation_edges(
+        self, connector_id: str, relation_type: str
+    ) -> int:
+        """Count record-to-record edges of a specific relationshipType (PARENT_CHILD, ATTACHMENT, BLOCKS, etc.)."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            f"""
+            MATCH (p {{connectorId: $cid}})-[r:{_relation_edge(relation_type)} {{relationshipType: $rtype}}]->(c {{connectorId: $cid}})
+            WHERE NOT p:RecordGroup
+            RETURN count(*) AS c
+            """,
+            {"cid": connector_id, "rtype": relation_type},
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_entity_relations_edges(
+        self, connector_id: str, edge_type: Optional[str] = None
+    ) -> int:
+        """Count ENTITYRELATIONS edges (Record -> User: LEAD_BY, ASSIGNED_TO, REPORTED_BY, CREATED_BY).
+
+        When ``edge_type`` is None, counts all entity-relation edges originating from this connector's records.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        if edge_type is None:
+            result = await self.client.execute_query(
+                """
+                MATCH (r:Record {connectorId: $cid})-[e:ENTITYRELATIONS]->()
+                RETURN count(e) AS c
+                """,
+                {"cid": connector_id},
+            )
+        else:
+            result = await self.client.execute_query(
+                """
+                MATCH (r:Record {connectorId: $cid})-[e:ENTITYRELATIONS {edgeType: $etype}]->()
+                RETURN count(e) AS c
+                """,
+                {"cid": connector_id, "etype": edge_type},
+            )
+        return int(result[0]["c"]) if result else 0
+
+    async def count_user_app_relation_edges(
+        self, connector_id: str, *, external: bool | None = None,
+    ) -> int:
+        """Count USER_APP_RELATION edges to the App associated with this connector.
+
+        ``external`` narrows to people outside the source directory (``True``, the
+        ``isExternalUser`` edges a share to an outside address creates) or to directory
+        users only (``False``); ``None`` counts both. Returns 0 if the App has no users.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (g:RecordGroup {connectorId: $cid})-[:BELONGS_TO]->(app:App)
+            WITH app LIMIT 1
+            MATCH ()-[e:USER_APP_RELATION]->(app)
+            WHERE $external IS NULL OR coalesce(e.isExternalUser, false) = $external
+            RETURN count(e) AS c
+            """,
+            {"cid": connector_id, "external": external},
+        )
+        return int(result[0]["c"]) if result else 0
+
+    async def get_record_outgoing_relations(
+        self, connector_id: str, external_record_id: str, relation_type: str
+    ) -> List[str]:
+        """Return external ids of records reachable via an outbound edge of the given relationshipType.
+
+        For parent_child / attachment edges, the connector emits ``parent -> child``
+        (see ``create_record_relation(parent_id, record_id, ...)``), so this method
+        returns the **children** of the given record. To resolve the parent of a
+        record, use :meth:`get_record_incoming_relations` or the
+        ``parent_external_record_id`` field directly.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        # No :Record label filter — placeholder records and tickets share the same
+        # connectorId+externalRecordId index but may carry different labels.
+        result = await self.client.execute_query(
+            f"""
+            MATCH (r {{connectorId: $cid, externalRecordId: $eid}})
+            MATCH (r)-[:{_relation_edge(relation_type)} {{relationshipType: $rtype}}]->(t)
+            RETURN t.externalRecordId AS ext_id
+            """,
+            {"cid": connector_id, "eid": external_record_id, "rtype": relation_type},
+        )
+        return [rec["ext_id"] for rec in result if rec.get("ext_id")] if result else []
+
+    async def get_record_incoming_relations(
+        self, connector_id: str, external_record_id: str, relation_type: str
+    ) -> List[str]:
+        """Return external ids of records pointing TO this record via an edge of the given type.
+
+        Inverse of :meth:`get_record_outgoing_relations`. For parent_child / attachment
+        edges, this returns the parent (since the connector stores the edge
+        ``parent -> child``).
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            f"""
+            MATCH (r {{connectorId: $cid, externalRecordId: $eid}})
+            MATCH (src)-[:{_relation_edge(relation_type)} {{relationshipType: $rtype}}]->(r)
+            RETURN src.externalRecordId AS ext_id
+            """,
+            {"cid": connector_id, "eid": external_record_id, "rtype": relation_type},
+        )
+        return [rec["ext_id"] for rec in result if rec.get("ext_id")] if result else []
+
+    async def get_record_outgoing_entity_relations(
+        self, connector_id: str, external_record_id: str, edge_type: str
+    ) -> List[str]:
+        """Return user ids on the receiving end of ENTITYRELATIONS edges with the given edgeType."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid, externalRecordId: $eid})
+            MATCH (r)-[:ENTITYRELATIONS {edgeType: $etype}]->(u)
+            RETURN coalesce(u.sourceUserId, u.userId, u.id) AS uid
+            """,
+            {"cid": connector_id, "eid": external_record_id, "etype": edge_type},
+        )
+        return [rec["uid"] for rec in result if rec.get("uid")] if result else []
+
+    async def get_record_parent_external_id(
+        self, connector_id: str, external_record_id: str
+    ) -> Optional[str]:
+        """Return the record's parent external id, or None if unset.
+
+        Written as ``externalParentId``; the alternate spelling is kept as a fallback for
+        nodes written by older code.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid, externalRecordId: $eid})
+            RETURN coalesce(r.externalParentId, r.parentExternalRecordId) AS pid
+            LIMIT 1
+            """,
+            {"cid": connector_id, "eid": external_record_id},
+        )
+        if not result:
+            return None
+        pid = result[0].get("pid")
+        return str(pid) if pid is not None else None
+
+    async def get_placeholder_records(self, connector_id: str) -> List[Record]:
+        """Return every placeholder stub for a connector.
+
+        ``= true`` rather than truthiness: records written before ``isPlaceholder``
+        existed have no such property, and ``null <> true`` is the intended behaviour.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid})
+            WHERE r.isPlaceholder = true
+            RETURN r
+            """,
+            {"cid": connector_id},
+        )
+        records: List[Record] = []
+        for row in result or []:
+            node = row.get("r")
+            if not node:
+                continue
+            record_dict = self._neo4j_to_arango_node(dict(node), CollectionNames.RECORDS.value)
+            records.append(Record.from_arango_base_record(record_dict))
+        return records
+
+    async def get_typed_record_by_external_id(
+        self, connector_id: str, external_record_id: str
+    ) -> Optional[Record]:
+        """Load base :Record plus ``IS_OF_TYPE`` document as a typed ``TicketRecord`` / ``FileRecord`` / …"""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record {connectorId: $cid, externalRecordId: $eid})
+            OPTIONAL MATCH (r)-[:IS_OF_TYPE]->(typeDoc)
+            RETURN r, typeDoc
+            LIMIT 1
+            """,
+            {"cid": connector_id, "eid": external_record_id},
+        )
+        if not result:
+            return None
+        row = result[0]
+        record_dict = dict(row["r"])
+        record_dict = self._neo4j_to_arango_node(record_dict, CollectionNames.RECORDS.value)
+        type_doc = dict(row["typeDoc"]) if row.get("typeDoc") else None
+        if type_doc:
+            type_doc = self._neo4j_to_arango_node(type_doc, "")
+        try:
+            return self._create_typed_record_from_neo4j(record_dict, type_doc)
+        except ValueError:
+            return Record.from_arango_base_record(record_dict)
+
+    _ARANGO_TO_NEO4J_EDGE: dict[str, str] = {
+        "nodeRelations": "NODE_RELATION",
+        "recordLinks": "RECORD_LINK",
+        "belongsTo": "BELONGS_TO",
+        "inheritPermissions": "INHERIT_PERMISSIONS",
+        "permission": "PERMISSION",
+        "isOfType": "IS_OF_TYPE",
+        "entityRelations": "ENTITYRELATIONS",
+        "userAppRelation": "USER_APP_RELATION",
+    }
+
+    async def find_edges_between(
+        self,
+        from_collection: str,
+        from_key: str,
+        to_collection: str,
+        to_key: str,
+        edge_collection: str,
+    ) -> List[Dict[str, Any]]:
+        """Return raw edge properties between two specific vertices."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+
+        # Delegate to the production resolver rather than keeping a second copy of
+        # the mapping here. A local copy silently drifted: it guessed "PullRequest"
+        # and "CodeFile" while production falls back to ``collection.capitalize()``
+        # for collections absent from COLLECTION_TO_LABEL, producing "Prs" and
+        # "Codefiles". Nothing asserted a PR or code-file edge until the GitHub Teams
+        # suite did, so the wrong labels matched zero rows and read as a missing edge.
+        from_label = collection_to_label(from_collection)
+        to_label = collection_to_label(to_collection)
+        edge_label = self._ARANGO_TO_NEO4J_EDGE.get(edge_collection)
+
+        if not from_label or not to_label or not edge_label:
+            logger.warning(
+                "find_edges_between: unmapped collection/edge: "
+                "from=%s, to=%s, edge=%s",
+                from_collection, to_collection, edge_collection,
+            )
+            return []
+
+        query = (
+            f"MATCH (a:{from_label} {{id: $fk}})"
+            f"-[r:{edge_label}]->"
+            f"(b:{to_label} {{id: $tk}}) "
+            f"RETURN properties(r) AS props"
+        )
+        result = await self.client.execute_query(
+            query, {"fk": from_key, "tk": to_key},
+        )
+        return [dict(row["props"]) for row in result] if result else []
+
+    # =========================================================================
+    # Delete footprints. A handle is "<label>/<id>", the Neo4j counterpart of
+    # ArangoDB's "<collection>/<key>", so a node is named the same way on both.
+    # =========================================================================
+
+    async def connector_node_handles(self, connector_id: str) -> List[str]:
+        """Every node a connector (or knowledge base) owns: nodes carrying its
+        connectorId, the node whose id is the connector id, and its records' type nodes."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            CALL {
+                MATCH (n {connectorId: $cid}) RETURN n
+                UNION
+                MATCH (n {id: $cid}) RETURN n
+                UNION
+                MATCH (:Record {connectorId: $cid})-[:IS_OF_TYPE]->(n) RETURN n
+            }
+            WITH n WHERE n.id IS NOT NULL
+            RETURN DISTINCT labels(n)[0] + '/' + n.id AS handle
+            """,
+            {"cid": connector_id},
+        )
+        return sorted(row["handle"] for row in result or [])
+
+    async def record_node_handles(self, record_ids: Iterable[str]) -> List[str]:
+        """The given records and their type nodes (File, Mail, ...)."""
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        result = await self.client.execute_query(
+            """
+            MATCH (r:Record) WHERE r.id IN $ids
+            OPTIONAL MATCH (r)-[:IS_OF_TYPE]->(t)
+            WITH collect(DISTINCT r) + collect(DISTINCT t) AS nodes
+            UNWIND nodes AS n
+            WITH n WHERE n.id IS NOT NULL
+            RETURN DISTINCT labels(n)[0] + '/' + n.id AS handle
+            """,
+            {"ids": list(record_ids)},
+        )
+        return sorted(row["handle"] for row in result or [])
+
+    @staticmethod
+    def _handles_by_label(handles: Iterable[str]) -> Dict[str, List[str]]:
+        grouped: Dict[str, List[str]] = {}
+        for handle in handles:
+            label, _, node_id = handle.partition("/")
+            if not label.isidentifier():
+                raise ValueError(f"Not a node handle: {handle!r}")
+            grouped.setdefault(label, []).append(node_id)
+        return grouped
+
+    async def count_existing_nodes(self, handles: Iterable[str]) -> int:
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        total = 0
+        for label, ids in self._handles_by_label(handles).items():
+            result = await self.client.execute_query(
+                f"MATCH (n:`{label}`) WHERE n.id IN $ids RETURN count(DISTINCT n) AS c",
+                {"ids": ids},
+            )
+            total += int(result[0]["c"]) if result else 0
+        return total
+
+    async def count_edges_touching(self, handles: Iterable[str], *, excluding: Iterable[str] = ()) -> int:
+        """Relationships with either end on one of these nodes, each counted once.
+
+        *excluding* names edge collections, as on ArangoDB; their relationship types are left out.
+        """
+        if not self.client:
+            raise RuntimeError("Provider not connected")
+        skipped = sorted({self._get_relationship_type(c) for c in excluding})
+        seen: set = set()
+        for label, ids in self._handles_by_label(handles).items():
+            result = await self.client.execute_query(
+                f"MATCH (n:`{label}`)-[r]-() WHERE n.id IN $ids AND NOT type(r) IN $skipped "
+                "RETURN collect(DISTINCT elementId(r)) AS rels",
+                {"ids": ids, "skipped": skipped},
+            )
+            if result:
+                seen.update(result[0]["rels"] or [])
+        return len(seen)

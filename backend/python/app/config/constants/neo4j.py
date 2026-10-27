@@ -1,0 +1,284 @@
+"""
+Neo4j Constants and Schema Mappings
+
+This module provides constants and mapping utilities for Neo4j implementation,
+translating ArangoDB concepts (collections, _key, edges) to Neo4j concepts (labels, properties, relationships).
+"""
+
+from enum import Enum
+
+from app.config.constants.arangodb import CollectionNames
+
+
+class Neo4jLabel(Enum):
+    """Neo4j node labels mapped from ArangoDB collections"""
+    # Records and Record relations
+    RECORDS = "Record"
+    STAGE_STATES = "StageState"
+    RECORD_GROUPS = "RecordGroup"
+    SYNC_POINTS = "SyncPoint"
+
+    # Record types
+    FILES = "File"
+    MAILS = "Mail"
+    MESSAGES = "Message"
+    WEBPAGES = "Webpage"
+    COMMENTS = "Comment"
+    TICKETS = "Ticket"
+    LINKS = "Link"
+    PROJECTS = "Project"
+    MEETINGS = "Meeting"
+    SQL_TABLES = "SqlTable"
+    SQL_VIEWS = "SqlView"
+
+    # Users and groups
+    USERS = "User"
+    GROUPS = "Group"
+    PEOPLE = "Person"
+    ROLES = "Role"
+    ORGS = "Organization"
+    ANYONE = "Anyone"
+
+    # Apps and relations
+    APPS = "App"
+    DRIVES = "Drive"
+
+    # Other
+    PAGE_TOKENS = "PageToken"
+    BLOCKS = "Block"
+
+    # Tools
+    TOOLS = "Tool"
+    TOOLS_CTAGS = "ToolCtag"
+
+    # Metadata (categories, departments, languages, topics)
+    # Using capitalized collection names to match default fallback behavior
+    DEPARTMENTS = "Departments"
+    CATEGORIES = "Categories"
+    SUBCATEGORIES1 = "Subcategories1"
+    SUBCATEGORIES2 = "Subcategories2"
+    SUBCATEGORIES3 = "Subcategories3"
+    LANGUAGES = "Languages"
+    TOPICS = "Topics"
+    NAMED_ENTITIES = "NamedEntity"
+    VALUE_MENTIONS = "ValueMention"
+    NAMED_ENTITY_PERSIST_RETRIES = "NamedEntityPersistRetry"
+
+    # Teams
+    TEAMS = "Teams"
+
+    # Agent Builder collections
+    AGENT_TEMPLATES = "AgentTemplate"
+    AGENT_INSTANCES = "AgentInstance"
+    AGENT_KNOWLEDGE = "AgentKnowledge"
+    AGENT_TOOLSETS = "AgentToolset"
+    AGENT_TOOLS = "AgentTool"
+    AGENT_MCP_SERVERS = "AgentMcpServer"
+
+    # Agent Skills collections
+    AGENT_SKILLS = "AgentSkills"
+    AGENT_SKILL_VERSIONS = "AgentSkillVersions"
+    AGENT_SKILL_CANDIDATES = "AgentSkillCandidates"
+
+    # Sales
+    DEALS = "Deals"
+    PRODUCTS = "Products"
+
+    # Artifacts
+    ARTIFACTS = "Artifact"
+
+
+class Neo4jRelationshipType(Enum):
+    """Neo4j relationship types mapped from ArangoDB edge collections"""
+    NODE_RELATIONS = "NODE_RELATION"
+    # Links between records (BLOCKS, FOREIGN_KEY, SIBLING, ...): the logical
+    # nodeRelations collection keeps only hierarchy on NODE_RELATION.
+    RECORD_LINK = "RECORD_LINK"
+    BELONGS_TO = "BELONGS_TO"
+    IS_OF_TYPE = "IS_OF_TYPE"
+    PERMISSION = "PERMISSION"
+    INHERIT_PERMISSIONS = "INHERIT_PERMISSIONS"
+    ENTITY_RELATIONS = "ENTITYRELATIONS"
+    USER_APP_RELATION = "USER_APP_RELATION"
+    AUTHENTICATED_AS = "AUTHENTICATED_AS"
+    ORG_APP_RELATION = "ORG_APP_RELATION"
+    USER_DRIVE_RELATION = "USER_DRIVE_RELATION"
+    BELONGS_TO_DEPARTMENT = "BELONGS_TO_DEPARTMENT"
+    BELONGS_TO_CATEGORY = "BELONGS_TO_CATEGORY"
+    BELONGS_TO_LANGUAGE = "BELONGS_TO_LANGUAGE"
+    BELONGS_TO_TOPIC = "BELONGS_TO_TOPIC"
+    MENTIONS_ENTITY = "MENTIONS_ENTITY"
+
+    # Agent Builder relationships
+    AGENT_HAS_KNOWLEDGE = "AGENT_HAS_KNOWLEDGE"
+    AGENT_HAS_TOOLSET = "AGENT_HAS_TOOLSET"
+    TOOLSET_HAS_TOOL = "TOOLSET_HAS_TOOL"
+    AGENT_HAS_SKILL = "AGENT_HAS_SKILL"
+    AGENT_HAS_MCP_SERVER = "AGENT_HAS_MCP_SERVER"
+    MCP_SERVER_HAS_TOOL = "MCP_SERVER_HAS_TOOL"
+
+    # Agent Skills relationships
+    AGENT_SKILL_RELATION = "AGENT_SKILL_RELATION"
+
+    # Sales relationships
+    SOLD_IN = "SOLD_IN"
+    DEAL_OF = "DEAL_OF"
+    MEMBER_OF = "MEMBER_OF"
+    PROSPECT = "PROSPECT"
+    CUSTOMER = "CUSTOMER"
+    LEAD = "LEAD"
+    CONTACT = "CONTACT"
+    DEAL_INFO = "DEAL_INFO"
+
+# Mapping from ArangoDB CollectionNames to Neo4j Labels
+COLLECTION_TO_LABEL: dict[str, str] = {
+    CollectionNames.RECORDS.value: Neo4jLabel.RECORDS.value,
+    CollectionNames.STAGE_STATES.value: Neo4jLabel.STAGE_STATES.value,
+    CollectionNames.RECORD_GROUPS.value: Neo4jLabel.RECORD_GROUPS.value,
+    CollectionNames.SYNC_POINTS.value: Neo4jLabel.SYNC_POINTS.value,
+    CollectionNames.FILES.value: Neo4jLabel.FILES.value,
+    CollectionNames.MAILS.value: Neo4jLabel.MAILS.value,
+    CollectionNames.MESSAGES.value: Neo4jLabel.MESSAGES.value,
+    CollectionNames.WEBPAGES.value: Neo4jLabel.WEBPAGES.value,
+    CollectionNames.COMMENTS.value: Neo4jLabel.COMMENTS.value,
+    CollectionNames.TICKETS.value: Neo4jLabel.TICKETS.value,
+    CollectionNames.MEETINGS.value: Neo4jLabel.MEETINGS.value,
+    CollectionNames.LINKS.value: Neo4jLabel.LINKS.value,
+    CollectionNames.PROJECTS.value: Neo4jLabel.PROJECTS.value,
+    CollectionNames.SQL_TABLES.value: Neo4jLabel.SQL_TABLES.value,
+    CollectionNames.SQL_VIEWS.value: Neo4jLabel.SQL_VIEWS.value,
+    CollectionNames.USERS.value: Neo4jLabel.USERS.value,
+    CollectionNames.GROUPS.value: Neo4jLabel.GROUPS.value,
+    CollectionNames.PEOPLE.value: Neo4jLabel.PEOPLE.value,
+    CollectionNames.ROLES.value: Neo4jLabel.ROLES.value,
+    CollectionNames.ORGS.value: Neo4jLabel.ORGS.value,
+    CollectionNames.ANYONE.value: Neo4jLabel.ANYONE.value,
+    CollectionNames.APPS.value: Neo4jLabel.APPS.value,
+    CollectionNames.DRIVES.value: Neo4jLabel.DRIVES.value,
+    CollectionNames.PAGE_TOKENS.value: Neo4jLabel.PAGE_TOKENS.value,
+    CollectionNames.BLOCKS.value: Neo4jLabel.BLOCKS.value,
+    CollectionNames.DEALS.value: Neo4jLabel.DEALS.value,
+    CollectionNames.PRODUCTS.value: Neo4jLabel.PRODUCTS.value,
+    CollectionNames.ARTIFACTS.value: Neo4jLabel.ARTIFACTS.value,
+
+    # Tools collections (not in CollectionNames enum, using string names)
+    "tools": Neo4jLabel.TOOLS.value,
+    "tools_ctags": Neo4jLabel.TOOLS_CTAGS.value,
+    # Metadata collections
+    CollectionNames.DEPARTMENTS.value: Neo4jLabel.DEPARTMENTS.value,
+    CollectionNames.CATEGORIES.value: Neo4jLabel.CATEGORIES.value,
+    CollectionNames.SUBCATEGORIES1.value: Neo4jLabel.SUBCATEGORIES1.value,
+    CollectionNames.SUBCATEGORIES2.value: Neo4jLabel.SUBCATEGORIES2.value,
+    CollectionNames.SUBCATEGORIES3.value: Neo4jLabel.SUBCATEGORIES3.value,
+    CollectionNames.LANGUAGES.value: Neo4jLabel.LANGUAGES.value,
+    CollectionNames.TOPICS.value: Neo4jLabel.TOPICS.value,
+    CollectionNames.NAMED_ENTITIES.value: Neo4jLabel.NAMED_ENTITIES.value,
+    CollectionNames.VALUE_MENTIONS.value: Neo4jLabel.VALUE_MENTIONS.value,
+    CollectionNames.NAMED_ENTITY_PERSIST_RETRIES.value: Neo4jLabel.NAMED_ENTITY_PERSIST_RETRIES.value,
+    # Teams
+    CollectionNames.TEAMS.value: Neo4jLabel.TEAMS.value,
+    # Agent Builder collections
+    CollectionNames.AGENT_TEMPLATES.value: Neo4jLabel.AGENT_TEMPLATES.value,
+    CollectionNames.AGENT_INSTANCES.value: Neo4jLabel.AGENT_INSTANCES.value,
+    CollectionNames.AGENT_KNOWLEDGE.value: Neo4jLabel.AGENT_KNOWLEDGE.value,
+    CollectionNames.AGENT_TOOLSETS.value: Neo4jLabel.AGENT_TOOLSETS.value,
+    CollectionNames.AGENT_TOOLS.value: Neo4jLabel.AGENT_TOOLS.value,
+    CollectionNames.AGENT_MCP_SERVERS.value: Neo4jLabel.AGENT_MCP_SERVERS.value,
+    # Agent Skills collections
+    CollectionNames.AGENT_SKILLS.value: Neo4jLabel.AGENT_SKILLS.value,
+    CollectionNames.AGENT_SKILL_VERSIONS.value: Neo4jLabel.AGENT_SKILL_VERSIONS.value,
+    CollectionNames.AGENT_SKILL_CANDIDATES.value: Neo4jLabel.AGENT_SKILL_CANDIDATES.value,
+}
+
+# Mapping from ArangoDB edge collections to Neo4j relationship types
+EDGE_COLLECTION_TO_RELATIONSHIP: dict[str, str] = {
+    CollectionNames.NODE_RELATIONS.value: Neo4jRelationshipType.NODE_RELATIONS.value,
+    CollectionNames.BELONGS_TO.value: Neo4jRelationshipType.BELONGS_TO.value,
+    CollectionNames.IS_OF_TYPE.value: Neo4jRelationshipType.IS_OF_TYPE.value,
+    CollectionNames.PERMISSION.value: Neo4jRelationshipType.PERMISSION.value,
+    CollectionNames.INHERIT_PERMISSIONS.value: Neo4jRelationshipType.INHERIT_PERMISSIONS.value,
+    CollectionNames.ENTITY_RELATIONS.value: Neo4jRelationshipType.ENTITY_RELATIONS.value,
+    CollectionNames.USER_APP_RELATION.value: Neo4jRelationshipType.USER_APP_RELATION.value,
+    CollectionNames.AUTHENTICATED_AS.value: Neo4jRelationshipType.AUTHENTICATED_AS.value,
+    CollectionNames.ORG_APP_RELATION.value: Neo4jRelationshipType.ORG_APP_RELATION.value,
+    CollectionNames.USER_DRIVE_RELATION.value: Neo4jRelationshipType.USER_DRIVE_RELATION.value,
+    CollectionNames.BELONGS_TO_DEPARTMENT.value: Neo4jRelationshipType.BELONGS_TO_DEPARTMENT.value,
+    CollectionNames.BELONGS_TO_CATEGORY.value: Neo4jRelationshipType.BELONGS_TO_CATEGORY.value,
+    CollectionNames.BELONGS_TO_LANGUAGE.value: Neo4jRelationshipType.BELONGS_TO_LANGUAGE.value,
+    CollectionNames.BELONGS_TO_TOPIC.value: Neo4jRelationshipType.BELONGS_TO_TOPIC.value,
+    CollectionNames.MENTIONS_ENTITY.value: Neo4jRelationshipType.MENTIONS_ENTITY.value,
+    # Agent Builder relationships
+    CollectionNames.AGENT_HAS_KNOWLEDGE.value: Neo4jRelationshipType.AGENT_HAS_KNOWLEDGE.value,
+    CollectionNames.AGENT_HAS_TOOLSET.value: Neo4jRelationshipType.AGENT_HAS_TOOLSET.value,
+    CollectionNames.TOOLSET_HAS_TOOL.value: Neo4jRelationshipType.TOOLSET_HAS_TOOL.value,
+    CollectionNames.AGENT_HAS_SKILL.value: Neo4jRelationshipType.AGENT_HAS_SKILL.value,
+    CollectionNames.AGENT_HAS_MCP_SERVER.value: Neo4jRelationshipType.AGENT_HAS_MCP_SERVER.value,
+    CollectionNames.MCP_SERVER_HAS_TOOL.value: Neo4jRelationshipType.MCP_SERVER_HAS_TOOL.value,
+    CollectionNames.AGENT_SKILL_RELATION.value: Neo4jRelationshipType.AGENT_SKILL_RELATION.value,
+    CollectionNames.SOLD_IN.value: Neo4jRelationshipType.SOLD_IN.value,
+    CollectionNames.DEAL_OF.value: Neo4jRelationshipType.DEAL_OF.value,
+    CollectionNames.MEMBER_OF.value: Neo4jRelationshipType.MEMBER_OF.value,
+    CollectionNames.PROSPECT.value: Neo4jRelationshipType.PROSPECT.value,
+    CollectionNames.CUSTOMER.value: Neo4jRelationshipType.CUSTOMER.value,
+    CollectionNames.LEAD.value: Neo4jRelationshipType.LEAD.value,
+    CollectionNames.CONTACT.value: Neo4jRelationshipType.CONTACT.value,
+    CollectionNames.DEAL_INFO.value: Neo4jRelationshipType.DEAL_INFO.value,
+}
+
+
+def collection_to_label(collection: str) -> str:
+    """Convert ArangoDB collection name to Neo4j label"""
+    return COLLECTION_TO_LABEL.get(collection, collection.capitalize())
+
+
+# Inverse of COLLECTION_TO_LABEL. A traversal returns the *label* of whatever it
+# landed on, and callers work in collection names, so the mapping has to run both
+# ways. First writer wins: several collections may share a label, and the
+# forward map's first entry is the canonical one.
+LABEL_TO_COLLECTION: dict[str, str] = {}
+for _collection, _label in COLLECTION_TO_LABEL.items():
+    LABEL_TO_COLLECTION.setdefault(_label, _collection)
+
+
+def label_to_collection(label: str) -> str:
+    """Convert a Neo4j label back to its ArangoDB collection name."""
+    return LABEL_TO_COLLECTION.get(label, label.lower())
+
+
+def edge_collection_to_relationship(edge_collection: str) -> str:
+    """Convert ArangoDB edge collection name to Neo4j relationship type"""
+    # Not in the mapping: node-wide sweeps over it already reach RECORD_LINK through nodeRelations.
+    if edge_collection == CollectionNames.RECORD_LINKS.value:
+        return Neo4jRelationshipType.RECORD_LINK.value
+    return EDGE_COLLECTION_TO_RELATIONSHIP.get(edge_collection, edge_collection.upper())
+
+
+def parse_node_id(node_id: str) -> tuple[str, str]:
+    """
+    Parse ArangoDB-style node ID (collection/key) to (collection, key).
+
+    Args:
+        node_id: ArangoDB node ID (e.g., "records/123" or "users/abc")
+
+    Returns:
+        Tuple of (collection, key)
+    """
+    if "/" in node_id:
+        parts = node_id.split("/", 1)
+        return (parts[0], parts[1])
+    return ("", node_id)
+
+
+def build_node_id(collection: str, key: str) -> str:
+    """
+    Build ArangoDB-style node ID from collection and key.
+
+    Args:
+        collection: Collection name
+        key: Document key
+
+    Returns:
+        Node ID string (e.g., "records/123")
+    """
+    return f"{collection}/{key}"
+

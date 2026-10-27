@@ -1,0 +1,97 @@
+import { Response, NextFunction } from 'express';
+import { isJwtTokenValid } from '../utils/validateJwt';
+import { AuthSessionRequest } from './types';
+import { SessionService } from '../services/session.service';
+import {
+  ForbiddenError,
+  NotFoundError,
+  UnauthorizedError,
+} from '../../../libs/errors/http.errors';
+import {
+  ADMIN_ACCESS_REQUIRED_MESSAGE,
+  isUserOrgAdmin,
+} from '../../user_management/services/user-admin.service';
+import { AppConfig } from '../../tokens_manager/config/config';
+
+export const userValidator = (
+  req: AuthSessionRequest,
+  _res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const container = req.container;
+    if (!container) {
+      throw new NotFoundError('Auth Container not found');
+    }
+    const config = container.get<AppConfig>('AppConfig');
+
+    const decodedData = isJwtTokenValid(req, config.jwtSecret);
+    if (!decodedData) {
+      throw new UnauthorizedError('Invalid Token');
+    }
+    req.user = decodedData;
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const adminValidator = async (
+  req: AuthSessionRequest,
+  _res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const container = req.container;
+    if (!container) {
+      throw new NotFoundError('Auth Container not found');
+    }
+    const config = container.get<AppConfig>('AppConfig');
+    const decodedData = isJwtTokenValid(req, config.jwtSecret);
+    if (!decodedData) {
+      throw new UnauthorizedError('Invalid Token');
+    }
+    req.user = decodedData;
+    const userId = req.user?.userId;
+    const orgId = req.user?.orgId;
+    if (!userId || !orgId) {
+      throw new NotFoundError('Account not found');
+    }
+
+    const isAdmin = await isUserOrgAdmin(userId, orgId);
+
+    if (!isAdmin) {
+      throw new ForbiddenError(ADMIN_ACCESS_REQUIRED_MESSAGE);
+    }
+
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const authSessionMiddleware = async (
+  req: AuthSessionRequest,
+  _res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const container = req.container;
+    if (!container) {
+      throw new NotFoundError('Auth container not found');
+    }
+    const sessionService = container.get<SessionService>('SessionService');
+    const sessionToken = req.headers['x-session-token'] as string;
+    if (!sessionToken) {
+      throw new UnauthorizedError('Invalid session token');
+    }
+    const session = await sessionService.getSession(sessionToken);
+    if (!session) {
+      throw new UnauthorizedError('Invalid session');
+    }
+    req.sessionInfo = session;
+    next();
+  } catch (error) {
+    next(error);
+  }
+};

@@ -1,0 +1,1866 @@
+"""Unit tests for app.services.messaging.kafka.handlers.entity.EntityEventService."""
+
+import asyncio
+import copy
+import logging
+from collections.abc import Iterator
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.config.constants.arangodb import (
+    AccountType,
+    CollectionNames,
+    ConnectorScopes,
+)
+from app.connectors.core.base.connector.connector_service import connector_sync_lock
+from app.connectors.core.sync.sync_runner import _run_sync_alone
+from app.services.messaging.kafka.handlers.entity import EntityEventService
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_entity_service(graph_provider=None, app_container=None, logger=None):
+    """Create an EntityEventService with mock dependencies."""
+    from app.services.messaging.kafka.handlers.entity import EntityEventService
+
+    logger = logger or MagicMock()
+    graph_provider = graph_provider or AsyncMock()
+    app_container = app_container or MagicMock()
+    app_container.messaging_producer = AsyncMock()
+    app_container.messaging_producer.send_message = AsyncMock()
+
+    return EntityEventService(
+        logger=logger,
+        graph_provider=graph_provider,
+        app_container=app_container,
+    )
+
+
+# ===================================================================
+# process_event — routing
+# ===================================================================
+
+class TestProcessEvent:
+    """Tests for the main event routing dispatcher."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_event_returns_false(self):
+        svc = _make_entity_service()
+        result = await svc.process_event("unknownEvent", {})
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_routes_to_org_created(self):
+        svc = _make_entity_service()
+        svc._handle_org_created = AsyncMock(return_value=True)
+        result = await svc.process_event("orgCreated", {"orgId": "org-1"})
+        assert result is True
+        svc._handle_org_created.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_routes_to_org_updated(self):
+        svc = _make_entity_service()
+        svc._handle_org_updated = AsyncMock(return_value=True)
+        result = await svc.process_event("orgUpdated", {"orgId": "org-1"})
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_routes_to_user_added(self):
+        svc = _make_entity_service()
+        svc._handle_user_added = AsyncMock(return_value=True)
+        result = await svc.process_event("userAdded", {"userId": "u-1"})
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_routes_to_user_updated(self):
+        svc = _make_entity_service()
+        svc._handle_user_updated = AsyncMock(return_value=True)
+        result = await svc.process_event("userUpdated", {"userId": "u-1"})
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_routes_to_user_deleted(self):
+        svc = _make_entity_service()
+        svc._handle_user_deleted = AsyncMock(return_value=True)
+        result = await svc.process_event("userDeleted", {"email": "test@test.com"})
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_routes_to_app_enabled(self):
+        svc = _make_entity_service()
+        svc._handle_app_enabled = AsyncMock(return_value=True)
+        result = await svc.process_event("appEnabled", {"orgId": "org-1"})
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_routes_to_app_disabled(self):
+        svc = _make_entity_service()
+        svc._handle_app_disabled = AsyncMock(return_value=True)
+        result = await svc.process_event("appDisabled", {"orgId": "org-1"})
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_exception_in_handler_returns_false(self):
+        svc = _make_entity_service()
+        svc._handle_org_created = AsyncMock(
+            side_effect=Exception("boom")
+        )
+        result = await svc.process_event("orgCreated", {"orgId": "org-1"})
+        assert result is False
+
+
+# ===================================================================
+# orgCreated — deeper tests
+# ===================================================================
+
+class TestOrgCreated:
+    """Tests for __handle_org_created."""
+
+    @pytest.mark.asyncio
+    async def test_enterprise_account_type(self):
+        """Business/enterprise payload maps to ENTERPRISE account type."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._create_kb_connector_app_instance = AsyncMock()
+
+        payload = {
+            "orgId": "org-1",
+            "accountType": AccountType.ENTERPRISE.value,
+            "registeredName": "Acme Corp",
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is True
+
+        # Verify org data
+        call_args = graph_provider.batch_upsert_nodes.call_args_list[0]
+        org_data = call_args[0][0][0]
+        assert org_data["accountType"] == AccountType.ENTERPRISE.value
+        assert org_data["name"] == "Acme Corp"
+
+    @pytest.mark.asyncio
+    async def test_business_account_type_maps_to_enterprise(self):
+        """Business account type should map to ENTERPRISE."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._create_kb_connector_app_instance = AsyncMock()
+
+        payload = {
+            "orgId": "org-2",
+            "accountType": AccountType.BUSINESS.value,
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is True
+
+        call_args = graph_provider.batch_upsert_nodes.call_args_list[0]
+        org_data = call_args[0][0][0]
+        assert org_data["accountType"] == AccountType.ENTERPRISE.value
+
+    @pytest.mark.asyncio
+    async def test_individual_account_type(self):
+        """Non-business/enterprise account type maps to INDIVIDUAL."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._create_kb_connector_app_instance = AsyncMock()
+
+        payload = {
+            "orgId": "org-3",
+            "accountType": AccountType.INDIVIDUAL.value,
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is True
+
+        call_args = graph_provider.batch_upsert_nodes.call_args_list[0]
+        org_data = call_args[0][0][0]
+        assert org_data["accountType"] == AccountType.INDIVIDUAL.value
+
+    @pytest.mark.asyncio
+    async def test_with_departments(self):
+        """When departments exist with orgId=None, edges are created."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(
+            return_value=[
+                {"id": "dept-1", "departmentName": "Engineering"},
+                {"_key": "dept-2", "departmentName": "Sales"},
+            ]
+        )
+        graph_provider.batch_create_edges = AsyncMock()
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._create_kb_connector_app_instance = AsyncMock()
+
+        payload = {
+            "orgId": "org-1",
+            "accountType": AccountType.ENTERPRISE.value,
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is True
+
+        # Should create department edges
+        graph_provider.batch_create_edges.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_departments_no_edge_creation(self):
+        """When no departments exist, no edge creation call is made."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        graph_provider.batch_create_edges = AsyncMock()
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._create_kb_connector_app_instance = AsyncMock()
+
+        payload = {
+            "orgId": "org-1",
+            "accountType": AccountType.INDIVIDUAL.value,
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is True
+
+        graph_provider.batch_create_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_registered_name_uses_default(self):
+        """When registeredName is absent, uses 'Individual Account'."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._create_kb_connector_app_instance = AsyncMock()
+
+        payload = {
+            "orgId": "org-1",
+            "accountType": AccountType.INDIVIDUAL.value,
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is True
+
+        call_args = graph_provider.batch_upsert_nodes.call_args_list[0]
+        org_data = call_args[0][0][0]
+        assert org_data["name"] == "Individual Account"
+
+    @pytest.mark.asyncio
+    async def test_db_error_returns_false(self):
+        """Database error during org creation returns False."""
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock(
+            side_effect=Exception("DB error")
+        )
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "accountType": AccountType.INDIVIDUAL.value,
+            "userId": "u-1",
+        }
+        result = await svc.process_event("orgCreated", payload)
+        assert result is False
+
+
+# ===================================================================
+# orgUpdated
+# ===================================================================
+
+class TestOrgUpdated:
+    """Tests for __handle_org_updated."""
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "registeredName": "Updated Corp",
+        }
+        result = await svc.process_event("orgUpdated", payload)
+        assert result is True
+
+        call_args = graph_provider.batch_upsert_nodes.call_args
+        org_data = call_args[0][0][0]
+        assert org_data["name"] == "Updated Corp"
+        assert org_data["id"] == "org-1"
+
+    @pytest.mark.asyncio
+    async def test_failure_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.batch_upsert_nodes = AsyncMock(
+            side_effect=Exception("update failed")
+        )
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "registeredName": "Updated Corp",
+        }
+        result = await svc.process_event("orgUpdated", payload)
+        assert result is False
+
+
+# ===================================================================
+# userAdded — deeper tests
+# ===================================================================
+
+class TestUserAdded:
+    """Tests for __handle_user_added."""
+
+    @pytest.mark.asyncio
+    async def test_new_user_created(self):
+        """When user doesn't exist, creates new user."""
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_email = AsyncMock(return_value=None)
+        graph_provider.get_document = AsyncMock(
+            return_value={"_key": "org-1", "accountType": "enterprise"}
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.batch_create_edges = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._get_or_create_knowledge_base = AsyncMock(return_value={})
+        svc._create_user_kb_app_relation = AsyncMock()
+
+        payload = {
+            "orgId": "org-1",
+            "userId": "u-1",
+            "email": "alice@test.com",
+            "fullName": "Alice Smith",
+            "firstName": "Alice",
+            "lastName": "Smith",
+            "syncAction": "none",
+        }
+        result = await svc.process_event("userAdded", payload)
+        assert result is True
+
+        # Should upsert user
+        graph_provider.batch_upsert_nodes.assert_awaited()
+        # Should create belongs_to edge
+        graph_provider.batch_create_edges.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existing_user_updated(self):
+        """When user exists by email, updates existing user."""
+        existing_user = MagicMock()
+        existing_user.id = "existing-key"
+
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_email = AsyncMock(return_value=existing_user)
+        graph_provider.get_document = AsyncMock(
+            return_value={"_key": "org-1", "accountType": "enterprise"}
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.batch_create_edges = AsyncMock()
+        graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._get_or_create_knowledge_base = AsyncMock(return_value={})
+        svc._create_user_kb_app_relation = AsyncMock()
+
+        payload = {
+            "orgId": "org-1",
+            "userId": "u-1",
+            "email": "alice@test.com",
+            "syncAction": "none",
+        }
+        result = await svc.process_event("userAdded", payload)
+        assert result is True
+
+        # Should use existing key
+        call_args = graph_provider.batch_upsert_nodes.call_args_list[0]
+        user_data = call_args[0][0][0]
+        assert user_data["id"] == "existing-key"
+
+    @pytest.mark.asyncio
+    async def test_org_not_found_returns_false(self):
+        """When org doesn't exist, returns False."""
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_email = AsyncMock(return_value=None)
+        graph_provider.get_document = AsyncMock(return_value=None)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-missing",
+            "userId": "u-1",
+            "email": "alice@test.com",
+            "syncAction": "none",
+        }
+        result = await svc.process_event("userAdded", payload)
+        assert result is False
+
+
+# ===================================================================
+# userUpdated
+# ===================================================================
+
+class TestUserUpdated:
+    """Tests for __handle_user_updated."""
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        existing_user = {"id": "user-key-1", "_key": "user-key-1"}
+
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(return_value=existing_user)
+        graph_provider.batch_upsert_nodes = AsyncMock()
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "userId": "u-1",
+            "orgId": "org-1",
+            "email": "alice@test.com",
+            "fullName": "Alice Smith Updated",
+            "firstName": "Alice",
+            "lastName": "Smith",
+        }
+        result = await svc.process_event("userUpdated", payload)
+        assert result is True
+
+        call_args = graph_provider.batch_upsert_nodes.call_args
+        user_data = call_args[0][0][0]
+        assert user_data["fullName"] == "Alice Smith Updated"
+        # `isActive` is no longer one of the merged fields. This node has
+        # never carried it, so it is stamped by the conditional write that
+        # follows instead — see
+        # `test_a_node_from_before_the_field_is_still_marked_active`.
+        assert "isActive" not in user_data
+        graph_provider.update_node_fields_if_match.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_user_is_not_put_back(self) -> None:
+        """Soft delete is `isActive: False`, and these upserts merge. An update
+        event still in flight, or one from a request that raced the delete,
+        would otherwise bring a removed user back — and for a service account
+        that is the field a bound agent's identity is checked against."""
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(
+            return_value={"id": "user-key-1", "_key": "user-key-1", "isActive": False},
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        result = await svc.process_event(
+            "userUpdated",
+            {
+                "userId": "u-1",
+                "orgId": "org-1",
+                "email": "alice@test.com",
+                "fullName": "Alice Smith Updated",
+            },
+        )
+        assert result is True
+
+        user_data = graph_provider.batch_upsert_nodes.call_args[0][0][0]
+        assert "isActive" not in user_data
+        assert user_data["fullName"] == "Alice Smith Updated"
+        graph_provider.update_node_fields_if_match.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_node_from_before_the_field_is_still_marked_active(self) -> None:
+        """A node written before `isActive` existed is not evidence of a
+        deletion, and the permission reads filter on `isActive == true`, so it
+        is stamped. Through the conditional write, not the merge: a delete
+        that commits first leaves `False` and this must not undo it."""
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(
+            return_value={"id": "user-key-1", "_key": "user-key-1"},
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        graph_provider.update_node_fields_if_match = AsyncMock(return_value=True)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        await svc.process_event(
+            "userUpdated",
+            {"userId": "u-1", "orgId": "org-1", "email": "alice@test.com"},
+        )
+
+        assert "isActive" not in graph_provider.batch_upsert_nodes.call_args[0][0][0]
+        key, collection, updates, expected = (
+            graph_provider.update_node_fields_if_match.call_args[0]
+        )
+        assert key == "user-key-1"
+        assert collection == CollectionNames.USERS.value
+        assert updates == {"isActive": True}
+        assert expected == {"isActive": None}
+
+    @pytest.mark.asyncio
+    async def test_a_delete_that_lands_mid_handler_still_wins(self) -> None:
+        """The window the guard has to survive: the delete commits after the
+        read and before the upsert. Written against a store that merges the way
+        both providers do, rather than against the call arguments."""
+        store = {"user-key-1": {"id": "user-key-1", "isActive": True}}
+
+        async def read_then_delete(user_id: str) -> dict:
+            seen = dict(store["user-key-1"])
+            # `_handle_user_deleted` on the other replica, in the window.
+            store["user-key-1"]["isActive"] = False
+            return seen
+
+        async def merge(nodes: list[dict], collection: str, **_: object) -> bool:
+            for node in nodes:
+                store.setdefault(node["id"], {}).update(node)
+            return True
+
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(side_effect=read_then_delete)
+        graph_provider.batch_upsert_nodes = AsyncMock(side_effect=merge)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        result = await svc.process_event(
+            "userUpdated",
+            {
+                "userId": "u-1",
+                "orgId": "org-1",
+                "email": "alice@test.com",
+                "fullName": "Alice Smith Updated",
+            },
+        )
+
+        assert result is True
+        assert store["user-key-1"]["isActive"] is False
+        assert store["user-key-1"]["fullName"] == "Alice Smith Updated"
+        graph_provider.update_node_fields_if_match.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_active_user_is_not_restamped(self) -> None:
+        """The read already saw the field, so there is nothing to backfill and
+        no reason to spend a second write on every rename."""
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(
+            return_value={"id": "user-key-1", "_key": "user-key-1", "isActive": True},
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        await svc.process_event(
+            "userUpdated",
+            {"userId": "u-1", "orgId": "org-1", "email": "alice@test.com"},
+        )
+
+        assert "isActive" not in graph_provider.batch_upsert_nodes.call_args[0][0][0]
+        graph_provider.update_node_fields_if_match.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_not_found_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(return_value=None)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "userId": "u-missing",
+            "orgId": "org-1",
+            "email": "unknown@test.com",
+        }
+        result = await svc.process_event("userUpdated", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_db_error_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_user_by_user_id = AsyncMock(
+            side_effect=Exception("DB fail")
+        )
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "userId": "u-1",
+            "orgId": "org-1",
+            "email": "alice@test.com",
+        }
+        result = await svc.process_event("userUpdated", payload)
+        assert result is False
+
+
+# ===================================================================
+# userDeleted
+# ===================================================================
+
+class TestUserDeleted:
+    """Tests for __handle_user_deleted."""
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_entity_id_by_email = AsyncMock(
+            return_value="user-key-1"
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "email": "alice@test.com",
+        }
+        result = await svc.process_event("userDeleted", payload)
+        assert result is True
+
+        call_args = graph_provider.batch_upsert_nodes.call_args
+        user_data = call_args[0][0][0]
+        assert user_data["isActive"] is False
+        assert user_data["id"] == "user-key-1"
+
+    @pytest.mark.asyncio
+    async def test_user_not_found_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_entity_id_by_email = AsyncMock(return_value=None)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "email": "unknown@test.com",
+        }
+        result = await svc.process_event("userDeleted", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_db_error_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_entity_id_by_email = AsyncMock(
+            side_effect=Exception("DB fail")
+        )
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        result = await svc.process_event(
+            "userDeleted", {"orgId": "org-1", "email": "a@b.com"}
+        )
+        assert result is False
+
+
+# ===================================================================
+# appEnabled — deeper tests
+# ===================================================================
+
+class TestAppEnabled:
+    """Tests for __handle_app_enabled."""
+
+    @pytest.mark.asyncio
+    async def test_success_no_sync(self):
+        """Apps enabled without immediate sync."""
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={"_key": "org-1", "accountType": "enterprise"}
+        )
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "apps": ["GoogleDrive", "Slack"],
+            "syncAction": "none",
+        }
+        result = await svc.process_event("appEnabled", payload)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_success_with_immediate_sync(self):
+        """Apps enabled with immediate sync triggers sync events."""
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={"_key": "org-1", "accountType": "enterprise"}
+        )
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._handle_sync_event = AsyncMock(return_value=True)
+
+        payload = {
+            "orgId": "org-1",
+            "apps": ["GoogleDrive", "Slack"],
+            "syncAction": "immediate",
+            "connectorId": "conn-1",
+            "scope": ConnectorScopes.PERSONAL.value,
+        }
+        result = await svc.process_event("appEnabled", payload)
+        assert result is True
+
+        # Should trigger sync for each app
+        assert svc._handle_sync_event.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_org_not_found_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(return_value=None)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-missing",
+            "apps": ["GoogleDrive"],
+            "syncAction": "immediate",
+        }
+        result = await svc.process_event("appEnabled", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_db_error_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            side_effect=Exception("DB error")
+        )
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "apps": ["GoogleDrive"],
+        }
+        result = await svc.process_event("appEnabled", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_default_sync_action_is_none(self):
+        """When syncAction is not in payload, defaults to 'none'."""
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={"_key": "org-1"}
+        )
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+        svc._handle_sync_event = AsyncMock(return_value=True)
+
+        payload = {
+            "orgId": "org-1",
+            "apps": ["GoogleDrive"],
+            # No syncAction key
+        }
+        result = await svc.process_event("appEnabled", payload)
+        assert result is True
+
+        # No sync should be triggered
+        svc._handle_sync_event.assert_not_awaited()
+
+
+# ===================================================================
+# appDisabled — deeper tests
+# ===================================================================
+
+class TestAppDisabled:
+    """Tests for __handle_app_disabled."""
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={
+                "_key": "conn-1",
+                "name": "GoogleDrive",
+                "type": "connector",
+                "appGroup": "google",
+                "createdAtTimestamp": 123456,
+            }
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.get_coordinator"
+        ) as _gc_mock_stm:
+            mock_stm = _gc_mock_stm.return_value
+            mock_stm.request_stop = AsyncMock()
+            payload = {
+                "orgId": "org-1",
+                "apps": ["GoogleDrive"],
+                "connectorId": "conn-1",
+            }
+            result = await svc.process_event("appDisabled", payload)
+            assert result is True
+
+            # App should be marked inactive
+            call_args = graph_provider.batch_upsert_nodes.call_args
+            app_data = call_args[0][0][0]
+            assert app_data["isActive"] is False
+
+            # Stop is requested without awaiting the unwind: this runs on the
+            # serial entity consumer, so waiting would stall every later event.
+            mock_stm.request_stop.assert_awaited_once_with("conn-1")
+
+    @pytest.mark.asyncio
+    async def test_missing_org_id_returns_false(self):
+        svc = _make_entity_service()
+
+        payload = {
+            "orgId": "",
+            "apps": ["GoogleDrive"],
+        }
+        result = await svc.process_event("appDisabled", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_missing_apps_returns_false(self):
+        svc = _make_entity_service()
+
+        payload = {
+            "orgId": "org-1",
+            "apps": [],
+        }
+        result = await svc.process_event("appDisabled", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_app_not_found_returns_false(self):
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(return_value=None)
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        payload = {
+            "orgId": "org-1",
+            "apps": ["NonExistentApp"],
+            "connectorId": "conn-missing",
+        }
+        result = await svc.process_event("appDisabled", payload)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_sync_failure_does_not_fail_overall(self):
+        """Even if requesting the stop fails, the overall operation succeeds."""
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={
+                "_key": "conn-1",
+                "name": "GoogleDrive",
+                "type": "connector",
+                "appGroup": "google",
+                "createdAtTimestamp": 123456,
+            }
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+
+        svc = _make_entity_service(graph_provider=graph_provider)
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.get_coordinator"
+        ) as _gc_mock_stm:
+            mock_stm = _gc_mock_stm.return_value
+            mock_stm.request_stop = AsyncMock(
+                side_effect=Exception("cancel failed")
+            )
+            payload = {
+                "orgId": "org-1",
+                "apps": ["GoogleDrive"],
+                "connectorId": "conn-1",
+            }
+            result = await svc.process_event("appDisabled", payload)
+            assert result is True
+
+
+# ===================================================================
+# _kb_name_from_user_added_payload
+# ===================================================================
+
+class TestKbNameFromPayload:
+    """Tests for _kb_name_from_user_added_payload."""
+
+    def test_with_full_name(self):
+        svc = _make_entity_service()
+        payload = {"fullName": "Alice Smith", "email": "alice@test.com"}
+        assert svc._kb_name_from_user_added_payload(payload) == "Alice Smith's Private"
+
+    def test_without_full_name_uses_email(self):
+        svc = _make_entity_service()
+        payload = {"fullName": "", "email": "alice@test.com"}
+        assert svc._kb_name_from_user_added_payload(payload) == "alice@test.com's Private"
+
+    def test_without_full_name_or_email(self):
+        svc = _make_entity_service()
+        payload = {"fullName": "", "email": ""}
+        assert svc._kb_name_from_user_added_payload(payload) == "Private"
+
+    def test_whitespace_only_full_name_uses_email(self):
+        svc = _make_entity_service()
+        payload = {"fullName": "   ", "email": "bob@test.com"}
+        assert svc._kb_name_from_user_added_payload(payload) == "bob@test.com's Private"
+
+    def test_no_keys_present(self):
+        svc = _make_entity_service()
+        payload = {}
+        assert svc._kb_name_from_user_added_payload(payload) == "Private"
+
+
+# ===================================================================
+# __handle_sync_event
+# ===================================================================
+
+class TestHandleSyncEvent:
+    """Tests for __handle_sync_event."""
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        svc = _make_entity_service()
+
+        result = await svc._handle_sync_event(
+            "googledrive.start", {"orgId": "org-1"}
+        )
+        assert result is True
+
+        svc.app_container.messaging_producer.send_message.assert_awaited_once()
+        call_args = svc.app_container.messaging_producer.send_message.call_args
+        assert call_args[1]["topic"] == "sync-events"
+        msg = call_args[1]["message"]
+        assert msg["eventType"] == "googledrive.start"
+
+    @pytest.mark.asyncio
+    async def test_keyed_by_connector(self):
+        """Like Node's sync events: an unkeyed start could land on another Kafka
+        partition than that connector's resyncs and be consumed out of order."""
+        svc = _make_entity_service()
+        await svc._handle_sync_event("googledrive.start", {"orgId": "org-1", "connectorId": "c1"})
+        assert svc.app_container.messaging_producer.send_message.call_args[1]["key"] == "c1"
+
+    @pytest.mark.asyncio
+    async def test_send_failure_returns_false(self):
+        svc = _make_entity_service()
+        svc.app_container.messaging_producer.send_message = AsyncMock(
+            side_effect=Exception("kafka down")
+        )
+
+        result = await svc._handle_sync_event(
+            "googledrive.start", {}
+        )
+        assert result is False
+
+# =============================================================================
+# Merged from test_entity_handler_coverage.py
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_service():
+    """Create an EntityEventService with mock dependencies."""
+    logger = MagicMock(spec=logging.Logger)
+    graph_provider = AsyncMock()
+    app_container = MagicMock()
+    app_container.messaging_producer = AsyncMock()
+    app_container.messaging_producer.send_message = AsyncMock()
+    app_container.config_service.return_value = AsyncMock()
+    app_container.data_store = AsyncMock()
+    # A mock's coroutine is truthy, which would read as "retry" to the idempotent writer.
+    graph_provider.is_write_conflict = MagicMock(return_value=False)
+    return EntityEventService(logger, graph_provider, app_container)
+
+
+class _Conflict(RuntimeError):
+    pass
+
+
+class _KbGraph:
+    """The apps and edges of one org on Neo4j with NEO4J_EXPLICIT_TRANSACTIONS off: each
+    statement lands as it runs, except inside begin_transaction(explicit=True) while
+    *honours_explicit* (NEO4J_CREATE_TRANSACTIONS) is on. The write numbered
+    *conflicts_on* hits another writer; the one numbered *fails_on* hits an outage."""
+
+    def __init__(self, *, conflicts_on: int | None = None, fails_on: int | None = None,
+                 honours_explicit: bool = True, lookup_fails: bool = False,
+                 user_lookup_fails: bool = False) -> None:
+        self.logger = MagicMock()
+        self.apps: dict[str, dict] = {}
+        self.users: dict[str, dict] = {}
+        self.edges: dict[tuple[str, str, str], dict] = {}
+        self.writes = 0
+        self.conflicts_on = conflicts_on
+        self.fails_on = fails_on
+        self.honours_explicit = honours_explicit
+        self.explicit_requests: list[bool | None] = []
+        self._snapshots: dict[str, tuple[dict, dict, dict]] = {}
+        self.lookup_fails = lookup_fails
+        self.user_lookup_fails = user_lookup_fails
+
+    async def get_user_by_email(self, email: str, *, raise_on_error: bool = False) -> SimpleNamespace | None:
+        if self.user_lookup_fails:  # As both providers do: raise only when asked, else answer "nobody".
+            if raise_on_error:
+                raise RuntimeError("LockAcquisitionTimeout")
+            return None
+        found = next((u for u in self.users.values() if u.get("email") == email), None)
+        return SimpleNamespace(id=found["id"]) if found else None
+
+    async def get_document(self, key: str, collection: str, **_: object) -> dict | None:
+        return {"_key": key, "accountType": "enterprise"}
+
+    async def add_user_to_all_team(self, org_id: str, user_key: str) -> None:
+        pass
+
+    async def get_nodes_by_filters(self, collection: str, filters: dict, *, raise_on_error: bool = False) -> list[dict]:
+        if self.lookup_fails:  # As both providers do: raise only when asked, else answer "nothing".
+            if raise_on_error:
+                raise RuntimeError("LockAcquisitionTimeout")
+            return []
+        return [app for app in self.apps.values() if all(app.get(k) == v for k, v in filters.items())]
+
+    def opens_explicit_transaction(self, explicit: bool | None) -> bool:
+        return bool(explicit and self.honours_explicit)
+
+    async def begin_transaction(self, read: list | None = None, write: list | None = None,
+                                explicit: bool | None = None) -> str:
+        self.explicit_requests.append(explicit)
+        txn = f"txn-{len(self.explicit_requests)}"
+        if explicit and self.honours_explicit:
+            self._snapshots[txn] = copy.deepcopy((self.apps, self.users, self.edges))
+        return txn
+
+    async def commit_transaction(self, txn: str) -> None:
+        self._snapshots.pop(txn, None)
+
+    async def rollback_transaction(self, txn: str) -> None:
+        # Without a real transaction there is nothing to undo: every statement committed.
+        snapshot = self._snapshots.pop(txn, None)
+        if snapshot is not None:
+            self.apps, self.users, self.edges = snapshot
+
+    def is_write_conflict(self, error: BaseException) -> bool:
+        return isinstance(error, _Conflict)
+
+    def is_transient_error(self, error: BaseException, *, explicit: bool | None = None) -> bool:
+        return isinstance(error, _Conflict) and bool(explicit) and self.honours_explicit
+
+    def _statement(self) -> None:
+        self.writes += 1
+        if self.writes == self.conflicts_on:
+            raise _Conflict("DeadlockDetected")
+        if self.writes == self.fails_on:
+            raise RuntimeError("connection reset")
+
+    async def batch_upsert_nodes(self, nodes: list[dict], collection: str, transaction: str | None = None) -> bool:
+        self._statement()
+        bucket = self.users if collection == CollectionNames.USERS.value else self.apps
+        for node in nodes:
+            bucket.setdefault(node["id"], {}).update(node)
+        return True
+
+    async def batch_create_edges(self, edges: list[dict], collection: str, transaction: str | None = None) -> None:
+        self._statement()
+        for edge in edges:  # MERGE then SET r = props: an existing edge is replaced
+            self.edges[(collection, edge["from_id"], edge["to_id"])] = edge
+
+    async def create_edges_if_absent(self, edges: list[dict], collection: str, transaction: str | None = None) -> None:
+        self._statement()
+        for edge in edges:  # MERGE then ON CREATE SET: an existing edge is left as it is
+            self.edges.setdefault((collection, edge["from_id"], edge["to_id"]), edge)
+
+    async def ensure_app_membership(self, principal_id: str, principal_collection: str, connector_id: str, *,
+                                    is_external: bool, source_user_id: str | None = None,
+                                    transaction: str | None = None) -> None:
+        self._statement()
+        self.edges.setdefault(
+            (CollectionNames.USER_APP_RELATION.value, principal_id, connector_id),
+            {"isExternalUser": is_external, "syncState": "NOT_STARTED"},
+        )
+
+    async def get_edge(self, from_id: str, from_collection: str, to_id: str, to_collection: str,
+                       collection: str, transaction: str | None = None) -> dict | None:
+        return None  # What both providers answer when the read itself fails.
+
+
+def _kb_edges(graph: _KbGraph, kb_id: str) -> set[tuple[str, str]]:
+    return {(collection, from_id) for collection, from_id, to_id in graph.edges if to_id == kb_id}
+
+
+_ALL_KB_EDGES = {
+    (CollectionNames.PERMISSION.value, "user-key"),
+    (CollectionNames.ORG_APP_RELATION.value, "org-1"),
+    (CollectionNames.USER_APP_RELATION.value, "user-key"),
+}
+
+
+def _service_on(graph: _KbGraph) -> EntityEventService:
+    svc = _make_service()
+    svc = EntityEventService(svc.logger, graph, svc.app_container)
+    svc.app_container.connectors_map = {}
+    return svc
+
+
+class TestDefaultKbCreateConverges:
+    """The default knowledge base is four writes. On Neo4j each commits on its own, so
+    a failure partway used to leave an App with edges missing, and every later call
+    found it by filter and handed it back as it was."""
+
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("app.connectors.core.base.data_store.graph_data_store.asyncio.sleep", AsyncMock())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("honours_explicit", [True, False], ids=["create_transactions", "kill_switch"])
+    async def test_a_conflict_on_the_second_write_is_retried_into_one_complete_kb(
+        self, honours_explicit: bool,
+    ) -> None:
+        graph = _KbGraph(conflicts_on=2, honours_explicit=honours_explicit)
+        svc = _service_on(graph)
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.ConnectorFactory.create_and_start_sync",
+            new_callable=AsyncMock, return_value=None,
+        ):
+            result = await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        assert result.get("success") is True, result
+        assert list(graph.apps) == [result["kb_id"]]
+        assert _kb_edges(graph, result["kb_id"]) == _ALL_KB_EDGES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("honours_explicit", [True, False], ids=["create_transactions", "kill_switch"])
+    async def test_a_failure_partway_leaves_nothing_unless_the_kill_switch_is_off(
+        self, honours_explicit: bool,
+    ) -> None:
+        graph = _KbGraph(fails_on=3, honours_explicit=honours_explicit)
+        svc = _service_on(graph)
+        with pytest.raises(RuntimeError, match="connection reset"):
+            await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        assert graph.explicit_requests == [True]
+        if honours_explicit:
+            assert (graph.apps, graph.edges) == ({}, {})
+        else:
+            # Today's auto-commit: the App and its first edge stay, for the next call to finish.
+            (kb_id,) = graph.apps
+            assert _kb_edges(graph, kb_id) == {(CollectionNames.PERMISSION.value, "user-key")}
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.ConnectorFactory.create_and_start_sync",
+            new_callable=AsyncMock, return_value=None,
+        ):
+            result = await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+        (kb_id,) = graph.apps
+        assert _kb_edges(graph, kb_id) == _ALL_KB_EDGES
+        assert result.get("kb_id", result.get("id")) == kb_id
+
+    @pytest.mark.asyncio
+    async def test_a_failed_repair_rolls_back_the_edges_it_had_added(self) -> None:
+        graph = _KbGraph(fails_on=2)
+        graph.apps["kb-1"] = {"id": "kb-1", "createdBy": "user-1", "orgId": "org-1", "type": "KB"}
+        svc = _service_on(graph)
+
+        with pytest.raises(RuntimeError, match="connection reset"):
+            await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        assert graph.explicit_requests == [True]
+        assert graph.edges == {}
+
+    @pytest.mark.asyncio
+    async def test_a_half_built_kb_is_completed_on_the_next_call(self) -> None:
+        graph = _KbGraph()
+        graph.apps["kb-1"] = {"id": "kb-1", "createdBy": "user-1", "orgId": "org-1", "type": "KB"}
+        graph.edges[(CollectionNames.ORG_APP_RELATION.value, "org-1", "kb-1")] = {}
+        svc = _service_on(graph)
+
+        result = await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        assert result["id"] == "kb-1"
+        assert list(graph.apps) == ["kb-1"]
+        assert _kb_edges(graph, "kb-1") == _ALL_KB_EDGES
+
+    @pytest.mark.asyncio
+    async def test_a_complete_kb_keeps_its_edges_as_they_are(self) -> None:
+        """The providers answer None to a failed edge read as well as to a missing edge,
+        so the repair must never decide from a read: it writes create-only."""
+        graph = _KbGraph()
+        graph.apps["kb-1"] = {"id": "kb-1", "createdBy": "user-1", "orgId": "org-1", "type": "KB"}
+        graph.edges[(CollectionNames.PERMISSION.value, "user-key", "kb-1")] = {"role": "OWNER", "createdAtTimestamp": 1}
+        graph.edges[(CollectionNames.ORG_APP_RELATION.value, "org-1", "kb-1")] = {"createdAtTimestamp": 1}
+        graph.edges[(CollectionNames.USER_APP_RELATION.value, "user-key", "kb-1")] = {
+            "syncState": "COMPLETED", "isExternalUser": False, "sourceUserId": "src-1", "createdAtTimestamp": 1,
+        }
+        before = {key: dict(edge) for key, edge in graph.edges.items()}
+        svc = _service_on(graph)
+
+        result = await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        assert result["id"] == "kb-1"
+        assert graph.edges == before
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_is_raised_and_adds_no_second_kb(self) -> None:
+        """The providers answer [] to a failed lookup unless told to raise; read as "no
+        knowledge base", that minted a second App and acknowledged the event."""
+        graph = _KbGraph(lookup_fails=True)
+        graph.apps["kb-1"] = {"id": "kb-1", "createdBy": "user-1", "orgId": "org-1", "type": "KB"}
+        svc = _service_on(graph)
+
+        with pytest.raises(RuntimeError, match="LockAcquisitionTimeout"):
+            await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+        assert list(graph.apps) == ["kb-1"]
+
+        graph.get_user_by_email = AsyncMock(return_value=None)
+        graph.get_document = AsyncMock(return_value={"_key": "org-1", "accountType": "enterprise"})
+        graph.batch_upsert_nodes = AsyncMock()
+        graph.batch_create_edges = AsyncMock()
+        svc._adopt_existing_person = AsyncMock()
+        payload = {"userId": "user-1", "orgId": "org-1", "email": "a@b.co", "syncAction": "none"}
+        assert await svc.process_event("userAdded", payload) is False
+        assert list(graph.apps) == ["kb-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_user_lookup_mints_no_second_user_and_fails_the_event(self) -> None:
+        """get_user_by_email answers None to a failed read unless told to raise; read as
+        "nobody", that minted a second user and healed the knowledge base from its id."""
+        graph = _KbGraph(user_lookup_fails=True)
+        graph.users["u-key"] = {"id": "u-key", "userId": "user-1", "orgId": "org-1", "email": "a@b.co"}
+        graph.apps["kb-1"] = {"id": "kb-1", "createdBy": "user-1", "orgId": "org-1", "type": "KB"}
+        svc = _service_on(graph)
+        svc._adopt_existing_person = AsyncMock()
+
+        payload = {"userId": "user-1", "orgId": "org-1", "email": "a@b.co", "syncAction": "none"}
+        assert await svc.process_event("userAdded", payload) is False
+        assert list(graph.users) == ["u-key"]
+        assert {from_id for _, from_id, to_id in graph.edges if to_id == "kb-1"} <= {"u-key"}
+
+    @pytest.mark.asyncio
+    async def test_every_knowledge_base_of_the_user_is_repaired(self) -> None:
+        """The lookup is unordered and matches every KB of the user, so repairing only
+        the first could skip the half-built one on a redelivery."""
+        graph = _KbGraph()
+        for kb in ("kb-1", "kb-2"):
+            graph.apps[kb] = {"id": kb, "createdBy": "user-1", "orgId": "org-1", "type": "KB"}
+        for collection, from_id in _ALL_KB_EDGES:
+            graph.edges[(collection, from_id, "kb-1")] = {"createdAtTimestamp": 1}
+        svc = _service_on(graph)
+
+        await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        assert _kb_edges(graph, "kb-1") == _ALL_KB_EDGES
+        assert _kb_edges(graph, "kb-2") == _ALL_KB_EDGES
+
+    @pytest.mark.asyncio
+    async def test_a_failed_repair_is_raised_and_fails_the_user_event(self) -> None:
+        """Swallowed, the event is acknowledged with the knowledge base still incomplete."""
+        svc = _make_service()
+        gp = svc.graph_provider
+        gp.get_nodes_by_filters = AsyncMock(return_value=[{"id": "kb-1", "isDeleted": False}])
+        gp.create_edges_if_absent = AsyncMock(side_effect=RuntimeError("org node unavailable"))
+        with pytest.raises(RuntimeError, match="org node unavailable"):
+            await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+
+        gp.get_user_by_email = AsyncMock(return_value=None)
+        gp.get_document = AsyncMock(return_value={"_key": "org-1", "accountType": "enterprise"})
+        svc._adopt_existing_person = AsyncMock()
+        payload = {"userId": "user-1", "orgId": "org-1", "email": "a@b.co", "syncAction": "none"}
+        assert await svc.process_event("userAdded", payload) is False
+
+
+# ===================================================================
+# __handle_sync_event
+# ===================================================================
+
+class TestHandleSyncEventCoverage:
+
+    @pytest.mark.asyncio
+    async def test_sync_event_success(self):
+        svc = _make_service()
+        result = await svc._handle_sync_event(
+            "gmail.start", {"orgId": "org-1"}
+        )
+        assert result is True
+        svc.app_container.messaging_producer.send_message.assert_awaited_once()
+        call_kwargs = svc.app_container.messaging_producer.send_message.call_args[1]
+        assert call_kwargs["topic"] == "sync-events"
+        msg = call_kwargs["message"]
+        assert msg["eventType"] == "gmail.start"
+        assert msg["payload"] == {"orgId": "org-1"}
+        assert "timestamp" in msg
+
+    @pytest.mark.asyncio
+    async def test_sync_event_exception(self):
+        svc = _make_service()
+        svc.app_container.messaging_producer.send_message = AsyncMock(
+            side_effect=Exception("send error")
+        )
+        result = await svc._handle_sync_event(
+            "gmail.start", {"orgId": "org-1"}
+        )
+        assert result is False
+
+
+# ===================================================================
+# __handle_user_updated - additional paths
+# ===================================================================
+
+class TestHandleUserUpdatedExtended:
+
+    @pytest.mark.asyncio
+    async def test_user_updated_with_optional_fields(self):
+        svc = _make_service()
+        existing = {"id": "key1", "_key": "key1"}
+        svc.graph_provider.get_user_by_user_id = AsyncMock(return_value=existing)
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+
+        payload = {
+            "userId": "u1",
+            "orgId": "org-1",
+            "email": "user@test.com",
+            "fullName": "Full Name",
+            "firstName": "First",
+            "middleName": "Middle",
+            "lastName": "Last",
+            "designation": "Engineer",
+            "businessPhones": ["+1234567890"],
+        }
+        result = await svc.process_event("userUpdated", payload)
+        assert result is True
+        # Verify optional fields were included in the upsert
+        call_args = svc.graph_provider.batch_upsert_nodes.call_args[0][0][0]
+        assert call_args["fullName"] == "Full Name"
+        assert call_args["firstName"] == "First"
+
+    @pytest.mark.asyncio
+    async def test_user_updated_exception(self):
+        svc = _make_service()
+        svc.graph_provider.get_user_by_user_id = AsyncMock(
+            side_effect=Exception("DB error")
+        )
+        result = await svc.process_event(
+            "userUpdated",
+            {"userId": "u1", "orgId": "org-1", "email": "user@test.com"},
+        )
+        assert result is False
+
+
+# ===================================================================
+# __handle_user_deleted - exception
+# ===================================================================
+
+class TestHandleUserDeletedExtended:
+
+    @pytest.mark.asyncio
+    async def test_user_deleted_exception(self):
+        svc = _make_service()
+        svc.graph_provider.get_entity_id_by_email = AsyncMock(
+            side_effect=Exception("DB error")
+        )
+        result = await svc.process_event(
+            "userDeleted", {"email": "user@test.com", "orgId": "org-1"}
+        )
+        assert result is False
+
+
+# ===================================================================
+# __handle_app_enabled - additional paths
+# ===================================================================
+
+class TestHandleAppEnabledExtended:
+
+    @pytest.mark.asyncio
+    async def test_app_enabled_exception(self):
+        svc = _make_service()
+        svc.graph_provider.get_document = AsyncMock(
+            side_effect=Exception("DB error")
+        )
+        result = await svc.process_event(
+            "appEnabled",
+            {"orgId": "org-1", "apps": ["Gmail"], "syncAction": "immediate"},
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_app_enabled_multiple_apps(self):
+        svc = _make_service()
+        svc.graph_provider.get_document = AsyncMock(
+            return_value={"accountType": "ENTERPRISE"}
+        )
+        svc._handle_sync_event = AsyncMock(return_value=True)
+
+        result = await svc.process_event(
+            "appEnabled",
+            {
+                "orgId": "org-1",
+                "apps": ["Gmail", "Drive", "Calendar"],
+                "syncAction": "immediate",
+                "connectorId": "c1",
+                "scope": "personal",
+                "fullSync": True,
+            },
+        )
+        assert result is True
+        assert svc._handle_sync_event.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_app_enabled_with_all_params(self):
+        svc = _make_service()
+        svc.graph_provider.get_document = AsyncMock(
+            return_value={"accountType": "ENTERPRISE"}
+        )
+        svc._handle_sync_event = AsyncMock(return_value=True)
+
+        result = await svc.process_event(
+            "appEnabled",
+            {
+                "orgId": "org-1",
+                "apps": ["Gmail"],
+                "syncAction": "immediate",
+                "connectorId": "conn-1",
+                "scope": "team",
+                "fullSync": True,
+            },
+        )
+        assert result is True
+        call_kwargs = svc._handle_sync_event.call_args[1]
+        assert call_kwargs["value"]["connectorId"] == "conn-1"
+        assert call_kwargs["value"]["scope"] == "team"
+        assert call_kwargs["value"]["fullSync"] is True
+
+
+# ===================================================================
+# __handle_app_disabled - cancel sync paths
+# ===================================================================
+
+class TestHandleAppDisabledExtended:
+
+    @pytest.mark.asyncio
+    async def test_app_disabled_cancel_sync_success(self):
+        svc = _make_service()
+        svc.graph_provider.get_document = AsyncMock(
+            return_value={
+                "name": "Gmail",
+                "type": "gmail",
+                "appGroup": "Google",
+                "createdAtTimestamp": 1000,
+            }
+        )
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+
+        with patch("app.services.messaging.kafka.handlers.entity.get_coordinator") as _gc_mock_stm:
+
+            mock_stm = _gc_mock_stm.return_value
+            mock_stm.request_stop = AsyncMock()
+            result = await svc.process_event(
+                "appDisabled",
+                {"orgId": "org-1", "apps": ["Gmail"], "connectorId": "c1"},
+            )
+            assert result is True
+            mock_stm.request_stop.assert_awaited_once_with("c1")
+
+    @pytest.mark.asyncio
+    async def test_app_disabled_cancel_sync_exception(self):
+        svc = _make_service()
+        svc.graph_provider.get_document = AsyncMock(
+            return_value={
+                "name": "Gmail",
+                "type": "gmail",
+                "appGroup": "Google",
+                "createdAtTimestamp": 1000,
+            }
+        )
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+
+        with patch("app.services.messaging.kafka.handlers.entity.get_coordinator") as _gc_mock_stm:
+
+            mock_stm = _gc_mock_stm.return_value
+            mock_stm.request_stop = AsyncMock(
+                side_effect=Exception("cancel failed")
+            )
+            result = await svc.process_event(
+                "appDisabled",
+                {"orgId": "org-1", "apps": ["Gmail"], "connectorId": "c1"},
+            )
+            # Should still succeed even if cancel fails
+            assert result is True
+
+
+# ===================================================================
+# __handle_org_created - BUSINESS account type
+# ===================================================================
+
+class TestOrgCreatedBusinessAccount:
+
+    @pytest.mark.asyncio
+    async def test_business_account_maps_to_enterprise(self):
+        svc = _make_service()
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+        svc.graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc._create_kb_connector_app_instance = AsyncMock(return_value=None)
+
+        # AccountType.BUSINESS.value is "business" (lowercase)
+        result = await svc.process_event(
+            "orgCreated",
+            {
+                "orgId": "org-1",
+                "accountType": "business",
+                "registeredName": "Business Org",
+            },
+        )
+        assert result is True
+        org_nodes = [
+            c[0][0][0]
+            for c in svc.graph_provider.batch_upsert_nodes.call_args_list
+            if len(c[0]) >= 2 and c[0][1] == CollectionNames.ORGS.value
+        ]
+        assert org_nodes, "expected batch_upsert_nodes for ORGS"
+        call_data = org_nodes[0]
+        assert call_data["accountType"] == AccountType.ENTERPRISE.value
+
+
+# ===================================================================
+# __get_or_create_knowledge_base - creation path (KB refactor)
+# ===================================================================
+
+class TestGetOrCreateKnowledgeBaseCreationActive:
+
+    @pytest.mark.asyncio
+    async def test_rollback_on_kb_upsert_failure(self):
+        """A failed KB app write rolls back the transaction and is raised, so the
+        user event is not acknowledged with no knowledge base."""
+        svc = _make_service()
+        svc.graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc.graph_provider.begin_transaction = AsyncMock(return_value="txn1")
+        svc.graph_provider.batch_upsert_nodes = AsyncMock(side_effect=RuntimeError("upsert failed"))
+        svc.graph_provider.rollback_transaction = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="upsert failed"):
+            await svc._get_or_create_knowledge_base("user-key", "user-1", "org-1")
+        svc.graph_provider.rollback_transaction.assert_awaited_once_with("txn1")
+
+    @pytest.mark.asyncio
+    async def test_connector_registration_failure_still_returns_kb(self):
+        """KB app is created even when runtime connector registration fails."""
+        svc = _make_service()
+        svc.graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc.graph_provider.begin_transaction = AsyncMock(return_value="txn1")
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+        svc.graph_provider.batch_create_edges = AsyncMock()
+        svc.graph_provider.commit_transaction = AsyncMock()
+        svc.app_container.data_store = AsyncMock(return_value=AsyncMock())
+        svc.app_container.connector_notification_service.return_value = MagicMock()
+        svc.app_container.connectors_map = {}
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.ConnectorFactory.create_and_start_sync",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("connector start failed"),
+        ):
+            result = await svc._get_or_create_knowledge_base(
+                "user-key", "user-1", "org-1"
+            )
+
+        assert result.get("success") is True
+        assert "kb_id" in result
+        kb_data = svc.graph_provider.batch_upsert_nodes.call_args[0][0][0]
+        assert kb_data["vectorMembershipBackfilled"] is True
+        svc.logger.warning.assert_called()
+
+
+# ===================================================================
+# __get_or_create_knowledge_base - edge cases
+# ===================================================================
+
+@pytest.mark.skip(reason="Method __create_kb_connector_app_instance removed - KB creation now per-user, not per-org")
+class TestGetOrCreateKBEdgeCases:
+
+    @pytest.mark.asyncio
+    async def test_empty_user_id_returns_empty(self):
+        svc = _make_service()
+        result = await svc._get_or_create_knowledge_base(
+            "user-key", "", "org-1"
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_org_id_returns_empty(self):
+        svc = _make_service()
+        result = await svc._get_or_create_knowledge_base(
+            "user-key", "user-1", ""
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_empty(self):
+        svc = _make_service()
+        svc.graph_provider.get_nodes_by_filters = AsyncMock(
+            side_effect=Exception("DB error")
+        )
+        result = await svc._get_or_create_knowledge_base(
+            "user-key", "user-1", "org-1"
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_existing_kbs_filters_deleted(self):
+        svc = _make_service()
+        svc.graph_provider.get_nodes_by_filters = AsyncMock(
+            return_value=[
+                {"id": "kb-1", "isDeleted": True},
+                {"id": "kb-2", "isDeleted": False},
+            ]
+        )
+        result = await svc._get_or_create_knowledge_base(
+            "user-key", "user-1", "org-1"
+        )
+        # Should return the non-deleted KB
+        assert result["id"] == "kb-2"
+
+    @pytest.mark.asyncio
+    async def test_kb_app_not_found_returns_empty(self):
+        svc = _make_service()
+        svc.graph_provider.get_nodes_by_filters = AsyncMock(return_value=[])
+        svc._get_or_create_kb_app_for_org = AsyncMock(
+            return_value=None
+        )
+        result = await svc._get_or_create_knowledge_base(
+            "user-key", "user-1", "org-1"
+        )
+        assert result == {}
+
+
+# ===================================================================
+# __create_kb_connector_app_instance - edge cases
+# ===================================================================
+
+@pytest.mark.skip(reason="Method __create_kb_connector_app_instance removed - KB creation now per-user, not per-org")
+class TestCreateKbConnectorAppInstanceEdgeCases:
+
+    @pytest.mark.asyncio
+    async def test_no_connector_metadata(self):
+        svc = _make_service()
+        svc.graph_provider.get_org_apps = AsyncMock(return_value=[])
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.KnowledgeBaseConnector",
+            create=True,
+        ) as mock_cls:
+            # No _connector_metadata attribute
+            if hasattr(mock_cls, '_connector_metadata'):
+                delattr(mock_cls, '_connector_metadata')
+            mock_cls._connector_metadata = None
+            del mock_cls._connector_metadata  # Force hasattr to return False
+
+            result = await svc._create_kb_connector_app_instance("org-1")
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_connector_factory_returns_none(self):
+        svc = _make_service()
+        svc.graph_provider.get_org_apps = AsyncMock(return_value=[])
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+        svc.graph_provider.batch_create_edges = AsyncMock()
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.KnowledgeBaseConnector",
+            create=True,
+        ) as mock_cls:
+            mock_cls._connector_metadata = {"name": "KB", "appGroup": "Local"}
+            with patch(
+                "app.services.messaging.kafka.handlers.entity.KB_CONNECTOR_NAME",
+                "KB",
+                create=True,
+            ):
+                with patch(
+                    "app.services.messaging.kafka.handlers.entity.ConnectorFactory"
+                ) as mock_factory:
+                    mock_factory.create_and_start_sync = AsyncMock(return_value=None)
+                    result = await svc._create_kb_connector_app_instance("org-1", "u1")
+                    # Should still return the instance_document
+                    assert result is not None
+                    assert result["isActive"] is True
+
+    @pytest.mark.asyncio
+    async def test_created_by_defaults_to_system(self):
+        svc = _make_service()
+        svc.graph_provider.get_org_apps = AsyncMock(return_value=[])
+        svc.graph_provider.batch_upsert_nodes = AsyncMock()
+        svc.graph_provider.batch_create_edges = AsyncMock()
+
+        with patch(
+            "app.services.messaging.kafka.handlers.entity.KnowledgeBaseConnector",
+            create=True,
+        ) as mock_cls:
+            mock_cls._connector_metadata = {"name": "KB", "appGroup": "Local"}
+            with patch(
+                "app.services.messaging.kafka.handlers.entity.KB_CONNECTOR_NAME",
+                "KB",
+                create=True,
+            ):
+                with patch(
+                    "app.services.messaging.kafka.handlers.entity.ConnectorFactory"
+                ) as mock_factory:
+                    mock_factory.create_and_start_sync = AsyncMock(return_value=None)
+                    # Pass no created_by_user_id
+                    result = await svc._create_kb_connector_app_instance("org-1", None)
+                    assert result is not None
+                    assert result["createdBy"] == "system"
+
+
+# ===================================================================
+# userAdded — link to running connectors
+# ===================================================================
+
+def _connector(org_id: str = "org-1", steps: tuple = ("_sync_users",), link=None) -> MagicMock:
+    c = MagicMock()
+    c.data_entities_processor.org_id = org_id
+    c.user_link_steps = steps
+    c.link_new_users = link or AsyncMock()
+    return c
+
+
+def _link_service(connectors: dict, app: dict | None = None) -> EntityEventService:
+    svc = _make_entity_service(app_container=SimpleNamespace(connectors_map=connectors, messaging_producer=None))
+    svc.graph_provider.get_document = AsyncMock(return_value={"isActive": True} if app is None else app)
+    return svc
+
+
+@pytest.fixture
+def no_debounce() -> Iterator[None]:
+    with patch("app.services.messaging.kafka.handlers.entity._LINK_DEBOUNCE_SEC", 0), \
+            patch("app.services.messaging.kafka.handlers.entity.get_coordinator", return_value=None):
+        yield
+
+
+async def _drain(svc) -> None:
+    await asyncio.gather(*[s["task"] for s in svc._link_state.values() if s["task"]])
+
+
+class TestUserAddedConnectorLink:
+    @pytest.mark.asyncio
+    async def test_added_user_schedules_link_pass(self) -> None:
+        svc = _make_entity_service()
+        svc._adopt_existing_person = AsyncMock()
+        svc._get_or_create_knowledge_base = AsyncMock()
+        svc._get_or_create_all_team_and_add_user = AsyncMock()
+        svc._schedule_connector_link = MagicMock()
+        svc.graph_provider.get_user_by_email = AsyncMock(return_value=None)
+        svc.graph_provider.get_document = AsyncMock(return_value={"_key": "org-1"})
+        payload = {"orgId": "org-1", "userId": "u-1", "email": "a@test.com"}
+        assert await svc._handle_user_added(payload) is True
+        svc._schedule_connector_link.assert_called_once_with("org-1")
+
+    @pytest.mark.asyncio
+    async def test_links_only_this_orgs_linking_connectors(self, no_debounce: None) -> None:
+        mine, other, plain = _connector(), _connector(org_id="org-2"), _connector(steps=())
+        svc = _link_service({"c1": mine, "c2": other, "c3": plain})
+        svc._schedule_connector_link("org-1")
+        await _drain(svc)
+        mine.link_new_users.assert_awaited_once()
+        other.link_new_users.assert_not_awaited()
+        plain.link_new_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failing_connector_does_not_stop_the_rest_or_raise(self, no_debounce: None) -> None:
+        bad = _connector(link=AsyncMock(side_effect=RuntimeError("boom")))
+        good = _connector()
+        svc = _link_service({"c1": bad, "c2": good})
+        svc._schedule_connector_link("org-1")
+        await _drain(svc)
+        good.link_new_users.assert_awaited_once()
+        svc.logger.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_burst_is_one_pass_per_connector(self) -> None:
+        c = _connector()
+        svc = _link_service({"c1": c})
+        with patch("app.services.messaging.kafka.handlers.entity._LINK_DEBOUNCE_SEC", 0.05), \
+                patch("app.services.messaging.kafka.handlers.entity.get_coordinator", return_value=None):
+            for _ in range(200):
+                svc._schedule_connector_link("org-1")
+            await _drain(svc)
+        assert c.link_new_users.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_an_add_during_a_pass_gets_one_more_and_never_overlaps(self) -> None:
+        running, overlap, calls = 0, 0, 0
+
+        started = asyncio.Event()
+
+        async def slow() -> None:
+            nonlocal running, overlap, calls
+            running += 1
+            overlap = max(overlap, running)
+            calls += 1
+            started.set()
+            await asyncio.sleep(0.1)
+            running -= 1
+
+        svc = _link_service({"c1": _connector(link=slow)})
+        with patch("app.services.messaging.kafka.handlers.entity._LINK_DEBOUNCE_SEC", 0.02), \
+                patch("app.services.messaging.kafka.handlers.entity.get_coordinator", return_value=None):
+            svc._schedule_connector_link("org-1")
+            await started.wait()  # first pass in flight
+            for _ in range(5):
+                svc._schedule_connector_link("org-1")
+            await _drain(svc)
+        assert (calls, overlap) == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_waits_for_a_running_sync_then_links(self) -> None:
+        c = _connector()
+        svc = _link_service({"c1": c})
+        coordinator = MagicMock()
+        coordinator.is_running = AsyncMock(side_effect=[True, True, False])
+        with patch("app.services.messaging.kafka.handlers.entity._LINK_DEBOUNCE_SEC", 0), \
+                patch("app.services.messaging.kafka.handlers.entity.get_coordinator", return_value=coordinator):
+            svc._schedule_connector_link("org-1")
+            await _drain(svc)
+        assert c.link_new_users.await_count == 1
+        assert coordinator.is_running.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_gives_up_on_a_sync_that_never_ends(self) -> None:
+        c = _connector()
+        svc = _link_service({"c1": c})
+        coordinator = MagicMock()
+        coordinator.is_running = AsyncMock(return_value=True)
+        with patch("app.services.messaging.kafka.handlers.entity._LINK_DEBOUNCE_SEC", 0), \
+                patch("app.services.messaging.kafka.handlers.entity._LINK_MAX_DEFERRALS", 3), \
+                patch("app.services.messaging.kafka.handlers.entity.get_coordinator", return_value=coordinator):
+            svc._schedule_connector_link("org-1")
+            await _drain(svc)
+        c.link_new_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("app", [None, {"isActive": False}, {"isActive": True, "status": "DELETING"}])
+    async def test_skipped_for_a_missing_off_or_deleting_connector(self, no_debounce: None, app: dict | None) -> None:
+        c = _connector()
+        svc = _link_service({"c1": c})
+        svc.graph_provider.get_document = AsyncMock(return_value=app)
+        svc._schedule_connector_link("org-1")
+        await _drain(svc)
+        c.link_new_users.assert_not_awaited()
+        svc.graph_provider.batch_upsert_nodes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deferred_while_a_sync_holds_the_connector(self, no_debounce: None) -> None:
+        c = _connector()
+        svc = _link_service({"c1": c})
+        async with connector_sync_lock("c1"):
+            assert await svc._link_connector("c1") is False
+        c.link_new_users.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_sync_admitted_during_a_pass_runs_after_it(self, no_debounce: None) -> None:
+        events: list[str] = []
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def link() -> None:
+            events.append("pass starts")
+            started.set()
+            await release.wait()
+            events.append("pass ends")
+
+        c = _connector(link=link)
+        c.run_sync = AsyncMock(side_effect=lambda: events.append("sync"))
+        svc = _link_service({"c1": c})
+        link_pass = asyncio.create_task(svc._link_connector("c1"))
+        await started.wait()
+        sync = asyncio.create_task(_run_sync_alone(c, "c1"))
+        await asyncio.sleep(0.01)
+        assert events == ["pass starts"]
+        release.set()
+        await asyncio.gather(link_pass, sync)
+        assert events == ["pass starts", "pass ends", "sync"]

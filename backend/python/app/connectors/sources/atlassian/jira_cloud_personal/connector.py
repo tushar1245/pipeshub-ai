@@ -1,0 +1,592 @@
+"""Jira Cloud Personal connector — single-user sync without permission APIs.
+
+Subclasses ``JiraConnector`` (Jira Cloud) and overrides only the user / permission
+plumbing so the personal variant:
+
+  * Never lists Jira users, groups, application roles, or project permission
+    schemes (no ``/rest/api/3/users``, ``/group``, ``/applicationrole``,
+    ``/project/{key}/permissionscheme`` calls).
+  * Gives every project an inherit edge to the app and no grant of its own.
+    The creator passes the connector gate (the user-app link written by
+    ``ensure_connector_group_permission``), and issues and attachments
+    already inherit from the project.
+
+All issue fetching / ADF parsing / attachment handling / streaming / reindexing
+logic is inherited unchanged from the workspace connector.
+
+A personal account has no audit log, so every sync finds deleted issues with the
+workspace connector's id comparison (``_remove_issues_gone_from_jira``). Jira
+answers 404 for an issue or project this account can no longer see just as for
+a deleted one, and both are removed, a project that left the account's view
+included (``_remove_projects_out_of_view``).
+"""
+
+from logging import Logger
+from typing import Any, Optional
+from uuid import uuid4
+
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.arangodb import (
+    AppGroups,
+    Connectors,
+    PermissionModel,
+)
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.connector.connector_service import BaseConnector, ConnectorInitError
+from app.connectors.core.base.data_processor.data_source_entities_processor import (
+    DataSourceEntitiesProcessor,
+)
+from app.connectors.core.base.data_store.data_store import DataStoreProvider
+from app.connectors.core.constants import CONNECTOR_EMAIL_IDENTITY_INFO, IconPaths
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import (
+    AuthField,
+    CommonFields,
+    ConnectorBuilder,
+    ConnectorScope,
+    DocumentationLink,
+    SyncStrategy,
+)
+from app.connectors.core.registry.filters import (
+    FilterCategory,
+    FilterField,
+    FilterOperatorType,
+    FilterType,
+    IndexingFilterKey,
+    OptionSourceType,
+    SyncFilterKey,
+    load_connector_filters,
+)
+from app.connectors.sources.atlassian.core.apps import JiraCloudPersonalApp
+from app.connectors.sources.atlassian.core.oauth import AtlassianScope
+from app.connectors.sources.atlassian.jira_cloud.connector import (
+    AUTHORIZE_URL,
+    TOKEN_URL,
+    JiraConnector,
+)
+from app.models.entities import AppUser, RecordGroup, RecordGroupType
+from app.models.permission import Permission
+from app.services.notification.types import NotificationSeverity, NotificationType
+
+
+def _excludes(project_keys_operator: FilterOperatorType | None) -> bool:
+    """Whether the project filter's operator leaves the listed keys out instead of keeping only them."""
+    if not project_keys_operator:
+        return False
+    value = (
+        project_keys_operator.value
+        if hasattr(project_keys_operator, "value")
+        else str(project_keys_operator)
+    )
+    return value == "not_in"
+
+
+@(
+    ConnectorBuilder("Jira Cloud Personal")
+    .in_group(AppGroups.ATLASSIAN.value)
+    .with_description(
+        "Sync Jira Cloud issues visible to your account into your personal workspace"
+    )
+    .with_categories(["IT Service Management", "Storage"])
+    .with_scopes([ConnectorScope.PERSONAL.value])
+    .with_permission_model(PermissionModel.APP_LEVEL)
+    .with_auth(
+        [
+            AuthBuilder.type(AuthType.OAUTH).oauth(
+                connector_name="Jira Cloud Personal",
+                authorize_url=AUTHORIZE_URL,
+                token_url=TOKEN_URL,
+                redirect_uri="connectors/oauth/callback/JiraCloudPersonal",
+                scopes=OAuthScopeConfig(
+                    personal_sync=AtlassianScope.get_jira_personal_read_access(),
+                    team_sync=AtlassianScope.get_jira_personal_read_access(),
+                    agent=[],
+                ),
+                fields=[
+                    AuthField(
+                        name="clientId",
+                        display_name="Application (Client) ID",
+                        placeholder="Enter your Atlassian Cloud Application ID",
+                        description="The Application (Client) ID from Atlassian Developer Console",
+                    ),
+                    AuthField(
+                        name="clientSecret",
+                        display_name="Client Secret",
+                        placeholder="Enter your Atlassian Cloud Client Secret",
+                        description="The Client Secret from Atlassian Developer Console",
+                        field_type="PASSWORD",
+                        is_secret=True,
+                    ),
+                ],
+                icon_path=IconPaths.connector_icon(Connectors.JIRA_CLOUD_PERSONAL.value),
+                app_group="Atlassian",
+                app_description="OAuth application for accessing Jira Cloud as a single user",
+                app_categories=["IT Service Management", "Storage"],
+            ),
+            AuthBuilder.type(AuthType.API_TOKEN).fields(
+                [
+                    AuthField(
+                        name="baseUrl",
+                        display_name="Base URL",
+                        placeholder="https://yourcompany.atlassian.net",
+                        description="The base URL of your Atlassian instance",
+                        field_type="URL",
+                        required=True,
+                        max_length=2000,
+                        is_secret=False,
+                    ),
+                    AuthField(
+                        name="email",
+                        display_name="Email",
+                        placeholder="your-email@company.com",
+                        description="Your Atlassian account email",
+                        field_type="TEXT",
+                        required=True,
+                        max_length=500,
+                        is_secret=False,
+                    ),
+                    AuthField(
+                        name="apiToken",
+                        display_name="API Token",
+                        placeholder="your-api-token",
+                        description="API token from Atlassian account settings",
+                        field_type="PASSWORD",
+                        required=True,
+                        max_length=2000,
+                        is_secret=True,
+                    ),
+                ]
+            ),
+        ]
+    )
+    .with_info(
+        "Syncs only projects and issues visible to the credentials you provide. "
+        "Access is limited to you — the user who created this connector — without "
+        "reading Jira permission schemes, groups, or other users."
+        + "\n\n"
+        + CONNECTOR_EMAIL_IDENTITY_INFO
+    )
+    .configure(
+        lambda builder: builder.with_icon(
+            IconPaths.connector_icon(Connectors.JIRA_CLOUD_PERSONAL.value)
+        )
+        .with_realtime_support(False)
+        .add_documentation_link(
+            DocumentationLink(
+                "Jira Cloud API Setup",
+                "https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/",
+                "setup",
+            )
+        )
+        .add_documentation_link(
+            DocumentationLink(
+                "Pipeshub Documentation",
+                "https://docs.pipeshub.com/connectors/jira/jira",
+                "pipeshub",
+            )
+        )
+        .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
+        .with_scheduled_config(True, 60)
+        .with_sync_support(True)
+        .with_agent_support(False)
+        .add_filter_field(
+            FilterField(
+                name=SyncFilterKey.PROJECT_KEYS.value,
+                display_name="Project Keys",
+                filter_type=FilterType.LIST,
+                category=FilterCategory.SYNC,
+                description="Filter issues by project keys (e.g., PROJ1, PROJ2)",
+                option_source_type=OptionSourceType.DYNAMIC,
+            )
+        )
+        .add_filter_field(
+            CommonFields.modified_date_filter("Filter issues by modification date.")
+        )
+        .add_filter_field(
+            CommonFields.created_date_filter("Filter issues by creation date.")
+        )
+        .add_filter_field(CommonFields.enable_manual_sync_filter())
+        .add_filter_field(
+            FilterField(
+                name=IndexingFilterKey.ISSUES.value,
+                display_name="Index Issues",
+                filter_type=FilterType.BOOLEAN,
+                category=FilterCategory.INDEXING,
+                description="Enable indexing of issues",
+                default_value=True,
+            )
+        )
+        .add_filter_field(
+            FilterField(
+                name=IndexingFilterKey.ISSUE_ATTACHMENTS.value,
+                display_name="Index Issue and comment Attachments",
+                filter_type=FilterType.BOOLEAN,
+                category=FilterCategory.INDEXING,
+                description="Enable indexing of issue attachments",
+                default_value=True,
+            )
+        )
+    )
+    .build_decorator()
+)
+class JiraCloudPersonalConnector(JiraConnector):
+    """Personal Jira Cloud: creator-only permissions, no user/group/role/scheme API calls."""
+
+    _enforces_issue_security = False
+
+    def __init__(
+        self,
+        logger: Logger,
+        data_entities_processor: DataSourceEntitiesProcessor,
+        data_store_provider: DataStoreProvider,
+        config_service: ConfigurationService,
+        connector_id: str,
+        scope: str,
+        created_by: str,
+    ) -> None:
+        super().__init__(
+            logger,
+            data_entities_processor,
+            data_store_provider,
+            config_service,
+            connector_id,
+            scope,
+            created_by,
+        )
+        # Override the parent's JiraApp / Connectors.JIRA defaults so every
+        # downstream RecordGroup / AppUser / TicketRecord / FileRecord built
+        # by inherited helpers is stamped with the personal connector name.
+        # The parent was refactored to use ``self.connector_name`` instead of
+        # the hardcoded ``Connectors.JIRA`` constant for exactly this reason.
+        self.app = JiraCloudPersonalApp(connector_id)
+        self.connector_name = self.app.get_app_name()
+
+    async def run_sync(self) -> None:
+        """Sync projects and issues visible to the configured user; no permission APIs."""
+        self._kept_unread_access = False
+        self._kept_after_refusal = []
+        try:
+            # Init is done by event_service / setup before run_sync is scheduled
+            # (same as Confluence Cloud). Do not re-init here.
+            if not self.data_source:
+                init_error = RuntimeError(
+                    f"Jira Cloud Personal connector {self.connector_id} not initialized. "
+                    "Call init() first."
+                )
+                init_error._notification_sent = True
+                raise init_error
+
+            # Force a fresh ConnectorGroup upsert each run so re-runs after the
+            # creator email is rotated pick up the new identity instead of
+            # reusing a stale cached permission.
+            self._connector_group_permission = None
+
+            if not self.creator_email and self.created_by:
+                try:
+                    creator = await self.data_entities_processor.get_user_by_user_id(
+                        self.created_by
+                    )
+                    if creator and getattr(creator, "email", None):
+                        self.creator_email = creator.email
+                except Exception as e:
+                    self.logger.warning(
+                        "Jira Cloud Personal connector %s: could not resolve creator "
+                        "email for created_by %s: %s",
+                        self.connector_id,
+                        self.created_by,
+                        e,
+                    )
+
+            if not self.creator_email:
+                self.logger.warning(
+                    "Jira Cloud Personal connector %s: no creator email — "
+                    "projects will sync without user permissions",
+                    self.connector_id,
+                )
+
+            # The creator's user-app link is the gate. Projects inherit from the
+            # app, so this does not stamp a grant on them.
+            await self.ensure_creator_user_app_relation()
+
+            self.sync_filters, self.indexing_filters = await load_connector_filters(
+                self.config_service,
+                "jira",
+                self.connector_id,
+                self.logger,
+            )
+
+            allowed_keys = None
+            project_keys_operator = None
+            if self.sync_filters:
+                project_keys_filter = self.sync_filters.get(SyncFilterKey.PROJECT_KEYS)
+                if project_keys_filter:
+                    allowed_keys = project_keys_filter.get_value(default=[])
+                    project_keys_operator = project_keys_filter.get_operator()
+                    if allowed_keys:
+                        action = "Excluding" if _excludes(project_keys_operator) else "Including"
+                        self.logger.info(
+                            "Project keys filter: %s projects: %s", action, allowed_keys
+                        )
+                    else:
+                        allowed_keys = None
+                        self.logger.info(
+                            "Project keys filter is empty — syncing all visible projects (Cloud Personal)"
+                        )
+
+            projects, _raw_projects = await self._fetch_projects(
+                allowed_keys, project_keys_operator, []
+            )
+            self._synced_project_keys = {group.short_name for group, _ in projects if group.short_name}
+
+            await self.data_entities_processor.on_new_record_groups(projects)
+
+            last_sync_time = await self._get_issues_sync_checkpoint()
+            sync_stats = await self._sync_all_project_issues(projects, [], last_sync_time)
+            failed_statuses = sync_stats.get("failed_project_statuses") or {}
+            for key in sync_stats.get("failed_project_keys") or []:
+                # Issues not read would look gone to a full sync's unlink.
+                self._note_unread(failed_statuses.get(key), ("project_issues", key))
+            await self._note_kept_after_refusal(projects)
+
+            await self._update_issues_sync_checkpoint(sync_stats, len(projects))
+
+            await self._remove_issues_no_longer_visible(
+                [group for group, _ in projects],
+                set(sync_stats.get("failed_project_keys") or []),
+                allowed_keys,
+                project_keys_operator,
+            )
+
+            # Backfill placeholder ancestors that out-of-scope sync filters left
+            # unreconciled (metadata only; they remain non-indexed stubs).
+            await self._sweep_placeholder_records(
+                synced_project_ids={p.external_group_id for p, _ in projects},
+                full_sync_project_ids=sync_stats.get("full_sync_project_ids") or set(),
+            )
+
+            # Notify the creator when any project failed issue sync (include keys).
+            failed_keys = sync_stats.get("failed_project_keys") or []
+            if failed_keys:
+                preview = ", ".join(failed_keys[:10])
+                if len(failed_keys) > 10:
+                    preview = f"{preview}, and {len(failed_keys) - 10} more"
+                self.logger.warning(
+                    "⚠️ Jira Cloud Personal sync: %s/%s project(s) failed to sync issues: %s",
+                    len(failed_keys), len(projects), preview,
+                )
+                await self.notify(
+                    type=NotificationType.CONNECTOR_SYNC_ERROR,
+                    severity=NotificationSeverity.ERROR,
+                    title=self._notification_title("couldn't sync some projects"),
+                    message=(
+                        f"Couldn't sync issues for {len(failed_keys)} project(s): {preview}. "
+                        "Retry sync; check Jira access if it keeps failing."
+                    ),
+                )
+
+            self.logger.info(
+                "Jira Cloud Personal sync completed. Total: %s issues "
+                "(New: %s, Updated: %s)",
+                sync_stats["total_synced"],
+                sync_stats["new_count"],
+                sync_stats["updated_count"],
+            )
+
+        except Exception as e:
+            self.logger.error(
+                "Error during Jira Cloud Personal sync: %s", e, exc_info=True
+            )
+            # Skip if init/multi-site already notified for this failure.
+            if not isinstance(e, ConnectorInitError) and not getattr(e, "_notification_sent", False):
+                await self.notify(
+                    type=NotificationType.CONNECTOR_SYNC_ERROR,
+                    severity=NotificationSeverity.ERROR,
+                    title=self._notification_title("sync failed"),
+                    message=(
+                        f"The sync stopped due to an error: {str(e)[:200]}. Recent Jira changes "
+                        "may not be reflected yet. Run the sync again; if it keeps failing, "
+                        "check the connector's configuration."
+                    ),
+                )
+            raise
+        finally:
+            self._synced_project_keys = None
+
+    async def _remove_issues_no_longer_visible(
+        self,
+        projects: list[RecordGroup],
+        failed_project_keys: set[str],
+        project_keys: list[str] | None,
+        project_keys_operator: FilterOperatorType | None,
+    ) -> None:
+        """Remove the stored issues this account can no longer see in Jira, deleted or hidden alike.
+
+        ``projects`` are the ones Jira listed in this sync. Those whose issues synced
+        are compared by id; a stored project Jira no longer lists is handled by
+        ``_remove_projects_out_of_view``. Jira answers an expired or revoked token
+        as an anonymous visitor, to whom every project and issue looks gone, so
+        nothing is removed unless Jira first confirms the account.
+        """
+        if not await self._signed_in_to_jira():
+            self.logger.warning(
+                "Jira did not confirm this connector's account, so no issue is removed in this sync. "
+                "If this keeps happening, reconnect the connector."
+            )
+            return
+        try:
+            await self._remove_projects_out_of_view(
+                {project.external_group_id for project in projects}, project_keys, project_keys_operator
+            )
+        except Exception as e:
+            self.logger.warning(
+                "Could not check for projects that left this account's view; retrying next sync: %s", e
+            )
+        await self._remove_issues_gone_from_jira(
+            [project for project in projects if project.short_name not in failed_project_keys]
+        )
+
+    async def _signed_in_to_jira(self) -> bool:
+        """Whether Jira still recognises the account (``GET /myself`` answers 401 to an anonymous visitor)."""
+        try:
+            response = await self._call_with_retry(
+                lambda ds: ds.get_current_user(), ctx="checking the Jira account"
+            )
+        except Exception as e:
+            self.logger.warning("Could not ask Jira which account this connector uses: %s", e)
+            return False
+        if response.status != HttpStatusCode.OK.value:
+            return False
+        profile = self._safe_json_parse(response, "GET /myself")
+        return isinstance(profile, dict) and bool(profile.get("accountId"))
+
+    async def _remove_projects_out_of_view(
+        self,
+        listed_project_ids: set[str],
+        project_keys: list[str] | None,
+        project_keys_operator: FilterOperatorType | None,
+    ) -> None:
+        """Remove the issues of stored projects Jira no longer lists for this account.
+
+        Such a project was deleted, archived, or the account lost access to it. Its
+        issues can't be compared by id (Jira refuses to search a project the account
+        can't see, which would read as a failed listing on every sync), so each one
+        is checked on its own once Jira confirms the project is gone, placeholder
+        ancestors included. A project the project filter leaves out is never touched.
+        """
+        for project_id, project_key in await self._stored_projects():
+            if project_id in listed_project_ids:
+                continue
+            if project_keys and (project_key in project_keys) == _excludes(project_keys_operator):
+                continue
+            try:
+                await self._remove_project_out_of_view(project_id, project_key)
+            except Exception as e:
+                self.logger.warning(
+                    "Could not finish removing project %s, which left this account's view; "
+                    "retrying next sync: %s",
+                    project_key, e,
+                )
+
+    async def _remove_project_out_of_view(self, project_id: str, project_key: str) -> None:
+        response = await self._call_with_retry(
+            lambda ds: ds.get_project(projectIdOrKey=project_id),
+            ctx=f"checking project {project_key}",
+        )
+        if response.status not in (HttpStatusCode.NOT_FOUND.value, HttpStatusCode.GONE.value):
+            self.logger.info(
+                "Project %s is not in Jira's project list, but Jira did not say it is gone (HTTP %s); "
+                "nothing removed",
+                project_key, response.status,
+            )
+            return
+
+        # Cleared before its issues go, so a project that comes back into view is read in full.
+        await self.issues_sync_point.delete_sync_point(f"project_{project_key}")
+        # Placeholders too: no later sync of this project would ever clear them, and one left
+        # behind would keep the project for good.
+        stored = await self._stored_issues(project_id, with_placeholders=True)
+        removed = await self._remove_unlisted_issues(project_key, stored, set())
+        self.logger.info(
+            "Project %s is no longer visible to this account in Jira: removed %d of its %d stored issue(s)",
+            project_key, removed, len(stored),
+        )
+
+        # Anything still stored (an issue Jira still answers for, a delete that failed) keeps the project.
+        if await self.data_entities_processor.get_records_in_record_group(self.connector_id, project_id, 1):
+            return
+        if not await self.data_entities_processor.on_record_group_deleted(project_id, self.connector_id):
+            self.logger.warning("Could not remove the emptied project %s; retrying next sync", project_key)
+
+    async def _fetch_projects(
+        self,
+        project_keys: Optional[list[str]] = None,
+        project_keys_operator: Optional[FilterOperatorType] = None,
+        jira_users: Optional[list[AppUser]] = None,
+    ) -> tuple[list[tuple[RecordGroup, list[Permission]]], list[dict[str, Any]]]:
+        """List projects. Each one inherits from the app and carries no grant.
+
+        Reuses the parent's ``_list_projects_with_filter`` helper for the actual
+        listing + pagination + client-side exclusion. Skips
+        ``_fetch_application_roles_to_groups_mapping`` and
+        ``_fetch_project_permission_scheme`` — both of which require admin-level
+        scopes that the personal flow intentionally does not request.
+        """
+        del jira_users  # unused — personal connector does not sync Jira users
+
+        projects = await self._list_projects_with_filter(
+            project_keys, project_keys_operator
+        )
+
+        # Keeps the creator's user-app link. The returned group permission is
+        # not written on the project: an empty list clears one an older sync stored.
+        if self.creator_email:
+            await self.ensure_creator_user_app_relation()
+
+        record_groups: list[tuple[RecordGroup, list[Permission]]] = []
+        for project in projects:
+            project_id = project.get("id")
+            project_name = project.get("name")
+            project_key = project.get("key")
+
+            record_group = RecordGroup(
+                id=str(uuid4()),
+                org_id=self.data_entities_processor.org_id,
+                external_group_id=project_id,
+                connector_id=self.connector_id,
+                connector_name=self.connector_name,
+                name=project_name,
+                short_name=project_key,
+                group_type=RecordGroupType.PROJECT,
+                web_url=project.get("url"),
+                inherit_permissions=True,
+            )
+
+            record_groups.append((record_group, []))
+
+        return record_groups, projects
+
+    @classmethod
+    async def create_connector(
+        cls,
+        logger: Logger,
+        data_store_provider: DataStoreProvider,
+        config_service: ConfigurationService,
+        connector_id: str,
+        scope: str,
+        created_by: str,
+        data_entities_processor,
+        **kwargs,
+    ) -> BaseConnector:
+        return cls(
+            logger,
+            data_entities_processor,
+            data_store_provider,
+            config_service,
+            connector_id,
+            scope,
+            created_by,
+        )

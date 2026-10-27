@@ -1,0 +1,3324 @@
+import json
+import logging
+import asyncio
+import re
+from datetime import date, datetime
+from http import HTTPStatus
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+from app.connectors.core.constants import IconPaths
+from app.agent_loop_lib.tools.base import ParameterType, Tag, ToolParameter
+from app.agent_loop_lib.tools.decorators import tool
+from app.agents.actions.util.tool_summaries import (
+    args_template,
+    confirmation,
+    entity_summary,
+    list_summary,
+    parse_json_maybe,
+)
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.types import AuthField, DocumentationLink
+from app.connectors.core.registry.tool_builder import (
+    ToolsetBuilder,
+    ToolsetCategory,
+)
+from app.sources.client.microsoft.microsoft import MSGraphClient
+from app.sources.external.microsoft.teams.teams import TeamsDataSource
+
+from msgraph.generated.models.aad_user_conversation_member import AadUserConversationMember
+from msgraph.generated.models.channel import Channel
+from msgraph.generated.models.chat import Chat
+from msgraph.generated.models.chat_type import ChatType
+from msgraph.generated.models.patterned_recurrence import PatternedRecurrence
+from msgraph.generated.models.recurrence_pattern import RecurrencePattern
+from msgraph.generated.models.recurrence_pattern_type import RecurrencePatternType
+from msgraph.generated.models.recurrence_range import RecurrenceRange
+from msgraph.generated.models.recurrence_range_type import RecurrenceRangeType
+
+logger = logging.getLogger(__name__)
+
+
+def _teams_team_label(team: dict) -> str:
+    return team.get("displayName") or team.get("id") or "?"
+
+
+def _teams_channel_label(channel: dict) -> str:
+    return channel.get("displayName") or channel.get("id") or "?"
+
+
+def _teams_meeting_label(meeting: dict) -> str:
+    return meeting.get("subject") or meeting.get("meeting_id") or "?"
+
+
+_GRAPH_STATUS_RE = re.compile(r"\(status (\d{3})\)\s*$")
+_RECONNECT_TEAMS = "Reconnect Teams under Your actions, then try again."
+_GRAPH_STATUS_HINTS = {
+    HTTPStatus.TOO_MANY_REQUESTS: "Microsoft Teams is limiting how fast requests can be made. Wait a minute and try again.",
+    HTTPStatus.UNAUTHORIZED: f"Microsoft did not accept the saved sign-in. {_RECONNECT_TEAMS}",
+    HTTPStatus.FORBIDDEN: (
+        "The signed-in account does not have permission to do this. If it should, reconnect Teams "
+        "under Your actions and approve the requested permissions."
+    ),
+    HTTPStatus.NOT_FOUND: "Check the id, or look it up first with get_teams, get_channels or get_users_list.",
+}
+
+
+def _graph_error(error: str | None, fallback: str) -> str:
+    """Graph's own message plus what to do next, read from the "(status N)" the SDK error ends with."""
+    text = (error or "").strip() or fallback
+    match = _GRAPH_STATUS_RE.search(text)
+    if not match:
+        return text
+    status = int(match.group(1))
+    hint = _GRAPH_STATUS_HINTS.get(status)
+    if hint is None and status >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        hint = "Microsoft Teams is having a temporary problem. Try again in a moment."
+    return f"{text}. {hint}" if hint else text
+
+
+def _coerce_str_list(value: object) -> Optional[list[str]]:
+    """Accept a real list, the JSON-array string the tool schema asks for, or a comma-separated string.
+
+    Returns None when the value cannot be read as a list, so a caller never iterates a string's characters.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            parsed = parse_json_maybe(text)
+            if not isinstance(parsed, list):
+                return None
+            items: list[Any] = parsed
+        else:
+            items = text.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return None
+    return [str(item).strip() for item in items if item is not None and str(item).strip()]
+
+
+def _coerce_dict(value: object) -> Optional[dict[str, Any]]:
+    if isinstance(value, dict):
+        return value
+    parsed = parse_json_maybe(value) if isinstance(value, str) else None
+    return parsed if isinstance(parsed, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+
+class SendChannelMessageInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    message: str = Field(description="Message content to send")
+
+
+class SendUserMessageInput(BaseModel):
+    user_identifier: str = Field(
+        description="User display name, email, user principal name, or user id to send message to"
+    )
+    message: str = Field(description="Message content to send")
+
+
+class GetTeamsInput(BaseModel):
+    top: Optional[int] = Field(default=20, description="Maximum number of teams to return (default 20, max 100)")
+
+
+class GetTeamInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+
+
+class GetChannelsInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    top: Optional[int] = Field(default=50, description="Maximum number of channels to return (default 50, max 200)")
+
+
+class GetChannelMessagesInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    top: Optional[int] = Field(default=20, description="Maximum number of messages to return (default 20, max 100)")
+
+
+class AddReactionInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    message_id: str = Field(description="ID of the Teams message to react to")
+    reaction_type: str = Field(
+        description="Reaction type to add (for example: like, heart, laugh, surprised, sad, angry)"
+    )
+class SearchCalendarEventsInRangeInput(BaseModel):
+    """Schema for searching calendar events by name within a time frame."""
+    keyword: str = Field(
+        description=(
+            "Partial or full name to search for in event subjects. "
+            "Case-insensitive. E.g. 'standup', 'catchup', 'sprint'."
+        ),
+    )
+    start_datetime: str = Field(
+        description="Start of time range (ISO 8601, e.g. '2026-03-01T00:00:00Z').",
+    )
+    end_datetime: str = Field(
+        description="End of time range (ISO 8601, e.g. '2026-03-31T23:59:59Z').",
+    )
+    timezone: str = Field(
+        default="UTC",
+        description="Windows timezone name for returned datetimes. E.g. 'India Standard Time'.",
+    )
+    top: int = Field(
+        default=10,
+        description="Maximum number of results to return (1–50).",
+        ge=1,
+        le=50,
+    )
+
+class ReplyToMessageInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    parent_message_id: str = Field(description="ID of the parent message to reply to")
+    message: str = Field(description="Reply text to post in the message thread")
+
+
+class SendMessageToMultipleChannelsInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_ids: List[str] = Field(description="List of Teams channel IDs to send the same message to")
+    message: str = Field(description="Message text to send to all channels")
+
+
+class SearchMessagesInput(BaseModel):
+    query: str = Field(description="Search text to match in message content")
+    team_id: Optional[str] = Field(default=None, description="Optional Team ID to scope search")
+    channel_id: Optional[str] = Field(default=None, description="Optional Channel ID to scope search")
+    top_per_channel: Optional[int] = Field(default=25, description="Max recent messages scanned per channel (default 25)")
+
+
+# class GetUserConversationsInput(BaseModel):
+#     top: Optional[int] = Field(default=100, description="Maximum number of conversations to return (default 100)")
+
+class GetUserConversationsInput(BaseModel):
+
+    user_identifier: Optional[str] = Field(
+        default=None,
+        description="User display name, email, or user id whose conversation should be fetched"
+    )
+
+    minutes: Optional[int] = Field(
+        default=None,
+        description="Fetch messages from last N minutes"
+    )
+
+    hours: Optional[int] = Field(
+        default=None,
+        description="Fetch messages from last N hours"
+    )
+
+    days: Optional[int] = Field(
+        default=None,
+        description="Fetch messages from last N days"
+    )
+
+    top: Optional[int] = Field(
+        default=50,
+        description="Maximum number of messages to return"
+    )
+
+class GetUserChannelsInput(BaseModel):
+    team_id: Optional[str] = Field(default=None, description="Optional Team ID to scope channels to one team")
+    top: Optional[int] = Field(default=200, description="Maximum number of channels to return (default 200)")
+
+
+class UpdateMessageInput(BaseModel):
+    team_id: Optional[str] = Field(
+        default=None,
+        description="ID of the Microsoft Team (required when updating a channel message)",
+    )
+    channel_id: Optional[str] = Field(
+        default=None,
+        description="ID of the Microsoft Teams channel (required when updating a channel message)",
+    )
+    chat_id: Optional[str] = Field(
+        default=None,
+        description="ID of the Teams chat (required when updating a direct chat message)",
+    )
+    message_id: str = Field(description="ID of the Teams message to update")
+    message: str = Field(description="Updated message text")
+
+
+class GetMessagePermalinkInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    message_id: str = Field(description="ID of the Teams message")
+
+
+class GetReactionsInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    message_id: str = Field(description="ID of the Teams message")
+
+
+class RemoveReactionInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    message_id: str = Field(description="ID of the Teams message")
+    reaction_type: str = Field(description="Reaction type to remove")
+
+
+class GetThreadRepliesInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the Microsoft Teams channel")
+    message_id: str = Field(description="ID of the parent Teams message")
+    top: Optional[int] = Field(default=50, description="Maximum number of replies to return (default 50, max 200)")
+
+
+class GetMyMeetingsInput(BaseModel):
+    top: Optional[int] = Field(default=50, description="Maximum number of meetings to return (default 50, max 500)")
+
+
+class GetMyRecurringMeetingsInput(BaseModel):
+    top: Optional[int] = Field(default=50, description="Maximum number of recurring meetings to return (default 50, max 500)")
+
+
+class GetMyMeetingsForGivenPeriodInput(BaseModel):
+    start_datetime: str = Field(description="Start datetime (ISO 8601)")
+    end_datetime: str = Field(description="End datetime (ISO 8601)")
+    top: Optional[int] = Field(default=100, description="Maximum number of meetings to return (default 100, max 1000)")
+
+
+class GetMyRecurringMeetingsForGivenPeriodInput(BaseModel):
+    start_datetime: str = Field(description="Start datetime (ISO 8601)")
+    end_datetime: str = Field(description="End datetime (ISO 8601)")
+    top: Optional[int] = Field(default=100, description="Maximum number of recurring meetings to return (default 100, max 1000)")
+
+
+class GetMeetingsInput(BaseModel):
+    start_datetime: Optional[str] = Field(
+        default=None,
+        description="Optional start datetime (ISO 8601). Must be provided together with end_datetime.",
+    )
+    end_datetime: Optional[str] = Field(
+        default=None,
+        description="Optional end datetime (ISO 8601). Must be provided together with start_datetime.",
+    )
+    is_deleted: Optional[bool] = Field(
+        default=None,
+        description="Strict filter for deleted meetings. true=only deleted, false=only non-deleted, null=do not filter.",
+    )
+    is_cancelled: Optional[bool] = Field(
+        default=None,
+        description="Strict filter for cancelled meetings. true=only cancelled, false=only non-cancelled, null=do not filter.",
+    )
+    meeting_type: Optional[str] = Field(
+        default=None,
+        description="Optional strict meeting type filter. "
+        "Allowed values: 'recurring' or 'one_time'. "
+        "Only include this field if the user explicitly asks for recurring meetings or one-time meetings. "
+        "Otherwise omit this field.")
+    top: Optional[int] = Field(
+        default=100,
+        description="Maximum number of meetings to return (default 100, max 1000).",
+    )
+
+
+class GetMeetingTranscriptsInput(BaseModel):
+    """Schema for fetching transcripts of an online meeting.
+
+    Provide meeting_id directly when available.
+    Otherwise provide EITHER join_url (preferred, skips one API call) OR event_id.
+    join_url is available as event.onlineMeeting.joinUrl on any calendar
+    event returned by get_calendar_events or search_calendar_events.
+    """
+    meeting_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The online meeting ID. If provided, transcript APIs are called directly "
+            "without resolving from join_url/event_id."
+        ),
+    )
+    join_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "The Teams join URL (joinUrl from event.onlineMeeting.joinUrl). "
+            "Preferred over event_id — skips one API call."
+        ),
+    )
+    event_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The calendar event ID. Used as fallback when join_url is not available. "
+            "The tool will fetch the event to extract joinUrl automatically."
+        ),
+    )
+
+class GetPeopleAttendedInput(BaseModel):
+    meeting_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The online meeting ID. If provided, attendance API is called directly "
+            "without resolving from join_url/event_id."
+        ),
+    )
+    join_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "The Teams join URL (joinUrl from event.onlineMeeting.joinUrl). "
+            "Preferred over event_id because it skips one API call."
+        ),
+    )
+    event_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The calendar event ID. Used as fallback when join_url is unavailable. "
+            "The tool fetches event details to extract joinUrl and resolve meeting_id."
+        ),
+    )
+
+
+class GetPeopleInvitedInput(BaseModel):
+    meeting_id: str = Field(description="ID of the meeting")
+
+
+
+class CreateEventInput(BaseModel):
+    """Schema for creating a calendar event"""
+    subject: str = Field(description="Title/subject of the event")
+    start_datetime: str = Field(description="Start datetime in ISO 8601 format (e.g. 2024-01-15T10:00:00)")
+    end_datetime: str = Field(description="End datetime in ISO 8601 format (e.g. 2024-01-15T11:00:00)")
+    timezone: Optional[str] = Field(default="UTC", description="Timezone for the event (e.g. 'UTC', 'America/New_York', 'India Standard Time')")
+    body: Optional[str] = Field(default=None, description="Body/description of the event")
+    location: Optional[str] = Field(default=None, description="Location of the event")
+    attendees: Optional[List[str]] = Field(default=None, description="List of attendee email addresses")
+    is_online_meeting: Optional[bool] = Field(default=False, description="Whether to create an online meeting link")
+    recurrence: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional recurrence dict to make this a repeating event."
+            " Must have two keys: 'pattern' (how often) and 'range' (when it ends)."
+            " All keys are camelCase matching the MS Graph API."
+            " PATTERN keys:"
+            " type (required): 'daily' | 'weekly' | 'absoluteMonthly' | 'relativeMonthly' | 'absoluteYearly' | 'relativeYearly'."
+            " interval (int, default 1): repeat every N units."
+            " daysOfWeek (list[str]): required for weekly/relativeMonthly/relativeYearly."
+            "   Valid: Sunday Monday Tuesday Wednesday Thursday Friday Saturday."
+            " dayOfMonth (int 1-31): required for absoluteMonthly/absoluteYearly."
+            " month (int 1-12): required for absoluteYearly/relativeYearly."
+            " index (str): required for relativeMonthly/relativeYearly."
+            "   Valid: first second third fourth last."
+            " RANGE keys:"
+            " type (required): 'endDate' (needs startDate+endDate) | 'noEnd' (needs startDate) | 'numbered' (needs startDate+numberOfOccurrences)."
+            " startDate (YYYY-MM-DD, required): MUST match the date portion of start_datetime."
+            " endDate (YYYY-MM-DD): required when type='endDate'."
+            " numberOfOccurrences (int): required when type='numbered'."
+            " EXAMPLES:"
+            " daily 30x: {'pattern':{'type':'daily','interval':1},'range':{'type':'numbered','startDate':'2026-03-01','numberOfOccurrences':30}}."
+            " weekly Mon+Wed until Dec: {'pattern':{'type':'weekly','interval':1,'daysOfWeek':['Monday','Wednesday']},'range':{'type':'endDate','startDate':'2026-03-02','endDate':'2026-12-31'}}."
+            " monthly 15th forever: {'pattern':{'type':'absoluteMonthly','interval':1,'dayOfMonth':15},'range':{'type':'noEnd','startDate':'2026-03-15'}}."
+            " first Monday each month: {'pattern':{'type':'relativeMonthly','interval':1,'daysOfWeek':['Monday'],'index':'first'},'range':{'type':'noEnd','startDate':'2026-03-02'}}."
+            " yearly Mar 15: {'pattern':{'type':'absoluteYearly','interval':1,'dayOfMonth':15,'month':3},'range':{'type':'noEnd','startDate':'2026-03-15'}}."
+            " last Friday of March each year: {'pattern':{'type':'relativeYearly','interval':1,'daysOfWeek':['Friday'],'index':'last','month':3},'range':{'type':'noEnd','startDate':'2026-03-27'}}."
+        ),
+    )
+
+
+class CreateChannelMeetingInput(BaseModel):
+    """Schema for creating a Teams channel meeting event."""
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_name: str = Field(description="Display name of the Teams channel")
+    subject: str = Field(description="Meeting title/subject")
+    start_datetime: str = Field(description="Start datetime in ISO 8601 format (e.g. 2024-01-15T10:00:00)")
+    end_datetime: str = Field(description="End datetime in ISO 8601 format (e.g. 2024-01-15T11:00:00)")
+    timezone: Optional[str] = Field(
+        default="Asia/Kolkata",
+        description="Timezone for the meeting (e.g. 'Asia/Kolkata', 'UTC')",
+    )
+
+
+class EditEventInput(BaseModel):
+    event_id: str = Field(description="ID of the event to update")
+    subject: Optional[str] = Field(default=None, description="Updated event title")
+    start_datetime: Optional[str] = Field(default=None, description="Updated start datetime in ISO 8601 format")
+    end_datetime: Optional[str] = Field(default=None, description="Updated end datetime in ISO 8601 format")
+    timezone: Optional[str] = Field(default="UTC", description="Timezone label (default UTC)")
+    description: Optional[str] = Field(default=None, description="Updated event description")
+    is_online_meeting: Optional[bool] = Field(default=None, description="Whether event should be online")
+
+
+class CreateTeamInput(BaseModel):
+    display_name: str = Field(description="Display name of the team")
+    description: Optional[str] = Field(default=None, description="Description of the team")
+
+
+class DeleteTeamInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team to delete")
+
+
+class AddMemberInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    user_id: str = Field(description="User ID or Azure AD object ID to add")
+    role: Optional[str] = Field(default="member", description="Role for the new member: 'member' or 'owner'")
+    channel_id: Optional[str] = Field(
+        default=None,
+        description="Optional channel ID. If omitted, adds user to team. For private channel, user is added directly to channel.",
+    )
+
+
+class GetMembersInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: Optional[str] = Field(
+        default=None,
+        description="Optional channel ID. If provided, returns members for that channel.",
+    )
+    top: Optional[int] = Field(default=100, description="Maximum number of members to return (default 100, max 500)")
+
+
+class RemoveMemberInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    membership_id: str = Field(description="Membership ID of the member to remove (conversationMember ID, not user ID)")
+
+
+class CreateChannelInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    display_name: str = Field(description="Display name of the channel")
+    description: Optional[str] = Field(default=None, description="Description of the channel")
+    channel_type: Optional[str] = Field(
+        default="standard",
+        description="Type of channel: 'standard' (visible to all team members) or 'private' (invite-only)",
+    )
+
+
+class DeleteChannelInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the channel to delete")
+
+
+class UpdateChannelInput(BaseModel):
+    team_id: str = Field(description="ID of the Microsoft Team")
+    channel_id: str = Field(description="ID of the channel to update")
+    display_name: Optional[str] = Field(default=None, description="New display name for the channel")
+    description: Optional[str] = Field(default=None, description="New description for the channel")
+
+
+class CreateChatInput(BaseModel):
+    chat_type: str = Field(
+        description="Type of chat: 'oneOnOne' for 1:1 direct message or 'group' for group chat"
+    )
+    member_user_ids: List[str] = Field(
+        description="List of Azure AD user object IDs (or UPNs) to include in the chat (including yourself for group chats)"
+    )
+    topic: Optional[str] = Field(default=None, description="Topic/title for group chats (optional for 1:1 chats)")
+
+
+class GetChatInput(BaseModel):
+    chat_id: str = Field(description="ID of the chat to retrieve")
+
+
+class GetUserInfoInput(BaseModel):
+    user: str = Field(description="User ID, UPN/email, or display name")
+
+
+class GetUsersListInput(BaseModel):
+    limit: Optional[int] = Field(
+        default=None,
+        description="Maximum users to return. If omitted, fetches all users with pagination.",
+    )
+
+
+class TeamsAmbiguousUserError(Exception):
+    """Raised when a Teams identifier does not pin down exactly one user.
+
+    exact_required: raised by an exact-only lookup whose only candidates contain the query.
+    """
+
+    def __init__(self, query: str, matches: List[Dict[str, Any]], *, exact_required: bool = False) -> None:
+        self.query = query
+        self.matches = matches
+        self.exact_required = exact_required
+        super().__init__(f"Multiple users found matching '{query}'")
+
+
+class TeamsUserLookupError(Exception):
+    """The directory could not be read, so "no such user" cannot be concluded."""
+
+    def __init__(self, query: str, error: str | None) -> None:
+        self.query = query
+        self.error = error
+        super().__init__(error or "directory lookup failed")
+
+    def agent_message(self) -> str:
+        reason = _graph_error(self.error, "the directory lookup failed")
+        return f"Could not look up '{self.query}' in the directory: {reason}"
+
+
+_RECURRENCE_PATTERN_TYPES = (
+    "daily", "weekly", "absoluteMonthly", "relativeMonthly", "absoluteYearly", "relativeYearly",
+)
+_RECURRENCE_RANGE_TYPES = ("endDate", "noEnd", "numbered")
+
+
+def _validate_recurrence(pattern: dict[str, Any], range_obj: dict[str, Any]) -> None:
+    """Refuse an invalid recurrence, and rewrite pattern type and dates in place to the form Graph expects.
+
+    The datasource lowercases the pattern type without stripping it and maps anything it doesn't
+    know to daily, and parses dates with date.fromisoformat unstripped, so only canonical values
+    may leave this function.
+    """
+    pattern_type = pattern.get("type")
+    canonical_type = next(
+        (t for t in _RECURRENCE_PATTERN_TYPES
+         if isinstance(pattern_type, str) and pattern_type.strip().lower() == t.lower()),
+        None,
+    )
+    if canonical_type is None:
+        raise ValueError(
+            f"recurrence pattern type {pattern_type!r} is not supported. Use one of: daily, weekly, "
+            "absoluteMonthly (for example the 15th of every month), relativeMonthly (for example "
+            "the first Monday of every month), absoluteYearly, relativeYearly."
+        )
+    pattern["type"] = canonical_type
+    if range_obj.get("type") not in _RECURRENCE_RANGE_TYPES:
+        raise ValueError(
+            f"recurrence range type {range_obj.get('type')!r} is not supported. Use endDate "
+            "(with endDate), noEnd, or numbered (with numberOfOccurrences)."
+        )
+    if "startDate" not in range_obj:
+        raise ValueError("recurrence range is missing startDate.")
+    for key in ("startDate", "endDate"):
+        if key == "endDate" and key not in range_obj:
+            continue
+        parsed = _parse_recurrence_date(range_obj.get(key))
+        if parsed is None:
+            raise ValueError(
+                f"recurrence range {key} must be a date in YYYY-MM-DD form, for example 2026-03-02."
+            )
+        range_obj[key] = parsed.isoformat()
+
+
+def _parse_recurrence_date(value: object) -> Optional[date]:
+    # fromisoformat alone also takes 20260302 and week dates like 2026-W10-1.
+    # datetime is a subclass of date, so check it first: Graph wants a date without a time.
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip(), re.ASCII):
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        return None
+
+
+def _build_recurrence_body(recurrence: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a recurrence dict into the MS Graph API format.
+
+    Accepts either:
+    1) Nested Graph shape:
+       {"pattern": {...}, "range": {...}}
+    2) Flattened convenience shape (top-level recurrence fields), e.g.:
+       {
+         "type": "weekly",
+         "interval": 1,
+         "daysOfWeek": ["Monday"],
+         "rangeType": "endDate",
+         "startDate": "2026-03-02",
+         "endDate": "2026-12-28"
+       }
+    """
+    if not isinstance(recurrence, dict):
+        raise ValueError("recurrence must be a dict")
+
+    def _normalize_range_type(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower().replace("_", "")
+        mapping = {
+            "enddate": "endDate",
+            "noend": "noEnd",
+            "numbered": "numbered",
+        }
+        return mapping.get(normalized)
+
+    # Already in Graph-native nested format.
+    if "pattern" in recurrence and "range" in recurrence:
+        if not isinstance(recurrence["pattern"], dict) or not isinstance(recurrence["range"], dict):
+            raise ValueError("recurrence.pattern and recurrence.range must be dicts")
+        pattern = dict(recurrence["pattern"])
+        range_obj = dict(recurrence["range"])
+        # Allow rangeType as alias in nested payloads.
+        if "type" not in range_obj and "rangeType" in range_obj:
+            normalized_type = _normalize_range_type(range_obj.get("rangeType"))
+            if normalized_type:
+                range_obj["type"] = normalized_type
+        elif "type" in range_obj:
+            normalized_type = _normalize_range_type(range_obj.get("type"))
+            if normalized_type:
+                range_obj["type"] = normalized_type
+
+        # Derive a sensible default if omitted.
+        if "type" not in range_obj:
+            if "numberOfOccurrences" in range_obj:
+                range_obj["type"] = "numbered"
+            elif "endDate" in range_obj:
+                range_obj["type"] = "endDate"
+            else:
+                range_obj["type"] = "noEnd"
+
+        _validate_recurrence(pattern, range_obj)
+        return {
+            "pattern": pattern,
+            "range": range_obj,
+        }
+
+    # Build Graph-native structure from flattened keys.
+    pattern_keys = {
+        "type",
+        "interval",
+        "daysOfWeek",
+        "firstDayOfWeek",
+        "index",
+        "dayOfMonth",
+        "month",
+    }
+    range_keys = {
+        "rangeType",
+        "startDate",
+        "endDate",
+        "numberOfOccurrences",
+        "recurrenceTimeZone",
+    }
+
+    pattern: Dict[str, Any] = {}
+    for key in pattern_keys:
+        if key in recurrence:
+            pattern[key] = recurrence[key]
+
+    range_obj: Dict[str, Any] = {}
+    if "rangeType" in recurrence:
+        normalized_type = _normalize_range_type(recurrence["rangeType"])
+        range_obj["type"] = normalized_type or recurrence["rangeType"]
+    elif "range_type" in recurrence:
+        normalized_type = _normalize_range_type(recurrence["range_type"])
+        range_obj["type"] = normalized_type or recurrence["range_type"]
+    for key in ("startDate", "endDate", "numberOfOccurrences", "recurrenceTimeZone"):
+        if key in recurrence:
+            range_obj[key] = recurrence[key]
+
+    # If user passed one nested key, reuse it and fill the missing one from flat keys.
+    if "pattern" in recurrence and isinstance(recurrence["pattern"], dict):
+        pattern = dict(recurrence["pattern"])
+    if "range" in recurrence and isinstance(recurrence["range"], dict):
+        range_obj = dict(recurrence["range"])
+
+    if "type" in range_obj:
+        normalized_type = _normalize_range_type(range_obj.get("type"))
+        if normalized_type:
+            range_obj["type"] = normalized_type
+    elif "rangeType" in range_obj:
+        normalized_type = _normalize_range_type(range_obj.get("rangeType"))
+        if normalized_type:
+            range_obj["type"] = normalized_type
+
+    # Auto-derive range type when missing.
+    if "type" not in range_obj:
+        if "numberOfOccurrences" in range_obj:
+            range_obj["type"] = "numbered"
+        elif "endDate" in range_obj:
+            range_obj["type"] = "endDate"
+        else:
+            range_obj["type"] = "noEnd"
+
+    if not pattern:
+        raise ValueError(
+            "recurrence is missing pattern data. Provide recurrence.pattern or flat keys like type/interval/daysOfWeek."
+        )
+    if not range_obj:
+        raise ValueError(
+            "recurrence is missing range data. Provide recurrence.range or flat keys like startDate/endDate/numberOfOccurrences."
+        )
+    _validate_recurrence(pattern, range_obj)
+
+    return {
+        "pattern": pattern,
+        "range": range_obj,
+    }
+# ---------------------------------------------------------------------------
+# Toolset registration
+# ---------------------------------------------------------------------------
+
+@ToolsetBuilder("Teams")\
+    .in_group("Microsoft 365")\
+    .with_description("Microsoft Teams integration for messaging and collaboration")\
+    .with_category(ToolsetCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Teams",
+            authorize_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            token_url="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            redirect_uri="toolsets/oauth/callback/teams",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "Team.ReadBasic.All",
+                    "Channel.ReadBasic.All",
+                    "Channel.Create",
+                    "Channel.Delete.All",
+                    "ChannelMessage.Read.All",
+                    "ChannelMessage.Send",
+                    "TeamMember.ReadWrite.All",
+                    "Group.ReadWrite.All",
+                    "Chat.ReadWrite",
+                    "Chat.Create",
+                    "offline_access",
+                    "User.Read",
+                    "User.ReadBasic.All",
+                    "Calendars.Read",
+                    "Calendars.Read.Shared",
+                    "Calendars.ReadBasic",
+                    "Calendars.ReadWrite",
+                    "OnlineMeetings.Read",
+                    "OnlineMeetingTranscript.Read.All",
+                    "OnlineMeetingArtifact.Read.All",
+                    "ChannelMember.ReadWrite.All",
+                ],
+            ),
+            additional_params={
+                "prompt": "consent",
+                "response_mode": "query",
+            },
+            fields=[
+                CommonFields.client_id("Azure App Registration"),
+                CommonFields.client_secret("Azure App Registration"),
+                AuthField(
+                    name="tenantId",
+                    display_name="Tenant ID",
+                    field_type="TEXT",
+                    placeholder="common  (or your Azure AD tenant ID / domain)",
+                    description=(
+                        "Your Azure Active Directory tenant ID (for example "
+                        "'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx') or domain "
+                        "(for example 'contoso.onmicrosoft.com'). "
+                        "Leave blank or enter 'common' to allow both personal Microsoft "
+                        "accounts and any Azure AD tenant."
+                    ),
+                    required=False,
+                    default_value="common",
+                    min_length=0,
+                    max_length=500,
+                    is_secret=False,
+                ),
+            ],
+            app_group="Microsoft 365",
+            app_description="Microsoft Teams OAuth application for agent integration"
+        )
+    ])\
+    .configure(lambda builder: builder.with_icon(IconPaths.connector_icon("teams"))
+        .add_documentation_link(DocumentationLink(
+            title="Create an Azure App Registration",
+            url="https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app",
+            doc_type="setup",
+        ))
+        .add_documentation_link(DocumentationLink(
+            title="Microsoft Graph Teams permissions reference",
+            url="https://learn.microsoft.com/en-us/graph/permissions-reference",
+            doc_type="setup",
+        ))
+        .add_documentation_link(DocumentationLink(
+            title="Configure OAuth 2.0 redirect URIs",
+            url="https://learn.microsoft.com/en-us/entra/identity-platform/reply-url",
+            doc_type="setup",
+        ))
+        .add_documentation_link(DocumentationLink(
+            title="Pipeshub Documentation",
+            url="https://docs.pipeshub.com/toolsets/microsoft-365/teams",
+            doc_type="pipeshub",
+        )))\
+    .build_decorator()
+class Teams:
+    """Microsoft Teams toolset for messaging and team collaboration operations."""
+
+    def __init__(
+        self,
+        client: Optional[MSGraphClient] = None,
+        state: Optional[dict] = None,
+    ) -> None:
+        self.client: Optional[TeamsDataSource] = None
+        self.state = state
+        logger.debug(client)
+        logger.debug(
+            "Teams.__init__ called with client_type=%s has_get_client=%s",
+            type(client).__name__ if client is not None else "None",
+            hasattr(client, "get_client") if client is not None else False,
+        )
+        # Some wrapper fallback paths pass state positionally as dict.
+        if isinstance(client, dict) and state is None:
+            self.state = client
+            client = None
+        if client is None:
+            logger.warning("Teams.__init__ received client=None; datasource initialization skipped")
+            return
+        if isinstance(client, dict):
+            logger.error(
+                "Teams.__init__ received dict instead of MSGraphClient; keys=%s",
+                list(client.keys())[:20],
+            )
+        try:
+            logger.debug("Attempting TeamsDataSource initialization")
+            self.client = TeamsDataSource(client)
+            logger.debug("TeamsDataSource initialization successful")
+        except Exception as e:
+            logger.exception(
+                "Teams client initialization failed; client_type=%s has_get_client=%s error=%s",
+                type(client).__name__,
+                hasattr(client, "get_client"),
+                str(e),
+            )
+            self.client = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _handle_error(self, error: Exception, operation: str = "operation") -> tuple[bool, str]:
+        error_msg = str(error).lower()
+
+        if isinstance(error, AttributeError):
+            if (
+                "client" in error_msg
+                or "me" in error_msg
+                or "nonetype" in error_msg
+                or "has no attribute" in error_msg
+            ):
+                logger.error(
+                    f"Teams client not properly initialised - authentication may be required: {error}"
+                )
+                return False, json.dumps({
+                    "error": (
+                        "Teams toolset is not authenticated. "
+                        "Please complete the OAuth flow first. "
+                        "Authenticate your Teams account under Your actions."
+                    )
+                })
+
+        # ValueErrors come from argument validation (e.g. recurrence); their text says what to fix.
+        if isinstance(error, ValueError):
+            logger.error(f"Invalid arguments for {operation}: {error}")
+            return False, json.dumps({"error": str(error)})
+
+        if (
+            "not authenticated" in error_msg
+            or "oauth" in error_msg
+            or "authentication" in error_msg
+            or "unauthorized" in error_msg
+            or "get_client" in error_msg
+        ):
+            logger.error(f"Teams authentication error during {operation}: {error}")
+            return False, json.dumps({
+                "error": (
+                    "Teams toolset is not authenticated. "
+                    "Please complete the OAuth flow first. "
+                    "Authenticate your Teams account under Your actions."
+                )
+            })
+
+        logger.error(f"Failed to {operation}: {error}")
+        return False, json.dumps({"error": str(error)})
+
+    @staticmethod
+    def _serialize_response(response_obj: Any) -> Any:
+        if response_obj is None:
+            return None
+        if isinstance(response_obj, (str, int, float, bool)):
+            return response_obj
+        if isinstance(response_obj, list):
+            return [Teams._serialize_response(item) for item in response_obj]
+        if isinstance(response_obj, dict):
+            return {k: Teams._serialize_response(v) for k, v in response_obj.items()}
+
+        if hasattr(response_obj, "get_field_deserializers"):
+            try:
+                from kiota_serialization_json.json_serialization_writer import (  # type: ignore
+                    JsonSerializationWriter,
+                )
+                import json as _json
+
+                writer = JsonSerializationWriter()
+                writer.write_object_value(None, response_obj)
+                content = writer.get_serialized_content()
+                if content:
+                    raw = content.decode("utf-8") if isinstance(content, bytes) else content
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, dict) and parsed:
+                        return parsed
+            except Exception:
+                pass
+
+        try:
+            obj_dict = vars(response_obj)
+        except TypeError:
+            obj_dict = {}
+
+        result: Dict[str, Any] = {}
+        for k, v in obj_dict.items():
+            if k.startswith("_"):
+                continue
+            try:
+                result[k] = Teams._serialize_response(v)
+            except Exception:
+                result[k] = str(v)
+
+        additional = getattr(response_obj, "additional_data", None)
+        if isinstance(additional, dict):
+            for k, v in additional.items():
+                if k not in result:
+                    try:
+                        result[k] = Teams._serialize_response(v)
+                    except Exception:
+                        result[k] = str(v)
+
+        return result if result else str(response_obj)
+
+    @staticmethod
+    def _extract_collection_items(serialized: Any) -> List[Any]:
+        if isinstance(serialized, dict):
+            value = serialized.get("value")
+            if isinstance(value, list):
+                return value
+        if isinstance(serialized, list):
+            return serialized
+        return []
+
+    @staticmethod
+    def _extract_team_id(serialized: Any) -> Optional[str]:
+        if isinstance(serialized, dict):
+            team_id = serialized.get("id")
+            if isinstance(team_id, str) and team_id:
+                return team_id
+            value = serialized.get("value")
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        item_id = item.get("id")
+                        if isinstance(item_id, str) and item_id:
+                            return item_id
+        return None
+
+    @staticmethod
+    def _find_team_by_display_name(items: List[Any], display_name: str) -> Optional[Dict[str, Any]]:
+        target_name = display_name.strip().lower()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            current_name = str(item.get("displayName") or "").strip().lower()
+            if current_name == target_name:
+                return item
+        return None
+
+    async def _wait_for_created_team(
+        self,
+        display_name: str,
+        attempts: int = 5,
+        delay_seconds: float = 2.0,
+    ) -> Optional[Dict[str, Any]]:
+        for attempt in range(attempts):
+            try:
+                response = await self.client.me_list_joined_teams()
+                if response.success:
+                    serialized = self._serialize_response(response.data)
+                    teams = self._extract_collection_items(serialized)
+                    matched_team = self._find_team_by_display_name(teams, display_name)
+                    if matched_team:
+                        return matched_team
+            except Exception as e:
+                logger.debug("create_team polling attempt %s failed: %s", attempt + 1, e)
+
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay_seconds)
+        return None
+
+
+    @staticmethod
+    def _extract_next_link(serialized: Any) -> Optional[str]:
+        if not isinstance(serialized, dict):
+            return None
+        for key in ("@odata.nextLink", "odata_next_link", "next_link", "nextLink"):
+            value = serialized.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    async def _resolve_user_identifier(
+        self,
+        user_identifier: str,
+        allow_ambiguous: bool = False,
+        *,
+        exact_only: bool = False,
+    ) -> Optional[str]:
+        """Resolve user identifier (ID, UPN/email, or display name) to user ID.
+
+        exact_only: return only an exact match; names that merely contain the query are raised as
+        TeamsAmbiguousUserError candidates, even when there is just one.
+        """
+        try:
+            if not user_identifier or not isinstance(user_identifier, str):
+                return None
+
+            target_identifier = user_identifier.lstrip("@").strip().casefold()
+            if not target_identifier:
+                return None
+
+            # Fast-path: ID/UPN/email can often be resolved directly via /users/{id-or-upn}
+            direct_response = await self.client.teams_get_user(user_identifier.strip())
+            if direct_response.success and direct_response.data:
+                direct_user = self._serialize_response(direct_response.data)
+                if isinstance(direct_user, dict):
+                    direct_id = direct_user.get("id")
+                    if isinstance(direct_id, str) and direct_id:
+                        return direct_id
+
+            exact_matches: List[Dict[str, Any]] = []
+            partial_matches: List[Dict[str, Any]] = []
+            next_link: Optional[str] = None
+            seen_links = set()
+            read_to_end = False
+
+            for _ in range(50):
+                users_response = await self.client.teams_list_users(cursor_url=next_link)
+                # An unread page may hold the real person or a namesake, so never pick from a partial read.
+                if not users_response.success:
+                    raise TeamsUserLookupError(user_identifier, users_response.error)
+                if not users_response.data:
+                    read_to_end = True
+                    break
+
+                # An empty page can still carry a next link, so only a missing link ends the read.
+                users_payload = self._serialize_response(users_response.data)
+                users = self._extract_collection_items(users_payload)
+
+                for user in users:
+                    if not isinstance(user, dict):
+                        continue
+                    user_id = user.get("id")
+                    if not isinstance(user_id, str) or not user_id:
+                        continue
+
+                    user_info = {
+                        "id": user_id,
+                        "display_name": user.get("displayName") or user.get("display_name"),
+                        "mail": user.get("mail"),
+                        "user_principal_name": user.get("userPrincipalName") or user.get("user_principal_name"),
+                    }
+
+                    names = [
+                        user.get("displayName"),
+                        user.get("display_name"),
+                        user.get("mail"),
+                        user.get("userPrincipalName"),
+                        user.get("user_principal_name"),
+                    ]
+                    names_to_match = [*names, user_id]
+
+                    found_exact = False
+                    for name in names_to_match:
+                        if not isinstance(name, str):
+                            continue
+                        name_normalized = name.casefold()
+                        if name_normalized == target_identifier:
+                            if not any(m.get("id") == user_id for m in exact_matches):
+                                exact_matches.append(user_info)
+                            found_exact = True
+                            break
+
+                    if found_exact:
+                        continue
+
+                    # Only a name that contains the query: never "Ann" for "Joanna", and never a
+                    # substring of a hex object id ("deb" appears in plenty of them).
+                    for name in names:
+                        if not isinstance(name, str):
+                            continue
+                        name_normalized = name.casefold()
+                        if len(target_identifier) >= 3 and target_identifier in name_normalized:
+                            if not any(m.get("id") == user_id for m in partial_matches):
+                                partial_matches.append(user_info)
+                            break
+
+                next_link_candidate = self._extract_next_link(users_payload)
+                if not next_link_candidate:
+                    read_to_end = True
+                    break
+                if next_link_candidate in seen_links:
+                    break
+                seen_links.add(next_link_candidate)
+                next_link = next_link_candidate
+
+            # The page cap or a repeating next link left part of the directory unread: same as a failed page.
+            if not read_to_end:
+                raise TeamsUserLookupError(user_identifier, "the directory could not be read to the end")
+
+            if exact_matches:
+                if len(exact_matches) > 1 and not allow_ambiguous:
+                    raise TeamsAmbiguousUserError(user_identifier, exact_matches)
+                return exact_matches[0]["id"]
+
+            if partial_matches:
+                if exact_only:
+                    raise TeamsAmbiguousUserError(user_identifier, partial_matches, exact_required=True)
+                if len(partial_matches) > 1 and not allow_ambiguous:
+                    raise TeamsAmbiguousUserError(user_identifier, partial_matches)
+                return partial_matches[0]["id"]
+
+            logger.debug(f"Could not resolve Teams user identifier '{user_identifier}'")
+            return None
+        except (TeamsAmbiguousUserError, TeamsUserLookupError):
+            raise
+        except Exception as e:
+            logger.error(f"Error resolving Teams user identifier '{user_identifier}': {e}")
+            return None
+
+    @staticmethod
+    def _ambiguous_user_message(error: TeamsAmbiguousUserError) -> str:
+        matches_list = []
+        for match in error.matches[:20]:
+            label = match.get("display_name") or match.get("user_principal_name") or "Unknown"
+            if match.get("mail"):
+                label += f" ({match.get('mail')})"
+            label += f" [ID: {match.get('id', 'Unknown')}]"
+            matches_list.append(f"  - {label}")
+        if error.exact_required:
+            return (
+                f"No Teams user is named exactly '{error.query}'. If you meant one of these people, "
+                f"call the tool again with their email address or user ID.\n\n"
+                f"Closest matches:\n" + "\n".join(matches_list)
+            )
+        return (
+            f"Multiple users found matching '{error.query}'. Please use email/UPN or user ID for disambiguation.\n\n"
+            f"Matching users:\n" + "\n".join(matches_list)
+        )
+
+    async def _resolve_single_user(self, user_identifier: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        """Return (user_id, None) for exactly one exact match, else (None, error message for the agent).
+
+        Exact only: these callers message someone or read their chat, so a near miss must be confirmed.
+        """
+        identifier = (user_identifier or "").strip() if isinstance(user_identifier, str) else ""
+        if not identifier:
+            return None, (
+                "user_identifier is required. Pass the person's email address, "
+                "user principal name, display name or user ID."
+            )
+        try:
+            user_id = await self._resolve_user_identifier(identifier, allow_ambiguous=False, exact_only=True)
+        except TeamsAmbiguousUserError as e:
+            return None, self._ambiguous_user_message(e)
+        except TeamsUserLookupError as e:
+            return None, e.agent_message()
+        if not user_id:
+            return None, (
+                f"No Teams user matches '{identifier}'. Check the spelling, or use "
+                "get_users_list to find the person's email address or user ID."
+            )
+        return user_id, None
+
+    # ------------------------------------------------------------------
+    # User tools
+    # ------------------------------------------------------------------
+
+    @tool(
+        path="/tools/teams/get_user_info",
+        short_description="Get information about a Teams/Entra user",
+        description="Retrieve detailed profile information for a specific Microsoft Teams or Entra user by ID, email, UPN, or display name.",
+        parameters=[
+            ToolParameter(name="user", type=ParameterType.STRING, description="User ID, UPN/email, or display name", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_user_info(self, user: str) -> tuple[bool, str]:
+        """Get Teams user details with transformed response for easy extraction."""
+        try:
+            try:
+                user_id = await self._resolve_user_identifier(user, allow_ambiguous=False)
+            except TeamsAmbiguousUserError as e:
+                return False, json.dumps({"error": self._ambiguous_user_message(e)})
+            except TeamsUserLookupError as e:
+                return False, json.dumps({"error": e.agent_message()})
+
+            if not user_id:
+                user_id = user
+                logger.debug(f"Could not resolve Teams user '{user}', trying as-is: {user_id}")
+
+            response = await self.client.teams_get_user(user_id=user_id)
+            if response.success and response.data:
+                user_obj = self._serialize_response(response.data)
+                if isinstance(user_obj, dict):
+                    transformed = {
+                        "id": user_obj.get("id") or user_id,
+                        "display_name": user_obj.get("displayName") or user_obj.get("display_name"),
+                        "mail": user_obj.get("mail"),
+                        "user_principal_name": user_obj.get("userPrincipalName") or user_obj.get("user_principal_name"),
+                        "given_name": user_obj.get("givenName") or user_obj.get("given_name"),
+                        "surname": user_obj.get("surname"),
+                        "job_title": user_obj.get("jobTitle") or user_obj.get("job_title"),
+                        "department": user_obj.get("department"),
+                        "office_location": user_obj.get("officeLocation") or user_obj.get("office_location"),
+                        "mobile_phone": user_obj.get("mobilePhone") or user_obj.get("mobile_phone"),
+                        "business_phones": user_obj.get("businessPhones") or user_obj.get("business_phones"),
+                        "raw_user": user_obj,
+                    }
+                    return True, json.dumps({
+                        **transformed,
+                        "data": {
+                            # Keep both shapes for placeholder compatibility:
+                            # - teams.get_user_info.data.id
+                            # - teams.get_user_info.data.results[0].id
+                            "id": transformed["id"],
+                            "results": [transformed],
+                        },
+                    })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get user info")})
+        except TeamsAmbiguousUserError:
+            raise
+        except Exception as e:
+            return self._handle_error(e, "get user info")
+
+    @tool(
+        path="/tools/teams/get_users_list",
+        short_description="Get list of users available in Microsoft Entra/Teams tenant",
+        description="List all users in the Microsoft Entra/Teams tenant with optional pagination limit.",
+        parameters=[
+            ToolParameter(name="limit", type=ParameterType.INTEGER, description="Maximum users to return. If omitted, fetches all users with pagination.", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_users_list(self, limit: Optional[int] = None) -> tuple[bool, str]:
+        """Get users list with pagination support."""
+        try:
+            # Graph pages users 100 at a time, so a larger limit has to read on.
+            want = max(limit, 0) if limit is not None else None
+            all_users: List[Any] = []
+            seen_ids: set[str] = set()
+            next_link: Optional[str] = None
+            seen_links = set()
+            complete = False
+            link_repeated = False
+
+            for _ in range(50):
+                if want is not None and len(all_users) >= want:
+                    complete = True
+                    break
+                response = await self.client.teams_list_users(cursor_url=next_link)
+                if not response.success:
+                    if not all_users:
+                        return False, json.dumps({"error": _graph_error(response.error, "Failed to get users list")})
+                    break
+                if not response.data:
+                    complete = True
+                    break
+
+                payload = self._serialize_response(response.data)
+                for user in self._extract_collection_items(payload):
+                    user_id = user.get("id") if isinstance(user, dict) else None
+                    # A page Graph serves twice must not count its users twice toward the limit.
+                    if isinstance(user_id, str) and user_id:
+                        if user_id in seen_ids:
+                            continue
+                        seen_ids.add(user_id)
+                    all_users.append(user)
+
+                next_link_candidate = self._extract_next_link(payload)
+                if not next_link_candidate:
+                    complete = True
+                    break
+                if next_link_candidate in seen_links:
+                    link_repeated = True
+                    break
+                seen_links.add(next_link_candidate)
+                next_link = next_link_candidate
+
+            if want is not None:
+                complete = (complete or len(all_users) >= want) and not link_repeated
+                all_users = all_users[:want]
+            reply: dict[str, Any] = {
+                "members": all_users,
+                "count": len(all_users),
+                "complete": complete,
+                "data": {"results": all_users},
+            }
+            if not complete:
+                reply["message"] = (
+                    "Microsoft Teams stopped answering part-way through, so this is only part of the "
+                    "directory. Try again in a moment to get the rest."
+                )
+            return True, json.dumps(reply)
+        except Exception as e:
+            return self._handle_error(e, "get users list")
+
+    # @tool(
+    #     app_name="teams",
+    #     tool_name="get_user_conversations",
+    #     description="Get conversations/chats for the authenticated Teams user",
+    #     args_schema=GetUserConversationsInput,
+    #     when_to_use=[
+    #         "User wants to list their Teams conversations",
+    #         "User asks for chats they are part of",
+    #     ],
+    #     when_not_to_use=[
+    #         "User wants team channels only (use get_user_channels)",
+    #         "No Teams mention",
+    #     ],
+    #     primary_intent=ToolIntent.SEARCH,
+    #     typical_queries=[
+    #         "Show my Teams conversations",
+    #         "List my chats in Teams",
+    #     ],
+    #     category=ToolCategory.SEARCH,
+    # )
+    # async def get_user_conversations(self, top: Optional[int] = 100) -> tuple[bool, str]:
+    #     try:
+    #         response = await self.client.teams_get_user_conversations()
+    #         if response.success:
+    #             serialized = self._serialize_response(response.data)
+    #             conversations = self._extract_collection_items(serialized)
+    #             limit = min(top or 100, 500)
+    #             conversations = conversations[:limit]
+    #             return True, json.dumps({
+    #                 "data": {"results": conversations},
+    #                 "conversations": conversations,
+    #                 "count": len(conversations),
+    #             })
+    #         return False, json.dumps({"error": response.error or "Failed to get user conversations"})
+    #     except Exception as e:
+    #         return self._handle_error(e, "get user conversations")
+
+    @tool(
+        path="/tools/teams/get_user_conversations",
+        short_description="Get conversation messages with a Teams user",
+        description="Retrieve direct chat messages with a specific Teams user, optionally filtered by time range (minutes/hours/days).",
+        parameters=[
+            ToolParameter(name="user_identifier", type=ParameterType.STRING, description="User display name, email, or user id whose conversation should be fetched", required=False),
+            ToolParameter(name="minutes", type=ParameterType.INTEGER, description="Fetch messages from last N minutes", required=False),
+            ToolParameter(name="hours", type=ParameterType.INTEGER, description="Fetch messages from last N hours", required=False),
+            ToolParameter(name="days", type=ParameterType.INTEGER, description="Fetch messages from last N days", required=False),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of messages to return", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_user_conversations(
+        self,
+        user_identifier: Optional[str] = None,
+        minutes: Optional[int] = None,
+        hours: Optional[int] = None,
+        days: Optional[int] = None,
+        top: Optional[int] = 50,
+        ) -> tuple[bool, str]:
+
+        try:
+            # The datasource's own lookup takes the first substring match on the first directory
+            # page, so resolve exactly one user here and hand over the id.
+            user_id, resolve_error = await self._resolve_single_user(user_identifier)
+            if resolve_error:
+                return False, json.dumps({"error": resolve_error})
+
+            response = await self.client.teams_get_conversation_with_user(
+                user_identifier=user_id,
+                user_id=user_id,
+                minutes=minutes,
+                hours=hours,
+                days=days,
+                top=top,
+            )
+          
+
+            if response.success:
+
+                serialized = self._serialize_response(response.data)
+                messages = self._extract_collection_items(
+                    serialized.get("results") if isinstance(serialized, dict) else serialized
+                )
+                if not messages and isinstance(serialized, dict):
+                    raw_messages = serialized.get("results")
+                    if isinstance(raw_messages, list):
+                        messages = raw_messages
+                    else:
+                        messages = self._extract_collection_items(serialized)
+
+                return True, json.dumps(
+                    {
+                        "data": {"results": messages},
+                        "messages": messages,
+                        "count": len(messages),
+                    }
+                )
+
+            return False, json.dumps(
+                {"error": _graph_error(response.error, "Failed to get conversation")}
+            )
+
+        except Exception as e:
+            return self._handle_error(e, "get user conversations")
+            
+    @tool(
+        path="/tools/teams/get_user_channels",
+        short_description="Get channels accessible to the authenticated Teams user",
+        description="List all channels the authenticated user can access, optionally scoped to a specific team.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="Optional Team ID to scope channels to one team", required=False),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of channels to return (default 200)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_user_channels(self, team_id: Optional[str] = None, top: Optional[int] = 200) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_user_channels(team_id=team_id)
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                channels = self._extract_collection_items(serialized.get("channels") if isinstance(serialized, dict) else serialized)
+                if not channels and isinstance(serialized, dict):
+                    raw_channels = serialized.get("channels")
+                    if isinstance(raw_channels, list):
+                        channels = raw_channels
+                limit = min(top or 200, 1000)
+                channels = channels[:limit]
+                return True, json.dumps({
+                    "data": {"results": channels},
+                    "channels": channels,
+                    "count": len(channels),
+                    "team_id": team_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get user channels")})
+        except Exception as e:
+            return self._handle_error(e, "get user channels")
+
+    @tool(
+        path="/tools/teams/get_meetings",
+        short_description="Get meetings for the authenticated Teams user with optional filters",
+        description=(
+            "Get meetings for the authenticated Teams user with optional strict filters "
+            "(date range, deleted, cancelled, recurring/one_time)."
+        ),
+        parameters=[
+            ToolParameter(name="start_datetime", type=ParameterType.STRING, description="Optional start datetime (ISO 8601). Must be provided together with end_datetime.", required=False),
+            ToolParameter(name="end_datetime", type=ParameterType.STRING, description="Optional end datetime (ISO 8601). Must be provided together with start_datetime.", required=False),
+            ToolParameter(name="is_deleted", type=ParameterType.BOOLEAN, description="Strict filter for deleted meetings. true=only deleted, false=only non-deleted, null=do not filter.", required=False),
+            ToolParameter(name="is_cancelled", type=ParameterType.BOOLEAN, description="Strict filter for cancelled meetings. true=only cancelled, false=only non-cancelled, null=do not filter.", required=False),
+            ToolParameter(name="meeting_type", type=ParameterType.STRING, description="Optional strict meeting type filter. Allowed values: 'recurring' or 'one_time'.", required=False),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of meetings to return (default 100, max 1000).", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+        args_summary=lambda _args: "Fetching Teams meetings",
+        result_summary=list_summary("results", _teams_meeting_label, "meeting"),
+    )
+    async def get_meetings(
+        self,
+        start_datetime: Optional[str] = None,
+        end_datetime: Optional[str] = None,
+        is_deleted: Optional[bool] = None,
+        is_cancelled: Optional[bool] = None,
+        meeting_type: Optional[str] = None,
+        top: Optional[int] = 100,
+    ) -> tuple[bool, str]:
+        try:
+
+            logger.info("========== GET_MEETINGS TOOL CALLED ==========")
+
+            logger.info(f"start_datetime: {start_datetime} | type: {type(start_datetime)}")
+            logger.info(f"end_datetime: {end_datetime} | type: {type(end_datetime)}")
+            logger.info(f"is_deleted: {is_deleted} | type: {type(is_deleted)}")
+            logger.info(f"is_cancelled: {is_cancelled} | type: {type(is_cancelled)}")
+            logger.info(f"meeting_type: {meeting_type} | type: {type(meeting_type)}")
+            logger.info(f"top: {top} | type: {type(top)}")
+
+            logger.info("===============================================")
+            response = await self.client.teams_get_meetings(
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                is_deleted=is_deleted,
+                is_cancelled=is_cancelled,
+                meeting_type=meeting_type,
+                top=top or 100,
+            )
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                
+                meetings = []
+                if isinstance(serialized, dict):
+                    raw_meetings = serialized.get("results")
+                    if isinstance(raw_meetings, list):
+                        meetings = raw_meetings
+
+                normalized_meetings = []
+                for meeting in meetings:
+                    if not isinstance(meeting, dict):
+                        continue
+                    meeting_id = meeting.get("meeting_id") or meeting.get("online_meeting_id") 
+                    meeting["meeting_id"] = meeting_id
+                    normalized_meetings.append(meeting)
+
+                return True, json.dumps({
+                    "data": {"results": normalized_meetings},
+                    "meetings": normalized_meetings,
+                    "count": len(normalized_meetings),
+                    "start_datetime": start_datetime,
+                    "end_datetime": end_datetime,
+                    "is_deleted": is_deleted,
+                    "is_cancelled": is_cancelled,
+                    "meeting_type": meeting_type,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get meetings")})
+        except Exception as e:
+            return self._handle_error(e, "get meetings")
+
+    # @tool(
+    #     app_name="teams",
+    #     tool_name="get_my_meetings",
+    #     description="Get meetings for the authenticated Teams user",
+    #     args_schema=GetMyMeetingsInput,
+    #     when_to_use=[
+    #         "User wants to list their upcoming or recent meetings",
+    #         "User asks for my Teams meetings",
+    #     ],
+    #     when_not_to_use=[
+    #         "User wants chat conversations (use get_user_conversations)",
+    #         "No Teams mention",
+    #     ],
+    #     primary_intent=ToolIntent.SEARCH,
+    #     typical_queries=[
+    #         "Show my meetings",
+    #         "List my Teams meetings",
+    #     ],
+    #     category=ToolCategory.SEARCH,
+    # )
+    # async def get_my_meetings(self, top: Optional[int] = 50) -> tuple[bool, str]:
+    #     try:
+    #         response = await self.client.teams_get_my_meetings(top=top or 50)
+    #         if response.success:
+    #             serialized = self._serialize_response(response.data)
+    #             meetings = []
+    #             if isinstance(serialized, dict):
+    #                 raw_meetings = serialized.get("results")
+    #                 if isinstance(raw_meetings, list):
+    #                     meetings = raw_meetings
+    #             return True, json.dumps({
+    #                 "data": {"results": meetings},
+    #                 "meetings": meetings,
+    #                 "count": len(meetings),
+    #             })
+    #         return False, json.dumps({"error": response.error or "Failed to get meetings"})
+    #     except Exception as e:
+    #         return self._handle_error(e, "get my meetings")
+
+    # @tool(
+    #     app_name="teams",
+    #     tool_name="get_my_recurring_meetings",
+    #     description="Get recurring meetings for the authenticated Teams user",
+    #     args_schema=GetMyRecurringMeetingsInput,
+    #     when_to_use=[
+    #         "User wants recurring meetings only",
+    #         "User asks for repeated/series meetings",
+    #     ],
+    #     when_not_to_use=[
+    #         "User wants all meetings (use get_my_meetings)",
+    #         "No Teams mention",
+    #     ],
+    #     primary_intent=ToolIntent.SEARCH,
+    #     typical_queries=[
+    #         "Show my recurring meetings",
+    #         "List repeated Teams meetings",
+    #     ],
+    #     category=ToolCategory.SEARCH,
+    # )
+    # async def get_my_recurring_meetings(self, top: Optional[int] = 50) -> tuple[bool, str]:
+    #     try:
+    #         response = await self.client.teams_get_my_recurring_meetings(top=top or 50)
+    #         if response.success:
+    #             serialized = self._serialize_response(response.data)
+    #             meetings = []
+    #             if isinstance(serialized, dict):
+    #                 raw_meetings = serialized.get("results")
+    #                 if isinstance(raw_meetings, list):
+    #                     meetings = raw_meetings
+    #             return True, json.dumps({
+    #                 "data": {"results": meetings},
+    #                 "meetings": meetings,
+    #                 "count": len(meetings),
+    #             })
+    #         return False, json.dumps({"error": response.error or "Failed to get recurring meetings"})
+    #     except Exception as e:
+    #         return self._handle_error(e, "get my recurring meetings")
+
+    # @tool(
+    #     app_name="teams",
+    #     tool_name="get_my_meetings_for_given_period",
+    #     description="Get meetings for the authenticated Teams user within a given datetime period",
+    #     args_schema=GetMyMeetingsForGivenPeriodInput,
+    #     when_to_use=[
+    #         "User wants meetings between start and end datetime",
+    #         "User asks meetings for a specific period",
+    #     ],
+    #     when_not_to_use=[
+    #         "User wants all meetings without date filter (use get_my_meetings)",
+    #         "No Teams mention",
+    #     ],
+    #     primary_intent=ToolIntent.SEARCH,
+    #     typical_queries=[
+    #         "Show my meetings between two dates",
+    #         "Find meetings for this week",
+    #     ],
+    #     category=ToolCategory.SEARCH,
+    # )
+    # async def get_my_meetings_for_given_period(
+    #     self,
+    #     start_datetime: str,
+    #     end_datetime: str,
+    #     top: Optional[int] = 100,
+    # ) -> tuple[bool, str]:
+    #     try:  
+    #         response = await self.client.teams_get_my_meetings_for_given_period(
+    #             start_datetime=start_datetime,
+    #             end_datetime=end_datetime,
+    #             top=top or 100,
+    #         )
+    #         if response.success:
+    #             serialized = self._serialize_response(response.data)
+    #             logger.info(
+    #                 "teams_get_my_meetings_for_given_period response=%s",
+    #                 json.dumps(serialized, default=str)[:4000],
+    #             )
+    #             meetings = []
+    #             if isinstance(serialized, dict):
+    #                 raw_meetings = serialized.get("results")
+    #                 if isinstance(raw_meetings, list):
+    #                     meetings = raw_meetings
+    #             return True, json.dumps({
+    #                 "data": {"results": meetings},
+    #                 "meetings": meetings,
+    #                 "count": len(meetings),
+    #                 "start_datetime": start_datetime,
+    #                 "end_datetime": end_datetime,
+    #             })
+    #         return False, json.dumps({"error": response.error or "Failed to get meetings for period"})
+    #     except Exception as e:
+    #         return self._handle_error(e, "get my meetings for given period")
+
+    @tool(
+        path="/tools/teams/search_calendar_events_in_range",
+        short_description="Search calendar events by name within a time frame",
+        description=(
+            "Search calendar events by partial name (subject) within a time frame. "
+            "Returns only events matching the keyword that fall within the given date range."
+        ),
+        parameters=[
+            ToolParameter(name="keyword", type=ParameterType.STRING, description="Partial or full name to search for in event subjects. Case-insensitive.", required=True),
+            ToolParameter(name="start_datetime", type=ParameterType.STRING, description="Start of time range (ISO 8601, e.g. '2026-03-01T00:00:00Z').", required=True),
+            ToolParameter(name="end_datetime", type=ParameterType.STRING, description="End of time range (ISO 8601, e.g. '2026-03-31T23:59:59Z').", required=True),
+            ToolParameter(name="timezone", type=ParameterType.STRING, description="Windows timezone name for returned datetimes. E.g. 'India Standard Time'.", required=False),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of results to return (1-50).", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def search_calendar_events_in_range(
+        self,
+        keyword: str,
+        start_datetime: str,
+        end_datetime: str,
+        timezone: str = "UTC",
+        top: int = 10,
+    ) -> tuple[bool, str]:
+        """Search calendar events by partial subject match within a time range.
+
+        The datasource reads calendarView for the range and matches subjects in Python,
+        so the keyword is not part of an OData filter and must not be quote-escaped.
+        """
+        try:
+            keyword = (keyword or "").strip()
+
+            if not keyword:
+                return False, json.dumps({"error": "keyword cannot be empty."})
+
+
+            resp = await self.client.me_search_events_in_range(
+                keyword=keyword,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                timezone=timezone,
+                top=top,
+            )
+
+            if not resp.success:
+                return False, json.dumps({"error": _graph_error(resp.error, "Failed to search calendar events")})
+            
+            data = self._serialize_response(resp.data)
+            
+            events = (
+                data.get("value", []) if isinstance(data, dict)
+                else (data if isinstance(data, list) else [])
+            )
+
+            
+
+            return True, json.dumps({
+                "results": events,
+                "count": len(events),
+                "keyword": keyword,
+                "start_datetime": start_datetime,
+                "end_datetime": end_datetime,
+            })
+
+        except Exception as e:
+            return self._handle_error(e, "search calendar events in range")
+
+
+
+
+    @tool(
+        path="/tools/teams/get_my_meeting_transcripts",
+        short_description="Get transcript records for an online meeting",
+        description="Get transcript records, content, and metadata for one of the authenticated user's online meetings. Provide meeting_id directly, or pass join_url or event_id to resolve.",
+        parameters=[
+            ToolParameter(name="meeting_id", type=ParameterType.STRING, description="The online meeting ID. If provided, transcript APIs are called directly.", required=False),
+            ToolParameter(name="join_url", type=ParameterType.STRING, description="The Teams join URL. Preferred over event_id — skips one API call.", required=False),
+            ToolParameter(name="event_id", type=ParameterType.STRING, description="The calendar event ID. Used as fallback when join_url is not available.", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_my_meeting_transcripts(
+        self,
+        meeting_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        join_url: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """Fetch all transcripts for an online meeting.
+
+        Preferred: meeting_id (direct call, no resolution).
+        Fallback:  join_url (skips one API call) or event_id (fetches event first).
+        """
+        
+        try:
+            # Step 1: Resolve to online meeting ID
+            resolved_meeting_id = meeting_id
+            if not resolved_meeting_id:
+                resolved_meeting_id = await self._resolve_to_online_meeting_id(
+                    event_id=event_id,
+                    join_url=join_url,
+                )
+
+            if not resolved_meeting_id:
+                return False, json.dumps({
+                    "error": (
+                        "Could not resolve to a Teams online meeting ID. "
+                        "Provide meeting_id directly, or pass a valid join_url/event_id. "
+                        "The event may not be a Teams meeting, or you may lack "
+                        "OnlineMeetings.Read permission."
+                    )
+                })
+
+            
+
+            # Step 2: List transcripts
+            list_resp = await self.client.me_list_online_meeting_transcripts(
+                onlineMeeting_id=resolved_meeting_id,
+            )
+            if not list_resp.success:
+                return False, json.dumps({"error": _graph_error(list_resp.error, "Failed to list transcripts")})
+            
+            data = self._serialize_response(list_resp.data) if list_resp.data else {}
+            transcript_items = (
+                data.get("value", []) if isinstance(data, dict)
+                else (data if isinstance(data, list) else [])
+            )
+
+            if not transcript_items:
+                return True, json.dumps({
+                    "message": "No transcripts available for this meeting",
+                    "transcripts": [],
+                })
+
+            
+
+            # Step 3: Fetch metadataContent for each transcript
+            all_transcripts = []
+            for t_obj in transcript_items:
+                t_id = (
+                    t_obj.id if hasattr(t_obj, "id")
+                    else (t_obj.get("id") if isinstance(t_obj, dict) else None)
+                )
+                if not t_id:
+                    continue
+
+                created = (
+                    str(t_obj.created_date_time) if hasattr(t_obj, "created_date_time")
+                    else (t_obj.get("createdDateTime") if isinstance(t_obj, dict) else None)
+                )
+
+                parsed_entries = []
+                meta_resp = await self.client.me_get_online_meeting_transcript_metadata(
+                    onlineMeeting_id=resolved_meeting_id,
+                    callTranscript_id=t_id,
+                )
+                if meta_resp.success:
+                    meta_data = self._serialize_response(meta_resp.data) if meta_resp.data else {}
+                    meta_text = meta_data.get("content", "") if isinstance(meta_data, dict) else ""
+                    if meta_text:
+                        parsed_entries = self._parse_metadata_json(meta_text)
+
+                all_transcripts.append({
+                    "transcript_id": t_id,
+                    "created": created,
+                    "entries": parsed_entries,
+                    "entry_count": len(parsed_entries),
+                })
+            
+            
+            return True, json.dumps({
+                "meeting_id": resolved_meeting_id,
+                "transcripts": all_transcripts,
+                "transcript_count": len(all_transcripts),
+            })
+
+        except Exception as e:
+            return self._handle_error(e, "get meeting transcripts")
+
+
+    async def _resolve_to_online_meeting_id(
+        self,
+        event_id: Optional[str] = None,
+        join_url: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve to an online meeting ID.
+
+        Path A (join_url provided) — 1 API call:
+            GET /me/onlineMeetings?$filter=JoinWebUrl eq '{join_url}'
+
+        Path B (event_id provided) — 2 API calls:
+            GET /me/events/{event_id}  →  extract joinUrl
+            GET /me/onlineMeetings?$filter=JoinWebUrl eq '{join_url}'
+        """
+        try:
+            # Path A: join_url provided directly — skip event fetch
+            if join_url:
+                result = await self._online_meeting_id_from_join_url(join_url)
+                return result
+
+            # Path B: event_id provided — fetch event to extract joinUrl
+            if event_id:
+                ev_resp = await self.client.me_calendar_get_events(event_id=event_id)
+                if not ev_resp.success:
+                    return None
+
+                ev = self._serialize_response(ev_resp.data) if ev_resp.data else {}
+                if not isinstance(ev, dict):
+                    return None
+
+                om = ev.get("onlineMeeting") or ev.get("online_meeting")
+                if not isinstance(om, dict):
+                    return None
+
+                extracted_join_url = (
+                    om.get("joinWebUrl")
+                    or om.get("joinUrl")
+                    or om.get("join_web_url")
+                    or om.get("join_url")
+                )
+                if not extracted_join_url or not isinstance(extracted_join_url, str):
+                    return None
+
+                result = await self._online_meeting_id_from_join_url(extracted_join_url)
+                return result
+
+            return None
+
+        except Exception as e:
+            print(f"[_resolve_to_online_meeting_id] exception: {e!r}")
+            return None
+
+
+    async def _online_meeting_id_from_join_url(self, join_url: str) -> Optional[str]:
+        """Resolve a Teams joinWebUrl to an online meeting ID.
+
+        GET /me/onlineMeetings?$filter=JoinWebUrl eq '{join_url}'
+        NOTE: join_url must be URL-decoded before filtering — Graph API 
+        returns 400 if the URL contains percent-encoded characters.
+        """
+        try:
+            from urllib.parse import unquote
+            
+            # Decode percent-encoded characters before passing to Graph filter
+            decoded_url = unquote(join_url)
+
+            safe_url = decoded_url.replace("'", "''")
+            resp = await self.client.me_list_online_meetings(
+                filter=f"joinWebUrl eq '{safe_url}'",
+            )
+            if not resp.success:
+                return None
+
+            data = self._serialize_response(resp.data) if resp.data else {}
+            
+            items = (
+                data.get("value") or data.get("results", [])
+                if isinstance(data, dict)
+                else (data if isinstance(data, list) else [])
+            )
+            if not items:
+                return None
+
+            first = items[0]
+            return (
+                first.get("id") if isinstance(first, dict)
+                else getattr(first, "id", None)
+            )
+
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_metadata_json(meta_text: str) -> List[Dict[str, str]]:
+        """Parse metadataContent (speaker diarization JSON lines) into entries."""
+        entries: List[Dict[str, str]] = []
+        for line in meta_text.strip().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                    speaker = obj.get("speakerName", "Unknown")
+                    text = obj.get("spokenText", "")
+                    if text:
+                        entries.append({"timestamp": "", "speaker": speaker, "text": text})
+                except json.JSONDecodeError:
+                    pass
+        return entries
+
+
+
+    @tool(
+        path="/tools/teams/get_people_attended",
+        short_description="Get people attendance records for a Teams online meeting",
+        description="Get attendance records for a Teams online meeting. Provide meeting_id directly, or pass join_url or event_id to resolve.",
+        parameters=[
+            ToolParameter(name="meeting_id", type=ParameterType.STRING, description="The online meeting ID. If provided, attendance API is called directly.", required=False),
+            ToolParameter(name="join_url", type=ParameterType.STRING, description="The Teams join URL. Preferred over event_id because it skips one API call.", required=False),
+            ToolParameter(name="event_id", type=ParameterType.STRING, description="The calendar event ID. Used as fallback when join_url is unavailable.", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_people_attended(
+        self,
+        meeting_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        join_url: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        try:
+            resolved_meeting_id = meeting_id
+            if not resolved_meeting_id:
+                resolved_meeting_id = await self._resolve_to_online_meeting_id(
+                    event_id=event_id,
+                    join_url=join_url,
+                )
+
+            if not resolved_meeting_id:
+                return False, json.dumps({
+                    "error": (
+                        "Could not resolve to a Teams online meeting ID. "
+                        "Provide meeting_id directly, or pass a valid join_url/event_id. "
+                        "The event may not be a Teams meeting, or you may lack "
+                        "OnlineMeetings.Read permission."
+                    )
+                })
+
+            response = await self.client.teams_get_people_attended(meeting_id=resolved_meeting_id)
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                people = []
+                if isinstance(serialized, dict):
+                    raw_people = serialized.get("results")
+                    if isinstance(raw_people, list):
+                        people = raw_people
+                return True, json.dumps({
+                    "data": {"results": people},
+                    "people": people,
+                    "count": len(people),
+                    "meeting_id": resolved_meeting_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get people attended")})
+        except Exception as e:
+            return self._handle_error(e, "get people attended")
+
+    @tool(
+        path="/tools/teams/get_people_invited",
+        short_description="Get people invited to a Teams meeting",
+        description="Get the list of people invited to a specific Teams online meeting by meeting ID.",
+        parameters=[
+            ToolParameter(name="meeting_id", type=ParameterType.STRING, description="ID of the meeting", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_people_invited(self, meeting_id: str) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_people_invited(meeting_id=meeting_id)
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                people = []
+                if isinstance(serialized, dict):
+                    raw_people = serialized.get("results")
+                    if isinstance(raw_people, list):
+                        people = raw_people
+                return True, json.dumps({
+                    "data": {"results": people},
+                    "people": people,
+                    "count": len(people),
+                    "meeting_id": meeting_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get people invited")})
+        except Exception as e:
+            return self._handle_error(e, "get people invited")
+
+    @tool(
+        path="/tools/teams/create_event",
+        short_description="Create a calendar event/meeting for the authenticated Teams user",
+        description="Create a calendar event or meeting with optional attendees, location, recurrence, and online meeting link.",
+        parameters=[
+            ToolParameter(name="subject", type=ParameterType.STRING, description="Title/subject of the event", required=True),
+            ToolParameter(name="start_datetime", type=ParameterType.STRING, description="Start datetime in ISO 8601 format (e.g. 2024-01-15T10:00:00)", required=True),
+            ToolParameter(name="end_datetime", type=ParameterType.STRING, description="End datetime in ISO 8601 format (e.g. 2024-01-15T11:00:00)", required=True),
+            ToolParameter(name="timezone", type=ParameterType.STRING, description="Timezone for the event (e.g. 'UTC', 'America/New_York', 'India Standard Time')", required=False),
+            ToolParameter(name="body", type=ParameterType.STRING, description="Body/description of the event", required=False),
+            ToolParameter(name="location", type=ParameterType.STRING, description="Location of the event", required=False),
+            ToolParameter(name="attendees", type=ParameterType.STRING, description="List of attendee email addresses (JSON array)", required=False),
+            ToolParameter(name="is_online_meeting", type=ParameterType.BOOLEAN, description="Whether to create an online meeting link", required=False),
+            ToolParameter(name="recurrence", type=ParameterType.STRING, description="Optional recurrence dict (JSON) to make this a repeating event with 'pattern' and 'range' keys.", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+        args_summary=args_template('Creating Teams event "{subject}"', "subject"),
+        result_summary=entity_summary(lambda e: f"Event created: {e.get('subject') or '?'}", path=()),
+    )
+    async def create_event(
+        # self,
+        # subject: str,
+        # start_datetime: str,
+        # end_datetime: str,
+        # timezone: Optional[str] = "UTC",
+        # description: Optional[str] = None,
+        # is_online_meeting: Optional[bool] = True,
+        self,
+        subject: str,
+        start_datetime: str,
+        end_datetime: str,
+        timezone: Optional[str] = "UTC",
+        body: Optional[str] = None,
+        location: Optional[str] = None,
+        attendees: Optional[List[str]] = None,
+        recurrence: Optional[Dict[str, Any]] = None,
+        is_online_meeting: Optional[bool] = False,
+    ) -> tuple[bool, str]:
+        try:
+            tz = timezone or "UTC"
+            event_body: Dict[str, Any] = {
+                "subject": subject,
+                "start": {
+                    "dateTime": start_datetime,
+                    "timeZone": tz,
+                },
+                "end": {
+                    "dateTime": end_datetime,
+                    "timeZone": tz,
+                },
+                "isOnlineMeeting": bool(is_online_meeting),
+                "onlineMeetingProvider": "teamsForBusiness",
+            }
+
+            if body:
+                event_body["body"] = {
+                    "contentType": "Text",
+                    "content": body,
+                }
+
+            if location:
+                event_body["location"] = {"displayName": location}
+
+            if attendees:
+                attendee_addresses = _coerce_str_list(attendees)
+                if attendee_addresses is None:
+                    return False, json.dumps({
+                        "error": 'attendees must be a list of email addresses, for example ["ann@contoso.com"].'
+                    })
+                event_body["attendees"] = [
+                    {"emailAddress": {"address": addr}, "type": "required"}
+                    for addr in attendee_addresses
+                ]
+
+            if recurrence:
+                recurrence_dict = _coerce_dict(recurrence)
+                if recurrence_dict is None:
+                    return False, json.dumps({
+                        "error": (
+                            "recurrence must be an object with 'pattern' and 'range' keys, for example "
+                            '{"pattern": {"type": "daily", "interval": 1}, '
+                            '"range": {"type": "noEnd", "startDate": "2026-03-02"}}.'
+                        )
+                    })
+                event_body["recurrence"] = _build_recurrence_body(recurrence_dict)
+            response = await self.client.me_calendar_create_events(request_body=event_body)
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                event_id = None
+                if isinstance(serialized_result, dict):
+                    event_id = serialized_result.get("id")
+                return True, json.dumps({
+                    "message": "Event created successfully",
+                    "event_id": event_id,
+                    "subject": subject,
+                    "result": serialized_result,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to create event")})
+        except Exception as e:
+            return self._handle_error(e, "create event")
+
+    @tool(
+        path="/tools/teams/create_channel_meeting",
+        short_description="Schedule an online meeting for a Teams channel",
+        description="Schedule an online meeting for a specific Teams channel in a team.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_name", type=ParameterType.STRING, description="Display name of the Teams channel", required=True),
+            ToolParameter(name="subject", type=ParameterType.STRING, description="Meeting title/subject", required=True),
+            ToolParameter(name="start_datetime", type=ParameterType.STRING, description="Start datetime in ISO 8601 format (e.g. 2024-01-15T10:00:00)", required=True),
+            ToolParameter(name="end_datetime", type=ParameterType.STRING, description="End datetime in ISO 8601 format (e.g. 2024-01-15T11:00:00)", required=True),
+            ToolParameter(name="timezone", type=ParameterType.STRING, description="Timezone for the meeting (e.g. 'Asia/Kolkata', 'UTC')", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def create_channel_meeting(
+        self,
+        team_id: str,
+        channel_name: str,
+        subject: str,
+        start_datetime: str,
+        end_datetime: str,
+        timezone: Optional[str] = "Asia/Kolkata",
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_create_channel_meeting(
+                team_id=team_id,
+                channel_name=channel_name,
+                subject=subject,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                timezone=timezone or "Asia/Kolkata",
+            )
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                event_id = None
+                if isinstance(serialized_result, dict):
+                    event_id = serialized_result.get("event_id") or serialized_result.get("id")
+                return True, json.dumps(
+                    {
+                        "message": "Channel meeting created successfully",
+                        "event_id": event_id,
+                        "team_id": team_id,
+                        "channel_name": channel_name,
+                        "subject": subject,
+                        "result": serialized_result,
+                    }
+                )
+            return False, json.dumps(
+                {"error": _graph_error(response.error or response.message, "Failed to create channel meeting")}
+            )
+        except Exception as e:
+            return self._handle_error(e, "create channel meeting")
+
+    @tool(
+        path="/tools/teams/edit_event",
+        short_description="Edit/update an existing calendar event",
+        description="Edit/update an existing calendar event for the authenticated Teams user. Supports updating subject, time, description, and online meeting status.",
+        parameters=[
+            ToolParameter(name="event_id", type=ParameterType.STRING, description="ID of the event to update", required=True),
+            ToolParameter(name="subject", type=ParameterType.STRING, description="Updated event title", required=False),
+            ToolParameter(name="start_datetime", type=ParameterType.STRING, description="Updated start datetime in ISO 8601 format", required=False),
+            ToolParameter(name="end_datetime", type=ParameterType.STRING, description="Updated end datetime in ISO 8601 format", required=False),
+            ToolParameter(name="timezone", type=ParameterType.STRING, description="Timezone label (default UTC)", required=False),
+            ToolParameter(name="description", type=ParameterType.STRING, description="Updated event description", required=False),
+            ToolParameter(name="is_online_meeting", type=ParameterType.BOOLEAN, description="Whether event should be online", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def edit_event(
+        self,
+        event_id: str,
+        subject: Optional[str] = None,
+        start_datetime: Optional[str] = None,
+        end_datetime: Optional[str] = None,
+        timezone: Optional[str] = "UTC",
+        description: Optional[str] = None,
+        is_online_meeting: Optional[bool] = None,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_edit_event(
+                event_id=event_id,
+                subject=subject,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                timezone=timezone,
+                description=description,
+                is_online_meeting=is_online_meeting,
+            )
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                return True, json.dumps({
+                    "message": "Event updated successfully",
+                    "event_id": event_id,
+                    "result": serialized_result,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to edit event")})
+        except Exception as e:
+            return self._handle_error(e, "edit event")
+
+    # Team tools
+    # ------------------------------------------------------------------
+
+    @tool(
+        path="/tools/teams/get_teams",
+        short_description="List Microsoft Teams the authenticated user has joined",
+        description="List Microsoft Teams that the authenticated user has joined, with optional limit on results.",
+        parameters=[
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of teams to return (default 20, max 100)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+        args_summary=lambda _args: "Fetching Microsoft Teams",
+        result_summary=list_summary("results", _teams_team_label, "team"),
+    )
+    async def get_teams(self, top: Optional[int] = 20) -> tuple[bool, str]:
+        try:
+            response = await self.client.me_list_joined_teams()
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                teams = self._extract_collection_items(serialized)
+                limit = min(top or 20, 100)
+                teams = teams[:limit]
+                return True, json.dumps({
+                    "teams": teams,
+                    "count": len(teams),
+                    # Backward-compatible shape for placeholder resolvers
+                    # expecting teams.get_teams.data.results[*].id
+                    "data": {
+                        "results": teams,
+                    },
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get teams")})
+        except Exception as e:
+            return self._handle_error(e, "get teams")
+
+    @tool(
+        path="/tools/teams/get_team",
+        short_description="Get details for a specific Microsoft Team",
+        description="Get details for a specific Microsoft Team by its ID.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_team(self, team_id: str) -> tuple[bool, str]:
+        try:
+            # me_get_joined_teams needs a joinedTeams item selector this SDK version does not have.
+            response = await self.client.teams_team_get_team(team_id=team_id)
+            if response.success:
+                return True, json.dumps(self._serialize_response(response.data))
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get team")})
+        except Exception as e:
+            return self._handle_error(e, f"get team {team_id}")
+
+    @tool(
+        path="/tools/teams/create_team",
+        short_description="Create a new Microsoft Team",
+        description="Create a new Microsoft Team with a display name and optional description.",
+        parameters=[
+            ToolParameter(name="display_name", type=ParameterType.STRING, description="Display name of the team", required=True),
+            ToolParameter(name="description", type=ParameterType.STRING, description="Description of the team", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def create_team(self, display_name: str, description: Optional[str] = None) -> tuple[bool, str]:
+        try:
+            request_body: Dict[str, Any] = {
+                "template@odata.bind": "https://graph.microsoft.com/v1.0/teamsTemplates('standard')",
+                "displayName": display_name,
+            }
+            if description:
+                request_body["description"] = description
+
+            response = await self.client.teams_team_create_team(body=request_body)
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                team_id = self._extract_team_id(serialized_result)
+                matched_team: Optional[Dict[str, Any]] = None
+
+                if not team_id:
+                    matched_team = await self._wait_for_created_team(display_name=display_name)
+                    if matched_team:
+                        team_id = matched_team.get("id")
+
+                if team_id:
+                    return True, json.dumps({
+                        "message": "Team created successfully",
+                        "display_name": display_name,
+                        "team_id": team_id,
+                        "result": serialized_result,
+                        "provisioning_status": "completed",
+                    })
+
+                return True, json.dumps({
+                    "message": "Team creation request submitted successfully",
+                    "display_name": display_name,
+                    "result": serialized_result,
+                    "provisioning_status": "accepted",
+                    "next_step": "Use get_teams shortly to fetch the new team_id once provisioning finishes.",
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to create team")})
+        except Exception as e:
+            return self._handle_error(e, "create team")
+
+   
+
+    @tool(
+        path="/tools/teams/get_members",
+        short_description="List members in a Microsoft Team or channel",
+        description="List members in a Microsoft Team, or in a specific channel within that team.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="Optional channel ID. If provided, returns members for that channel.", required=False),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of members to return (default 100, max 500)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_members(
+        self,
+        team_id: str,
+        channel_id: Optional[str] = None,
+        top: Optional[int] = 100,
+    ) -> tuple[bool, str]:
+        try:
+            membership_scope = "team"
+            membership_type: Optional[str] = None
+
+            if channel_id:
+                channels_response = await self.client.teams_get_channels(team_id=team_id)
+                if not channels_response.success:
+                    return False, json.dumps({
+                        "error": _graph_error(channels_response.error, "Failed to fetch channels to resolve membership scope")
+                    })
+
+                serialized_channels = self._serialize_response(channels_response.data)
+                channels = self._extract_collection_items(serialized_channels)
+                channel_obj = next(
+                    (
+                        channel
+                        for channel in channels
+                        if isinstance(channel, dict) and channel.get("id") == channel_id
+                    ),
+                    None,
+                )
+                if not channel_obj:
+                    return False, json.dumps({
+                        "error": f"Channel '{channel_id}' was not found in team '{team_id}'"
+                    })
+
+                membership_type = str(
+                    channel_obj.get("membershipType")
+                    or channel_obj.get("membership_type")
+                    or "standard"
+                ).strip().lower()
+
+                # Standard channels inherit team membership.
+                if membership_type == "standard":
+                    response = await self.client.teams_list_members(team_id=team_id)
+                    membership_scope = "team"
+                else:
+                    response = await self.client.teams_list_channel_members(
+                        team_id=team_id,
+                        channel_id=channel_id,
+                    )
+                    membership_scope = "channel"
+            else:
+                response = await self.client.teams_list_members(team_id=team_id)
+
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                members = self._extract_collection_items(serialized)
+                limit = min(top or 100, 500)
+                members = members[:limit]
+                payload: Dict[str, Any] = {
+                    "data": {
+                        "results": members,
+                    },
+                    "members": members,
+                    "count": len(members),
+                    "team_id": team_id,
+                }
+                if channel_id:
+                    payload["channel_id"] = channel_id
+                    payload["membership_type"] = membership_type
+                    payload["membership_scope"] = membership_scope
+                return True, json.dumps(payload)
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get members")})
+        except Exception as e:
+            return self._handle_error(e, f"get members for team {team_id}")
+
+
+    @tool(
+        path="/tools/teams/add_member",
+        short_description="Add a member to a Microsoft Team or channel",
+        description="Add a member to a Microsoft Team or channel (supports team, standard channel, and private channel).",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="user_id", type=ParameterType.STRING, description="User ID or Azure AD object ID to add", required=True),
+            ToolParameter(name="role", type=ParameterType.STRING, description="Role for the new member: 'member' or 'owner'", required=False),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="Optional channel ID. If omitted, adds user to team. For private channel, user is added directly to channel.", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def add_member(
+        self,
+        team_id: str,
+        user_id: str,
+        role: Optional[str] = "member",
+        channel_id: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        try:
+            logger.info(f"Adding member to team {team_id} with user {user_id} and role {role} and channel {channel_id}")
+            normalized_role = (role or "member").strip().lower()
+            roles = ["owner"] if normalized_role == "owner" else []
+            safe_user_id = user_id.replace("'", "''")
+            request_body = {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": roles,
+                "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{safe_user_id}')",
+            }
+
+            # CASE 1 — Add to team
+            if not channel_id:
+                response = await self.client.me_joined_teams_create_members(
+                    team_id=team_id,
+                    body=request_body,
+                )
+                if response.success:
+                    return True, json.dumps({
+                        "message": "Member added to team successfully",
+                        "team_id": team_id,
+                        "user_id": user_id,
+                    })
+                return False, json.dumps({"error": _graph_error(response.error, "Failed to add member to team")})
+
+            # CASE 2 — Channel provided: determine membership type first
+            channels_response = await self.client.teams_get_channels(team_id=team_id)
+            if not channels_response.success:
+                return False, json.dumps({
+                    "error": _graph_error(channels_response.error, "Failed to fetch channels to resolve membership type")
+                })
+
+            serialized_channels = self._serialize_response(channels_response.data)
+            channels = self._extract_collection_items(serialized_channels)
+            channel_obj = next(
+                (
+                    channel
+                    for channel in channels
+                    if isinstance(channel, dict) and channel.get("id") == channel_id
+                ),
+                None,
+            )
+            if not channel_obj:
+                return False, json.dumps({
+                    "error": f"Channel '{channel_id}' was not found in team '{team_id}'"
+                })
+
+            membership_type = str(
+                channel_obj.get("membershipType")
+                or channel_obj.get("membership_type")
+                or "standard"
+            ).strip().lower()
+
+            # Standard channel inherits team membership
+            if membership_type == "standard":
+                response = await self.client.me_joined_teams_create_members(
+                    team_id=team_id,
+                    body=request_body,
+                )
+                if response.success:
+                    return True, json.dumps({
+                        "message": "User added to team (standard channel inherits team members)",
+                        "team_id": team_id,
+                        "channel_id": channel_id,
+                        "user_id": user_id,
+                    })
+                return False, json.dumps({
+                    "error": _graph_error(response.error, "Failed to add user to team for standard channel")
+                })
+
+            # Private channel
+            elif membership_type == "private":
+                response = await self.client.teams_channels_create_members(
+                    team_id=team_id,
+                    channel_id=channel_id,
+                    body=request_body,
+                )
+                if response.success:
+                    return True, json.dumps({
+                        "message": "User added to private channel",
+                        "team_id": team_id,
+                        "channel_id": channel_id,
+                        "user_id": user_id,
+                    })
+                return False, json.dumps({
+                    "error": _graph_error(response.error, "Failed to add user to private channel")
+                })
+
+            return False, json.dumps({
+                "error": f"Unsupported channel membership type: {membership_type}"
+            })
+
+        except Exception as e:
+            return self._handle_error(e, "add member")
+        
+
+    @tool(
+        path="/tools/teams/get_channels",
+        short_description="List channels in a Microsoft Team",
+        description="List channels in a specific Microsoft Team by team ID.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of channels to return (default 50, max 200)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+        args_summary=args_template("Fetching channels for Teams team {team_id}", "team_id"),
+        result_summary=list_summary("results", _teams_channel_label, "channel"),
+    )
+    async def get_channels(self, team_id: str, top: Optional[int] = 50) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_channels(team_id=team_id)
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                channels = self._extract_collection_items(serialized)
+                limit = min(top or 50, 200)
+                channels = channels[:limit]
+                return True, json.dumps({
+                    "data":{
+                        "results": channels,
+                    }
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get channels")})
+        except Exception as e:
+            return self._handle_error(e, f"get channels for team {team_id}")
+
+    @tool(
+        path="/tools/teams/create_channel",
+        short_description="Create a new channel in a Microsoft Team",
+        description="Create a new standard or private channel in a Microsoft Team.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="display_name", type=ParameterType.STRING, description="Display name of the channel", required=True),
+            ToolParameter(name="description", type=ParameterType.STRING, description="Description of the channel", required=False),
+            ToolParameter(name="channel_type", type=ParameterType.STRING, description="Type of channel: 'standard' or 'private'", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def create_channel(
+        self,
+        team_id: str,
+        display_name: str,
+        description: Optional[str] = None,
+        channel_type: Optional[str] = "standard",
+    ) -> tuple[bool, str]:
+        try:
+            membership_type = (channel_type or "standard").strip().lower()
+            if membership_type not in ("standard", "private"):
+                membership_type = "standard"
+
+            request_body: Dict[str, Any] = {
+                "displayName": display_name,
+                "membershipType": membership_type,
+            }
+            if description:
+                request_body["description"] = description
+
+            response = await self.client.teams_create_channels(
+                team_id=team_id,
+                body=request_body,
+            )
+            if response.success:
+                data = self._serialize_response(response.data)
+                channel_id = None
+                if isinstance(data, dict):
+                    channel_id = data.get("id")
+                return True, json.dumps({
+                    "message": "Channel created successfully",
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "display_name": display_name,
+                    "channel": data,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to create channel")})
+        except Exception as e:
+            return self._handle_error(e, f"create channel in team {team_id}")
+
+    # @tool(
+    #     app_name="teams",
+    #     tool_name="delete_channel",
+    #     description="Delete a channel from a Microsoft Team",
+    #     args_schema=DeleteChannelInput,
+    #     when_to_use=[
+    #         "User wants to delete or remove a channel from a Microsoft Team",
+    #         "User asks to permanently remove a team channel",
+    #     ],
+    #     when_not_to_use=[
+    #         "User wants to delete the entire team (use delete_team)",
+    #         "User wants to send a message (use send_message)",
+    #         "No Teams mention",
+    #     ],
+    #     primary_intent=ToolIntent.ACTION,
+    #     typical_queries=[
+    #         "Delete channel X from team Y",
+    #         "Remove the announcements channel",
+    #         "Permanently delete this Teams channel",
+    #     ],
+    #     category=ToolCategory.COMMUNICATION,
+    # )
+    # async def delete_channel(
+    #     self,
+    #     team_id: str,
+    #     channel_id: str,
+    # ) -> tuple[bool, str]:
+    #     try:
+    #         response = await self.client.teams_delete_channels(
+    #             team_id=team_id,
+    #             channel_id=channel_id,
+    #         )
+    #         if response.success:
+    #             return True, json.dumps({
+    #                 "message": "Channel deleted successfully",
+    #                 "team_id": team_id,
+    #                 "channel_id": channel_id,
+    #             })
+    #         return False, json.dumps({"error": response.error or "Failed to delete channel"})
+    #     except Exception as e:
+    #         return self._handle_error(e, f"delete channel {channel_id} from team {team_id}")
+
+    @tool(
+        path="/tools/teams/update_channel",
+        short_description="Update a Microsoft Teams channel's name or description",
+        description="Update the display name or description of a Microsoft Teams channel.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the channel to update", required=True),
+            ToolParameter(name="display_name", type=ParameterType.STRING, description="New display name for the channel", required=False),
+            ToolParameter(name="description", type=ParameterType.STRING, description="New description for the channel", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def update_channel(
+        self,
+        team_id: str,
+        channel_id: str,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        try:
+            if display_name is None and description is None:
+                return False, json.dumps({"error": "No fields provided to update"})
+
+            # The SDK serializes only model objects; a plain dict body fails before any request is sent.
+            patch_body = Channel()
+            if display_name is not None:
+                patch_body.display_name = display_name
+            if description is not None:
+                patch_body.description = description
+
+            response = await self.client.teams_update_channels(
+                team_id=team_id,
+                channel_id=channel_id,
+                body=patch_body,
+            )
+            if response.success:
+                return True, json.dumps({
+                    "message": "Channel updated successfully",
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to update channel")})
+        except Exception as e:
+            return self._handle_error(e, f"update channel {channel_id} in team {team_id}")
+
+    # ------------------------------------------------------------------
+    # Channel message tools
+    # ------------------------------------------------------------------
+
+    @tool(
+        path="/tools/teams/send_channel_message",
+        short_description="Send a message to a Microsoft Teams channel",
+        description="Send a message to a specific Microsoft Teams channel.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="message", type=ParameterType.STRING, description="Message content to send", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+        args_summary=args_template("Sending Teams message to channel {channel_id}", "channel_id"),
+        result_summary=confirmation("Message sent to channel {channel_id}", "channel_id"),
+    )
+    async def send_channel_message(self, team_id: str, channel_id: str, message: str) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_send_channel_message(
+                team_id=team_id,
+                channel_id=channel_id,
+                message=message,
+            )
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                return True, json.dumps({
+                    "message": "Teams message sent successfully",
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "result": serialized_result,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to send Teams message")})
+        except Exception as e:
+            return self._handle_error(e, "send Teams message")
+
+    @tool(
+        path="/tools/teams/send_user_message",
+        short_description="Send a direct message to a Microsoft Teams user",
+        description="Send a direct message to a specific Microsoft Teams user by name, email, UPN, or user ID.",
+        parameters=[
+            ToolParameter(name="user_identifier", type=ParameterType.STRING, description="User display name, email, user principal name, or user id to send message to", required=True),
+            ToolParameter(name="message", type=ParameterType.STRING, description="Message content to send", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def send_user_message(
+        self,
+        user_identifier: str,
+        message: str,
+    ) -> tuple[bool, str]:
+        try:
+            # The datasource's own lookup takes the first substring match on the first directory
+            # page ("Sam" could reach "Samantha"), so resolve exactly one user here and hand over the id.
+            user_id, resolve_error = await self._resolve_single_user(user_identifier)
+            if resolve_error:
+                return False, json.dumps({"error": resolve_error})
+
+            response = await self.client.teams_send_message_to_user(
+                user_identifier=user_id,
+                user_id=user_id,
+                message=message,
+            )
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                return True, json.dumps(
+                    {
+                        "message": "Teams direct message sent successfully",
+                        "user_identifier": user_identifier,
+                        "result": serialized_result,
+                    }
+                )
+            return False, json.dumps(
+                {"error": _graph_error(response.error, "Failed to send Teams direct message")}
+            )
+        except Exception as e:
+            return self._handle_error(e, "send Teams direct message")
+
+    @tool(
+        path="/tools/teams/reply_to_message",
+        short_description="Reply to a specific message in a Teams channel thread",
+        description="Reply to a specific message in a Microsoft Teams channel thread.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="parent_message_id", type=ParameterType.STRING, description="ID of the parent message to reply to", required=True),
+            ToolParameter(name="message", type=ParameterType.STRING, description="Reply text to post in the message thread", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def reply_to_message(
+        self,
+        team_id: str,
+        channel_id: str,
+        parent_message_id: str,
+        message: str,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_reply_to_channel_message(
+                team_id=team_id,
+                channel_id=channel_id,
+                parent_message_id=parent_message_id,
+                message=message,
+            )
+            if response.success:
+                return True, json.dumps({
+                    "message": "Reply posted successfully",
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "parent_message_id": parent_message_id,
+                    "result": self._serialize_response(response.data),
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to reply to message")})
+        except Exception as e:
+            return self._handle_error(e, "reply to Teams message")
+
+    @tool(
+        path="/tools/teams/send_message_to_multiple_channels",
+        short_description="Send the same message to multiple channels in a Team",
+        description="Send the same message to multiple channels in a Microsoft Team simultaneously.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_ids", type=ParameterType.STRING, description="List of Teams channel IDs to send the same message to (JSON array)", required=True),
+            ToolParameter(name="message", type=ParameterType.STRING, description="Message text to send to all channels", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def send_message_to_multiple_channels(
+        self,
+        team_id: str,
+        channel_ids: List[str],
+        message: str,
+    ) -> tuple[bool, str]:
+        try:
+            channel_list = _coerce_str_list(channel_ids)
+            if not channel_list:
+                return False, json.dumps({
+                    "error": (
+                        "channel_ids must list at least one channel ID, for example "
+                        '["19:abc@thread.tacv2"]. Use get_channels to look up the channel IDs of a team.'
+                    )
+                })
+            response = await self.client.teams_send_message_to_multiple_channels(
+                team_id=team_id,
+                channel_ids=channel_list,
+                message=message,
+            )
+            serialized = self._serialize_response(response.data)
+            return response.success, json.dumps({
+                "message": "Message sent to multiple channels" if response.success else "One or more channel sends failed",
+                "result": serialized,
+                "error": _graph_error(response.error, "") or None,
+            })
+        except Exception as e:
+            return self._handle_error(e, "send Teams message to multiple channels")
+
+    @tool(
+        path="/tools/teams/search_messages",
+        short_description="Search messages in Microsoft Teams channels",
+        description="Search messages in Microsoft Teams channels by text content, optionally scoped to a specific team or channel.",
+        parameters=[
+            ToolParameter(name="query", type=ParameterType.STRING, description="Search text to match in message content", required=True),
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="Optional Team ID to scope search", required=False),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="Optional Channel ID to scope search", required=False),
+            ToolParameter(name="top_per_channel", type=ParameterType.INTEGER, description="Max recent messages scanned per channel (default 25)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def search_messages(
+        self,
+        query: str,
+        team_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        top_per_channel: Optional[int] = 25,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_search_messages(
+                query=query,
+                team_id=team_id,
+                channel_id=channel_id,
+                top_per_channel=max(top_per_channel or 25, 1),
+            )
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                results = []
+                complete, message = True, None
+                if isinstance(serialized, dict):
+                    raw_results = serialized.get("results")
+                    if isinstance(raw_results, list):
+                        results = raw_results
+                    complete = serialized.get("complete", True) is not False
+                    message = serialized.get("message")
+                reply: dict[str, Any] = {
+                    "data": {"results": results},
+                    "results": results,
+                    "count": len(results),
+                    "query": query,
+                    "complete": complete,
+                }
+                if message:
+                    reply["message"] = message
+                return True, json.dumps(reply)
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to search messages")})
+        except Exception as e:
+            return self._handle_error(e, "search Teams messages")
+
+    @tool(
+        path="/tools/teams/add_reaction",
+        short_description="Add a reaction to a Microsoft Teams channel message",
+        description="Add an emoji reaction (like, heart, laugh, surprised, sad, angry) to a specific Teams channel message.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="message_id", type=ParameterType.STRING, description="ID of the Teams message to react to", required=True),
+            ToolParameter(name="reaction_type", type=ParameterType.STRING, description="Reaction type to add (e.g.: like, heart, laugh, surprised, sad, angry)", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def add_reaction(
+        self,
+        team_id: str,
+        channel_id: str,
+        message_id: str,
+        reaction_type: str,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_add_message_reaction(
+                team_id=team_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                reaction_type=reaction_type,
+            )
+            if response.success:
+                serialized_result = self._serialize_response(response.data)
+                return True, json.dumps({
+                    "message": "Reaction added successfully",
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "reaction_type": (reaction_type or "").strip().lower(),
+                    "result": serialized_result,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to add reaction")})
+        except Exception as e:
+            return self._handle_error(e, "add Teams reaction")
+
+    @tool(
+        path="/tools/teams/get_reactions",
+        short_description="Get reactions for a Microsoft Teams channel message",
+        description="Get the list of emoji reactions on a specific Teams channel message.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="message_id", type=ParameterType.STRING, description="ID of the Teams message", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_reactions(self, team_id: str, channel_id: str, message_id: str) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_message_reactions(
+                team_id=team_id,
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                reactions = []
+                if isinstance(serialized, dict):
+                    raw_reactions = serialized.get("reactions")
+                    if isinstance(raw_reactions, list):
+                        reactions = raw_reactions
+                return True, json.dumps({
+                    "data": {"results": reactions},
+                    "reactions": reactions,
+                    "count": len(reactions),
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get reactions")})
+        except Exception as e:
+            return self._handle_error(e, "get Teams reactions")
+
+    @tool(
+        path="/tools/teams/remove_reaction",
+        short_description="Remove a reaction from a Microsoft Teams channel message",
+        description="Remove an emoji reaction from a specific Teams channel message.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="message_id", type=ParameterType.STRING, description="ID of the Teams message", required=True),
+            ToolParameter(name="reaction_type", type=ParameterType.STRING, description="Reaction type to remove", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="destructive")],
+    )
+    async def remove_reaction(
+        self,
+        team_id: str,
+        channel_id: str,
+        message_id: str,
+        reaction_type: str,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_remove_message_reaction(
+                team_id=team_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                reaction_type=reaction_type,
+            )
+            if response.success:
+                return True, json.dumps({
+                    "message": "Reaction removed successfully",
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "reaction_type": (reaction_type or "").strip().lower(),
+                    "result": self._serialize_response(response.data),
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to remove reaction")})
+        except Exception as e:
+            return self._handle_error(e, "remove Teams reaction")
+
+    @tool(
+        path="/tools/teams/get_channel_messages",
+        short_description="List messages from a Microsoft Teams channel",
+        description="List recent messages from a specific Microsoft Teams channel.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of messages to return (default 20, max 100)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_channel_messages(
+        self,
+        team_id: str,
+        channel_id: str,
+        top: Optional[int] = 20,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_channel_messages(
+                team_id=team_id,
+                channel_id=channel_id,
+            )
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                messages = self._extract_collection_items(serialized)
+                limit = min(top or 20, 100)
+                messages = messages[:limit]
+                return True, json.dumps({
+                    "data": {
+                        "results": messages,
+                    },
+                    "messages": messages,
+                    "count": len(messages),
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get channel messages")})
+        except Exception as e:
+            return self._handle_error(e, "get channel messages")
+
+    @tool(
+        path="/tools/teams/get_thread_replies",
+        short_description="Get replies in a Microsoft Teams message thread",
+        description="Get replies in a specific Microsoft Teams message thread.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="message_id", type=ParameterType.STRING, description="ID of the parent Teams message", required=True),
+            ToolParameter(name="top", type=ParameterType.INTEGER, description="Maximum number of replies to return (default 50, max 200)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_thread_replies(
+        self,
+        team_id: str,
+        channel_id: str,
+        message_id: str,
+        top: Optional[int] = 50,
+    ) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_thread_replies(
+                team_id=team_id,
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+            if response.success:
+                serialized = self._serialize_response(response.data)
+                replies = self._extract_collection_items(serialized)
+                limit = min(top or 50, 200)
+                replies = replies[:limit]
+                return True, json.dumps({
+                    "data": {"results": replies},
+                    "replies": replies,
+                    "count": len(replies),
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get thread replies")})
+        except Exception as e:
+            return self._handle_error(e, "get Teams thread replies")
+
+    @tool(
+        path="/tools/teams/update_message",
+        short_description="Update an existing Microsoft Teams message",
+        description="Update an existing Microsoft Teams message in a channel or direct chat.",
+        parameters=[
+            ToolParameter(name="message_id", type=ParameterType.STRING, description="ID of the Teams message to update", required=True),
+            ToolParameter(name="message", type=ParameterType.STRING, description="Updated message text", required=True),
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team (required when updating a channel message)", required=False),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel (required when updating a channel message)", required=False),
+            ToolParameter(name="chat_id", type=ParameterType.STRING, description="ID of the Teams chat (required when updating a direct chat message)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def update_message(
+        self,
+        message_id: str,
+        message: str,
+        team_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        try:
+            if not chat_id and ((team_id and not channel_id) or (channel_id and not team_id)):
+                return False, json.dumps({
+                    "error": "Provide both team_id and channel_id for channel updates, or provide chat_id for direct chat updates",
+                })
+
+            response = await self.client.teams_update_channel_message(
+                team_id=team_id,
+                channel_id=channel_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                message=message,
+            )
+
+            if response.success:
+                result_payload = {
+                    "message": "Message updated successfully",
+                    "message_id": message_id,
+                    "result": self._serialize_response(response.data),
+                }
+                if chat_id:
+                    result_payload["chat_id"] = chat_id
+                elif team_id and channel_id:
+                    result_payload["team_id"] = team_id
+                    result_payload["channel_id"] = channel_id
+                return True, json.dumps(result_payload)
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to update message")})
+        except Exception as e:
+            return self._handle_error(e, "update Teams message")
+
+    @tool(
+        path="/tools/teams/get_message_permalink",
+        short_description="Get a permalink/URL for a Teams channel message",
+        description="Get a shareable permalink URL for a specific Microsoft Teams channel message.",
+        parameters=[
+            ToolParameter(name="team_id", type=ParameterType.STRING, description="ID of the Microsoft Team", required=True),
+            ToolParameter(name="channel_id", type=ParameterType.STRING, description="ID of the Microsoft Teams channel", required=True),
+            ToolParameter(name="message_id", type=ParameterType.STRING, description="ID of the Teams message", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_message_permalink(self, team_id: str, channel_id: str, message_id: str) -> tuple[bool, str]:
+        try:
+            response = await self.client.teams_get_message_permalink(
+                team_id=team_id,
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+            if response.success:
+                data = self._serialize_response(response.data)
+                permalink = data.get("permalink") if isinstance(data, dict) else None
+                return True, json.dumps({
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "permalink": permalink,
+                    "result": data,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get message permalink")})
+        except Exception as e:
+            return self._handle_error(e, "get Teams message permalink")
+
+    # ------------------------------------------------------------------
+    # Chat tools
+    # ------------------------------------------------------------------
+
+    @tool(
+        path="/tools/teams/create_chat",
+        short_description="Create a 1:1 or group chat in Microsoft Teams",
+        description="Create a 1:1 or group chat in Microsoft Teams with specified members.",
+        parameters=[
+            ToolParameter(name="chat_type", type=ParameterType.STRING, description="Type of chat: 'oneOnOne' for 1:1 direct message or 'group' for group chat", required=True),
+            ToolParameter(name="member_user_ids", type=ParameterType.STRING, description="List of Azure AD user object IDs (or UPNs) to include in the chat (JSON array)", required=True),
+            ToolParameter(name="topic", type=ParameterType.STRING, description="Topic/title for group chats (optional for 1:1 chats)", required=False),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="write")],
+    )
+    async def create_chat(
+        self,
+        chat_type: str,
+        member_user_ids: List[str],
+        topic: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        try:
+            normalized_type = (chat_type or "oneOnOne").strip()
+            if normalized_type not in ("oneOnOne", "group"):
+                normalized_type = "oneOnOne"
+
+            member_ids = _coerce_str_list(member_user_ids)
+            if not member_ids:
+                return False, json.dumps({
+                    "error": (
+                        "member_user_ids must list at least one user ID or email address. "
+                        "Use get_user_info or get_users_list to look up user IDs."
+                    )
+                })
+
+            members: list[AadUserConversationMember] = []
+            for uid in member_ids:
+                member = AadUserConversationMember()
+                member.roles = ["owner"]
+                safe_uid = uid.replace("'", "''")
+                member.additional_data = {
+                    "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{safe_uid}')",
+                }
+                members.append(member)
+
+            # The SDK serializes only model objects; a plain dict body fails before any request is sent.
+            chat = Chat()
+            chat.chat_type = ChatType.Group if normalized_type == "group" else ChatType.OneOnOne
+            chat.members = members
+            if topic and normalized_type == "group":
+                chat.topic = topic
+
+            response = await self.client.chats_chat_create_chat(body=chat)
+            if response.success:
+                data = self._serialize_response(response.data)
+                chat_id = None
+                if isinstance(data, dict):
+                    chat_id = data.get("id")
+                return True, json.dumps({
+                    "message": "Chat created successfully",
+                    "chat_id": chat_id,
+                    "chat_type": normalized_type,
+                    "chat": data,
+                })
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to create chat")})
+        except Exception as e:
+            return self._handle_error(e, "create chat")
+
+    @tool(
+        path="/tools/teams/get_chat",
+        short_description="Get details of a specific Microsoft Teams chat",
+        description="Get details and metadata of a specific Microsoft Teams chat by chat ID.",
+        parameters=[
+            ToolParameter(name="chat_id", type=ParameterType.STRING, description="ID of the chat to retrieve", required=True),
+        ],
+        tags=[Tag(key="category", value="communication"), Tag(key="type", value="read")],
+    )
+    async def get_chat(self, chat_id: str) -> tuple[bool, str]:
+        try:
+            response = await self.client.me_get_chats(chat_id=chat_id)
+            if response.success:
+                return True, json.dumps(self._serialize_response(response.data))
+            return False, json.dumps({"error": _graph_error(response.error, "Failed to get chat")})
+        except Exception as e:
+            return self._handle_error(e, f"get chat {chat_id}")

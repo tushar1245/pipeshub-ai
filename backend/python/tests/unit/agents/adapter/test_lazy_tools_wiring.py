@@ -1,0 +1,622 @@
+"""`app/agents/agent_loop/lazy_tools_wiring.py` — env-driven activation
+(flag + threshold + scope parsing), re-parenting of pre-registered connector
+`ToolsetGroup`s under `CONNECTORS_PARENT`, meta-tool/preloading registration
+idempotency, the full `make_lazy_tools_decider` decision flow (including
+`essential_names` exclusion), and `PipesHubGlobalCatalogFallback` adapting
+`ToolsetRegistry` for `search_tools`' global-catalog fallback."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+from app.agent_loop_lib.tools.base import Tool, ToolOutput, ToolParameter
+from app.agent_loop_lib.tools.registry import ToolRegistry
+from app.agents.agent_loop.lazy_tools_wiring import (
+    MCP_PARENT,
+    META_TOOL_NAMES,
+    PipesHubGlobalCatalogFallback,
+    group_connector_toolsets,
+    lazy_tools_enabled,
+    lazy_tools_scope,
+    lazy_tools_threshold,
+    make_lazy_tools_decider,
+    register_lazy_tool_meta_tools,
+    should_apply_lazy_tools,
+)
+from tests.unit.agents.adapter.conftest import make_context
+
+
+class _ConnectorTool(Tool):
+    """A minimal connector-shaped tool — only `name`/`path` matter to
+    `group_connector_toolsets`, which groups by pre-registered `ToolsetGroup`
+    membership, not by any attribute on the tool itself."""
+
+    def __init__(self, app_name: str, tool_name: str) -> None:
+        self._app_name = app_name
+        self._tool_name = tool_name
+
+    @property
+    def name(self) -> str:
+        return f"{self._app_name}_{self._tool_name}"
+
+    @property
+    def short_description(self) -> str:
+        return f"{self._tool_name} on {self._app_name}"
+
+    @property
+    def description(self) -> str:
+        return self.short_description
+
+    @property
+    def path(self) -> str:
+        return f"/connectors/{self._app_name}/{self._tool_name}"
+
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        return []
+
+    async def execute(self, **kwargs: Any) -> ToolOutput:
+        return ToolOutput(success=True, data=self.name)
+
+
+class _UngroupableTool(Tool):
+    """No toolset registration at all — an internal/coordination tool that
+    must stay ungrouped (always visible) regardless of lazy disclosure."""
+
+    @property
+    def name(self) -> str:
+        return "write_todos"
+
+    @property
+    def short_description(self) -> str:
+        return "Write todos"
+
+    @property
+    def description(self) -> str:
+        return "Write todos"
+
+    @property
+    def path(self) -> str:
+        return "/planning/write_todos"
+
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        return []
+
+    async def execute(self, **kwargs: Any) -> ToolOutput:
+        return ToolOutput(success=True, data="ok")
+
+
+def _registry_with_connectors() -> ToolRegistry:
+    """Mirrors what `PipesHubToolLoader.load()` actually does: register each
+    tool AND a matching top-level `ToolsetGroup` per connector."""
+    registry = ToolRegistry()
+    for tool in (
+        _ConnectorTool("jira", "create_issue"),
+        _ConnectorTool("jira", "search_issues"),
+        _ConnectorTool("slack", "send_message"),
+        _UngroupableTool(),
+    ):
+        registry.register_tool(tool)
+    registry.register_toolset("jira", "Jira issue tracker", ["jira_create_issue", "jira_search_issues"])
+    registry.register_toolset("slack", "Slack messaging", ["slack_send_message"])
+    return registry
+
+
+class TestEnvParsing:
+    def test_lazy_tools_enabled_defaults_to_true(self, monkeypatch) -> None:
+        monkeypatch.delenv("PIPESHUB_ENABLE_LAZY_TOOLS", raising=False)
+        assert lazy_tools_enabled() is True
+
+    def test_lazy_tools_enabled_false_when_flag_set_to_false(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "false")
+        assert lazy_tools_enabled() is False
+
+    def test_lazy_tools_enabled_true_when_flag_set(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        assert lazy_tools_enabled() is True
+
+    def test_lazy_tools_threshold_defaults_to_20(self, monkeypatch) -> None:
+        monkeypatch.delenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", raising=False)
+        assert lazy_tools_threshold() == 20
+
+    def test_lazy_tools_threshold_reads_custom_value(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "5")
+        assert lazy_tools_threshold() == 5
+
+    def test_lazy_tools_threshold_falls_back_on_invalid_value(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "not-a-number")
+        assert lazy_tools_threshold() == 20
+
+    def test_lazy_tools_scope_defaults_to_top_level(self, monkeypatch) -> None:
+        monkeypatch.delenv("PIPESHUB_LAZY_TOOLS_SCOPE", raising=False)
+        assert lazy_tools_scope() == "top_level"
+
+    def test_lazy_tools_scope_accepts_domain_and_both(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_SCOPE", "domain")
+        assert lazy_tools_scope() == "domain"
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_SCOPE", "both")
+        assert lazy_tools_scope() == "both"
+
+    def test_lazy_tools_scope_falls_back_on_invalid_value(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_SCOPE", "nonsense")
+        assert lazy_tools_scope() == "top_level"
+
+
+class TestShouldApplyLazyTools:
+    def test_false_when_flag_disabled_even_above_threshold(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "false")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "5")
+        assert should_apply_lazy_tools(100) is False
+
+    def test_false_when_below_threshold_even_with_flag_enabled(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "20")
+        assert should_apply_lazy_tools(10) is False
+
+    def test_true_when_flag_enabled_and_above_threshold(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "5")
+        assert should_apply_lazy_tools(6) is True
+
+
+class TestGroupConnectorToolsets:
+    def test_groups_connector_tools_under_connectors_parent(self) -> None:
+        registry = _registry_with_connectors()
+        names = ["jira_create_issue", "jira_search_issues", "slack_send_message", "write_todos"]
+
+        grouped_anything = group_connector_toolsets(registry, names)
+
+        assert grouped_anything is True
+        assert {g.name for g in registry.children_of("connectors")} == {"jira", "slack"}
+        assert set(registry.tools_in_toolset("jira")) == {"jira_create_issue", "jira_search_issues"}
+        assert set(registry.tools_in_toolset("slack")) == {"slack_send_message"}
+        # Ungroupable tool was never registered as a toolset, so it never
+        # ends up "hidden" behind fetch_tools.
+        assert "write_todos" not in registry.grouped_tool_names()
+
+    def test_returns_false_when_nothing_groupable(self) -> None:
+        registry = ToolRegistry()
+        registry.register_tool(_UngroupableTool())
+        grouped_anything = group_connector_toolsets(registry, ["write_todos"])
+        assert grouped_anything is False
+        assert registry.has_toolsets() is False
+
+    def test_excludes_essential_toolset_names_from_grouping(self) -> None:
+        registry = _registry_with_connectors()
+        names = ["jira_create_issue", "jira_search_issues", "slack_send_message"]
+
+        grouped_anything = group_connector_toolsets(registry, names, exclude=frozenset({"jira"}))
+
+        assert grouped_anything is True
+        assert {g.name for g in registry.children_of("connectors")} == {"slack"}
+        jira_group = next(g for g in registry.toolsets() if g.name == "jira")
+        assert jira_group.parent is None
+
+    def test_idempotent_across_repeated_calls(self) -> None:
+        registry = _registry_with_connectors()
+        names = ["jira_create_issue", "jira_search_issues", "slack_send_message"]
+        group_connector_toolsets(registry, names)
+        group_connector_toolsets(registry, names)
+        assert set(registry.tools_in_toolset("jira")) == {"jira_create_issue", "jira_search_issues"}
+        assert len(registry.children_of("connectors")) == 2
+
+    def test_skips_names_not_present_in_registry(self) -> None:
+        registry = _registry_with_connectors()
+        grouped_anything = group_connector_toolsets(registry, ["jira_create_issue", "not_a_real_tool"])
+        assert grouped_anything is True
+        # The whole jira group is pulled in once ANY of its members is
+        # present in the grant, not just the one that matched.
+        assert set(registry.tools_in_toolset("jira")) == {"jira_create_issue", "jira_search_issues"}
+
+    def test_never_reparents_a_group_already_nested_under_mcp_parent(self) -> None:
+        """An MCP instance group (`MCPToolProvider`, `mcp_tool_loader.py`)
+        is registered with `parent=MCP_PARENT` from the moment it's loaded
+        — never top-level — so it must never be swept under `"connectors"`
+        even if one of its tool names is in this turn's grant."""
+        registry = _registry_with_connectors()
+        registry.register_tool(_ConnectorTool("jira_mcp", "search"))
+        registry.register_toolset(MCP_PARENT, "Attached MCP servers", [])
+        registry.register_toolset(
+            "mcp_jiramcp", "Jira MCP server tools", ["jira_mcp_search"], parent=MCP_PARENT,
+        )
+
+        grouped_anything = group_connector_toolsets(
+            registry, ["jira_create_issue", "slack_send_message", "jira_mcp_search"],
+        )
+
+        assert grouped_anything is True
+        assert {g.name for g in registry.children_of("connectors")} == {"jira", "slack"}
+        mcp_group = next(g for g in registry.toolsets() if g.name == "mcp_jiramcp")
+        assert mcp_group.parent == MCP_PARENT
+
+    def test_mcp_only_registry_activates_lazy_without_reparenting(self) -> None:
+        """An agent with ONLY MCP servers attached (no connector toolsets at
+        all — the reported request's exact shape) must still be able to
+        reach lazy disclosure. Before this fix, `candidates` was always
+        empty for such a registry (MCP groups are excluded from it by
+        design), so the function returned `False` unconditionally and
+        `_decide` pinned the agent to eager forever, regardless of how many
+        MCP tools/schemas it carried."""
+        registry = ToolRegistry()
+        registry.register_tool(_ConnectorTool("jira_mcp", "search"))
+        registry.register_tool(_ConnectorTool("jira_mcp", "create"))
+        registry.register_toolset(MCP_PARENT, "Attached MCP servers", [])
+        registry.register_toolset(
+            "mcp_jiramcp", "Jira MCP server tools",
+            ["jira_mcp_search", "jira_mcp_create"], parent=MCP_PARENT,
+        )
+
+        grouped_anything = group_connector_toolsets(
+            registry, ["jira_mcp_search", "jira_mcp_create"],
+        )
+
+        assert grouped_anything is True
+        # No re-parenting happened — there were no top-level candidates to
+        # re-parent, and the MCP group must stay exactly where
+        # `MCPToolProvider` put it.
+        assert registry.children_of("connectors") == []
+        mcp_group = next(g for g in registry.toolsets() if g.name == "mcp_jiramcp")
+        assert mcp_group.parent == MCP_PARENT
+
+    def test_mcp_group_with_no_member_in_this_turns_grant_does_not_activate_lazy(self) -> None:
+        """The MCP group exists on the shared registry but none of its
+        tools are in THIS turn's `tool_names` (e.g. a domain child's own
+        narrower claim) — must not spuriously flip to lazy."""
+        registry = ToolRegistry()
+        registry.register_tool(_ConnectorTool("jira_mcp", "search"))
+        registry.register_toolset(MCP_PARENT, "Attached MCP servers", [])
+        registry.register_toolset("mcp_jiramcp", "Jira MCP server tools", ["jira_mcp_search"], parent=MCP_PARENT)
+
+        grouped_anything = group_connector_toolsets(registry, ["some_other_tool"])
+
+        assert grouped_anything is False
+
+
+class TestRegisterLazyToolMetaTools:
+    def test_registers_all_three_meta_tools(self) -> None:
+        registry = ToolRegistry()
+        register_lazy_tool_meta_tools(registry)
+        assert set(META_TOOL_NAMES) <= set(registry.names())
+
+    def test_search_tools_ranks_with_the_toolset_aware_index(self) -> None:
+        """The model names the app as often as the action; tool_preloading keeps the plain index."""
+        from app.agent_loop_lib.tools.index import ToolsetAwareToolIndex
+
+        registry = ToolRegistry()
+        register_lazy_tool_meta_tools(registry)
+        assert isinstance(registry.resolve_by_name("search_tools")._index, ToolsetAwareToolIndex)
+
+    def test_second_call_on_same_registry_is_a_no_op(self) -> None:
+        registry = ToolRegistry()
+        register_lazy_tool_meta_tools(registry)
+        register_lazy_tool_meta_tools(registry)  # must not raise
+        assert set(META_TOOL_NAMES) <= set(registry.names())
+
+    def test_find_records_by_entity_is_reported_as_waiting_for_search_entities(self) -> None:
+        registry = ToolRegistry()
+        register_lazy_tool_meta_tools(registry)
+        deferral = registry.deferral("knowledgegraph__find_records_by_entity")
+        assert deferral is not None
+        assert (deferral.unlocked_by, deferral.condition) == (
+            "knowledgegraph__search_entities", "returns at least one entity",
+        )
+
+
+class TestMakeLazyToolsDecider:
+    def test_apply_false_always_passes_through_unchanged(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "0")
+        registry = _registry_with_connectors()
+        decide = make_lazy_tools_decider(apply=False)
+
+        names, disclosure = decide(registry, ["jira_create_issue", "slack_send_message"])
+
+        assert disclosure == "eager"
+        assert names == ["jira_create_issue", "slack_send_message"]
+        assert registry.has_toolsets() is True  # pre-registered groups untouched, just not re-parented
+        assert registry.children_of("connectors") == []
+
+    def test_apply_true_below_threshold_passes_through_unchanged(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "20")
+        registry = _registry_with_connectors()
+        decide = make_lazy_tools_decider(apply=True)
+
+        names, disclosure = decide(registry, ["jira_create_issue", "slack_send_message"])
+
+        assert disclosure == "eager"
+        assert names == ["jira_create_issue", "slack_send_message"]
+
+    def test_apply_true_above_threshold_groups_and_augments_with_meta_tools(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "1")
+        registry = _registry_with_connectors()
+        decide = make_lazy_tools_decider(apply=True)
+
+        original = ["jira_create_issue", "jira_search_issues", "slack_send_message"]
+        names, disclosure = decide(registry, original)
+
+        assert disclosure == "lazy"
+        assert set(original) <= set(names)
+        assert set(META_TOOL_NAMES) <= set(names)
+        assert {g.name for g in registry.children_of("connectors")} == {"jira", "slack"}
+
+    def test_uncounted_names_do_not_push_a_grant_over_the_threshold(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "2")
+        grant = ["jira_create_issue", "jira_search_issues", "slack_send_message"]
+
+        counted = make_lazy_tools_decider(apply=True)
+        uncounted = make_lazy_tools_decider(apply=True, uncounted_names=frozenset({"slack_send_message"}))
+
+        assert counted(_registry_with_connectors(), grant)[1] == "lazy"
+        names, disclosure = uncounted(_registry_with_connectors(), grant)
+        assert (names, disclosure) == (grant, "eager"), "still granted, just not counted"
+
+    def test_uncounted_names_change_nothing_once_the_rest_is_over(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "1")
+        decide = make_lazy_tools_decider(apply=True, uncounted_names=frozenset({"slack_send_message"}))
+
+        names, disclosure = decide(
+            _registry_with_connectors(), ["jira_create_issue", "jira_search_issues", "slack_send_message"],
+        )
+
+        assert disclosure == "lazy" and "slack_send_message" in names
+
+    def test_essential_names_are_excluded_from_grouping(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "1")
+        registry = _registry_with_connectors()
+        decide = make_lazy_tools_decider(apply=True, essential_names=frozenset({"jira"}))
+
+        names, disclosure = decide(
+            registry, ["jira_create_issue", "jira_search_issues", "slack_send_message"],
+        )
+
+        assert disclosure == "lazy"
+        assert {g.name for g in registry.children_of("connectors")} == {"slack"}
+
+    def test_apply_true_but_nothing_groupable_stays_eager(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "0")
+        registry = _registry_with_connectors()
+        decide = make_lazy_tools_decider(apply=True)
+
+        names, disclosure = decide(registry, ["write_todos"])
+
+        assert disclosure == "eager"
+        assert names == ["write_todos"]
+
+    def test_does_not_duplicate_meta_tool_names_already_present(self, monkeypatch) -> None:
+        monkeypatch.setenv("PIPESHUB_ENABLE_LAZY_TOOLS", "true")
+        monkeypatch.setenv("PIPESHUB_LAZY_TOOLS_THRESHOLD", "0")
+        registry = _registry_with_connectors()
+        decide = make_lazy_tools_decider(apply=True)
+
+        names, _ = decide(registry, ["jira_create_issue", "list_toolsets"])
+
+        assert names.count("list_toolsets") == 1
+
+
+class _FakeToolsetRegistry:
+    def __init__(self, toolsets: dict[str, dict[str, Any]]) -> None:
+        self._toolsets = toolsets
+
+    def get_all_toolsets(self) -> dict[str, dict[str, Any]]:
+        return self._toolsets
+
+
+def _toolset_meta(*, tools: list[dict[str, str]], is_internal: bool = False) -> dict[str, Any]:
+    return {"isInternal": is_internal, "class": None, "tools": tools}
+
+
+class TestPipesHubGlobalCatalogFallback:
+    async def test_search_wraps_global_registry_hits(self, monkeypatch) -> None:
+        fake_registry = _FakeToolsetRegistry({
+            "confluence": _toolset_meta(tools=[
+                {"name": "search_pages", "description": "Search Confluence pages"},
+                {"name": "get_page", "description": ""},
+            ]),
+        })
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry", lambda: fake_registry,
+        )
+
+        fallback = PipesHubGlobalCatalogFallback()
+        hits = await fallback.search("confluence wiki", limit=5)
+
+        assert hits[0].name == "confluence__search_pages"
+        assert hits[0].toolset == "confluence"
+        assert hits[0].description == "Search Confluence pages"
+        assert hits[0].reason == "not_attached"
+        # Falls back to a generated description when the registry tool has none.
+        assert hits[1].description == "confluence get_page"
+
+    async def test_search_respects_limit(self, monkeypatch) -> None:
+        fake_registry = _FakeToolsetRegistry({
+            "jira": _toolset_meta(tools=[
+                {"name": "create_issue", "description": "Create issue"},
+                {"name": "search_issues", "description": "Search issues"},
+                {"name": "delete_issue", "description": "Delete issue"},
+            ]),
+        })
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry", lambda: fake_registry,
+        )
+
+        fallback = PipesHubGlobalCatalogFallback()
+        hits = await fallback.search("issue", limit=2)
+
+        assert len(hits) == 2
+
+    async def test_search_skips_internal_toolsets(self, monkeypatch) -> None:
+        fake_registry = _FakeToolsetRegistry({
+            "retrieval": _toolset_meta(
+                is_internal=True,
+                tools=[{"name": "search_knowledge", "description": "Search the knowledge base"}],
+            ),
+        })
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry", lambda: fake_registry,
+        )
+
+        fallback = PipesHubGlobalCatalogFallback()
+        hits = await fallback.search("search", limit=5)
+
+        assert hits == []
+
+    async def test_search_reports_not_authenticated_from_context_failures(self, monkeypatch) -> None:
+        fake_registry = _FakeToolsetRegistry({
+            "jira": _toolset_meta(tools=[
+                {"name": "create_issue", "description": "Create a Jira issue"},
+            ]),
+        })
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry", lambda: fake_registry,
+        )
+        context = SimpleNamespace(
+            toolset_load_failures={"jira": "not_authenticated"},
+            mcp_tool_load_failures=[], mcp_servers=[],
+        )
+
+        fallback = PipesHubGlobalCatalogFallback(context)
+        hits = await fallback.search("jira issue", limit=5)
+
+        assert hits[0].reason == "not_authenticated"
+        assert "authenticate" in hits[0].description.lower()
+        assert "Your actions" in hits[0].description
+
+    async def test_a_service_account_agent_is_sent_to_the_agent_builder(self, monkeypatch) -> None:
+        fake_registry = _FakeToolsetRegistry({
+            "jira": _toolset_meta(tools=[
+                {"name": "create_issue", "description": "Create a Jira issue"},
+            ]),
+        })
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry", lambda: fake_registry,
+        )
+        context = SimpleNamespace(
+            toolset_load_failures={"jira": "not_authenticated"},
+            mcp_tool_load_failures=[], mcp_servers=[], is_service_account=True,
+        )
+
+        hits = await PipesHubGlobalCatalogFallback(context).search("jira issue", limit=5)
+
+        assert "agent builder" in hits[0].description
+        assert "Your actions" not in hits[0].description
+
+    async def test_search_defaults_to_not_attached_without_context(self, monkeypatch) -> None:
+        fake_registry = _FakeToolsetRegistry({
+            "jira": _toolset_meta(tools=[
+                {"name": "create_issue", "description": "Create a Jira issue"},
+            ]),
+        })
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry", lambda: fake_registry,
+        )
+
+        fallback = PipesHubGlobalCatalogFallback(None)
+        hits = await fallback.search("jira issue", limit=5)
+
+        assert hits[0].reason == "not_attached"
+
+    async def test_search_reports_mcp_unavailable_for_a_failed_instance(self, monkeypatch) -> None:
+        """A query matching a tool that belongs to an attached MCP instance
+        whose live discovery failed this request must come back as
+        `"mcp_unavailable"`, not silently miss — an MCP instance group is
+        never in `ToolsetRegistry`, so without `_mcp_hits` this would fall
+        straight through the connector-toolset scan below and find
+        nothing, telling the model the capability doesn't exist at all."""
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry",
+            lambda: _FakeToolsetRegistry({}),
+        )
+        context = make_context(
+            mcp_servers=[{
+                "instanceId": "inst-1", "name": "RovoMCP", "displayName": "Atlassian Rovo",
+                "tools": [{"name": "search_issues", "fullName": "mcp_rovo__search_issues",
+                           "description": "Search Jira issues via Rovo"}],
+            }],
+            mcp_tool_load_failures=[{"instanceId": "inst-1", "name": "RovoMCP", "reason": "discovery_failed"}],
+        )
+
+        fallback = PipesHubGlobalCatalogFallback(context)
+        hits = await fallback.search("jira issues", limit=5)
+
+        assert len(hits) == 1
+        # The name the tool registers under once reachable, not the attachment's saved
+        # `fullName` (which reflects however names were built when the agent was saved).
+        assert hits[0].name == "mcp_rovomcp_search_issues"
+        assert hits[0].reason == "mcp_unavailable"
+        assert "unavailable" in hits[0].description.lower()
+        # `name`, not `displayName` — the loader groups by `ResolvedMCPServer.name`, so
+        # reporting `mcp_atlassian_rovo` here would name a group no later `fetch_tools`
+        # call could resolve.
+        assert hits[0].toolset == "mcp_rovomcp"
+
+    async def test_reports_the_names_the_loader_assigned_this_request(self, monkeypatch) -> None:
+        """A second same-type instance gets tagged names; the fallback must report those."""
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry",
+            lambda: _FakeToolsetRegistry({}),
+        )
+        context = make_context(
+            mcp_servers=[{
+                "instanceId": "inst-2", "name": "Rovo", "tools": [{"name": "search_issues", "description": "Search Jira"}],
+            }],
+            mcp_tool_load_failures=[{"instanceId": "inst-2", "name": "Rovo", "reason": "discovery_failed"}],
+        )
+        context.tool_state["mcp_names"] = {"inst-2": {"namespace": "atlassian_rovo_ab12", "group": "mcp_rovo_ab12"}}
+
+        hits = await PipesHubGlobalCatalogFallback(context).search("jira", limit=5)
+
+        assert (hits[0].name, hits[0].toolset) == ("mcp_atlassian_rovo_ab12_search_issues", "mcp_rovo_ab12")
+
+    async def test_mcp_hit_without_full_name_falls_back_to_the_namespaced_name(
+        self, monkeypatch,
+    ) -> None:
+        """With no `fullName` on the attachment, the reported name must still
+        be the one the tool registers under once discovery succeeds — that's
+        `build_namespaced_tool_name(typeId or name, tool)` (`discovery.py`),
+        the same discriminator `MCPToolProvider._attached_full_names` uses,
+        not the `{group}__{tool}` convention connector toolsets use."""
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry",
+            lambda: _FakeToolsetRegistry({}),
+        )
+        context = make_context(
+            mcp_servers=[{
+                "instanceId": "inst-1", "name": "RovoMCP", "displayName": "Atlassian Rovo",
+                "tools": [{"name": "search_issues", "description": "Search Jira issues via Rovo"}],
+            }],
+            mcp_server_configs={"inst-1": {"instance": {"typeId": "atlassian-rovo"}, "auth": {}}},
+            mcp_tool_load_failures=[{"instanceId": "inst-1", "name": "RovoMCP", "reason": "discovery_failed"}],
+        )
+
+        hits = await PipesHubGlobalCatalogFallback(context).search("jira issues", limit=5)
+
+        assert len(hits) == 1
+        assert hits[0].name == "mcp_atlassian_rovo_search_issues"
+        assert hits[0].toolset == "mcp_rovomcp"
+
+    async def test_search_ignores_mcp_servers_that_did_not_fail(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "app.agents.registry.toolset_registry.get_toolset_registry",
+            lambda: _FakeToolsetRegistry({}),
+        )
+        context = make_context(
+            mcp_servers=[{
+                "instanceId": "inst-1", "name": "RovoMCP", "displayName": "Atlassian Rovo",
+                "tools": [{"name": "search_issues", "fullName": "mcp_rovo__search_issues",
+                           "description": "Search Jira issues via Rovo"}],
+            }],
+            mcp_tool_load_failures=[],
+        )
+
+        fallback = PipesHubGlobalCatalogFallback(context)
+        hits = await fallback.search("jira issues", limit=5)
+
+        assert hits == []

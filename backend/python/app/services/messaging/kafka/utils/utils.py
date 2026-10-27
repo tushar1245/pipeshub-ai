@@ -1,0 +1,399 @@
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
+from typing import Any
+
+from app.services.messaging.kafka.config.kafka_config import kafka_security_kwargs
+from app.config.constants.service import KafkaConfig as KafkaConstants, config_node_constants
+from app.edition_services import (
+    EntityEventService,
+    EventService,
+    RecordEventHandler,
+)
+from app.connectors.services.code_graph_event_service import CodeGraphEventService
+from app.containers.connector import ConnectorAppContainer
+from app.containers.indexing import IndexingAppContainer
+from app.containers.query import QueryAppContainer
+from app.modules.code_graph.edge_build_runner import CodeEdgeBuildRunner
+from app.modules.code_graph.facts_source import BlobCodeFactsSource
+from app.modules.transformers.blob_storage import BlobStorage
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.model_identity.boundary import config_service_of
+from app.services.model_identity.principal import service_principal
+from app.services.model_identity.runtime import call_scope
+from app.services.model_identity.workload import Workload
+from app.services.messaging.config import (
+    IndexingMessageHandler,
+    MessageHandler,
+    PipelineEvent,
+    StreamMessage,
+    Topic,
+)
+from app.services.messaging.kafka.config.kafka_config import (
+    KafkaConsumerConfig,
+    KafkaProducerConfig,
+)
+from app.services.messaging.kafka.handlers.ai_config import AiConfigEventService
+from app.services.vector_db.rebuild_state import redis_from_config_service
+
+
+def _str_or_none(value: Any) -> str | None:  # noqa: ANN401 - a message field of unknown type
+    return str(value) if value else None
+
+
+class KafkaUtils:
+    @staticmethod
+    async def _create_base_consumer_config(
+    app_container: ConnectorAppContainer | IndexingAppContainer | QueryAppContainer,
+    client_id: str,
+    group_id: str,
+    topics: list[str]
+) -> KafkaConsumerConfig:
+        """Create a base Kafka consumer configuration."""
+        config_service = app_container.config_service()
+        kafka_config = await config_service.get_config(
+            config_node_constants.KAFKA.value
+        )
+
+        if not kafka_config:
+            raise ValueError("Kafka configuration not found")
+
+        brokers = kafka_config.get('brokers') # type: ignore
+        if not brokers:
+            raise ValueError("Kafka brokers not found in configuration")
+
+        return KafkaConsumerConfig(
+            client_id=client_id,
+            group_id=group_id,
+            auto_offset_reset='earliest',
+            enable_auto_commit=True,
+            bootstrap_servers=brokers,
+            topics=topics,
+            ssl=kafka_config.get('ssl', False),
+            sasl=kafka_config.get('sasl')
+        )
+
+    @staticmethod
+    async def create_producer_config(app_container: ConnectorAppContainer) -> KafkaProducerConfig:
+        """Create Kafka configuration for producer"""
+        config_service = app_container.config_service()
+        kafka_config = await config_service.get_config(
+            config_node_constants.KAFKA.value
+        )
+        if not kafka_config:
+            raise ValueError("Kafka configuration not found")
+
+        return KafkaProducerConfig(
+            bootstrap_servers=kafka_config["brokers"], # type: ignore
+            client_id=KafkaConstants.CLIENT_ID_MESSAGING_PRODUCER.value,
+            ssl=kafka_config.get('ssl', False),
+            sasl=kafka_config.get('sasl')
+        )
+
+    @staticmethod
+    async def create_entity_kafka_consumer_config(app_container: ConnectorAppContainer) -> KafkaConsumerConfig:
+        """Create Kafka configuration for entity events"""
+        return await KafkaUtils._create_base_consumer_config(
+            app_container, KafkaConstants.CLIENT_ID_ENTITY_CONSUMER.value, KafkaConstants.GROUP_ID_ENTITY.value, [Topic.ENTITY_EVENTS.value]
+        )
+
+
+    @staticmethod
+    async def create_sync_kafka_consumer_config(app_container: ConnectorAppContainer) -> KafkaConsumerConfig:
+        """Create Kafka configuration for sync events"""
+        return await KafkaUtils._create_base_consumer_config(
+            app_container, KafkaConstants.CLIENT_ID_SYNC_CONSUMER.value, KafkaConstants.GROUP_ID_SYNC.value, [Topic.SYNC_EVENTS.value]
+        )
+
+
+    @staticmethod
+    async def create_record_kafka_consumer_config(app_container: IndexingAppContainer) -> KafkaConsumerConfig:
+        """Create Kafka configuration for record events"""
+        return await KafkaUtils._create_base_consumer_config(
+            app_container,
+            KafkaConstants.CLIENT_ID_RECORDS_CONSUMER.value,
+            KafkaConstants.GROUP_ID_RECORDS.value,
+            [Topic.RECORD_EVENTS.value],
+        )
+
+
+    @staticmethod
+    async def create_aiconfig_kafka_consumer_config(app_container: QueryAppContainer) -> KafkaConsumerConfig:
+        """Create Kafka configuration for AI config events.
+
+        Not used by the query service, which goes through
+        ``MessagingUtils.create_aiconfig_consumer_config``. Prefer that: this one uses a
+        single shared group, so with more than one query process only ONE of them would
+        receive a model change and the rest would serve a stale LLM until restart.
+        """
+        return await KafkaUtils._create_base_consumer_config(
+            app_container, KafkaConstants.CLIENT_ID_AICONFIG_CONSUMER.value, KafkaConstants.GROUP_ID_AICONFIG.value, [Topic.AI_CONFIG_EVENTS.value]
+        )
+
+
+    @staticmethod
+    async def kafka_config_to_dict(kafka_config: KafkaConsumerConfig) -> dict[str, Any]:
+        """Convert KafkaConsumerConfig dataclass to dictionary format for aiokafka consumer"""
+        config: dict[str, Any] = {
+            'bootstrap_servers': ",".join(kafka_config.bootstrap_servers),
+            'group_id': kafka_config.group_id,
+            'auto_offset_reset': kafka_config.auto_offset_reset,
+            'enable_auto_commit': kafka_config.enable_auto_commit,
+            'client_id': kafka_config.client_id,
+            'topics': kafka_config.topics  # Include topics in the dictionary
+        }
+
+        config.update(kafka_security_kwargs(ssl_enabled=kafka_config.ssl, sasl=kafka_config.sasl))
+
+        return config
+
+    @staticmethod
+    async def create_entity_message_handler(
+        app_container: ConnectorAppContainer, graph_provider: IGraphDBProvider
+    ) -> MessageHandler:
+        """Create a message handler for entity events"""
+        logger = app_container.logger()
+
+        entity_event_service = EntityEventService(
+            logger=logger,
+            graph_provider=graph_provider,
+            app_container=app_container
+        )
+
+        async def handle_entity_message(message: StreamMessage) -> bool:
+            try:
+                event_type = message.eventType
+                payload = message.payload
+
+                if not event_type:
+                    logger.error("Missing event_type in message")
+                    return False
+
+                if not payload:
+                    logger.error("Missing payload in message")
+                    return False
+
+                logger.info(f"Processing entity event: {event_type}")
+                return await entity_event_service.process_event(event_type, payload)
+
+            except Exception as e:
+                logger.error(f"Error processing entity message: {str(e)}", exc_info=True)
+                return False
+
+        return handle_entity_message
+
+    @staticmethod
+    async def create_record_event_handler(
+        app_container: IndexingAppContainer,
+        producer: Any = None,
+    ) -> RecordEventHandler:
+        """Build the record event handler.
+
+        Separate from ``create_record_message_handler`` because the consumer
+        needs this same instance as its ``AbandonedMessageSink`` — it is what
+        puts a record into a terminal status when its message is discarded — and
+        two instances would mean two graph clients for one job.
+        """
+        logger = app_container.logger()
+        event_processor = getattr(app_container, '_event_processor', None)
+        if not event_processor:
+            event_processor = await app_container.event_processor()
+        return RecordEventHandler(
+            logger=logger,
+            config_service=app_container.config_service(),
+            event_processor=event_processor,
+            producer=producer,
+        )
+
+    @staticmethod
+    async def create_record_message_handler(
+        app_container: IndexingAppContainer,
+        producer: Any = None,
+        record_event_service: RecordEventHandler | None = None,
+    ) -> IndexingMessageHandler:
+        """Create a message handler for record events.
+
+        `producer` is used to publish follow-up events (e.g. re-triggering the
+        next queued duplicate); pass the same producer used for retries so we
+        don't spin up a second Kafka connection.
+
+        Pass `record_event_service` to reuse an instance already built for the
+        consumer's abandonment sink.
+
+        Returns an async generator function that yields PipelineEvent during processing.
+        """
+        logger = app_container.logger()
+        if record_event_service is None:
+            record_event_service = await KafkaUtils.create_record_event_handler(
+                app_container, producer
+            )
+
+        async def handle_record_message(message: StreamMessage) -> AsyncGenerator[PipelineEvent, None]:
+            try:
+                event_type = message.eventType
+                payload = message.payload
+
+                if not event_type:
+                    logger.error("Missing event_type in message")
+                    return
+
+                if not payload:
+                    logger.error("Missing payload in message")
+                    return
+
+                # Pass retry context to handler so it knows whether to update DB status on failure
+                # Convert payload to dict if it's not already, then add is_final_failure
+                if not isinstance(payload, dict):
+                    payload = dict(payload)
+                else:
+                    payload = payload.copy()  # Don't mutate original
+                payload["is_final_failure"] = message.is_final_failure
+
+                logger.debug(f"Processing record event: {event_type}")
+                # Every model call this record makes (describe images, embed, extract)
+                # goes out as the indexing service, not as whoever happens to be
+                # logged in. Bound here because this generator is driven by one worker
+                # task for the whole record; the handler's own coroutines copy it.
+                async with call_scope(
+                    service_principal("indexing", str(payload.get("orgId") or "")),
+                    Workload.INDEXING,
+                    config_service=config_service_of(app_container),
+                    container=app_container,
+                    record_id=_str_or_none(payload.get("recordId")),
+                    connector_id=_str_or_none(payload.get("connectorId")),
+                ):
+                    async with aclosing(record_event_service.process_event(event_type, payload)) as events:
+                        async for event in events:
+                            yield event
+
+            except Exception as e:
+                logger.error(f"Error processing record message: {str(e)}", exc_info=True)
+                raise
+
+        return handle_record_message
+
+    @staticmethod
+    async def create_sync_message_handler(
+        app_container: ConnectorAppContainer, graph_provider: IGraphDBProvider
+    ) -> MessageHandler:
+        """Create a message handler for sync events"""
+        logger = app_container.logger()
+
+        async def handle_sync_message(message: StreamMessage) -> bool:
+            try:
+                event_type = message.eventType
+                payload = message.payload
+
+                if not event_type:
+                    logger.error("Missing event_type in sync message")
+                    return False
+
+                connector = None
+                if "." in event_type:
+                    connector = event_type.split(".")[0].lower()
+                else:
+                    connector = payload.get("connector")
+
+                if not connector:
+                    logger.error("Missing connector in event_type or payload")
+                    return False
+
+                logger.debug(f"Processing sync event: {event_type} for connector {connector}")
+
+                event_service = EventService(
+                    logger=logger,
+                    graph_provider=graph_provider,
+                    app_container=app_container,
+                )
+                return await event_service.process_event(event_type, payload)
+
+            except Exception as e:
+                logger.error(f"Error processing sync message: {str(e)}", exc_info=True)
+                return False
+
+        return handle_sync_message
+
+    @staticmethod
+    async def create_code_graph_event_service(
+        app_container: ConnectorAppContainer,
+        graph_provider: IGraphDBProvider,
+    ) -> CodeGraphEventService:
+        """One instance per process, shared by the consumer and the reconciler.
+
+        Both must see the same Redis client and task manager, or the lock and
+        the in-process "already running" check would disagree about a repo.
+        """
+        event_service = vars(app_container).get("code_graph_event_service")
+        if event_service is not None:
+            return event_service
+        logger = app_container.logger()
+        redis = vars(app_container).get("code_edge_build_redis")
+        if redis is None:
+            redis = await redis_from_config_service(app_container.config_service())
+            app_container.code_edge_build_redis = redis
+        blob_storage = BlobStorage(logger, app_container.config_service(), graph_provider)
+        event_service = CodeGraphEventService(
+            logger=logger,
+            runner=CodeEdgeBuildRunner(
+                graph_provider,
+                redis,
+                logger,
+                facts_source=BlobCodeFactsSource(blob_storage, graph_provider, logger),
+            ),
+        )
+        app_container.code_graph_event_service = event_service
+        return event_service
+
+    @staticmethod
+    async def create_code_graph_message_handler(
+        app_container: ConnectorAppContainer,
+        graph_provider: IGraphDBProvider,
+    ) -> MessageHandler:
+        event_service = await KafkaUtils.create_code_graph_event_service(
+            app_container,
+            graph_provider,
+        )
+
+        async def handle_code_graph_message(message: StreamMessage) -> bool:
+            return await event_service.process_event(
+                message.eventType,
+                message.payload,
+            )
+
+        return handle_code_graph_message
+
+    @staticmethod
+    async def create_aiconfig_message_handler(
+        app_container: QueryAppContainer,
+    ) -> MessageHandler:
+        """Create a message handler for AI config events"""
+        logger = app_container.logger()
+
+        retrieval_service = await app_container.retrieval_service()
+
+        aiconfig_event_service = AiConfigEventService(
+            logger=logger,
+            retrieval_service=retrieval_service,
+        )
+
+        async def handle_aiconfig_message(message: StreamMessage) -> bool:
+            try:
+                event_type = message.eventType
+                payload = message.payload
+
+                if not event_type:
+                    logger.error("Missing event_type in AI config message")
+                    return False
+
+                # Only process AI configuration events
+                if event_type not in ["llmConfigured", "embeddingModelConfigured"]:
+                    logger.debug(f"Skipping non-AI config event: {event_type}")
+                    return True
+
+                logger.info(f"Processing AI config event: {event_type}")
+                return await aiconfig_event_service.process_event(event_type, payload)
+
+            except Exception as e:
+                logger.error(f"Error processing AI config message: {str(e)}", exc_info=True)
+                return False
+
+        return handle_aiconfig_message

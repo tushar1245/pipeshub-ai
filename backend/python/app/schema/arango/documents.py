@@ -1,0 +1,1787 @@
+from app.config.constants.arangodb import (
+    AccessRule,
+    Connectors,
+    ConnectorScopes,
+    DeleteSource,
+    OriginTypes,
+    PermissionModel,
+    ProgressStatus,
+)
+from app.models.entities import RecordGroupType, RecordType
+
+# One list for every status field: the three used to drift apart, and a status
+# a writer can produce but a schema rejects fails the write at runtime.
+PROGRESS_STATUS_VALUES = [status.value for status in ProgressStatus]
+
+# User schema for ArangoDB
+orgs_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},  # orgId
+            "accountType": {"type": "string", "enum": ["individual", "enterprise"]},
+            "name": {"type": "string"},
+            "isActive": {"type": "boolean", "default": False},
+            "website": {"type": ["string", "null"]},
+            "industry": {"type": ["string", "null"]},
+            "ownershipType": {"type": ["string", "null"]},
+            "phone": {"type": ["string", "null"]},
+            "dunsId": {"type": ["string", "null"]},
+            "isExternal": {"type": "boolean", "default": False},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "sourceCreatedAtTimestamp": {"type": ["number", "null"]},
+            "sourceLastModifiedTimestamp": {"type": ["number", "null"]},
+            # app.modules.indexing.entity_index_rebuild
+            "entityIndexState": {"type": ["string", "null"]},
+            "entityIndexPhase": {"type": ["string", "null"]},
+            "entityIndexAfterKey": {"type": ["string", "null"]},
+            "entityIndexAttempts": {"type": ["integer", "null"]},
+            "entityIndexFailures": {"type": ["integer", "null"]},
+            "entityIndexExhausted": {"type": ["boolean", "null"]},
+            "entityIndexTarget": {"type": ["string", "null"]},
+            "entityIndexErrors": {"type": ["integer", "null"]},
+            "entityIndexSweptAt": {"type": ["number", "null"]},
+            "entityIndexSweepOffset": {"type": ["string", "null"]},
+            "entityIndexSweepFailures": {"type": ["integer", "null"]},
+        },
+        "required": ["accountType", "isActive"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the organization schema.",
+}
+
+user_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},  # uuid
+            "userId": {"type": "string"},
+            "orgId": {"type": "string"},
+            "firstName": {"type": "string"},
+            "middleName": {"type": "string"},
+            "lastName": {"type": "string"},
+            "fullName": {"type": "string"},
+            "email": {"type": "string"},
+            "designation": {"type": "string"},
+            "profileId": {"type": ["string", "null"]},
+            "businessPhones": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 0,
+            },
+            "isActive": {"type": "boolean", "default": False},
+            # What sort of principal this is. Absent on nodes written before
+            # this field existed and on anything an older producer sends, so
+            # readers treat absence as "human" rather than as unknown.
+            #
+            # Always carried on the event, never worked out here. The user
+            # management service decides what is a service account, and a
+            # second rule in this process — reading the address, say — would
+            # be a copy of that one, free to drift. Nodes that predate the
+            # field are stamped by ServiceAccountKindMigrationService from a
+            # list that service stages, which writes this field and nothing
+            # else; replaying the creation event for them would do far more.
+            "kind": {"type": "string", "enum": ["human", "service"]},
+            # Whether an administrator has switched this service account off.
+            # Separate from `isActive`, which soft-delete owns and which a
+            # rename sets back to true — a disable stored there would not
+            # survive one. Absent means not disabled, so a node that predates
+            # this field, or a person, reads as usable.
+            "isDisabled": {"type": "boolean"},
+            # Arango collection entry
+            "createdAtTimestamp": {"type": "number"},
+            # Arango collection entry
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["email"],  # Required fields
+        "additionalProperties": False,  # disallow extra fields
+    },
+    "level": "strict",  # Strict validation (reject invalid documents)
+    "message": "Document does not match the user schema.",
+}
+
+user_group_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string"},
+            # should be a uuid
+            "externalGroupId": {"type": "string", "minLength": 1},
+            "connectorName": {
+                "type": "string",
+                "enum": [connector.value for connector in Connectors],
+            },
+            "connectorId": {"type": "string"},
+            "mail": {"type": ["string", "null"]},
+            "mailEnabled": {"type": "boolean", "default": False},
+            # Arango collection entry
+            "createdAtTimestamp": {"type": "number"},
+            # Arango collection entry
+            "updatedAtTimestamp": {"type": "number"},
+            "lastSyncTimestamp": {"type": "number"},  # Arango collection entry
+            "isDeletedAtSource": {"type": "boolean", "default": False},
+            "deletedAtSourceTimestamp": {"type": "number"},
+            "sourceCreatedAtTimestamp": {"type": "number"},
+            "sourceLastModifiedTimestamp": {"type": "number"},
+        },
+        "required": [
+            "groupName",
+            "externalGroupId",
+            "connectorName",
+            "createdAtTimestamp",
+        ],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the record group schema.",
+}
+
+app_role_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string"},
+            # should be a uuid
+            "externalRoleId": {"type": "string", "minLength": 1},
+            "parentRoleId": {"type": ["string", "null"]},
+            "connectorName": {
+                "type": "string",
+                "enum": [connector.value for connector in Connectors],
+            },
+            "connectorId": {"type": "string"},
+            # Arango collection entry
+            "createdAtTimestamp": {"type": "number"},
+            # Arango collection entry
+            "updatedAtTimestamp": {"type": ["number", "null"], "default": None},
+            "lastSyncTimestamp": {"type": "number"},  # Arango collection entry
+            "isDeletedAtSource": {"type": "boolean", "default": False},
+            "deletedAtSourceTimestamp": {"type": ["number", "null"], "default": None},
+            "sourceCreatedAtTimestamp": {"type": ["number", "null"], "default": None},
+            "sourceLastModifiedTimestamp": {"type": ["number", "null"], "default": None},
+        },
+        "required": [
+            "name",
+            "externalRoleId",
+            "connectorName",
+            "connectorId",
+            "createdAtTimestamp",
+        ],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the app role schema.",
+}
+
+app_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "name": {"type": "string"},
+            "type": {"type": "string"},
+            "appGroup": {"type": "string"},
+            "authType": {"type": "string"},
+            "scope": {"type": "string", "enum": [scope.value for scope in ConnectorScopes]},
+            "isActive": {"type": "boolean", "default": True},
+            "isAgentActive": {"type": "boolean", "default": False},
+            "isConfigured": {"type": "boolean", "default": False},
+            "isAuthenticated": {"type": "boolean", "default": False},
+            "pendingFullSync": {"type": "boolean", "default": False},
+            "pendingResync": {"type": ["boolean", "null"]},
+            # app.connectors.core.sync.sync_runner: when the last run started and ended, and how.
+            "lastSyncStartedAtTimestamp": {"type": ["number", "null"]},
+            "lastSyncFinishedAtTimestamp": {"type": ["number", "null"]},
+            "lastSyncOutcome": {"type": ["string", "null"]},
+            "lastSyncSummary": {"type": ["string", "null"]},
+            # What the connector's admin has to do (JSON text, see ActionItem); null when nothing.
+            "actionItems": {"type": ["string", "null"]},
+            "queuedAtTimestamp": {"type": ["number", "null"]},
+            # Set when sync is turned on; see toggle_connector_instance.
+            "enabledAtTimestamp": {"type": ["number", "null"]},
+            "vectorMembershipBackfilled": {"type": "boolean", "default": False},
+            "vectorMembershipBackfillAfterKey": {"type": ["string", "null"]},
+            "vectorMembershipBackfillFailures": {"type": ["integer", "null"]},
+            "vectorMembershipBackfillAttempts": {"type": ["integer", "null"]},
+            "vectorMembershipBackfillVrids": {"type": ["integer", "null"]},
+            "vectorMembershipBackfillExhausted": {"type": ["boolean", "null"]},
+            # app.modules.indexing.entity_index_rebuild
+            "entityIndexState": {"type": ["string", "null"]},
+            "entityIndexPhase": {"type": ["string", "null"]},
+            "entityIndexAfterKey": {"type": ["string", "null"]},
+            "entityIndexAttempts": {"type": ["integer", "null"]},
+            "entityIndexFailures": {"type": ["integer", "null"]},
+            "entityIndexExhausted": {"type": ["boolean", "null"]},
+            "entityIndexTarget": {"type": ["string", "null"]},
+            "entityIndexErrors": {"type": ["integer", "null"]},
+            # app.modules.indexing.record_label_repair
+            "recordLabelRepairState": {"type": ["string", "null"]},
+            "recordLabelRepairAfterKey": {"type": ["string", "null"]},
+            "recordLabelRepairRepaired": {"type": ["integer", "null"]},
+            "recordLabelRepairSkipped": {"type": ["integer", "null"]},
+            "recordLabelRepairMissing": {"type": ["integer", "null"]},
+            "recordLabelRepairFailures": {"type": ["integer", "null"]},
+            "recordLabelRepairAttempts": {"type": ["integer", "null"]},
+            "recordLabelRepairExhausted": {"type": ["boolean", "null"]},
+            # app.connectors.services.stored_content_heal
+            "storedContentHealState": {"type": ["string", "null"]},
+            "storedContentHealAfterKey": {"type": ["string", "null"]},
+            "storedContentHealChecked": {"type": ["integer", "null"]},
+            "storedContentHealMissing": {"type": ["integer", "null"]},
+            "storedContentHealHealed": {"type": ["integer", "null"]},
+            "storedContentHealOrphaned": {"type": ["integer", "null"]},
+            "storedContentHealFailures": {"type": ["integer", "null"]},
+            "storedContentHealAttempts": {"type": ["integer", "null"]},
+            "storedContentHealExhausted": {"type": ["boolean", "null"]},
+            "rootMembershipRequested": {"type": ["boolean", "null"]},
+            "createdBy": {"type": ["string", "null"]},
+            "updatedBy": {"type": ["string", "null"]},
+            "authenticatedBy": {"type": ["string", "null"]},
+            "lastSyncedBy": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "status": {"type": ["string", "null"]},
+            "isLocked": {"type": ["boolean", "null"]},
+            "ownerDeviceId": {"type": ["string", "null"]},
+            "ownerDeviceName": {"type": ["string", "null"]},
+            "permissionModel": {
+                "type": ["string", "null"],
+                "enum": [
+                    PermissionModel.APP_LEVEL.value,
+                    PermissionModel.RECORD_LEVEL.value,
+                    None,
+                ],
+            },
+            # KB-specific optional fields
+            "orgId": {"type": ["string", "null"]},
+            "description": {"type": ["string", "null"]},
+            "hideConnector": {"type": ["boolean", "null"]},
+            # Excludes this KB from list/browse/unscoped-search surfaces even
+            # though it is a normal KB app; explicit filters.kb still resolves it.
+            "isHidden": {"type": ["boolean", "null"]},
+        },
+        "required": [
+            "name",
+            "type",
+            "appGroup",
+            "scope",
+            "isActive",
+            "createdAtTimestamp"
+        ],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the app schema.",
+}
+
+# Record schema for ArangoDB
+record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "recordName": {"type": "string", "minLength": 1},
+            # should be a uuid
+            "externalRecordId": {"type": "string", "minLength": 1},
+            "connectorId": {"type": ["string", "null"]},
+            "externalGroupId": {"type": ["string", "null"]},
+            "externalParentId": {"type": ["string", "null"]},
+            "externalRevisionId": {"type": ["string", "null"], "default": None},
+            "externalRootGroupId": {"type": ["string", "null"]},
+            "recordGroupId": {"type": ["string", "null"]},
+            "rootRecordGroupId": {"type": ["string", "null"]},
+            "recordType": {
+                "type": "string",
+                "enum": [record_type.value for record_type in RecordType],
+            },
+            "version": {"type": "number", "default": 0},
+            "origin": {"type": "string", "enum": [origin.value for origin in OriginTypes]},
+            "connectorName": {
+                "type": "string",
+                "enum": [connector.value for connector in Connectors],
+            },
+            "mimeType": {"type": ["string", "null"], "default": None},
+            "webUrl": {"type": ["string", "null"]},
+            # Arango collection entry
+            "createdAtTimestamp": {"type": "number"},
+            # Arango collection entry
+            "updatedAtTimestamp": {"type": "number"},
+            "lastSyncTimestamp": {"type": ["number", "null"]},
+            "sourceCreatedAtTimestamp": {"type": ["number", "null"]},
+            "sourceLastModifiedTimestamp": {"type": ["number", "null"]},
+            # Knowledge-base uploads: what set the two above (SourceTimestampOrigin).
+            # A pattern, so a new origin needs no schema release first.
+            "sourceTimestampOrigin": {"type": "string", "pattern": "^[a-z_]{1,32}$"},
+            # What the upload had set, kept while dates the content states replace it.
+            "uploadSourceCreatedAtTimestamp": {"type": ["number", "null"]},
+            "uploadSourceLastModifiedTimestamp": {"type": ["number", "null"]},
+            "uploadSourceTimestampOrigin": {"type": "string", "pattern": "^[a-z_]{1,32}$"},
+            "isDeleted": {"type": "boolean", "default": False},
+            "isArchived": {"type": "boolean", "default": False},
+            "isVLMOcrProcessed": {"type": "boolean", "default": False},
+            "deletedByUserId": {"type": ["string", "null"]},
+            # Soft delete: when the record entered the trash, who put it there,
+            # the batch a restore brings back together, and the purge's retries.
+            "deletedAtTimestamp": {"type": ["number", "null"]},
+            "deleteSource": {
+                "type": ["string", "null"],
+                "enum": [source.value for source in DeleteSource] + [None],
+            },
+            "deleteBatchId": {"type": ["string", "null"]},
+            "purgeAttempts": {"type": ["number", "null"]},
+            "purgeLastError": {"type": ["string", "null"]},
+            # The source id a trashed record gave up when a live record moved onto it.
+            "trashedExternalRecordId": {"type": ["string", "null"]},
+            # When a restore brought the record back; see RESTORED_AT_FIELD.
+            "restoredAtTimestamp": {"type": ["number", "null"]},
+            "processingStartedAt": {"type": ["number", "null"]},
+            # Clocks the stranded-record sweep in indexing_main ages rows on,
+            # and how many times it has re-sent the record since it was queued.
+            "queuedAtTimestamp": {"type": ["number", "null"]},
+            "lastRepublishedAt": {"type": ["number", "null"]},
+            "republishCount": {"type": ["number", "null"]},
+            # A record whose source rate-limited its content fetch: when it may
+            # be sent again, and when this run of waits began (see
+            # app/modules/indexing/rate_limit_deferral.py).
+            "retryNotBefore": {"type": ["number", "null"]},
+            "rateLimitedSince": {"type": ["number", "null"]},
+            "parsingStatus": {"type": "string", "enum": PROGRESS_STATUS_VALUES},
+            "indexingStatus": {
+                "type": "string",
+                # CONNECTOR_DISABLED is deprecated (use AUTO_INDEX_OFF) but still on old records.
+                "enum": [*PROGRESS_STATUS_VALUES, "CONNECTOR_DISABLED"],
+            },
+            "extractionStatus": {"type": "string", "enum": PROGRESS_STATUS_VALUES},
+            "isLatestVersion": {"type": "boolean", "default": True},
+            "isDirty": {"type": "boolean", "default": False},  # needs re indexing
+            "reason": {"type": ["string", "null"]},  # fail reason, didn't index reason
+            # Credentials redacted from the content before indexing (S-2).
+            "secretsRedacted": {"type": ["integer", "null"], "minimum": 0},
+            # Promoted duplicates of this record still need its taxonomy copied.
+            "duplicateReconcilePending": {"type": "boolean"},
+            # app.modules.indexing.duplicate_reconcile
+            "duplicateReconcileAttempts": {"type": ["integer", "null"]},
+            "duplicateReconcileDueAt": {"type": ["number", "null"]},
+            "uploadedBy": {"type": ["string", "null"]},  # uploader userId
+            "lastIndexTimestamp": {"type": ["number", "null"]},
+            "hasIndexedCopy": {"type": "boolean"},
+            "lastExtractionTimestamp": {"type": ["number", "null"]},
+            # A pattern, not an enum: widening an enum on this strict schema is a
+            # release that must ship before any writer of the new value.
+            "entityExtractionStatus": {"type": "string", "pattern": "^[A-Z_]{1,32}$"},
+            "lastEntityExtractionTimestamp": {"type": ["number", "null"]},
+            "entityExtractionStrategy": {"type": ["string", "null"]},
+            "entityExtractorVersion": {"type": ["string", "null"]},
+            "summaryDocumentId": {"type": ["string", "null"]},
+            "virtualRecordId": {"type": ["string", "null"], "default": None},
+            "previewRenderable": {"type": ["boolean", "null"], "default": True},
+            "isShared": {"type": ["boolean", "null"], "default": False},
+            "isDependentNode": {"type": "boolean", "default": False},
+            "parentNodeId": {"type": ["string", "null"], "default": None},
+            "hideWeburl": {"type": "boolean", "default": False},
+            "isInternal": {"type": "boolean", "default": False},
+            "isPlaceholder": {"type": "boolean", "default": False},
+            # Permission traversal input, read per visited node. Per node and
+            # mixable within a connector; RESTRICTED applies to the node it is
+            # on and is never inherited by its children. Absent reads as OPEN,
+            # so it stays out of "required".
+            "accessRule": {
+                "type": "string",
+                "enum": [rule.value for rule in AccessRule],
+                "default": AccessRule.OPEN.value,
+            },
+            "md5Checksum": {"type": ["string", "null"]},
+            "sizeInBytes": {"type": ["number", "null"]},
+            "storageDocumentId": {"type": ["string", "null"]},
+            # SQL record fields (tables/views)
+            "definition": {"type": ["string", "null"]},
+            "sourceTables": {"type": ["array", "null"], "items": {"type": "string"}},
+            "rowCount": {"type": ["number", "null"]},
+            # sha256(source bytes)[:16] of the revision being processed; stage status writes CAS on it.
+            "contentRev": {"type": ["string", "null"]},
+        },
+        "required": [
+            "recordName",
+            "externalRecordId",
+            "recordType",
+            "origin",
+            "createdAtTimestamp",
+            "connectorId"
+        ],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the record schema.",
+}
+
+
+# Pipeline stage state: one document per (virtual record, content revision, stage).
+# ``_key`` is ``{virtualRecordId}:{rev}:{stage}``; see app/modules/pipeline/models.py.
+STAGE_TIERS = ["heavy", "light"]
+STAGE_PRIORITIES = ["interactive", "bulk"]
+stage_state_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "virtualRecordId": {"type": "string"},
+            "rev": {"type": "string"},
+            "stage": {"type": "string"},
+            "status": {"type": "string", "enum": PROGRESS_STATUS_VALUES},
+            "stageVersion": {"type": "integer", "minimum": 1},
+            "recordIds": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "connectorId": {"type": "string"},
+            "tier": {"type": "string", "enum": STAGE_TIERS},
+            "priority": {"type": "string", "enum": STAGE_PRIORITIES},
+            "trigger": {"type": "string"},
+            "force": {"type": "boolean"},
+            "mimeType": {"type": ["string", "null"]},
+            "textDigest": {"type": "string"},
+            "blocksDigest": {"type": "string"},
+            "textChars": {"type": "integer", "minimum": 0},
+            "hasTables": {"type": "boolean"},
+            "hasImages": {"type": "boolean"},
+            "fingerprint": {"type": ["string", "null"]},
+            "attempt": {"type": "integer", "minimum": 0},
+            "startedAtMs": {"type": ["number", "null"]},
+            "finishedAtMs": {"type": ["number", "null"]},
+            "publishedAtMs": {"type": ["number", "null"]},
+            "updatedAtMs": {"type": "number"},
+            "workerId": {"type": ["string", "null"]},
+            "reason": {"type": ["string", "null"]},
+            "output": {"type": ["string", "null"]},
+        },
+        "required": [
+            "orgId",
+            "virtualRecordId",
+            "rev",
+            "stage",
+            "status",
+            "stageVersion",
+            "recordIds",
+            "connectorId",
+            "tier",
+            "priority",
+            "trigger",
+            "textDigest",
+            "blocksDigest",
+            "textChars",
+            "hasTables",
+            "hasImages",
+            "updatedAtMs",
+        ],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the stage state schema.",
+}
+
+# File Record schema for ArangoDB
+file_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "isFile": {"type": "boolean"},
+            "extension": {"type": ["string", "null"]},
+            "etag": {"type": ["string", "null"]},
+            "ctag": {"type": ["string", "null"]},
+            "md5Checksum": {"type": ["string", "null"]},
+            "quickXorHash": {"type": ["string", "null"]},
+            "crc32Hash": {"type": ["string", "null"]},
+            "sha1Hash": {"type": ["string", "null"]},
+            "sha256Hash": {"type": ["string", "null"]},
+            "path": {"type": ["string", "null"]},
+            "localFsRelativePath": {"type": ["string", "null"]},
+            "sizeInBytes": {"type": ["number", "null"]}, # deprecated
+            "webUrl": {"type": ["string", "null"]}, # deprecated
+            "mimeType": {"type": ["string", "null"]}, # deprecated
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the file record schema.",
+}
+
+artifact_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "extension": {"type": ["string", "null"]},
+            "mimeType": {"type": ["string", "null"]},
+            "sizeInBytes": {"type": ["number", "null"]},
+            "description": {"type": ["string", "null"]},
+            "lifecycleStatus": {"type": ["string", "null"]},
+            "artifactType": {"type": ["string", "null"]},
+            "sourceTool": {"type": ["string", "null"]},
+            "conversationId": {"type": ["string", "null"]},
+            "isTemporary": {"type": ["boolean", "null"]},
+            "expiresAt": {"type": ["number", "null"]},
+            "visibility": {"type": ["string", "null"]},
+            "logicalName": {"type": ["string", "null"]},
+            "contentHash": {"type": ["string", "null"]},
+            "resultSchema": {"type": ["object", "null"]},
+            # Written JSON-encoded (`serialize_artifact_versions`) because Neo4j
+            # rejects list-of-map properties; "array" stays valid for documents
+            # written before that.
+            "versions": {"type": ["array", "string", "null"]},
+        },
+        "required": ["name", "orgId"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the artifact record schema.",
+}
+
+drive_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "isFile": {"type": "boolean"},
+        },
+    },
+}
+
+mail_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "threadId": {"type": "string"},
+            "isParent": {"type": "boolean", "default": False},
+            "internalDate": {"type": "string"},
+            "subject": {"type": "string"},
+            "date": {"type": "string"},
+            "from": {"type": "string"},
+            "to": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "cc": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "bcc": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "messageIdHeader": {"type": ["string", "null"]},
+            "historyId": {"type": "string"},
+            "webUrl": {"type": "string"},
+            "labelIds": {"type": "array", "items": {"type": "string"}},
+            "conversationIndex": {"type": ["string", "null"]},
+        },
+        "required": ["threadId", "isParent"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the mail record schema.",
+}
+
+webpage_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "domain": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the webpage record schema.",
+}
+
+comment_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "authorSourceId": {"type": "string"},
+            "resolutionStatus": {"type": ["string", "null"]},
+            "commentSelection": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the comment record schema.",
+}
+
+link_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "url": {"type": "string"},
+            "title": {"type": ["string", "null"]},
+            "isPublic": {
+                "type": "string",
+                "enum": ["true", "false", "unknown"]
+            },
+            "linkedRecordId": {"type": ["string", "null"]},
+        },
+        "required": ["orgId", "url", "isPublic"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the link record schema.",
+}
+
+ticket_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "status": {"type": ["string", "null"]},
+            "sourceStatus": {"type": ["string", "null"]},
+            "priority": {"type": ["string", "null"]},
+            "type": {"type": ["string", "null"]},
+            "deliveryStatus": {"type": ["string", "null"]},
+            "assignee": {"type": ["string", "null"]},
+            "reporterEmail": {"type": ["string", "null"]},
+            "assigneeEmail": {"type": ["string", "null"]},
+            "creatorEmail": {"type": ["string", "null"]},
+            "creatorName": {"type": ["string", "null"]},
+            "reporterName": {"type": ["string", "null"]},
+            "dueDateTimestamp": {"type": ["number", "null"]},
+            "resolvedAtTimestamp": {"type": ["number", "null"]},
+            "assigneeSourceTimestamp": {"type": ["number", "null"]},
+            "creatorSourceTimestamp": {"type": ["number", "null"]},
+            "reporterSourceTimestamp": {"type": ["number", "null"]},
+            "labels":{
+                "type": ["array", "null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "assignee_source_id":{
+                "type": ["array", "null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "reporter_source_id":{"type": ["string", "null"]},
+            "is_email_hidden": {"type": "boolean", "default": False},
+        },
+    },
+}
+
+project_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "status": {"type": ["string", "null"]},
+            "priority": {"type": ["string", "null"]},
+            "leadId": {"type": ["string", "null"]},
+            "leadName": {"type": ["string", "null"]},
+            "leadEmail": {"type": ["string", "null"]},
+        },
+    },
+}
+
+meeting_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "hostEmail": {"type": ["string", "null"]},
+            "hostId": {"type": ["string", "null"]},
+            "meetingType": {"type": ["integer", "number", "null"]},
+            "durationMinutes": {"type": ["integer", "number", "null"]},
+            "startTime": {"type": ["string", "null"]},
+            "endTime": {"type": ["string", "null"]},
+            "timezone": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the meeting record schema.",
+}
+
+message_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            # Generic fields (common across Slack, Teams, Discord, WhatsApp, etc.)
+            "threadId": {"type": ["string", "null"]},
+            "hasReplies": {"type": "boolean", "default": False},
+            "isReply": {"type": "boolean", "default": False},
+            "isEdited": {"type": "boolean", "default": False},
+            "authorId": {"type": ["string", "null"]},
+            "authorEmail": {"type": ["string", "null"]},
+            # Burst / thread range timestamps (Slack ts strings)
+            "startTs": {"type": ["string", "null"]},
+            "endTs": {"type": ["string", "null"]},
+        },
+        "required": ["orgId"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the message record schema.",
+}
+
+pull_request_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties":{
+            "orgId": {"type": "string"},
+            "summary": {"type": ["string", "null"]},
+            "description": {"type": ["string", "null"]},
+            "status": {"type": ["string", "null"]},
+            "assignee":{
+                "type": ["array","null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "assigneeEmail":{
+                "type": ["array","null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "creatorEmail": {"type": ["string", "null"]},
+            "creatorName": {"type": ["string", "null"]},
+            "reviewEmail":{
+                "type": ["array","null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": []
+            },
+            "reviewName":{
+                "type": ["array","null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": []
+            },
+            "mergeable":{"type": ["string", "null"]},
+            "mergedBy": {"type": ["string", "null"]},
+            "labels":{
+                "type": ["array","null"],
+                "items": {"type": "string", "minLength": 0},
+                "default": [],
+            },
+            "lastCommitSha": {"type": ["string", "null"]},
+            "mergedAtTimestamp": {"type": ["number", "null"]},
+            "closedAtTimestamp": {"type": ["number", "null"]},
+        },
+    },
+}
+
+code_file_record_schema={
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "summary": {"type": ["string", "null"]},
+            "description": {"type": ["string", "null"]},
+            "filePath": {"type": "string", "minLength": 0},
+            "fileHash": {"type": "string", "minLength": 0},
+            "language": {"type": ["string", "null"]},
+            # source | test | config | build | migration | script |
+            # type_definition | generated -- see parsers/code_parser/file_role.py
+            "fileRole": {"type": ["string", "null"]},
+            "commitSha": {"type": ["string", "null"]},
+            # Symbol names referenced by this file (calls, imports, type refs).
+            # Used by the edge builder to find files that need re-resolution
+            # when a touched file adds or removes a symbol definition.
+            "referencedNames": {"type": ["array", "null"], "items": {"type": "string"}},
+            # Names the file stopped defining in recent projections, and when the
+            # last was added; the next build re-resolves the files that use them.
+            "changedNames": {"type": ["array", "null"], "items": {"type": "string"}},
+            "changedNamesAt": {"type": ["number", "null"]},
+        },
+    },
+}
+
+# Deliberately loose: no additionalProperties:false. (ArangoDB's `level`
+# already defaults to "strict"; it is the missing additionalProperties that
+# lets unknown fields through.) update_collection_schema re-applies this on
+# every boot, so a closed schema would hard-reject existing documents the
+# moment a field is added.
+block_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "recordId": {"type": "string"},
+            "recordGroupId": {"type": ["string", "null"]},
+            "connectorId": {"type": ["string", "null"]},
+            "filePath": {"type": ["string", "null"]},
+            "qualifiedName": {"type": ["string", "null"]},
+            "name": {"type": ["string", "null"]},
+            "nameFolded": {"type": ["string", "null"]},
+            "parserVersion": {"type": ["string", "null"]},
+            "kind": {"type": ["string", "null"]},
+            "subType": {"type": ["string", "null"]},
+            "isBlockGroup": {"type": "boolean"},
+            "isExternal": {"type": "boolean"},
+            "index": {"type": ["number", "null"]},
+            "startLine": {"type": ["number", "null"]},
+            "endLine": {"type": ["number", "null"]},
+            "language": {"type": ["string", "null"]},
+            "contentHash": {"type": ["string", "null"]},
+            "parentBlockId": {"type": ["string", "null"]},
+            "pendingEdges": {"type": ["array", "null"], "items": {"type": "object"}},
+            "typeTable": {"type": ["object", "null"]},
+            "referencedNames": {"type": ["array", "null"], "items": {"type": "string"}},
+            "createdAtTimestamp": {"type": ["number", "null"]},
+            "updatedAtTimestamp": {"type": ["number", "null"]},
+        },
+        "required": ["orgId", "recordId"],
+    },
+}
+sql_table_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "databaseName": {"type": ["string", "null"]},
+            "schemaName": {"type": ["string", "null"]},
+            "fqn": {"type": ["string", "null"]},  # fully qualified name: database.schema.table
+            "rowCount": {"type": ["number", "null"]},
+            "sizeInBytes": {"type": ["number", "null"]},
+            "columnCount": {"type": ["number", "null"]},
+            "ddl": {"type": ["string", "null"]},  # CREATE TABLE statement
+            "primaryKeys": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+            },
+            "foreignKeys": {
+                "type": ["array", "null"],
+                "items": {"type": "object"},
+            },
+            "comment": {"type": ["string", "null"]},
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the SQL table record schema.",
+}
+
+sql_view_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "databaseName": {"type": ["string", "null"]},
+            "schemaName": {"type": ["string", "null"]},
+            "fqn": {"type": ["string", "null"]},  # fully qualified name: database.schema.view
+            "definition": {"type": ["string", "null"]},  # CREATE VIEW statement
+            "sourceTables": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+            },
+            "isSecure": {"type": "boolean", "default": False},
+            "comment": {"type": ["string", "null"]},
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the SQL view record schema.",
+}
+
+product_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "productCode": {"type": ["string", "null"]},
+            "productFamily": {"type": ["string", "null"]},
+            "isActive": {"type": ["boolean", "null"]},
+            "sku": {"type": ["string", "null"]},
+            "listPrice": {"type": ["number", "null"]},
+        },
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the product record schema.",
+
+}
+
+deal_record_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "name": {"type": ["string", "null"]},
+            "amount": {"type": ["number", "null"]},
+            "expectedRevenue": {"type": ["number", "null"]},
+            "expectedCloseDate": {"type": ["string", "null"]},
+            "conversionProbability": {"type": ["number", "null"]},
+            "type": {"type": ["string", "null"]},
+            "ownerId": {"type": ["string", "null"]},
+            "isWon": {"type": ["boolean", "null"]},
+            "isClosed": {"type": ["boolean", "null"]},
+            "createdDate": {"type": ["string", "null"]},
+            "closeDate": {"type": ["string", "null"]},
+        },
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the deal record schema.",
+}
+
+record_group_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "groupName": {"type": "string", "minLength": 1},
+            "shortName": {"type": ["string", "null"]},
+            "description": {"type": ["string", "null"]},
+            # should be a uuid
+            "externalGroupId": {"type": "string", "minLength": 1},
+            "externalRevisionId": {"type": ["string", "null"], "default": None},
+            "groupType": {
+                "type": "string",
+                "enum": [group_type.value for group_type in RecordGroupType],
+            },
+            "connectorName": {
+                "type": "string",
+                "enum": [connector.value for connector in Connectors],
+            },
+            "isInternal": {"type": ["boolean", "null"], "default": False},
+            "hideChildren": {"type": ["boolean", "null"], "default": False},
+            # Permission traversal input, as on records: per node, and
+            # RESTRICTED never cascades to children.
+            "accessRule": {
+                "type": "string",
+                "enum": [rule.value for rule in AccessRule],
+                "default": AccessRule.OPEN.value,
+            },
+            # Whether container-filtered search may trust this group's grant
+            # instead of checking each record. Null means "verify" — the safe
+            # state, and the only one until a connector proves otherwise.
+            # APP_LEVEL is excluded: it describes a connector, not a group.
+            "permissionModel": {
+                "type": ["string", "null"],
+                "enum": [
+                    PermissionModel.RECORD_GROUP_LEVEL.value,
+                    PermissionModel.RECORD_LEVEL.value,
+                    None,
+                ],
+            },
+            "connectorId": {"type": ["string", "null"]},
+            "parentExternalGroupId": {"type": ["string", "null"]},
+            "webUrl": {"type": ["string", "null"]},
+            "createdBy":{"type": ["string", "null"]},
+            "deletedByUserId":{"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "lastSyncTimestamp": {"type": "number"},
+            "isDeletedAtSource": {"type": "boolean", "default": False},
+            "deletedAtSourceTimestamp": {"type": ["number", "null"]},
+            "sourceCreatedAtTimestamp": {"type": ["number", "null"]},
+            "sourceLastModifiedTimestamp": {"type": ["number", "null"]},
+        },
+        "required": [
+            "groupName",
+            # "externalGroupId",
+            "groupType",
+            "connectorName",
+            "createdAtTimestamp"
+        ],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the record group schema.",
+}
+
+named_entity_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "kind": {"type": "string"},
+            "category": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "name": {"type": "string"},
+            "normKey": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "normalizedAliases": {"type": "array", "items": {"type": "string"}},
+            "schemaVersion": {"type": "integer"},
+            # Reserved: a field added to this strict schema later would break rollback.
+            "keyScheme": {"type": ["integer", "null"]},
+            "mergedInto": {"type": ["string", "null"]},
+            "orphanedAt": {"type": ["number", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "startMs": {"type": ["number", "null"]},
+            "endMs": {"type": ["number", "null"]},
+            "granularity": {"type": ["string", "null"]},
+            "timex": {"type": ["string", "null"]},
+            "amount": {"type": ["string", "null"]},
+            "amountFloat": {"type": ["number", "null"]},
+            "currency": {"type": ["string", "null"]},
+            "numericValue": {"type": ["number", "null"]},
+            "unit": {"type": ["string", "null"]},
+            "dimension": {"type": ["string", "null"]},
+            "siValue": {"type": ["number", "null"]},
+            "durationIso": {"type": ["string", "null"]},
+            "durationSeconds": {"type": ["number", "null"]},
+            "mergedAt": {"type": ["number", "null"]},
+            "types": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["orgId", "kind", "name", "normKey"],
+        # Open: a field a later release adds must not make this release's schema,
+        # reapplied on rollback, reject updates to the documents that carry it.
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the named entity schema.",
+}
+
+# One typed value (date, amount, quantity, percentage, duration, age) a record
+# mentions. Keyed by record, never shared between records: a shared value node
+# such as "2026" or "USD" becomes a hub every record write locks.
+value_mention_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "recordId": {"type": "string"},
+            "kind": {"type": "string"},
+            "normKey": {"type": "string"},
+            "name": {"type": "string"},
+            "startMs": {"type": ["number", "null"]},
+            "endMs": {"type": ["number", "null"]},
+            "granularity": {"type": ["string", "null"]},
+            "timex": {"type": ["string", "null"]},
+            "amount": {"type": ["string", "null"]},
+            "amountFloat": {"type": ["number", "null"]},
+            "currency": {"type": ["string", "null"]},
+            "numericValue": {"type": ["number", "null"]},
+            "unit": {"type": ["string", "null"]},
+            "dimension": {"type": ["string", "null"]},
+            "siValue": {"type": ["number", "null"]},
+            "durationIso": {"type": ["string", "null"]},
+            "durationSeconds": {"type": ["number", "null"]},
+            "mentionCount": {"type": "integer"},
+            "maxEvidence": {"type": "number"},
+            "extractors": {"type": "array", "items": {"type": "string"}},
+            "extractedNames": {"type": "array", "items": {"type": "string"}},
+            "blockIndexes": {"type": "array", "items": {"type": "integer"}},
+            "blockIds": {"type": "array", "items": {"type": "string"}},
+            "extractorVersion": {"type": "string"},
+            "schemaVersion": {"type": "integer"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["orgId", "recordId", "kind", "normKey"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the value mention schema.",
+}
+
+# A record whose named-entity graph write failed after its retries. Keyed by the
+# record; the recovery pass writes the record's stored extraction again when due.
+named_entity_persist_retry_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "orgId": {"type": "string"},
+            "recordId": {"type": "string"},
+            # AQL arithmetic yields a double, so a count it increments is a number.
+            "attempts": {"type": "number"},
+            "dueAt": {"type": "number"},
+            "lastError": {"type": ["string", "null"]},
+            # The job extracts again from the stored blocks instead of re-writing
+            # the stored extraction (app.modules.indexing.named_entity_completion).
+            "reextract": {"type": ["boolean", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["orgId", "recordId", "attempts", "dueAt"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the named entity persist retry schema.",
+}
+
+department_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "departmentName": {"type": "string", "minLength": 1},
+            "orgId": {"type": ["string", "null"]},
+        },
+        "required": ["departmentName"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the department schema.",
+}
+
+
+agent_template_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string", "minLength": 1},
+            "startMessage": {"type": "string", "minLength": 1},
+            "systemPrompt": {"type": "string", "minLength": 1},
+            "tools": {
+                "type": "array",
+                "items" :{
+                    "type": "object",
+                    "properties": {
+                        #scoped name for tool wild card (google.* (all tools for google)) (e.g. app_name.tool_name, google.search)
+                        "name": {"type": "string", "minLength": 1},
+                        "description": {"type": "string", "minLength": 1},
+                    },
+                    "nullable": True,
+                    "required": ["name"],
+                    "additionalProperties": True,
+                },
+                "default": [],
+            },
+            "models": {
+                "type": "array",
+                "items" :{
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "role": {"type": "string", "minLength": 1},
+                        "provider": {"type": "string", "minLength": 1},
+                        "config": {"type": "object"},
+                    },
+                    "nullable": True,
+                    "required": ["name", "role", "provider"],
+                    "additionalProperties": True,
+                },
+                "default": [],
+            },
+            "memory": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "array", "items": {"type": "string", "enum": ["CONVERSATIONS", "KNOWLEDGE_BASE", "APPS", "ACTIVITIES", "VECTOR_DB"]}},
+                },
+                "nullable": True,
+                "required": ["type"],
+                "additionalProperties": True,
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+            },
+            "orgId": {"type": ["string", "null"]},
+            "isActive": {"type": "boolean", "default": True},
+            "createdBy": {"type": ["string", "null"]},
+            "updatedByUserId": {"type": ["string", "null"]},
+            "deletedByUserId": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": ["number", "null"]},
+            "deletedAtTimestamp": {"type": ["number", "null"]},
+            "isDeleted": {"type": "boolean", "default": False},
+        },
+        "required": ["name", "description", "startMessage", "systemPrompt"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent template schema.",
+}
+
+agent_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string", "minLength": 1},
+            "startMessage": {"type": "string", "minLength": 1},
+            "systemPrompt": {"type": "string", "minLength": 1},
+            "instructions": {"type": ["string", "null"]},
+            "models": {
+                "type": "array",
+                "items": {"type": "string"},  # Array of modelKey_modelName (e.g., ["uuid_gpt-4", "uuid_claude-3"])
+                "default": [],
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+            },
+            "webSearch": {"type": ["string", "null"]},
+            # Falls back to this when a chat request omits its own reasoningEffort.
+            "defaultReasoningEffort": {
+                "type": ["string", "null"],
+                "enum": ["none", "low", "medium", "high", "max", None],
+            },
+            # API toolset operations the agent may call: "<instanceId>:<toolName>".
+            "apiToolsetTools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+            },
+            "isActive": {"type": "boolean", "default": True},
+            "isServiceAccount": {"type": "boolean", "default": False},
+            # The service account this agent searches knowledge as, by user
+            # node key. Absent on agents made before binding existed, and on
+            # any agent that is not a service agent; those still search as
+            # their creator. See _enrich_user_info_for_service_account_agent_chat.
+            "serviceAccountUserId": {"type": ["string", "null"]},
+            "sendUserContext": {"type": "boolean", "default": True},
+            "createdBy": {"type": "string"},
+            "updatedBy": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "deletedAtTimestamp": {"type": "number"},
+            "deletedByUserId": {"type": ["string", "null"]},
+            "isDeleted": {"type": "boolean", "default": False}
+        },
+        "required": ["name", "description", "startMessage", "systemPrompt", "models", "createdBy", "createdAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent schema.",
+}
+
+team_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": ["string", "null"]},
+            "orgId": {"type": ["string", "null"]},
+            "createdBy": {"type": ["string", "null"]},
+            "updatedByUserId": {"type": ["string", "null"]},
+            "deletedByUserId": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "deletedAtTimestamp": {"type": "number"},
+            "isDeleted": {"type": "boolean", "default": False},
+        },
+        "required": ["name"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the team schema.",
+}
+
+# future schema
+
+# agent_template_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "name": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "startMessage": {"type": "string", "minLength": 1},
+#             "systemPrompt": {"type": "string", "minLength": 1},
+#             "tools": {
+#                 "type": "array",
+#                 "items" :{
+#                     "type": "object",
+#                     "properties": {
+#                         #scoped name for tool wild card (google.* (all tools for google)) (e.g. app_name.tool_name, google.search)
+#                         "name": {"type": "string", "minLength": 1},
+#                         "description": {"type": "string", "minLength": 1},
+#                         "config": {"type": "object"},
+#                     },
+#                     "required": ["name"],
+#                     "additionalProperties": True,
+#                 }
+#             },
+#             "models": {
+#                 "type": "array",
+#                 "items" :{
+#                     "type": "object",
+#                     "properties": {
+#                         "name": {"type": "string", "minLength": 1},
+#                         "role": {"type": "string", "minLength": 1},
+#                         "provider": {"type": "string", "minLength": 1},
+#                         "config": {"type": "object"},
+#                     },
+#                     "required": ["name", "role", "provider"],
+#                     "additionalProperties": True,
+#                 }
+#             },
+#             "actions": {
+#                 "type": "array",
+#                 # scoped action name (e.g. app_name.action_name, google.search)
+#                 "items": {
+#                     "type": "object",
+#                     "properties": {
+#                         "name": {"type": "string", "minLength": 1},
+#                         # add self approval option and add user id in approvers
+#                         "approvers": {"type": "array", "items":{
+#                             "type": "object",
+#                             "properties": {
+#                                 "userId": {"type": "array", "items": {"type": "string"}},
+#                                 "userGroupsIds": {"type": "array", "items": {"type": "string"}},
+#                                 "order": {"type": "number"},
+#                             },
+#                             "required": ["userId", "order"],
+#                             "additionalProperties": True,
+#                         }},
+#                         "reviewers": {"type": "array", "items":{
+#                             "type": "object",
+#                             "properties": {
+#                                 "userId": {"type": "array", "items": {"type": "string"}},
+#                                 "userGroupsIds": {"type": "array", "items": {"type": "string"}},
+#                                 "order": {"type": "number"},
+#                             },
+#                             "required": ["userId", "order"],
+#                             "additionalProperties": True,
+#                         }},
+#                     },
+#                     "required": ["name", "approvers", "reviewers"],
+#                     "additionalProperties": True,
+#                 },
+#                 "default": [],
+#             },
+#             "memory": {
+#                 "type": "object",
+#                 "properties": {
+#                     "type": {"type": "array", "items": {"type": "string", "enum": ["CONVERSATIONS", "KNOWLEDGE_BASE", "APPS", "ACTIVITIES", "VECTOR_DB"]}},
+#                 },
+#                 "required": ["type"],
+#                 "additionalProperties": True,
+#             },
+#             "tags": {
+#                 "type": "array",
+#                 "items": {"type": "string"},
+#                 "default": [],
+#             },
+#             "orgId": {"type": ["string", "null"]},
+#             "isActive": {"type": "boolean", "default": True},
+#             "createdBy": {"type": ["string", "null"]},
+#             "updatedByUserId": {"type": ["string", "null"]},
+#             "deletedByUserId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["name", "description", "startMessage", "systemPrompt", "tools", "models", "apps", "knowledgeBases"],
+#         "additionalProperties": True,
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the agent template schema.",
+# }
+
+# agent_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "name": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "templateKey": {"type": "string", "minLength": 1},
+#             "systemPrompt": {"type": "string", "minLength": 1},
+#             "startingMessage": {"type": "string", "minLength": 1},
+#             "tags": {
+#                 "type": "array",
+#                 "items": {"type": "string"},
+#                 "default": [],
+#             },
+#             "isActive": {"type": "boolean", "default": True},
+#             "createdBy": {"type": ["string", "null"]},
+#             "updatedByUserId": {"type": ["string", "null"]},
+#             "deletedByUserId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["name", "description", "templateKey", "tools", "models", "apps", "knowledgeBases"],
+#         "additionalProperties": True,
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the agent schema.",
+# }
+
+# tool_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             # scoped name for tool (e.g. app_name.tool_name, google.search)
+#             "name": {"type": "string", "minLength": 1},
+#             "vendorName": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "isActive": {"type": "boolean", "default": True},
+#             "createdByUserId": {"type": ["string", "null"]},
+#             "updatedByUserId": {"type": ["string", "null"]},
+#             "deletedByUserId": {"type": ["string", "null"]},
+#             "orgId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["name", "description", "vendorName"],
+#         "additionalProperties": True,
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the tool schema.",
+# }
+
+# # AI Models Schema
+# ai_model_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "name": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "provider": {
+#                 "type": "string",
+#                 "enum": [
+#                     "OPENAI", "AZURE_OPENAI", "ANTHROPIC", "GOOGLE", "COHERE",
+#                     "MISTRAL", "OLLAMA", "BEDROCK", "GEMINI", "GROQ", "TOGETHER",
+#                     "FIREWORKS", "XAI", "VERTEX_AI", "CUSTOM"
+#                 ]
+#             },
+#             "modelType": {
+#                 "type": "string",
+#                 "enum": ["LLM", "EMBEDDING", "OCR", "SLM", "REASONING", "MULTIMODAL"]
+#             },
+#             "orgId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["name", "description", "modelKey", "provider", "modelType"],
+#         "additionalProperties": True,
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the AI model schema.",
+# }
+
+# # App Actions Schema
+# app_action_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             # scoped name for action (e.g. app_name.action_name, drive.upload, gmail.send, etc. )
+#             "name": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "orgId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["name", "description"],
+#         "additionalProperties": True,
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the app action schema.",
+# }
+
+# # Conversation Schema
+# conversation_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "conversationDocId": {"type": "string", "minLength": 1},
+#             "orgId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["conversationDocId"],
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the conversation schema.",
+# }
+
+# # task schema
+# task_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "orgId": {"type": ["string", "null"]},
+#             "name": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "priority": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#     },
+# }
+
+# # workflow schema
+# workflow_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "orgId": {"type": ["string", "null"]},
+#             "name": {"type": "string", "minLength": 1},
+#             "description": {"type": "string", "minLength": 1},
+#             "taskCounts": {"type": "number"},
+#             "createdBy": {"type": ["string", "null"]},
+#             "updatedByUserId": {"type": ["string", "null"]},
+#             "deletedByUserId": {"type": ["string", "null"]},
+#             "createdAtTimestamp": {"type": "number"},
+#             "updatedAtTimestamp": {"type": "number"},
+#             "deletedAtTimestamp": {"type": "number"},
+#             "isDeleted": {"type": "boolean", "default": False},
+#         },
+#         "required": ["name", "description", "taskCounts"],
+#         "additionalProperties": True,
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the workflow schema.",
+# }
+
+# people schema - for external email addresses (not organization members)
+people_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},  # uuid4; (orgId, email) is the business key (composite unique index)
+            "email": {"type": "string"},
+            # Not in "required": pre-existing documents written before org-scoping
+            # was added have no orgId and must stay schema-valid.
+            "orgId": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "fullName": {"type": ["string", "null"]},
+            "firstName": {"type": ["string", "null"]},
+            "lastName": {"type": ["string", "null"]},
+            "phone": {"type": ["string", "null"]},
+        },
+        "required": ["email", "createdAtTimestamp", "updatedAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the people schema.",
+}
+
+# Knowledge Node Schema
+knowledge_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "connectorId": {"type": "string"},
+            "filters": {"type": "string"},  # Stringified JSON: '{"recordGroups":[],"records":[],...}'
+            "createdBy": {"type": "string"},
+            "updatedBy": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"}
+        },
+        "required": ["connectorId", "filters", "createdBy", "createdAtTimestamp"],
+        "additionalProperties": False
+    },
+    "level": "strict",
+    "message": "Document does not match the knowledge schema.",
+}
+
+
+# Toolset Node Schema
+toolset_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "name": {"type": "string"},  # Normalized name (e.g., "slack")
+            "displayName": {"type": "string"},
+            "type": {"type": "string"},  # "app", "utility", etc
+            "userId": {"type": "string"},  # Executing user (used for etcd auth path lookup)
+            "instanceId": {"type": "string"},  # Admin-created instance UUID (new architecture)
+            "instanceName": {"type": "string"},  # Human-readable instance name
+            "createdBy": {"type": "string"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"}
+        },
+        "required": ["name", "displayName", "type", "userId", "createdBy", "createdAtTimestamp"],
+        "additionalProperties": False
+    },
+    "level": "strict",
+    "message": "Document does not match the toolset schema.",
+}
+
+
+# Tool Node Schema - Created for each selected tool in a toolset
+tool_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "name": {"type": "string"},  # e.g., "send_message"
+            "fullName": {"type": "string"},  # e.g., "slack.send_message" (for registry lookup)
+            "toolsetName": {"type": "string"},  # e.g., "slack"
+            "description": {"type": "string"},
+            "createdBy": {"type": "string"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"}
+        },
+        "required": ["name", "fullName", "toolsetName", "createdBy", "createdAtTimestamp"],
+        "additionalProperties": False
+    },
+    "level": "strict",
+    "message": "Document does not match the tool schema.",
+}
+
+
+# MCP Server Node Schema — per-agent attachment of an org-wide MCP instance
+# (see app/agents/mcp/service.py). No secrets: credentials live in etcd,
+# keyed by instanceId + owner id, never on this node. Mirrors toolset_schema.
+mcp_server_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "name": {"type": "string"},  # Instance display name, snapshotted at attach time
+            "displayName": {"type": "string"},
+            "typeId": {"type": ["string", "null"]},  # Catalog type id, null for custom servers
+            "instanceId": {"type": "string"},  # /services/mcp/instances/{orgId}/{instanceId}
+            "allTools": {"type": "boolean"},  # every tool the server offers at chat time, not just the saved list
+            "userId": {"type": "string"},  # Executing user (used for etcd auth path lookup)
+            "createdBy": {"type": "string"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"}
+        },
+        "required": ["name", "displayName", "instanceId", "userId", "createdBy", "createdAtTimestamp"],
+        "additionalProperties": False
+    },
+    "level": "strict",
+    "message": "Document does not match the MCP server schema.",
+}
+
+
+# Agent Skills Node Schema — agent_loop_lib SkillManager's GraphSkillStore.
+# `content`/`resources` carry the full SKILL.md so the store can serve
+# `get_skill`/`get_resource` from one document; every other property is a
+# denormalized frontmatter field kept in sync on every write so
+# `list_skills`/filtering never has to parse `content`.
+agent_skills_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "orgId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string", "minLength": 1},
+            "content": {"type": "string"},  # full SKILL.md (frontmatter + body)
+            # Bundled resources as index-aligned parallel arrays (paths[i]'s
+            # content is contents[i]) — NOT a nested {path: content} map,
+            # because Neo4j node properties only allow primitives/arrays of
+            # primitives and this schema is shared by both graph backends.
+            "resourcePaths": {"type": "array", "items": {"type": "string"}, "default": []},
+            "resourceContents": {"type": "array", "items": {"type": "string"}, "default": []},
+            # Legacy nested {path: content} map from before the parallel-array
+            # encoding — read-tolerated so pre-existing Arango docs still
+            # validate on partial updates; never written anymore.
+            "resources": {"type": "object"},
+            "category": {"type": ["string", "null"]},
+            "subcategory": {"type": ["string", "null"]},
+            "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+            "concepts": {"type": "array", "items": {"type": "string"}, "default": []},
+            "related": {"type": "array", "items": {"type": "string"}, "default": []},
+            "requires": {"type": "array", "items": {"type": "string"}, "default": []},
+            "status": {"type": "string", "enum": ["active", "deprecated", "disabled"]},
+            "source": {"type": "string"},
+            "version": {"type": "string"},
+            "deprecatedReason": {"type": ["string", "null"]},
+            "replacedBy": {"type": ["string", "null"]},
+            "packName": {"type": ["string", "null"]},
+            "packVersion": {"type": ["string", "null"]},
+            "createdBy": {"type": "string"},
+            "updatedBy": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            # Usage tracking (GraphUsageTracker / MUSE-Autoskill pattern) —
+            # kept on the skill document itself rather than a separate
+            # collection since it's a small, per-skill counter set read
+            # and written together on every activation/outcome.
+            "usageTotalActivations": {"type": "number", "default": 0},
+            "usageSuccessfulOutcomes": {"type": "number", "default": 0},
+            "usageFailedOutcomes": {"type": "number", "default": 0},
+            "usageLastActivated": {"type": ["string", "null"]},
+            "usageFailureModes": {"type": "array", "items": {"type": "string"}, "default": []},
+            "usageImprovementNotes": {"type": "array", "items": {"type": "string"}, "default": []},
+            # Governance audit trail (`AuditGovernor`) — capped, append-only
+            # log of create/deprecate events as index-aligned parallel
+            # arrays (entry i spans all four), primitive-only for Neo4j
+            # compatibility; full content history for a revision lives in
+            # `agentSkillVersions`, this is just the "who did what, when"
+            # trail. `auditReasons` uses "" for "no reason" (Neo4j rejects
+            # nulls inside arrays).
+            "auditActions": {"type": "array", "items": {"type": "string"}, "default": []},
+            "auditActorIds": {"type": "array", "items": {"type": "string"}, "default": []},
+            "auditReasons": {"type": "array", "items": {"type": "string"}, "default": []},
+            "auditTimestamps": {"type": "array", "items": {"type": "number"}, "default": []},
+            # Legacy array-of-objects trail from before the parallel-array
+            # encoding — read-tolerated, never written anymore.
+            "auditLog": {"type": "array"},
+        },
+        "required": ["orgId", "name", "description", "content", "status", "createdBy", "createdAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent skills schema.",
+}
+
+# Agent Skill Versions Node Schema — immutable prior-revision snapshots
+# (append-only; never updated after insert). One document per revision,
+# NOT per skill — a skill with N revisions has N of these.
+agent_skill_versions_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "orgId": {"type": "string"},
+            "skillKey": {"type": "string"},  # _key of the agentSkills document this revises
+            "name": {"type": "string", "minLength": 1},
+            "version": {"type": "string"},
+            "content": {"type": "string"},
+            # Same parallel-array encoding as agent_skills_schema (Neo4j
+            # compatibility — no nested maps); legacy `resources` map
+            # read-tolerated for pre-encoding snapshots.
+            "resourcePaths": {"type": "array", "items": {"type": "string"}, "default": []},
+            "resourceContents": {"type": "array", "items": {"type": "string"}, "default": []},
+            "resources": {"type": "object"},
+            "summary": {"type": "string", "default": ""},
+            "updatedBy": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+        },
+        "required": ["orgId", "skillKey", "name", "version", "content", "createdAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent skill versions schema.",
+}
+
+# Agent Skill Candidates Node Schema — learning-loop candidates pending
+# governance review (`SkillCandidateStore`, `manager.py`). Rows are deleted
+# once approved/rejected, so this collection only ever holds pending work.
+agent_skill_candidates_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_key": {"type": "string"},
+            "orgId": {"type": "string"},
+            "candidateId": {"type": "string"},
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string"},
+            "body": {"type": "string"},
+            "category": {"type": ["string", "null"]},
+            "subcategory": {"type": ["string", "null"]},
+            "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+            "status": {"type": "string"},
+            "sourceTrajectorySummary": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+        },
+        "required": ["orgId", "candidateId", "name", "description", "body", "createdAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent skill candidates schema.",
+}

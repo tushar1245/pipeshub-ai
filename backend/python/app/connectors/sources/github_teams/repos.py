@@ -1,0 +1,1205 @@
+"""
+Code repository synchronisation for the GitHub Teams connector.
+
+Shared verbatim by the personal connector (identical logic; only the caller —
+``ProjectsSync``'s scope resolution — differs).
+
+The flow, top to bottom, mirrors this file's layout:
+
+1. ``run``          — decide: full sync, incremental, or skip (checkpoint = HEAD SHA).
+2. Full sync        — ONE recursive Git Tree call -> folders -> files -> prune
+                      deletions (BFS per-subtree fallback for giant repos).
+3. Incremental      — ONE Compare Commits call -> classify -> reconcile
+                      squash-renames -> deletes, renames, upserts -> folder cleanup.
+4. Folder lifecycle — folder records synthesised from path strings (no API);
+                      emptied folders removed bottom-up.
+5. Record builders  — plain records handed to the data-entities processor,
+                      which owns new-vs-update, versioning, and reindex decisions.
+6. Content streaming— raw bytes at index time: one Git Blob call by the
+                      record's sha (Contents API when it has none), and the
+                      oversized-413 guard.
+
+Failure ladder: incremental failure -> full sync same run; any persist failure
+-> checkpoint withheld -> redone next sync (all writes are idempotent upserts).
+An untrusted delta (force-push, branch reset, GitHub's 300-file/250-commit
+caps) is never applied — full sync re-baselines and pruning removes what the
+delta could not see.
+
+Dependency, build-output, cache and generated trees (the ``file_role`` list
+GitLab uses) and files ``.gitattributes`` marks ``linguist-generated`` or
+``linguist-vendored`` get no record: they are never fetched, parsed, embedded
+or classified, and records left from before are pruned. Every other file in
+the tree gets a record. Files above
+``CODE_FILE_MAX_SIZE_BYTES`` still get a record (visible, name-searchable) but
+have content indexing switched off with a reason; the stream-time 413 guard
+covers the incremental path, where Compare Commits carries no blob size.
+
+External IDs are anchored on the stable numeric ``repo.id`` — never
+``owner/repo`` or branch name — so renames/transfers never orphan a checkpoint
+or a record's identity. Source timestamps live in ``timestamps.py``.
+"""
+
+from __future__ import annotations
+
+import base64
+import uuid
+from collections import deque
+from typing import TYPE_CHECKING, Any
+
+from fastapi import HTTPException
+
+from app.config.constants.arangodb import (
+    Connectors,
+    MimeTypes,
+    OriginTypes,
+    ProgressStatus,
+    get_mime_type_for_extension,
+)
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.error.stream_errors import (
+    not_downloadable,
+    raise_for_stream_fetch,
+)
+from app.connectors.core.base.sync_point.sync_point import (
+    generate_record_sync_point_key,
+)
+from app.connectors.core.registry.code_indexing_flags import (
+    code_branch,
+    code_exclude_globs,
+    code_indexing_flags,
+)
+from app.models.entities import (
+    CodeFileRecord,
+    FileRecord,
+    Record,
+    RecordGroupType,
+    RecordType,
+)
+from app.modules.parsers.code_parser.file_role import FileRole, classify_file_role
+from app.modules.parsers.code_parser.gitattributes import (
+    LinguistExclusions,
+    parse_linguist_exclusions,
+)
+from app.modules.parsers.code_parser.lang_config import detect_language
+from app.modules.parsers.code_parser.path_policy import PathPolicy
+from app.services.graph_db.common.record_visibility import RecordVisibility
+from app.sources.external.github.github_async import GhObject
+
+from .constants import (
+    CODE_FILE_MAX_SIZE_BYTES,
+    COMPARE_COMMITS_FILES_LIMIT,
+    COMPARE_COMMITS_TOTAL_LIMIT,
+    GIT_TREE_TRUNCATION_ENTRY_HINT,
+    PREVIEW_RENDERABLE_EXTENSIONS,
+)
+from .models import (
+    GitHubLiterals,
+    blob_external_id,
+    path_from_external_id,
+    tree_external_id,
+)
+from .timestamps import TimestampBackfill
+
+if TYPE_CHECKING:
+    from app.connectors.sources.github_teams.connector import GitHubTeamsConnector
+
+
+def _git_tree_entries(prefix: str, tree: Any) -> list[tuple[str, str, str, int | None]]:
+    """``(full_path, type, sha, size)`` for one Git Tree response, rebased on ``prefix``.
+
+    A recursive response already carries paths relative to the tree it was
+    fetched from, so prefixing is all that is needed to make them repo-relative.
+    """
+    entries: list[tuple[str, str, str, int | None]] = []
+    for el in tree.tree or []:
+        if not el.path:
+            continue
+        full_path = f"{prefix}/{el.path}" if prefix else el.path
+        entries.append((full_path, el.type, el.sha, getattr(el, "size", None)))
+    return entries
+
+
+
+def _oversized(file_path: str, repo_name: str, size: int) -> HTTPException:
+    # 413 is TERMINAL for the indexing consumer: the record fails once with this
+    # reason instead of retrying, and stays synced and searchable by name.
+    return HTTPException(
+        status_code=HttpStatusCode.PAYLOAD_TOO_LARGE.value,
+        detail=(
+            f"File {file_path!r} in {repo_name} is {size} bytes, above the "
+            f"{CODE_FILE_MAX_SIZE_BYTES}-byte content-indexing limit; "
+            "metadata synced, content not indexed"
+        ),
+    )
+
+
+class ReposSync:
+    """Handles code repository (file/blob) synchronisation for ``GitHubTeamsConnector``."""
+
+    def __init__(self, connector: "GitHubTeamsConnector") -> None:
+        self.c = connector
+        self.logger = connector.logger
+        self.timestamps = TimestampBackfill(connector)
+        # Per repo, loaded at the start of each run.
+        self._policy = PathPolicy()
+
+    # ------------------------------------------------------------------
+    # 1. Entry point: dispatch + checkpoints
+    # ------------------------------------------------------------------
+
+    def branch_for(self, repo: GhObject) -> str | None:
+        """The branch whose code is synced: the admin's pick, else the repo's default."""
+        return code_branch(self.c.sync_filters) or repo.default_branch
+
+    async def run(self, repo: GhObject) -> bool:
+        """Sync a repo's code: incremental when a checkpoint exists and the
+        synced branch hasn't changed, full sync (re-baseline) otherwise.
+        Returns False when the code could not be brought up to date."""
+        c = self.c
+        owner, name = repo.owner.login, repo.name
+        branch = self.branch_for(repo)
+        if not branch:
+            self.logger.warning("Repo %s has no default branch (empty repo?); skipping code sync", repo.full_name)
+            return True
+
+        branch_res = await c.runtime.ds_call(c.data_source.get_branch, owner, name, branch)
+        if not branch_res.success or not branch_res.data:
+            if branch_res.status_code == HttpStatusCode.NOT_FOUND.value and branch != repo.default_branch:
+                # Never fall back to the default branch: its files would replace the
+                # chosen branch's in the index without the admin asking for it.
+                self.logger.error(
+                    "Branch %s chosen in the connector's filters does not exist in %s; "
+                    "code not synced, existing records kept", branch, repo.full_name,
+                )
+            else:
+                self.logger.error(
+                    "Failed to fetch branch %s for %s: %s", branch, repo.full_name, branch_res.error
+                )
+            return False
+        commit = getattr(branch_res.data, "commit", None)
+        current_sha = getattr(commit, "sha", None) if commit else None
+        if not current_sha:
+            self.logger.error("No HEAD commit SHA on branch %s for %s", branch, repo.full_name)
+            return False
+
+        self._policy = PathPolicy(
+            linguist=await self._load_linguist_exclusions(repo, current_sha),
+            exclude_globs=code_exclude_globs(c.sync_filters),
+        )
+
+        checkpoint = await self._get_checkpoint(repo.id)
+        last_sha = checkpoint.get(GitHubLiterals.LAST_COMMIT_SHA.value) if checkpoint else None
+        last_branch = checkpoint.get(GitHubLiterals.SYNCED_BRANCH.value) if checkpoint else None
+
+        if last_sha is None:
+            self.logger.info("No code checkpoint for %s; running full sync", repo.full_name)
+            ok = await self._full_sync(repo, current_sha)
+            if ok:
+                await self._update_checkpoint(repo, current_sha, branch)
+            else:
+                self.logger.warning("Full code sync for %s completed with errors; checkpoint not advanced", repo.full_name)
+            return ok
+
+        if last_branch and last_branch != branch:
+            self.logger.info(
+                "Synced branch changed for %s (%s -> %s); re-baselining with full sync",
+                repo.full_name, last_branch, branch,
+            )
+            ok = await self._full_sync(repo, current_sha)
+            if ok:
+                await self._update_checkpoint(repo, current_sha, branch)
+            return ok
+
+        if last_sha == current_sha:
+            self.logger.debug("Code repo unchanged for %s (HEAD %s); skipping", repo.full_name, current_sha[:8])
+            return True
+
+        ok = await self._incremental_sync(repo, last_sha, current_sha)
+        if ok:
+            await self._update_checkpoint(repo, current_sha, branch)
+            return True
+
+        self.logger.warning("Incremental code sync failed for %s; falling back to full sync", repo.full_name)
+        ok = await self._full_sync(repo, current_sha)
+        if ok:
+            await self._update_checkpoint(repo, current_sha, branch)
+        else:
+            self.logger.warning("Full sync fallback for %s completed with errors; checkpoint not advanced", repo.full_name)
+        return ok
+
+    # ------------------------------------------------------------------
+    # Which paths get records
+    # ------------------------------------------------------------------
+
+    async def _load_linguist_exclusions(self, repo: GhObject, sha: str) -> LinguistExclusions:
+        """The repo's root ``.gitattributes`` linguist rules at ``sha``; none when absent."""
+        c = self.c
+        try:
+            res = await c.runtime.ds_call(
+                c.data_source.get_file_contents, repo.owner.login, repo.name, ".gitattributes", sha
+            )
+        except Exception as e:
+            self.logger.warning("Could not read .gitattributes for %s: %s", repo.full_name, e)
+            return LinguistExclusions()
+        content = getattr(res.data, "content", None) if res.success and res.data is not None else None
+        if not content:
+            return LinguistExclusions()
+        try:
+            text = base64.b64decode(content).decode(GitHubLiterals.UTF_8.value, errors="replace")
+        except (ValueError, TypeError):
+            return LinguistExclusions()
+        rules = parse_linguist_exclusions(text)
+        if rules:
+            self.logger.info(
+                "%s: %s linguist-generated/vendored rule(s) from .gitattributes", repo.full_name, len(rules.rules)
+            )
+        return rules
+
+    def _keeps_file(self, path: str) -> bool:
+        return self._policy.keeps_file(path)
+
+    def _keeps_folder(self, path: str) -> bool:
+        return self._policy.keeps_folder(path)
+
+    def _kept_entries(
+        self, entries: list[tuple[str, str, str, int | None]]
+    ) -> list[tuple[str, str, str, int | None]]:
+        return [
+            e for e in entries
+            if (self._keeps_folder(e[0]) if e[1] == "tree" else self._keeps_file(e[0]))
+        ]
+
+    def _is_excluded_path(self, path: str) -> bool:
+        """A stored record's path the rules now exclude. The store does not say
+        whether it was a file or a folder, so either reading counts."""
+        return not self._keeps_folder(path) or not self._keeps_file(path)
+
+    def _drop_excluded_changes(
+        self,
+        deletes: dict[str, str],
+        adds: dict[str, str],
+        modifies: dict[str, str],
+        renames: list[tuple[str, str, str]],
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str], list[tuple[str, str, str]]]:
+        """Filter a compare delta. A move out of an excluded tree is a fresh add;
+        a move into one deletes the old record."""
+        deletes = dict(deletes)
+        kept_renames: list[tuple[str, str, str]] = []
+        for old_path, new_path, sha in renames:
+            if not self._keeps_file(new_path):
+                deletes[old_path] = ""
+            elif not self._keeps_file(old_path):
+                deletes[old_path] = ""
+                adds = {**adds, new_path: sha}
+            else:
+                kept_renames.append((old_path, new_path, sha))
+        adds = {p: sha for p, sha in adds.items() if self._keeps_file(p)}
+        modifies = {p: sha for p, sha in modifies.items() if self._keeps_file(p)}
+        return deletes, adds, modifies, kept_renames
+
+    def _checkpoint_key(self, repo_id: int) -> str:
+        return generate_record_sync_point_key(
+            Connectors.GITHUB_TEAMS.value, f"{repo_id}-code-repository", ""
+        )
+
+    async def _get_checkpoint(self, repo_id: int) -> dict[str, Any] | None:
+        try:
+            return await self.c.record_sync_point.read_sync_point(self._checkpoint_key(repo_id))
+        except Exception:
+            return None
+
+    async def _update_checkpoint(self, repo: GhObject, commit_sha: str, branch: str) -> None:
+        await self.c.record_sync_point.update_sync_point(
+            self._checkpoint_key(repo.id),
+            {
+                GitHubLiterals.LAST_COMMIT_SHA.value: commit_sha,
+                GitHubLiterals.SYNCED_BRANCH.value: branch,
+                GitHubLiterals.FULL_NAME.value: repo.full_name,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Full sync: tree walk -> persist -> prune
+    # ------------------------------------------------------------------
+
+    async def _full_sync(self, repo: GhObject, head_sha: str) -> bool:
+        """Full sync via a single recursive Git Tree call; falls back to a
+        per-subtree walk when GitHub truncates the response."""
+        c = self.c
+        owner, name = repo.owner.login, repo.name
+        tree_res = await c.runtime.ds_call(c.data_source.get_git_tree, owner, name, head_sha, True)
+        if not tree_res.success or tree_res.data is None:
+            self.logger.error("get_git_tree failed for %s: %s", repo.full_name, tree_res.error)
+            return False
+
+        tree = tree_res.data
+        if getattr(tree, "truncated", False):
+            self.logger.warning(
+                "Git tree truncated for %s (>%s entries or >7MB); falling back to per-subtree walk",
+                repo.full_name,
+                f"{GIT_TREE_TRUNCATION_ENTRY_HINT:,}",
+            )
+            return await self._full_sync_untruncated(repo, head_sha)
+
+        all_entries = [
+            (el.path, el.type, el.sha, getattr(el, "size", None))
+            for el in (tree.tree or [])
+            if el.path
+        ]
+        entries = self._kept_entries(all_entries)
+        persisted_ok, folders, blobs = await self._persist_tree_entries(repo, entries, head_sha)
+        self.logger.info(
+            "Full code sync for %s: %s folder(s), %s file(s) persisted in 1 tree call "
+            "(%s excluded as dependency/build/generated)",
+            repo.full_name, folders, blobs, len(all_entries) - len(entries),
+        )
+        # A failed prune holds the checkpoint back, so the next sync walks and prunes again.
+        return persisted_ok and await self._prune_deleted_paths(repo, {path for path, *_ in entries})
+
+    async def _full_sync_untruncated(self, repo: GhObject, head_sha: str) -> bool:
+        """Subtree walk for a repo whose recursive Git Tree came back truncated.
+
+        Each queued node is fetched *recursively*, so one call normally covers a
+        whole subtree; only a node that itself comes back truncated is split into
+        its immediate children and re-queued. A repo with a few dozen top-level
+        directories therefore costs tens of calls rather than one per directory,
+        and the recursion only deepens where the API limit is really hit.
+
+        Entries are persisted per node as the walk proceeds rather than
+        accumulated and written at the end — the same streaming shape the GitLab
+        connector uses. Memory stays flat and records land continuously, so a
+        walk that dies at 90% keeps the 90%. Out-of-order arrival is safe: a blob
+        whose parent folder has not been written yet gets a placeholder parent
+        from the data-entities processor, upgraded in place when the real folder
+        record arrives.
+        """
+        c = self.c
+        owner, name = repo.owner.login, repo.name
+        all_ok = True
+        walked_paths: set[str] = set()
+        folders_walked = blobs_walked = tree_calls = 0
+
+        # The root's recursive fetch already returned truncated — that is why
+        # this path is running — so it is seeded as pre-split instead of being
+        # re-fetched recursively just to be told the same thing again.
+        queue: deque[tuple[str, str, bool]] = deque([("", head_sha, True)])
+        while queue:
+            prefix, sha, known_truncated = queue.popleft()
+            entries: list[tuple[str, str, str, int | None]] | None = None
+            children: list[tuple[str, str]] = []
+
+            if not known_truncated:
+                tree_calls += 1
+                res = await c.runtime.ds_call(c.data_source.get_git_tree, owner, name, sha, True)
+                if not res.success or res.data is None:
+                    self.logger.warning(
+                        "Recursive subtree fetch failed for %s at %r (sha=%s): %s",
+                        repo.full_name, prefix, sha, res.error,
+                    )
+                    all_ok = False
+                    continue
+                if not getattr(res.data, "truncated", False):
+                    entries = _git_tree_entries(prefix, res.data)
+
+            if entries is None:
+                # Subtree too large for one recursive call: take only this level
+                # and walk each child directory on its own.
+                tree_calls += 1
+                res = await c.runtime.ds_call(c.data_source.get_git_tree, owner, name, sha, False)
+                if not res.success or res.data is None:
+                    self.logger.warning(
+                        "Subtree fetch failed for %s at %r (sha=%s): %s",
+                        repo.full_name, prefix, sha, res.error,
+                    )
+                    all_ok = False
+                    continue
+                if getattr(res.data, "truncated", False):
+                    # One directory with more direct children than the API will
+                    # return: there is no smaller unit left to split into, so the
+                    # walk is knowingly incomplete. Fail the sync so pruning is
+                    # skipped and the checkpoint withheld — silently accepting it
+                    # would let the next prune delete files that still exist.
+                    self.logger.error(
+                        "Directory %r in %s exceeds the Git Tree limit even without "
+                        "recursion; it cannot be split further, so this walk is "
+                        "incomplete. Not pruning and not advancing the checkpoint.",
+                        prefix or "<root>", repo.full_name,
+                    )
+                    all_ok = False
+                    continue
+                entries = _git_tree_entries(prefix, res.data)
+                children = [(p, sha_) for p, t, sha_, _sz in entries if t == "tree"]
+
+            # Excluded subtrees are not walked at all, which also saves their
+            # tree calls on a giant repo.
+            entries = self._kept_entries(entries)
+            children = [(p, sha_) for p, sha_ in children if self._keeps_folder(p)]
+
+            if entries:
+                ok, n_folders, n_blobs = await self._persist_tree_entries(repo, entries, head_sha)
+                all_ok = ok and all_ok
+                folders_walked += n_folders
+                blobs_walked += n_blobs
+                walked_paths.update(path for path, *_ in entries)
+                # One line per subtree rather than a fixed cadence: a subtree is
+                # a whole recursive call, so the count is proportional to real
+                # work (tens of lines, not thousands) and a stall is visible at
+                # the path it stalled on.
+            # Enqueue before logging so the reported queue depth includes the
+            # children this node just produced.
+            for child_path, child_sha in children:
+                queue.append((child_path, child_sha, False))
+
+            if entries:
+                self.logger.info(
+                    "Subtree walk %s: %s -> %s folder(s), %s file(s) "
+                    "[total %s folder(s), %s file(s); %s subtree(s) queued]",
+                    repo.full_name, prefix or "<root>", n_folders, n_blobs,
+                    folders_walked, blobs_walked, len(queue),
+                )
+
+        self.logger.info(
+            "Full code sync for %s: %s folder(s), %s file(s) persisted in %s tree call(s)%s",
+            repo.full_name, folders_walked, blobs_walked, tree_calls,
+            "" if all_ok else " (INCOMPLETE - checkpoint withheld)",
+        )
+        # Deliberately no pruning after a partial walk: anything "missing" may
+        # simply not have been walked.
+        return all_ok and await self._prune_deleted_paths(repo, walked_paths)
+
+    async def _persist_tree_entries(
+        self, repo: GhObject, entries: list[tuple[str, str, str, int | None]],
+        commit_sha: str | None = None,
+    ) -> tuple[bool, int, int]:
+        """Persist one batch of ``(path, type, sha, size)`` Git Tree entries.
+
+        Folders go first, shallowest level first, so a parent is written before
+        its children; blobs follow in processor-sized batches. Returns
+        ``(ok, folders_persisted, blobs_persisted)`` — the caller owns the
+        summary log, because the truncated path calls this once per subtree.
+        """
+        c = self.c
+        folders = [(p, s) for p, t, s, _sz in entries if t == "tree"]
+        blobs = [(p, s, sz) for p, t, s, sz in entries if t == "blob"]
+
+        code_files_enabled = self._code_files_indexing_enabled()
+        test_files_enabled = self._test_files_indexing_enabled()
+
+        all_ok = True
+        level_wise: dict[int, list[tuple[str, str]]] = {}
+        for path, sha in folders:
+            level_wise.setdefault(path.count("/"), []).append((path, sha))
+        for _level, level_folders in sorted(level_wise.items()):
+            records = [
+                self._build_folder_record(repo, path, sha, code_files_enabled)
+                for path, sha in level_folders
+            ]
+            all_ok = await self._process_records(records) and all_ok
+
+        batch: list[Record] = []
+        for path, sha, size in blobs:
+            batch.append(
+                self._build_code_file_record(
+                    repo, path, sha, code_files_enabled, test_files_enabled, size=size,
+                    commit_sha=commit_sha,
+                )
+            )
+            if len(batch) >= c.batch_size * 4:
+                all_ok = await self._process_records(batch) and all_ok
+                batch = []
+        if batch:
+            all_ok = await self._process_records(batch) and all_ok
+
+        return all_ok, len(folders), len(blobs)
+
+    async def _prune_deleted_paths(self, repo: GhObject, walked_paths: set[str]) -> bool:
+        """Delete code records whose path is absent from a complete tree walk;
+        return False when the records could not be listed or removed.
+
+        Full sync is the recovery path for a diverged history, a Compare Commits
+        overflow, and a default-branch change — exactly the cases where the
+        incremental path never sees the deletions. Without this, upserts alone
+        leave those records permanently.
+
+        Only ever called with a complete, successfully-persisted walk: the
+        recursive tree reports truncation itself, and a truncated walk never gets
+        here. A fraction valve used to refuse any prune above half the records,
+        which left the files of a force push or a default-branch switch to a small
+        branch in PipesHub for good, with the checkpoint already advanced.
+        """
+        c = self.c
+        external_group_id = f"{repo.id}-code-repository"
+        try:
+            existing = await self._list_code_records_by_path(external_group_id)
+            # Listed apart so the valve below judges the walk by live records only,
+            # and a trashed record sharing a live one's path cannot hide it.
+            trashed = await self._list_code_records_by_path(
+                external_group_id, visibility=RecordVisibility.DELETED
+            )
+        except Exception as e:
+            self.logger.error("Could not list code records for pruning in %s: %s", repo.full_name, e, exc_info=True)
+            return False
+
+        stale = {path: rec_id for path, rec_id in existing.items() if path not in walked_paths}
+        stale_trashed = {path: rec_id for path, rec_id in trashed.items() if path not in walked_paths}
+        if not stale and not stale_trashed:
+            return True
+        # Records the rules now exclude (a node_modules ingested before them)
+        # are deliberate removals, whatever the walk returned.
+        missing = [path for path in stale if not self._is_excluded_path(path)]
+        if not walked_paths and missing:
+            # A complete walk that found nothing at all is the one answer not trusted
+            # on its own; every other complete, untruncated tree is GitHub's
+            # definite list of what exists.
+            self.logger.error(
+                "Refusing to prune %s code records in %s on an empty tree walk.",
+                len(missing), repo.full_name,
+            )
+            return True
+        self.logger.info(
+            "Pruning %s deleted code record(s) from %s", len(stale) + len(stale_trashed), repo.full_name
+        )
+        # Deepest-first so a stale folder is deleted only after its stale
+        # children — the same bottom-up order _cleanup_emptied_folders uses.
+        pruned = [*stale.items(), *stale_trashed.items()]
+        ordered_ids = [rec_id for _, rec_id in sorted(pruned, key=lambda item: item[0].count("/"), reverse=True)]
+        try:
+            result = await c.data_entities_processor.on_records_deleted_cascade(
+                ordered_ids, c.connector_id, include_trashed_roots=True
+            )
+        except Exception as e:
+            self.logger.error("Failed to prune deleted code records in %s: %s", repo.full_name, e, exc_info=True)
+            return False
+        # With the trash on, a record already in it stays there for the purge.
+        already_trashed = set(stale_trashed.values()) if (result or {}).get("softDeleted") else set()
+        failed = [
+            f.get("record_id") for f in (result or {}).get("failed_records") or []
+            if f.get("record_id") not in already_trashed
+        ]
+        if not (result or {}).get("success", False) or failed:
+            self.logger.error(
+                "Could not prune %s of %s deleted code record(s) in %s: %s",
+                len(failed) or len(ordered_ids), len(ordered_ids), repo.full_name,
+                failed[:20] or (result or {}).get("reason"),
+            )
+            return False
+        return True
+
+    async def _list_code_records_by_path(
+        self, external_group_id: str, visibility: RecordVisibility = RecordVisibility.LIVE
+    ) -> dict[str, str]:
+        """``{repo_path: record_id}`` for every record under a code record group.
+
+        Folders are ``FileRecord``s with no ``file_path`` attribute, so their
+        path is recovered from the external id instead — keying on ``file_path``
+        alone would leave pruning blind to folders.
+        """
+        c = self.c
+        repo_id = int(external_group_id.split("-")[0])
+        by_path: dict[str, str] = {}
+        page_size = 500
+        after_key: str | None = None
+        while True:
+            page = await c.data_entities_processor.get_records_in_record_group(
+                connector_id=c.connector_id,
+                external_group_id=external_group_id,
+                limit=page_size,
+                after_key=after_key,
+                visibility=visibility,
+            )
+            if not page:
+                break
+            for rec in page:
+                path = getattr(rec, "file_path", None) or path_from_external_id(
+                    repo_id, getattr(rec, "external_record_id", None) or ""
+                )
+                if path:
+                    by_path[path] = rec.id
+            if len(page) < page_size:
+                break
+            after_key = page[-1].id
+        return by_path
+
+    # ------------------------------------------------------------------
+    # 3. Incremental sync: compare -> classify -> reconcile -> apply
+    # ------------------------------------------------------------------
+
+    async def _incremental_sync(self, repo: GhObject, from_sha: str, to_sha: str) -> bool:
+        """Compare-commits-based incremental sync, with a two-tree diff when the
+        compare can't be trusted. Returns False (triggering a full-sync fallback)
+        when neither gives a delta or an API call fails."""
+        c = self.c
+        owner, name = repo.owner.login, repo.name
+        cmp_res = await c.runtime.ds_call(c.data_source.compare_commits, owner, name, from_sha, to_sha)
+        if not cmp_res.success or cmp_res.data is None:
+            self.logger.warning("compare_commits failed for %s: %s", repo.full_name, cmp_res.error)
+            return False
+
+        comparison = cmp_res.data
+        untrusted = self._untrusted_compare_reason(comparison)
+        if untrusted:
+            # Two tree calls give the exact delta between the snapshots, whatever
+            # happened between them; only a truncated tree needs the full walk (SC-11).
+            delta = await self._tree_delta(repo, from_sha, to_sha)
+            if delta is None:
+                self.logger.warning("%s for %s and no tree diff; falling back to full sync",
+                                    untrusted, repo.full_name)
+                return False
+            self.logger.info("%s for %s; using the tree diff", untrusted, repo.full_name)
+            deletes, adds, modifies = delta
+            renames: list[tuple[str, str, str]] = []
+        else:
+            deletes, adds, modifies, renames = self._classify_compare_files(
+                list(getattr(comparison, "files", None) or []))
+        self.logger.info(
+            "Incremental code sync for %s: %s deletes, %s adds, %s modifies, %s renames (before SHA reconcile)",
+            repo.full_name, len(deletes), len(adds), len(modifies), len(renames),
+        )
+
+        deletes, adds, extra_renames = await self._reconcile_sha_moves(repo, deletes, adds)
+        renames = renames + extra_renames
+        if extra_renames:
+            self.logger.info(
+                "SHA reconcile promoted %s delete+add pair(s) to rename for %s", len(extra_renames), repo.full_name
+            )
+        deletes, adds, modifies, renames = self._drop_excluded_changes(deletes, adds, modifies, renames)
+
+        # Order is load-bearing: deletes before upserts (file->folder swaps),
+        # folder cleanup last (folder->file swaps).
+        all_ok = True
+        if deletes:
+            await self._delete_code_files_by_paths(repo, list(deletes.keys()))
+        if renames:
+            all_ok = await self._apply_code_renames(repo, renames, to_sha) and all_ok
+        upserts: dict[str, str] = {**adds, **modifies}
+        if upserts:
+            all_ok = await self._upsert_code_files(repo, upserts, to_sha) and all_ok
+
+        removed_paths = list(deletes.keys()) + [old for old, _new, _sha in renames]
+        if removed_paths:
+            await self._cleanup_emptied_folders(repo, removed_paths)
+
+        if not all_ok:
+            self.logger.warning(
+                "Incremental sync for %s completed with partial failures; checkpoint not advanced", repo.full_name
+            )
+        return all_ok
+
+    @staticmethod
+    def _untrusted_compare_reason(comparison: GhObject) -> str | None:
+        """Why a compare's files list is not the full delta; None when it is.
+
+        Only "ahead" carries a trustworthy delta. "diverged" is a force-push;
+        "behind" is a branch reset, where compare returns an EMPTY files list --
+        applying it would advance the checkpoint and keep every rolled-back file.
+        ("identical" can't reach here: equal SHAs short-circuit in run().)
+        """
+        status = getattr(comparison, "status", None)
+        if status and status != "ahead":
+            return f"compare_commits status={status} (force-push/branch reset)"
+        files = getattr(comparison, "files", None) or []
+        if len(files) >= COMPARE_COMMITS_FILES_LIMIT:
+            return f"compare_commits files list capped ({len(files)})"
+        total_commits = getattr(comparison, "total_commits", 0) or 0
+        if total_commits >= COMPARE_COMMITS_TOTAL_LIMIT:
+            return f"compare_commits total_commits={total_commits} (>={COMPARE_COMMITS_TOTAL_LIMIT})"
+        return None
+
+    async def _tree_delta(
+        self, repo: GhObject, from_sha: str, to_sha: str,
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]] | None:
+        """``(deletes, adds, modifies)`` as ``{path: blob sha}`` between two
+        commits' recursive trees; None when either fetch fails or is truncated."""
+        before = await self._blob_shas(repo, from_sha)
+        after = await self._blob_shas(repo, to_sha) if before is not None else None
+        if before is None or after is None:
+            return None
+        deletes = {p: sha for p, sha in before.items() if p not in after}
+        adds = {p: sha for p, sha in after.items() if p not in before}
+        modifies = {p: sha for p, sha in after.items() if p in before and before[p] != sha}
+        return deletes, adds, modifies
+
+    async def _blob_shas(self, repo: GhObject, sha: str) -> dict[str, str] | None:
+        c = self.c
+        res = await c.runtime.ds_call(c.data_source.get_git_tree, repo.owner.login, repo.name, sha, True)
+        if not res.success or res.data is None or getattr(res.data, "truncated", False):
+            return None
+        return {el.path: el.sha for el in (res.data.tree or []) if el.path and el.type == "blob"}
+
+    def _classify_compare_files(
+        self, files: list[Any]
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str], list[tuple[str, str, str]]]:
+        """Classify Compare Commits ``files[]`` entries.
+
+        Returns ``(deletes, adds, modifies, renames)`` where deletes/adds/modifies
+        are ``{path: sha}`` (sha is ``None``/empty for deletes) and renames are
+        ``(previous_filename, filename, sha)`` tuples. ``copied`` is treated as
+        an add (new independent identity).
+        """
+        deletes: dict[str, str] = {}
+        adds: dict[str, str] = {}
+        modifies: dict[str, str] = {}
+        renames: list[tuple[str, str, str]] = []
+
+        for f in files:
+            status = getattr(f, "status", "")
+            filename = getattr(f, "filename", None)
+            previous_filename = getattr(f, "previous_filename", None)
+            sha = getattr(f, "sha", "") or ""
+
+            if status == "removed":
+                if filename:
+                    deletes[filename] = sha
+                continue
+            if status == "renamed":
+                old_path = previous_filename or filename
+                new_path = filename or previous_filename
+                if not old_path or not new_path:
+                    continue
+                renames.append((old_path, new_path, sha))
+                continue
+
+            target = filename or previous_filename
+            if not target:
+                continue
+            if status == "added" or status == "copied":
+                adds[target] = sha
+            else:  # "modified" | "changed"
+                modifies[target] = sha
+
+        return deletes, adds, modifies, renames
+
+    async def _reconcile_sha_moves(
+        self, repo: GhObject, deletes: dict[str, str], adds: dict[str, str]
+    ) -> tuple[dict[str, str], dict[str, str], list[tuple[str, str, str]]]:
+        """Promote delete+add pairs whose blob SHA matches into renames
+        (squash-merge/rebase reports a rename as delete+add).
+
+        The deleted path's "before" SHA comes from our own DB (the previously
+        indexed record's ``external_revision_id`` / ``file_hash``) — Compare's
+        ``removed`` entries do not reliably carry a usable SHA — while the added
+        path's SHA comes directly off the compare response, so no extra API
+        call is needed.
+        """
+        if not deletes or not adds:
+            return deletes, adds, []
+        c = self.c
+        sha_to_new_path: dict[str, str] = {}
+        for new_path, sha in adds.items():
+            if sha:
+                sha_to_new_path.setdefault(sha, new_path)
+
+        extra_renames: list[tuple[str, str, str]] = []
+        promoted_deletes: set[str] = set()
+        promoted_adds: set[str] = set()
+        for old_path in deletes:
+            old_external_id = blob_external_id(repo.id, old_path)
+            existing = await c.data_entities_processor.get_record_by_external_id(c.connector_id, old_external_id)
+            if existing is None:
+                continue
+            stored_sha = getattr(existing, "external_revision_id", None) or getattr(existing, "file_hash", None)
+            if not stored_sha:
+                continue
+            new_path = sha_to_new_path.get(stored_sha)
+            if new_path is None or new_path in promoted_adds:
+                continue
+            extra_renames.append((old_path, new_path, stored_sha))
+            promoted_deletes.add(old_path)
+            promoted_adds.add(new_path)
+
+        remaining_deletes = {p: s for p, s in deletes.items() if p not in promoted_deletes}
+        remaining_adds = {p: s for p, s in adds.items() if p not in promoted_adds}
+        return remaining_deletes, remaining_adds, extra_renames
+
+    async def _delete_code_files_by_paths(self, repo: GhObject, paths: list[str]) -> None:
+        c = self.c
+        for path in paths:
+            external_id = blob_external_id(repo.id, path)
+            record = await c.data_entities_processor.get_record_by_external_id(c.connector_id, external_id)
+            if record:
+                await c.data_entities_processor.on_record_deleted(record.id)
+
+    async def _apply_code_renames(self, repo: GhObject, renames: list[tuple[str, str, str]],
+                                  commit_sha: str | None = None) -> bool:
+        """Apply in-place renames via ``on_records_moved`` — reuses the existing
+        DB vertex, so permission/parent edges survive and no reindex fires
+        unless the blob SHA also changed."""
+        if not renames:
+            return True
+        c = self.c
+        new_paths = [new_p for _old, new_p, _sha in renames]
+        folders_ok = await self._ensure_folder_records_for_paths(repo, new_paths)
+
+        code_files_enabled = self._code_files_indexing_enabled()
+        test_files_enabled = self._test_files_indexing_enabled()
+        moves = [
+            (blob_external_id(repo.id, old_path),
+             self._build_code_file_record(
+                 repo, new_path, new_sha, code_files_enabled, test_files_enabled,
+                 commit_sha=commit_sha,
+             ),
+             [])
+            for old_path, new_path, new_sha in renames
+        ]
+        try:
+            await c.data_entities_processor.on_records_moved(moves)
+        except Exception as e:
+            # Caught here (rather than left to propagate) so a rename failure
+            # is reported as all_ok=False, letting `run` fall back to a full
+            # sync this cycle instead of raising past the checkpoint decision.
+            self.logger.error("Failed to apply GitHub code renames for %s: %s", repo.full_name, e, exc_info=True)
+            return False
+        return folders_ok
+
+    async def _upsert_code_files(self, repo: GhObject, path_to_sha: dict[str, str],
+                                 commit_sha: str | None = None) -> bool:
+        """Upsert (add/modify) code file records for the given repo-relative paths."""
+        if not path_to_sha:
+            return True
+        folders_ok = await self._ensure_folder_records_for_paths(repo, list(path_to_sha.keys()))
+        code_files_enabled = self._code_files_indexing_enabled()
+        test_files_enabled = self._test_files_indexing_enabled()
+        # Exact per-file dates at sync time (~2 GraphQL queries per 100 files)
+        # — the ONLY way a modified file's source_updated stays fresh: the
+        # processor carries stored dates forward when the incoming record has
+        # None, and the backfill's missing-only query never revisits an
+        # already-dated record.
+        dates = await self.timestamps.fetch_commit_dates(
+            repo.owner.login, repo.name, list(path_to_sha.keys()), commit_sha or self.branch_for(repo),
+        )
+        records: list[Record] = []
+        for path, sha in path_to_sha.items():
+            record = self._build_code_file_record(
+                repo, path, sha, code_files_enabled, test_files_enabled, commit_sha=commit_sha,
+            )
+            created_ms, updated_ms = dates.get(path, (None, None))
+            if created_ms is not None or updated_ms is not None:
+                record.source_created_at = created_ms
+                record.source_updated_at = updated_ms
+            records.append(record)
+        return await self._process_records(records) and folders_ok
+
+    # ------------------------------------------------------------------
+    # 4. Folder lifecycle
+    # ------------------------------------------------------------------
+
+    async def _ensure_folder_records_for_paths(self, repo: GhObject, file_paths: list[str]) -> bool:
+        """Create missing folder records for the parent-directory chain of changed files.
+
+        No API call is needed: a file existing at ``a/b/c.py`` implies ``a`` and
+        ``a/b`` exist in the tree, so folder records can be synthesised purely
+        from the path string. Only the DB existence check requires a lookup.
+        """
+        c = self.c
+        prefixes: set[str] = set()
+        for path in file_paths:
+            parts = path.split("/")
+            for i in range(1, len(parts)):
+                prefixes.add("/".join(parts[:i]))
+        if not prefixes:
+            return True
+
+        code_files_enabled = self._code_files_indexing_enabled()
+        records: list[Record] = []
+        for prefix in sorted(prefixes, key=lambda p: p.count("/")):
+            external_id = tree_external_id(repo.id, prefix)
+            existing = await c.data_entities_processor.get_record_by_external_id(c.connector_id, external_id)
+            if existing:
+                continue
+            records.append(self._build_folder_record(repo, prefix, sha=None, code_files_enabled=code_files_enabled))
+
+        if records:
+            return await self._process_records(records)
+        return True
+
+    async def _cleanup_emptied_folders(self, repo: GhObject, removed_paths: list[str]) -> None:
+        """Delete folder records that became empty after deletes/renames (bottom-up)."""
+        c = self.c
+        candidate_dirs: set[str] = set()
+        for path in removed_paths:
+            parts = path.split("/")
+            for i in range(1, len(parts)):
+                candidate_dirs.add("/".join(parts[:i]))
+        if not candidate_dirs:
+            return
+
+        deleted_count = 0
+        for dir_path in sorted(candidate_dirs, key=lambda p: p.count("/"), reverse=True):
+            external_id = tree_external_id(repo.id, dir_path)
+            folder = await c.data_entities_processor.get_record_by_external_id(c.connector_id, external_id)
+            if folder is None:
+                continue
+            children = await c.data_entities_processor.get_records_by_parent(c.connector_id, external_id)
+            if children:
+                continue
+            await c.data_entities_processor.on_record_deleted(folder.id)
+            deleted_count += 1
+        if deleted_count:
+            self.logger.info("Folder cleanup removed %s emptied folder record(s) for %s", deleted_count, repo.full_name)
+
+    # ------------------------------------------------------------------
+    # 5. Record builders + persistence
+    # ------------------------------------------------------------------
+
+    def _build_folder_record(
+        self, repo: GhObject, path: str, sha: str | None, code_files_enabled: bool
+    ) -> FileRecord:
+        """A folder record, stamped with the same indexing flag as the code files
+        it contains — folders hold no content, so publishing indexing events for
+        them when files are AUTO_INDEX_OFF would be pure waste."""
+        c = self.c
+        name = path.rsplit("/", 1)[-1]
+        parent_path = path.rpartition("/")[0] if "/" in path else None
+        external_id = tree_external_id(repo.id, path)
+        parent_external_id = tree_external_id(repo.id, parent_path) if parent_path else None
+        weburl = f"{repo.html_url}/tree/{self.branch_for(repo)}/{path}"
+        record = FileRecord(
+            id=str(uuid.uuid4()), org_id=c.data_entities_processor.org_id, record_name=name,
+            record_type=RecordType.FILE.value, connector_name=c.connector_name, connector_id=c.connector_id,
+            external_record_id=external_id, version=0, origin=OriginTypes.CONNECTOR.value,
+            record_group_type=RecordGroupType.PROJECT.value,
+            external_record_group_id=f"{repo.id}-code-repository",
+            mime_type=MimeTypes.FOLDER.value, external_revision_id=str(sha) if sha else "",
+            preview_renderable=False, parent_external_record_id=parent_external_id,
+            parent_record_type=(RecordType.FILE if parent_external_id else None),
+            is_file=False, inherit_permissions=True, weburl=weburl,
+        )
+        if not code_files_enabled:
+            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+        return record
+
+    def _build_code_file_record(
+        self,
+        repo: GhObject,
+        path: str,
+        sha: str | None,
+        code_files_enabled: bool,
+        test_files_enabled: bool,  # noqa: FBT001 - callers pass it positionally, like code_files_enabled
+        size: int | None = None,
+        commit_sha: str | None = None,
+    ) -> CodeFileRecord:
+        """A code file record. Every file gets one — oversized files (size only
+        known on the full-sync path; Compare Commits carries no blob size) keep
+        theirs with content indexing switched off and a reason, so the file
+        stays visible and name-searchable instead of silently not existing.
+        The incremental path is covered by the 413 guard in
+        ``fetch_code_file_content``."""
+        c = self.c
+        name = path.rsplit("/", 1)[-1]
+        extension = name.rsplit(".", 1)[-1] if "." in name else ""
+        mime_type = get_mime_type_for_extension(extension, fallback=MimeTypes.PLAIN_TEXT.value)
+        external_id = blob_external_id(repo.id, path)
+        parent_path = path.rpartition("/")[0] if "/" in path else None
+        parent_external_id = tree_external_id(repo.id, parent_path) if parent_path else None
+        file_role = classify_file_role(path, name)
+        record = CodeFileRecord(
+            id=str(uuid.uuid4()), org_id=c.data_entities_processor.org_id, record_name=name,
+            record_type=RecordType.CODE_FILE.value, connector_name=c.connector_name, connector_id=c.connector_id,
+            external_record_id=external_id, version=0, origin=OriginTypes.CONNECTOR.value,
+            record_group_type=RecordGroupType.PROJECT.value,
+            external_record_group_id=f"{repo.id}-code-repository",
+            mime_type=mime_type, external_revision_id=str(sha) if sha else "",
+            # None, not "", for extensionless names (LICENSE, Dockerfile).
+            extension=extension.lower() or None,
+            preview_renderable=extension.lower() in PREVIEW_RENDERABLE_EXTENSIONS if extension else True,
+            file_path=path, file_hash=sha, file_role=file_role.value,
+            size_in_bytes=size,
+            language=detect_language(name),
+            inherit_permissions=True, parent_external_record_id=parent_external_id,
+            parent_record_type=(RecordType.FILE if parent_external_id else None),
+            # Pinned to the commit the file was synced at: a citation keeps
+            # pointing at the lines it quoted after the branch moves (P-8, A-12).
+            weburl=f"{repo.html_url}/blob/{commit_sha or self.branch_for(repo)}/{path}",
+            commit_sha=commit_sha,
+        )
+        if not code_files_enabled:
+            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+        elif file_role is FileRole.TEST and not test_files_enabled:
+            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+        if size is not None and size > CODE_FILE_MAX_SIZE_BYTES:
+            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+            record.reason = (
+                f"File is {size} bytes, above the {CODE_FILE_MAX_SIZE_BYTES}-byte "
+                "content-indexing limit; metadata synced, content not indexed"
+            )
+        return record
+
+    async def _process_records(self, records: list[Record]) -> bool:
+        """Persist a batch via the data-entities processor (which owns
+        new-vs-update, versioning, and reindex decisions); returns False on
+        failure so callers can withhold checkpoint advancement instead of
+        silently losing the batch."""
+        if not records:
+            return True
+        try:
+            await self.c.data_entities_processor.on_new_records([(r, []) for r in records])
+            return True
+        except Exception as e:
+            self.logger.error("Error persisting GitHub code repo records: %s", e, exc_info=True)
+            return False
+
+    def _code_files_indexing_enabled(self) -> bool:
+        return code_indexing_flags(self.c.indexing_filters)[0]
+
+    def _test_files_indexing_enabled(self) -> bool:
+        return code_indexing_flags(self.c.indexing_filters)[1]
+
+    # ------------------------------------------------------------------
+    # 6. Content streaming (index time)
+    # ------------------------------------------------------------------
+
+    async def fetch_code_file_content(self, record: CodeFileRecord) -> bytes:
+        """Fetch raw code file content at stream time (no blocks — raw bytes)."""
+        c = self.c
+        external_group_id = getattr(record, "external_record_group_id", None)
+        if not external_group_id:
+            raise HTTPException(
+                HttpStatusCode.BAD_REQUEST.value,
+                f"Repository id not found on record {record.id}",
+            )
+        repo_id = int(external_group_id.split("-")[0])
+        file_path = record.file_path
+        if not file_path:
+            raise HTTPException(
+                HttpStatusCode.BAD_REQUEST.value,
+                f"Cannot resolve repo path for record {record.id}",
+            )
+
+        repo_res = await c.runtime.get_repo_by_id(repo_id)
+        if not repo_res.success or not repo_res.data:
+            raise_for_stream_fetch(
+                success=repo_res.success,
+                has_payload=bool(repo_res.data),
+                connector=c.display_name,
+                status=repo_res.status_code,
+                retry_after=repo_res.retry_after_seconds,
+                message=repo_res.error,
+            )
+        repo = repo_res.data
+
+        # A full sync records each blob's size, so its file is one Git Blob call
+        # by sha. The Contents API costs the same call plus a second for files
+        # over 1 MB; it stays for incremental records, whose size is unknown and
+        # whose content must not be downloaded before the size guard below.
+        size = getattr(record, "size_in_bytes", None)
+        if record.file_hash and size is not None:
+            if size > CODE_FILE_MAX_SIZE_BYTES:
+                raise _oversized(file_path, repo.full_name, size)
+            if size == 0:
+                return b""
+            content = await self._fetch_blob_by_sha(repo, record, file_path)
+            if content is not None:
+                return content
+
+        # At the commit the record was synced at, not the moving branch head:
+        # the content indexed is the content the record describes (P-8).
+        content_res = await c.runtime.ds_call(
+            c.data_source.get_file_contents, repo.owner.login, repo.name, file_path,
+            getattr(record, "commit_sha", None) or self.branch_for(repo),
+        )
+        if content_res.status_code == HttpStatusCode.NOT_FOUND.value:
+            # The lookup may be remembered from before the default branch was
+            # renamed; the old ref 404s and the record would fail for good.
+            # Ask again, and retry once only if the answer changed. A 404 on
+            # the current branch is a file that is really gone.
+            await c.runtime.forget_repo_lookup(repo_id)
+            fresh_res = await c.runtime.get_repo_by_id(repo_id)
+            if not fresh_res.success or not fresh_res.data:
+                # A failed lookup (rate limit, auth, 5xx) proves nothing about
+                # the file. Report it, so indexing can retry, not the 404.
+                raise_for_stream_fetch(
+                    success=fresh_res.success,
+                    has_payload=bool(fresh_res.data),
+                    connector=c.display_name,
+                    status=fresh_res.status_code,
+                    retry_after=fresh_res.retry_after_seconds,
+                    message=fresh_res.error,
+                )
+            fresh = fresh_res.data
+            if (fresh.owner.login, fresh.name, self.branch_for(fresh)) != (
+                repo.owner.login, repo.name, self.branch_for(repo),
+            ):
+                repo = fresh
+                content_res = await c.runtime.ds_call(
+                    c.data_source.get_file_contents, repo.owner.login, repo.name, file_path, self.branch_for(repo),
+                )
+        if not content_res.success or content_res.data is None:
+            raise_for_stream_fetch(
+                success=content_res.success,
+                has_payload=content_res.data is not None,
+                connector=c.display_name,
+                status=content_res.status_code,
+                retry_after=content_res.retry_after_seconds,
+                message=content_res.error,
+            )
+        content_file = content_res.data
+        # Incrementally-added/modified files bypass the full-sync size stamp
+        # (Compare Commits entries carry no blob size), so this is the only
+        # remaining checkpoint before an oversized file's content would be
+        # indexed.
+        blob_size = getattr(content_file, "size", None)
+        if blob_size is not None and blob_size > CODE_FILE_MAX_SIZE_BYTES:
+            raise _oversized(file_path, repo.full_name, blob_size)
+        try:
+            decoded = content_file.decoded_content
+            if decoded:
+                return decoded
+        except Exception as e:
+            self.logger.warning(
+                "Could not decode Contents API payload for %s in %s: %s", file_path, repo.full_name, e,
+            )
+
+        raw = getattr(content_file, "content", None)
+        if raw:
+            return base64.b64decode(raw)
+
+        # The Contents API returns empty content for blobs over 1 MB while the
+        # guard above admits up to CODE_FILE_MAX_SIZE_BYTES, so an incremental
+        # 1-5 MB file lands here. The Git Data API serves it by sha.
+        if blob_size:
+            if not record.file_hash:
+                raise not_downloadable(
+                    f"Contents API returned no content for {file_path!r} ({blob_size} bytes) in "
+                    f"{repo.full_name} and the record carries no blob sha to fall back on",
+                    connector=c.display_name,
+                )
+            content = await self._fetch_blob_by_sha(repo, record, file_path)
+            if content is None:
+                raise_for_stream_fetch(
+                    success=False, has_payload=False, connector=c.display_name,
+                    status=HttpStatusCode.NOT_FOUND.value,
+                )
+            return content
+        return b""
+
+    async def _fetch_blob_by_sha(
+        self, repo: Any, record: CodeFileRecord, file_path: str,
+    ) -> bytes | None:
+        """The record's blob, or None on a 404: a force-push GitHub has since
+        garbage-collected, or a repository renamed under the cached lookup."""
+        c = self.c
+        blob_sha = record.file_hash
+        blob_res = await c.runtime.ds_call(c.data_source.get_git_blob, repo.owner.login, repo.name, blob_sha)
+        if blob_res.status_code == HttpStatusCode.NOT_FOUND.value:
+            return None
+        if not blob_res.success or blob_res.data is None:
+            raise_for_stream_fetch(
+                success=blob_res.success,
+                has_payload=blob_res.data is not None,
+                connector=c.display_name,
+                status=blob_res.status_code,
+                retry_after=blob_res.retry_after_seconds,
+                message=blob_res.error,
+            )
+        blob_size = getattr(blob_res.data, "size", None)
+        if blob_size is not None and blob_size > CODE_FILE_MAX_SIZE_BYTES:
+            raise _oversized(file_path, repo.full_name, blob_size)
+        blob_content = getattr(blob_res.data, "content", None)
+        if not blob_content:
+            raise not_downloadable(
+                f"Blob {blob_sha} for {file_path!r} in {repo.full_name} returned no content",
+                connector=c.display_name,
+            )
+        if getattr(blob_res.data, "encoding", "base64") != "base64":
+            return blob_content.encode(GitHubLiterals.UTF_8.value)
+        return base64.b64decode(blob_content)

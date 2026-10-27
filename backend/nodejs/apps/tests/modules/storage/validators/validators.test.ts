@@ -1,0 +1,476 @@
+import 'reflect-metadata'
+import { expect } from 'chai'
+import sinon from 'sinon'
+import {
+  UploadNewSchema,
+  DocumentIdParams,
+  GetBufferSchema,
+  CreateDocumentSchema,
+  UploadNextVersionSchema,
+  DirectUploadSchema,
+  RollBackToPreviousVersionSchema,
+  DocumentIdParamsWithVersion,
+  MissingDocumentsSchema,
+  ConnectorIdParams,
+  ConnectorVirtualRecordsSchema,
+  RelocateVirtualRecordsSchema,
+  PresignArtifactsSchema,
+  ArtifactReadUrlsSchema,
+  ArtifactFileParams,
+  ListArtifactSetsSchema,
+} from '../../../../src/modules/storage/validators/validators'
+
+import { MAX_MISSING_DOCUMENT_IDS } from '../../../../src/modules/storage/constants/constants'
+
+const DOCUMENT_ID = '64d000000000000000000b01'
+
+describe('storage/validators/validators', () => {
+  afterEach(() => {
+    sinon.restore()
+  })
+
+  describe('MissingDocumentsSchema', () => {
+    const request = (documentIds: unknown) => ({
+      body: { documentIds },
+      headers: { authorization: 'Bearer token' },
+    })
+
+    it('accepts a batch up to the cap', () => {
+      const ids = Array.from({ length: MAX_MISSING_DOCUMENT_IDS }, () => DOCUMENT_ID)
+      expect(MissingDocumentsSchema.safeParse(request(ids)).success).to.be.true
+    })
+
+    it('refuses a batch over the cap', () => {
+      const ids = Array.from({ length: MAX_MISSING_DOCUMENT_IDS + 1 }, () => DOCUMENT_ID)
+      expect(MissingDocumentsSchema.safeParse(request(ids)).success).to.be.false
+    })
+
+    it('refuses an empty batch and a non-list', () => {
+      expect(MissingDocumentsSchema.safeParse(request([])).success).to.be.false
+      expect(MissingDocumentsSchema.safeParse(request(DOCUMENT_ID)).success).to.be.false
+    })
+  })
+
+  describe('UploadNewSchema', () => {
+    it('should accept valid upload body', () => {
+      const data = {
+        body: {
+          documentName: 'test-doc',
+          isVersionedFile: 'true',
+          fileBuffer: Buffer.from('hello'),
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token123' },
+      }
+      const result = UploadNewSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject when both fileBuffer and fileBuffers are missing', () => {
+      const data = {
+        body: {
+          documentName: 'test-doc',
+          isVersionedFile: 'true',
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token123' },
+      }
+      const result = UploadNewSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should reject when documentName is missing', () => {
+      const data = {
+        body: {
+          isVersionedFile: 'true',
+          fileBuffer: Buffer.from('hello'),
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token123' },
+      }
+      const result = UploadNewSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('connector ids on the handover routes', () => {
+    // Both feed the records/<connectorId> scope a relocation is allowed to move from.
+    const move = { virtualRecordId: 'v1', newPath: 'records/kb2/A', connectorId: 'kb2' }
+    it('accepts real ids', () => {
+      expect(ConnectorVirtualRecordsSchema.safeParse({ params: { connectorId: 'kb1' }, query: {}, headers: { authorization: 'Bearer token' } }).success).to.be.true
+      expect(RelocateVirtualRecordsSchema.safeParse({
+        headers: { authorization: 'Bearer token' }, body: { fromConnectorId: 'kb1', moves: [move] },
+      }).success).to.be.true
+    })
+    it('rejects an id that names a sub-folder', () => {
+      expect(ConnectorVirtualRecordsSchema.safeParse({ params: { connectorId: 'kb1/Keep' }, query: {}, headers: { authorization: 'Bearer token' } }).success).to.be.false
+      expect(RelocateVirtualRecordsSchema.safeParse({
+        headers: { authorization: 'Bearer token' }, body: { fromConnectorId: 'kb1/Keep', moves: [move] },
+      }).success).to.be.false
+      expect(RelocateVirtualRecordsSchema.safeParse({
+        headers: { authorization: 'Bearer token' },
+        body: { fromConnectorId: 'kb1', moves: [{ ...move, connectorId: 'kb2/x' }] },
+      }).success).to.be.false
+    })
+  })
+
+  describe('ConnectorIdParams', () => {
+    const parse = (connectorId: string) =>
+      ConnectorIdParams.safeParse({ params: { connectorId }, headers: { authorization: 'Bearer token' } })
+
+    for (const connectorId of ['c2013ab9-061b-4ff7-935d-3c59939ad7df', 'gmail_1', 'A']) {
+      it(`accepts the connector id ${connectorId}`, () => {
+        expect(parse(connectorId).success).to.be.true
+      })
+    }
+
+    // The id becomes the prefix records/<connectorId> whose files are deleted;
+    // Express decodes %2F, so "<other>/<folder>" named another connector's folder.
+    for (const connectorId of ['other-connector/Folder', '..', 'a/../b', 'c1%2Fx', 'c1 x', '', 'x'.repeat(65)]) {
+      it(`rejects ${JSON.stringify(connectorId)}`, () => {
+        const result = parse(connectorId)
+        expect(result.success).to.be.false
+      })
+    }
+  })
+
+  describe('DocumentIdParams', () => {
+    it('should accept valid documentId params', () => {
+      const data = {
+        params: { documentId: DOCUMENT_ID },
+        headers: { authorization: 'Bearer token' },
+        body: { fileBuffer: {} },
+      }
+      const result = DocumentIdParams.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    // A malformed id used to reach Mongoose, which failed to cast it and answered 500.
+    for (const documentId of ['abc123', 'not-an-object-id', '64d000000000000000000b0z', '']) {
+      it(`should reject the malformed documentId ${JSON.stringify(documentId)} with a message that says what to send`, () => {
+        const result = DocumentIdParams.safeParse({
+          params: { documentId },
+          headers: { authorization: 'Bearer token' },
+          body: { fileBuffer: {} },
+        })
+        expect(result.success).to.be.false
+        if (result.success) return
+        expect(result.error.issues[0]?.path).to.deep.equal(['params', 'documentId'])
+        expect(result.error.issues[0]?.message).to.contain('24-character id')
+      })
+    }
+
+    it('should reject a malformed documentId on every schema that takes one', () => {
+      const params = { documentId: 'abc123' }
+      const headers = { authorization: 'Bearer token' }
+      expect(GetBufferSchema.safeParse({ body: {}, query: {}, params, headers }).success).to.be.false
+      expect(RollBackToPreviousVersionSchema.safeParse({ body: { note: 'n' }, query: {}, params, headers }).success).to.be.false
+      expect(DirectUploadSchema.safeParse({ query: {}, params, headers }).success).to.be.false
+      expect(UploadNextVersionSchema.safeParse({ params, body: { fileBuffer: {} } }).success).to.be.false
+      expect(DocumentIdParamsWithVersion.safeParse({ params, headers, query: {} }).success).to.be.false
+    })
+  })
+
+  describe('GetBufferSchema', () => {
+    it('should accept valid request with optional version', () => {
+      const data = {
+        body: {},
+        query: { version: '2' },
+        params: { documentId: DOCUMENT_ID },
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = GetBufferSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should accept request without version', () => {
+      const data = {
+        body: {},
+        query: {},
+        params: { documentId: DOCUMENT_ID },
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = GetBufferSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+  })
+
+  describe('CreateDocumentSchema', () => {
+    it('should accept valid document creation data', () => {
+      const data = {
+        body: {
+          documentName: 'test',
+          documentPath: '/path/to/doc',
+          extension: 'pdf',
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = CreateDocumentSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject missing documentName', () => {
+      const data = {
+        body: {
+          documentPath: '/path/to/doc',
+          extension: 'pdf',
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = CreateDocumentSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should accept valid customMetadata array', () => {
+      const data = {
+        body: {
+          documentName: 'test',
+          documentPath: '/path/to/doc',
+          extension: 'pdf',
+          customMetadata: [{ key: 'source', value: 'api' }],
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = CreateDocumentSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject invalid customMetadata shape', () => {
+      const data = {
+        body: {
+          documentName: 'test',
+          documentPath: '/path/to/doc',
+          extension: 'pdf',
+          customMetadata: [{ value: 'api' }],
+        },
+        query: {},
+        params: {},
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = CreateDocumentSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('RollBackToPreviousVersionSchema', () => {
+    const baseData = {
+      body: { note: 'rollback' },
+      query: {},
+      params: { documentId: DOCUMENT_ID },
+      headers: { authorization: 'Bearer token' },
+    }
+
+    it('should accept request without body.version', () => {
+      const result = RollBackToPreviousVersionSchema.safeParse(baseData)
+      expect(result.success).to.be.true
+    })
+
+    it('should accept numeric body.version', () => {
+      const data = {
+        ...baseData,
+        body: { ...baseData.body, version: 2 },
+      }
+      const result = RollBackToPreviousVersionSchema.safeParse(data)
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.data.body.version).to.equal(2)
+      }
+    })
+
+    it('should reject string body.version (strict number required)', () => {
+      const data = {
+        ...baseData,
+        body: { ...baseData.body, version: '2' },
+      }
+      const result = RollBackToPreviousVersionSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should reject non-integer body.version', () => {
+      const data = {
+        ...baseData,
+        body: { ...baseData.body, version: 1.5 },
+      }
+      const result = RollBackToPreviousVersionSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should reject negative body.version', () => {
+      const data = {
+        ...baseData,
+        body: { ...baseData.body, version: -1 },
+      }
+      const result = RollBackToPreviousVersionSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should accept version 0 in body', () => {
+      const data = {
+        ...baseData,
+        body: { ...baseData.body, version: 0 },
+      }
+      const result = RollBackToPreviousVersionSchema.safeParse(data)
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.data.body.version).to.equal(0)
+      }
+    })
+  })
+
+  // The `version` query param on DocumentIdParamsWithVersion / GetBufferSchema
+  // now allows 0 (previously required > 0). See validators.ts review fix.
+  describe('DocumentIdParamsWithVersion - query.version', () => {
+    // Import here to avoid a top-level cycle if other tests don't need it
+    const {
+      DocumentIdParamsWithVersion,
+    } = require('../../../../src/modules/storage/validators/validators')
+
+    it('should accept version "0"', () => {
+      const data = {
+        query: { version: '0' },
+        params: { documentId: DOCUMENT_ID },
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = DocumentIdParamsWithVersion.safeParse(data)
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.data.query.version).to.equal(0)
+      }
+    })
+
+    it('should reject negative version "-1"', () => {
+      const data = {
+        query: { version: '-1' },
+        params: { documentId: DOCUMENT_ID },
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = DocumentIdParamsWithVersion.safeParse(data)
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('DirectUploadSchema', () => {
+    it('should accept valid direct upload schema', () => {
+      const data = {
+        query: {},
+        params: { documentId: DOCUMENT_ID },
+        headers: { authorization: 'Bearer token' },
+      }
+      const result = DirectUploadSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+  })
+})
+
+describe('artifact set validators', () => {
+  const headers = { authorization: 'Bearer t' }
+  const IMAGE = `images/${'0123456789abcdef'.repeat(4)}`
+  const presign = (body: Record<string, unknown>) =>
+    PresignArtifactsSchema.safeParse({
+      headers,
+      body: {
+        virtualRecordId: '3f2b1c9e-7d4a-4b8e-9c1f-2a6d5e8b7c40',
+        rev: '0123456789abcdef',
+        files: [{ path: 'manifest.json', contentType: 'application/json' }],
+        ...body,
+      },
+    })
+  const file = (path: string) =>
+    ArtifactFileParams.safeParse({ headers, params: { documentId: DOCUMENT_ID, 0: path } })
+
+  const accepted = [
+    'manifest.json',
+    'metadata.json',
+    'groups.json',
+    'reconciliation.json',
+    'record.json',
+    'properties.json',
+    'blocks/part-0000.jsonl',
+    'text/part-0042.jsonl',
+    `${IMAGE}.png`,
+    `${IMAGE}.jpg`,
+    `${IMAGE}.webp`,
+    'enrich/summary@1.json',
+    'enrich/key_points.v2-x@12.json',
+  ]
+  const refused = [
+    '',
+    '../manifest.json',
+    '/manifest.json',
+    'blocks/../manifest.json',
+    'blocks\\part-0000.jsonl',
+    'blocks/part-000.jsonl',
+    'blocks/part-00000.jsonl',
+    'other/part-0000.jsonl',
+    'images/abc.png',
+    `${IMAGE.toUpperCase()}.png`,
+    `${IMAGE}.gif`,
+    'enrich/..@1.json',
+    'enrich/a..b@1.json',
+    'enrich/Summary@1.json',
+    'enrich/summary@v1.json',
+    'enrich/a/b@1.json',
+    'manifest.json/x',
+    'MANIFEST.json',
+    'properties.jsonl',
+    'enrich/properties.json',
+    'record.json\0',
+  ]
+
+  for (const path of accepted) {
+    it(`accepts the artifact path ${path}`, () => {
+      expect(file(path).success).to.be.true
+      expect(presign({ files: [{ path, contentType: 'application/json' }] }).success).to.be.true
+    })
+  }
+
+  for (const path of refused) {
+    it(`refuses the artifact path ${JSON.stringify(path)}`, () => {
+      expect(file(path).success).to.be.false
+      expect(presign({ files: [{ path, contentType: 'application/json' }] }).success).to.be.false
+      expect(
+        ArtifactReadUrlsSchema.safeParse({ headers, params: { documentId: DOCUMENT_ID }, body: { paths: [path] } }).success,
+      ).to.be.false
+    })
+  }
+
+  it('accepts a lowercase hex rev of 8 to 64 characters only', () => {
+    for (const rev of ['01234567', 'a'.repeat(64), '0123456789abcdef']) {
+      expect(presign({ rev }).success, rev).to.be.true
+    }
+    for (const rev of ['0123456', 'a'.repeat(65), '0123456789ABCDEF', 'xyz12345', '../00000000']) {
+      expect(presign({ rev }).success, rev).to.be.false
+    }
+  })
+
+  it('accepts only a virtual record id shape', () => {
+    for (const virtualRecordId of ['../x', 'a/b', '', 'a'.repeat(129)]) {
+      expect(presign({ virtualRecordId }).success, virtualRecordId).to.be.false
+      expect(ListArtifactSetsSchema.safeParse({ headers, query: { virtualRecordId } }).success).to.be.false
+    }
+  })
+
+  it('refuses a path listed twice, no files, or an unusable content type', () => {
+    const twice = { path: 'manifest.json', contentType: 'application/json' }
+    expect(presign({ files: [twice, twice] }).success).to.be.false
+    expect(presign({ files: [] }).success).to.be.false
+    expect(presign({ files: [{ path: 'manifest.json', contentType: 'json' }] }).success).to.be.false
+    expect(presign({ files: [{ path: 'manifest.json', contentType: 'a/b\r\nX-Evil: 1' }] }).success).to.be.false
+    expect(
+      ArtifactReadUrlsSchema.safeParse({
+        headers,
+        params: { documentId: DOCUMENT_ID },
+        body: { paths: ['manifest.json', 'manifest.json'] },
+      }).success,
+    ).to.be.false
+  })
+})

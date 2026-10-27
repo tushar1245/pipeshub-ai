@@ -1,0 +1,341 @@
+import { randomUUID } from 'crypto';
+import AmazonS3Adapter from '../providers/s3.provider';
+import { StorageError } from '../../../libs/errors/storage.errors';
+import { Document } from '../types/storage.service.types';
+import { Logger } from '../../../libs/services/logger.service';
+import {
+  resolveS3Credentials,
+  S3_PARTIAL_CREDENTIALS_MESSAGE,
+} from './s3-credentials.util';
+
+const logger = Logger.getInstance({ service: 'S3HealthCheck' });
+
+export type S3CapabilityName =
+  | 'bucketAccess'
+  | 'upload'
+  | 'read'
+  | 'getContent'
+  | 'signedUrlGet'
+  | 'signedUrlPut';
+
+export interface S3CapabilityCheckResult {
+  capability: S3CapabilityName;
+  passed: boolean;
+  error?: string;
+}
+
+export interface S3HealthCheckResult {
+  success: boolean;
+  checks: S3CapabilityCheckResult[];
+}
+
+export interface S3HealthCheckCredentials {
+  // Optional: when omitted, checks run against the AWS default credential
+  // provider chain (EC2/ECS IAM role) instead of explicit IAM user credentials.
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  region: string;
+  bucketName: string;
+}
+
+const HEALTH_CHECK_PREFIX = '.pipeshub-health-check';
+const HEALTH_CHECK_CONTENT = 'pipeshub-s3-health-check';
+const SIGNED_URL_FETCH_TIMEOUT_MS = 15_000;
+
+function formatError(error: unknown): string {
+  if (error instanceof StorageError) {
+    const underlying = error.metadata?.originalError;
+    if (underlying) {
+      return `${error.message}: ${underlying}`;
+    }
+    return error.message;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function buildFailureMessage(checks: S3CapabilityCheckResult[]): string {
+  const failedChecks = checks.filter((check) => !check.passed);
+  const summary = failedChecks
+    .map((check) => `${check.capability}: ${check.error ?? 'failed'}`)
+    .join('; ');
+  return `S3 health check failed. Verify credentials (or the EC2/ECS IAM role if none were provided), bucket name, region, and IAM permissions (s3:PutObject, s3:GetObject, s3:DeleteObject). If getContent fails but upload/read succeed, the configured region likely does not match the bucket's actual region. ${summary}`;
+}
+
+export function buildS3HealthCheckErrorMessage(
+  checks: S3CapabilityCheckResult[],
+): string {
+  return buildFailureMessage(checks);
+}
+
+/**
+ * Classifies an upload/bucket error to distinguish a missing bucket from a
+ * permissions problem so the failure is reported under the right capability.
+ * A NoSuchBucket error is a bucket-access problem; everything else is an
+ * upload/write-permission problem.
+ */
+function classifyUploadError(error: unknown): S3CapabilityName {
+  const msg = formatError(error).toLowerCase();
+  if (
+    msg.includes('nosuchbucket') ||
+    msg.includes('no such bucket') ||
+    msg.includes('bucket is not valid') ||
+    msg.includes('bucket does not exist')
+  ) {
+    return 'bucketAccess';
+  }
+  return 'upload';
+}
+
+export async function validateS3Capabilities(
+  credentials: S3HealthCheckCredentials,
+): Promise<S3HealthCheckResult> {
+  const { accessKeyId, secretAccessKey } = credentials;
+  const region = (credentials.region ?? '').trim().toLowerCase();
+  const bucketName = (credentials.bucketName ?? '').trim();
+  const checks: S3CapabilityCheckResult[] = [];
+  const probeId = randomUUID();
+  const testKey = `${HEALTH_CHECK_PREFIX}/${probeId}`;
+  const directUploadKey = `${HEALTH_CHECK_PREFIX}/${probeId}-direct`;
+  const keysToCleanup = new Set<string>();
+
+  // Mirrors the adapter's credential resolution: explicit keys when provided,
+  // otherwise the AWS default credential chain (EC2/ECS IAM role).
+  const resolvedCredentials = resolveS3Credentials({
+    accessKeyId,
+    secretAccessKey,
+  });
+  if (resolvedCredentials.kind === 'partial') {
+    return {
+      success: false,
+      checks: [
+        {
+          capability: 'bucketAccess',
+          passed: false,
+          error: S3_PARTIAL_CREDENTIALS_MESSAGE,
+        },
+      ],
+    };
+  }
+
+  logger.info('Starting S3 health check', {
+    bucketName,
+    bucketNameLength: bucketName?.length,
+    region,
+    authMode:
+      resolvedCredentials.kind === 'explicit'
+        ? 'explicitCredentials'
+        : 'iamRole',
+  });
+
+  // Cleanup client only. Path-style addressing is for this client, not the adapter.
+  // require() at call time so tests can replace the exported function.
+  const provider =
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require('../providers/s3.provider') as typeof import('../providers/s3.provider');
+  const s3 = provider.createS3Service({
+    region,
+    forcePathStyle: true,
+    ...(resolvedCredentials.kind === 'explicit'
+      ? {
+          accessKeyId: resolvedCredentials.accessKeyId,
+          secretAccessKey: resolvedCredentials.secretAccessKey,
+        }
+      : {}),
+  });
+
+  let adapter: AmazonS3Adapter;
+  try {
+    adapter = new AmazonS3Adapter({
+      accessKeyId,
+      secretAccessKey,
+      region,
+      bucket: bucketName,
+    });
+  } catch (error) {
+    logger.error('S3 adapter initialization failed', {
+      error: formatError(error),
+    });
+    return {
+      success: false,
+      checks: [
+        {
+          capability: 'bucketAccess',
+          passed: false,
+          error: formatError(error),
+        },
+      ],
+    };
+  }
+
+  // The upload check validates bucket existence and write access — no
+  // separate HeadBucket call is needed, avoiding the s3:ListBucket IAM action.
+  let uploadedUrl: string | undefined;
+
+  try {
+    const uploadResult = await adapter.uploadDocumentToStorageService({
+      documentPath: testKey,
+      buffer: Buffer.from(HEALTH_CHECK_CONTENT),
+      mimeType: 'text/plain',
+      isVersioned: false,
+    });
+    uploadedUrl = uploadResult.data;
+    keysToCleanup.add(testKey);
+    checks.push({ capability: 'bucketAccess', passed: true });
+    checks.push({ capability: 'upload', passed: true });
+    logger.info('S3 upload check passed', { uploadedUrl });
+  } catch (error) {
+    const failedCapability = classifyUploadError(error);
+    logger.error('S3 upload check failed', {
+      capability: failedCapability,
+      error: formatError(error),
+    });
+    checks.push({
+      capability: 'bucketAccess',
+      passed: failedCapability !== 'bucketAccess',
+      error:
+        failedCapability === 'bucketAccess' ? formatError(error) : undefined,
+    });
+    checks.push({
+      capability: 'upload',
+      passed: false,
+      error:
+        failedCapability === 'upload'
+          ? formatError(error)
+          : 'Skipped because bucket was not found',
+    });
+  }
+
+  if (uploadedUrl) {
+    const probeDocument = {
+      s3: { url: uploadedUrl },
+      mimeType: 'text/plain',
+    } as Document;
+
+    try {
+      const readResult =
+        await adapter.getBufferFromStorageService(probeDocument);
+      const downloaded = readResult.data?.toString('utf-8');
+      if (downloaded !== HEALTH_CHECK_CONTENT) {
+        throw new Error(
+          `Content mismatch: expected '${HEALTH_CHECK_CONTENT}' but got '${downloaded?.slice(0, 100) ?? '(empty)'}'`,
+        );
+      }
+      checks.push({ capability: 'read', passed: true });
+      logger.info('S3 read check passed');
+    } catch (error) {
+      logger.error('S3 read check failed', { error: formatError(error) });
+      checks.push({
+        capability: 'read',
+        passed: false,
+        error: formatError(error),
+      });
+    }
+
+    let signedGetUrl: string | undefined;
+    try {
+      const signedUrlResult = await adapter.getSignedUrl(probeDocument);
+      signedGetUrl = signedUrlResult.data;
+      checks.push({ capability: 'signedUrlGet', passed: true });
+      logger.info('S3 signedUrlGet check passed');
+    } catch (error) {
+      logger.error('S3 signedUrlGet check failed', {
+        error: formatError(error),
+      });
+      checks.push({
+        capability: 'signedUrlGet',
+        passed: false,
+        error: formatError(error),
+      });
+    }
+
+    if (signedGetUrl) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => {
+          controller.abort();
+        }, SIGNED_URL_FETCH_TIMEOUT_MS);
+        try {
+          const response = await fetch(signedGetUrl, {
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            throw new Error(
+              `Signed URL returned HTTP ${response.status}. This usually indicates a region mismatch — the configured region '${region}' may not match the bucket's actual region`,
+            );
+          }
+          const body = await response.text();
+          if (body !== HEALTH_CHECK_CONTENT) {
+            throw new Error(
+              `Content mismatch via signed URL: expected '${HEALTH_CHECK_CONTENT}' but got '${body.slice(0, 100)}'`,
+            );
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+        checks.push({ capability: 'getContent', passed: true });
+        logger.info('S3 getContent check passed');
+      } catch (error) {
+        logger.error('S3 getContent check failed', {
+          error: formatError(error),
+        });
+        checks.push({
+          capability: 'getContent',
+          passed: false,
+          error: formatError(error),
+        });
+      }
+    } else {
+      checks.push({
+        capability: 'getContent',
+        passed: false,
+        error: 'Skipped because signed URL generation failed',
+      });
+    }
+  } else {
+    checks.push(
+      {
+        capability: 'read',
+        passed: false,
+        error: 'Skipped because upload check failed',
+      },
+      {
+        capability: 'getContent',
+        passed: false,
+        error: 'Skipped because upload check failed',
+      },
+      {
+        capability: 'signedUrlGet',
+        passed: false,
+        error: 'Skipped because upload check failed',
+      },
+    );
+  }
+
+  try {
+    await adapter.generatePresignedUrlForDirectUpload(directUploadKey);
+    checks.push({ capability: 'signedUrlPut', passed: true });
+    logger.info('S3 signedUrlPut check passed');
+  } catch (error) {
+    logger.error('S3 signedUrlPut check failed', { error: formatError(error) });
+    checks.push({
+      capability: 'signedUrlPut',
+      passed: false,
+      error: formatError(error),
+    });
+  }
+
+  for (const key of keysToCleanup) {
+    try {
+      await s3.deleteObject({ Bucket: bucketName, Key: key }).promise();
+    } catch {
+      // Best-effort cleanup; do not fail health check on delete errors.
+    }
+  }
+
+  const success = checks.every((check) => check.passed);
+  logger.info('S3 health check completed', { success, checks });
+  return { success, checks };
+}

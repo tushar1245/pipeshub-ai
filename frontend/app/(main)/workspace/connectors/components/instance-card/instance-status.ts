@@ -1,0 +1,80 @@
+import { CONNECTOR_INSTANCE_STATUS } from '../../constants';
+import { isConnectorInstanceOAuthAuthIncompleteForSyncUi } from '../../utils/auth-helpers';
+import type { ConnectorConfig, ConnectorInstance } from '../../types';
+
+/** Setup / readiness derived from list API flags (not indexing stats). */
+export type InstanceSetupStatusKey =
+  | 'not_configured'
+  | 'needs_authentication'
+  | 'action_needed'
+  | 'desktop_offline'
+  | 'ready';
+
+/** Transient sync job from backend `status` (IDLE → no badge). */
+export type InstanceSyncOperationKey =
+  | 'syncing'
+  | 'full_syncing'
+  | 'queued'
+  | 'deleting';
+
+export type InstanceSetupStatusView = {
+  key: InstanceSetupStatusKey;
+  badgeColor: 'gray' | 'amber' | 'red' | 'green';
+  icon: string;
+};
+
+export type InstanceSyncOperationView = {
+  key: InstanceSyncOperationKey;
+  badgeColor: 'blue' | 'amber' | 'red';
+  icon: string;
+};
+
+export function deriveInstanceSetupStatus(
+  instance: Pick<
+    ConnectorInstance,
+    'isConfigured' | 'isAuthenticated' | 'authType' | 'type' | 'scope' | 'isActive' | 'desktopOnline' | 'actionItems'
+  >,
+  config?: ConnectorConfig,
+): InstanceSetupStatusView {
+  if (!instance.isConfigured) {
+    return { key: 'not_configured', badgeColor: 'gray', icon: 'settings' };
+  }
+  if (isConnectorInstanceOAuthAuthIncompleteForSyncUi(config, instance)) {
+    return { key: 'needs_authentication', badgeColor: 'amber', icon: 'vpn_key' };
+  }
+  const actionItems = instance.actionItems ?? [];
+  if (actionItems.length > 0) {
+    const anError = actionItems.some((item) => item.severity === 'error');
+    return { key: 'action_needed', badgeColor: anError ? 'red' : 'amber', icon: 'priority_high' };
+  }
+  // Local FS: live socket presence stamped by Node on the row. Absent means
+  // unknown (other connector types, or the gateway was not ready), not offline.
+  // Only meaningful while sync is enabled: the desktop claims a connector when
+  // it mounts the watcher on enable, so a disabled one never has a claim, and a
+  // stale value can survive a toggle-off through the store's row merge.
+  if (instance.isActive && instance.desktopOnline === false) {
+    return { key: 'desktop_offline', badgeColor: 'amber', icon: 'desktop_access_disabled' };
+  }
+  return { key: 'ready', badgeColor: 'green', icon: 'check_circle' };
+}
+
+export function deriveInstanceSyncOperation(
+  instance: Pick<ConnectorInstance, 'status'>,
+): InstanceSyncOperationView | null {
+  const normalized = (instance.status ?? CONNECTOR_INSTANCE_STATUS.IDLE).toUpperCase();
+
+  if (normalized === CONNECTOR_INSTANCE_STATUS.DELETING) {
+    return { key: 'deleting', badgeColor: 'red', icon: 'delete' };
+  }
+  if (normalized === CONNECTOR_INSTANCE_STATUS.FULL_SYNCING) {
+    return { key: 'full_syncing', badgeColor: 'blue', icon: 'cloud_sync' };
+  }
+  if (normalized === CONNECTOR_INSTANCE_STATUS.SYNCING) {
+    return { key: 'syncing', badgeColor: 'blue', icon: 'sync' };
+  }
+  if (normalized === CONNECTOR_INSTANCE_STATUS.QUEUED) {
+    return { key: 'queued', badgeColor: 'amber', icon: 'schedule' };
+  }
+
+  return null;
+}

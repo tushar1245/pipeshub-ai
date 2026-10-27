@@ -1,0 +1,338 @@
+// Knowledge Base Utility Functions - Filter/Sort Conversion
+
+import type {
+  KnowledgeBaseFilter,
+  SortConfig,
+  AllRecordsFilter,
+  AllRecordsSortConfig,
+  AllRecordsPagination,
+  KnowledgeHubApiResponse,
+  KnowledgeHubQueryParams,
+  SizeRange,
+  DateFilterType,
+} from './types';
+
+/** Must match backend `MIN_SEARCH_QUERY_LENGTH` in `knowledge_hub_router.py`. */
+export const KB_MIN_SEARCH_QUERY_LENGTH = 2;
+
+/** Filters that require flattened/search mode on the knowledge-hub nodes API. */
+export function hasKnowledgeHubFlatteningFilters(
+  filter: Pick<
+    KnowledgeBaseFilter,
+    | 'recordTypes'
+    | 'indexingStatus'
+    | 'sizeRange'
+    | 'createdAfter'
+    | 'createdBefore'
+    | 'updatedAfter'
+    | 'updatedBefore'
+  >,
+  searchQuery?: string
+): boolean {
+  const q = searchQuery?.trim();
+  if (q && q.length >= KB_MIN_SEARCH_QUERY_LENGTH) return true;
+  if (filter.recordTypes?.length) return true;
+  if (filter.indexingStatus?.length) return true;
+  if (filter.sizeRange) return true;
+  if (filter.createdAfter || filter.createdBefore) return true;
+  if (filter.updatedAfter || filter.updatedBefore) return true;
+  return false;
+}
+
+/**
+ * Size range buckets in bytes
+ * All ranges include both gte and lte bounds to match API format: "gte:X,lte:Y"
+ */
+const SIZE_RANGES: Record<SizeRange, { gte: number; lte: number }> = {
+  lt1mb: { gte: 0, lte: 1048576 },                           // 0 to 1 MB
+  '1to10mb': { gte: 1048576, lte: 10485760 },                // 1 MB to 10 MB
+  '10to100mb': { gte: 10485760, lte: 104857600 },            // 10 MB to 100 MB
+};
+
+/**
+ * Converts a single size range to API format
+ *
+ * Example: 'lt1mb' -> "gte:0,lte:1048576"
+ *
+ * @param sizeRange Size range identifier
+ * @returns API-formatted size filter string or undefined
+ */
+export function convertSizeRangeToApiFormat(sizeRange?: SizeRange): string | undefined {
+  if (!sizeRange) {
+    return undefined;
+  }
+
+  const { gte, lte } = SIZE_RANGES[sizeRange];
+  return `gte:${gte},lte:${lte}`;
+}
+
+/**
+ * Converts date range to API format (epoch milliseconds)
+ *
+ * Handles different date filter types:
+ * - 'on': Exact date match (full day range from start to end of day)
+ * - 'between': Date range (from start of first day to end of last day)
+ * - 'before': Dates before the selected date (only lte bound)
+ * - 'after': Dates after the selected date (only gte bound)
+ *
+ * Example:
+ * - after: "2024-01-01", before: "2024-12-31", type: 'between'
+ * - returns: "gte:1704067200000,lte:1735689599999"
+ *
+ * @param after ISO date string (inclusive lower bound)
+ * @param before ISO date string (inclusive upper bound)
+ * @param dateType Type of date filter (on, between, before, after)
+ * @returns API-formatted date range string or undefined
+ */
+export function convertDateRangeToApiFormat(
+  after?: string,
+  before?: string,
+  dateType?: DateFilterType
+): string | undefined {
+  if (!after && !before) {
+    return undefined;
+  }
+
+  const parts: string[] = [];
+
+  switch (dateType) {
+    case 'on':
+      // Exact date: full day range (start of day to end of day)
+      if (after) {
+        const startOfDay = new Date(after);
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date(after);
+        endOfDay.setHours(23, 59, 59, 999);
+        parts.push(`gte:${startOfDay.getTime()}`);
+        parts.push(`lte:${endOfDay.getTime()}`);
+      }
+      break;
+
+    case 'before':
+      // Before date: only lte bound (end of selected day)
+      if (before) {
+        const endOfDay = new Date(before);
+        endOfDay.setHours(23, 59, 59, 999);
+        parts.push(`lte:${endOfDay.getTime()}`);
+      }
+      break;
+
+    case 'after':
+      // After date: only gte bound (start of selected day)
+      if (after) {
+        const startOfDay = new Date(after);
+        startOfDay.setHours(0, 0, 0, 0);
+        parts.push(`gte:${startOfDay.getTime()}`);
+      }
+      break;
+
+    case 'between':
+    default:
+      // Range: gte start of first day, lte end of last day
+      if (after) {
+        const startOfDay = new Date(after);
+        startOfDay.setHours(0, 0, 0, 0);
+        parts.push(`gte:${startOfDay.getTime()}`);
+      }
+      if (before) {
+        const endOfDay = new Date(before);
+        endOfDay.setHours(23, 59, 59, 999);
+        parts.push(`lte:${endOfDay.getTime()}`);
+      }
+      break;
+  }
+
+  return parts.length > 0 ? parts.join(',') : undefined;
+}
+
+/**
+ * Builds API query parameters from Collections mode filter/sort state
+ *
+ * Converts UI filter state to KnowledgeHubQueryParams for API calls.
+ * Handles array-to-CSV conversion and date/size range formatting.
+ *
+ * @param filter Collections mode filter state
+ * @param sort Collections mode sort configuration
+ * @param pagination Optional pagination config (defaults to page 1, limit 50)
+ * @returns Complete query parameters object for API
+ */
+/**
+ * Response pagination → table state.
+ *
+ * `cursor` is what this page was *fetched* with, which the response cannot know
+ * and the caller must supply: it is what a refetch (after a rename, a delete or
+ * a limit change) has to replay to land on the same page.
+ */
+export function toTablePagination(
+  pagination: KnowledgeHubApiResponse['pagination'],
+  cursor: string | null
+): AllRecordsPagination {
+  return {
+    cursor,
+    limit: pagination.limit,
+    totalItems: pagination.totalItems,
+    startIndex: pagination.startIndex ?? 0,
+    endIndex: pagination.endIndex ?? 0,
+    hasNext: pagination.hasNext,
+    hasPrev: pagination.hasPrev,
+    nextCursor: pagination.nextCursor ?? null,
+    prevCursor: pagination.prevCursor ?? null,
+  };
+}
+
+export function buildFilterParams(
+  filter: KnowledgeBaseFilter,
+  sort: SortConfig,
+  pagination?: { cursor: string | null; limit: number }
+): KnowledgeHubQueryParams {
+  const params: KnowledgeHubQueryParams = {
+    // No cursor means the first page; sending one the server did not issue is
+    // a 400, so it is only ever passed straight back.
+    ...(pagination?.cursor ? { cursor: pagination.cursor } : {}),
+    limit: pagination?.limit ?? 50,
+    include: 'counts,permissions,breadcrumbs,availableFilters',
+  };
+
+  // Search query (omit `q` until long enough — backend returns 400 otherwise)
+  const searchTrimmed = filter.searchQuery?.trim();
+  if (searchTrimmed && searchTrimmed.length >= KB_MIN_SEARCH_QUERY_LENGTH) {
+    params.q = searchTrimmed;
+  }
+
+  // Node types (CSV string)
+  if (filter.nodeTypes?.length) {
+    params.nodeTypes = filter.nodeTypes.join(',');
+  }
+
+  // Record types (CSV string)
+  if (filter.recordTypes?.length) {
+    params.recordTypes = filter.recordTypes.join(',');
+  }
+
+  // Indexing status (CSV string)
+  if (filter.indexingStatus?.length) {
+    params.indexingStatus = filter.indexingStatus.join(',');
+  }
+
+  // Origins (CSV string)
+  if (filter.origins?.length) {
+    params.origins = filter.origins.join(',');
+  }
+
+  // Connector IDs (CSV string)
+  if (filter.connectorIds?.length) {
+    params.connectorIds = filter.connectorIds.join(',');
+  }
+
+  // Collections need no filter of their own: a collection *is* an App, and
+  // connectorIds already matches an App or anything whose connectorId is it.
+
+  // Size range
+  if (filter.sizeRange) {
+    params.size = convertSizeRangeToApiFormat(filter.sizeRange);
+  }
+
+  // Date ranges (with date type support)
+  if (filter.createdAfter || filter.createdBefore) {
+    params.createdAt = convertDateRangeToApiFormat(
+      filter.createdAfter,
+      filter.createdBefore,
+      filter.createdDateType
+    );
+  }
+
+  if (filter.updatedAfter || filter.updatedBefore) {
+    params.updatedAt = convertDateRangeToApiFormat(
+      filter.updatedAfter,
+      filter.updatedBefore,
+      filter.updatedDateType
+    );
+  }
+
+  // Sorting
+  params.sortBy = sort.field;
+  params.sortOrder = sort.order;
+
+  return params;
+}
+
+/**
+ * Builds API query parameters from All Records mode filter/sort state
+ *
+ * Similar to buildFilterParams but handles All Records specific filters
+ * like collection IDs and connector IDs.
+ *
+ * @param filter All Records mode filter state
+ * @param sort All Records mode sort configuration
+ * @param pagination Pagination state with page and limit
+ * @returns Complete query parameters object for API
+ */
+export function buildAllRecordsFilterParams(
+  filter: AllRecordsFilter,
+  sort: AllRecordsSortConfig,
+  pagination: AllRecordsPagination
+): KnowledgeHubQueryParams {
+  const params: KnowledgeHubQueryParams = {
+    ...(pagination.cursor ? { cursor: pagination.cursor } : {}),
+    limit: pagination.limit,
+    include: 'counts,permissions,breadcrumbs,availableFilters',
+  };
+
+  const searchTrimmedAll = filter.searchQuery?.trim();
+  if (searchTrimmedAll && searchTrimmedAll.length >= KB_MIN_SEARCH_QUERY_LENGTH) {
+    params.q = searchTrimmedAll;
+  }
+
+  // Node types (CSV string)
+  if (filter.nodeTypes?.length) {
+    params.nodeTypes = filter.nodeTypes.join(',');
+  }
+
+  // Record types (CSV string)
+  if (filter.recordTypes?.length) {
+    params.recordTypes = filter.recordTypes.join(',');
+  }
+
+  // Indexing status (CSV string)
+  if (filter.indexingStatus?.length) {
+    params.indexingStatus = filter.indexingStatus.join(',');
+  }
+
+  // Origins (CSV string)
+  if (filter.origins?.length) {
+    params.origins = filter.origins.join(',');
+  }
+
+  // Connector IDs (CSV string)
+  if (filter.connectorIds?.length) {
+    params.connectorIds = filter.connectorIds.join(',');
+  }
+
+  // Size range
+  if (filter.sizeRange) {
+    params.size = convertSizeRangeToApiFormat(filter.sizeRange);
+  }
+
+  // Date ranges (with date type support)
+  if (filter.createdAfter || filter.createdBefore) {
+    params.createdAt = convertDateRangeToApiFormat(
+      filter.createdAfter,
+      filter.createdBefore,
+      filter.createdDateType
+    );
+  }
+
+  if (filter.updatedAfter || filter.updatedBefore) {
+    params.updatedAt = convertDateRangeToApiFormat(
+      filter.updatedAfter,
+      filter.updatedBefore,
+      filter.updatedDateType
+    );
+  }
+
+  // Sorting
+  params.sortBy = sort.field;
+  params.sortOrder = sort.order;
+
+  return params;
+}

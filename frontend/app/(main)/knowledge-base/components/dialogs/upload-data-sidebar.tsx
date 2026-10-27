@@ -1,0 +1,1146 @@
+'use client';
+
+import { useTranslation } from 'react-i18next';
+import { useIsMobile } from '@/lib/hooks/use-is-mobile';
+import { sidePanelFrame, touchTarget } from '@/app/components/ui/responsive';
+import React, { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react';
+import { Flex, Box, Text, Button, IconButton, Dialog, VisuallyHidden } from '@radix-ui/themes';
+import { LoadingButton } from '@/app/components/ui/loading-button';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { FileIcon } from '@/app/components/ui/file-icon';
+import { useUploadLimits } from '@/lib/hooks/use-upload-limits';
+import { folderLevelsInPath, uploadPathOf } from '../../utils/folder-depth';
+
+// iOS browsers expose `webkitdirectory` but cannot pick folders, so the folder
+// section is hidden there. Starts true so server and first client render match.
+function useFolderPickerSupport(): boolean {
+  const [supported, setSupported] = useState(true);
+  useEffect(() => {
+    const isIos =
+      /iP(hone|ad|od)/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    setSupported(!isIos && 'webkitdirectory' in HTMLInputElement.prototype);
+  }, []);
+  return supported;
+}
+
+function createUploadItemId(prefix: 'file' | 'folder'): string {
+  const cryptoApi = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') {
+    return `${prefix}-${cryptoApi.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
+function readAllEntries(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+  return new Promise((resolve, reject) => {
+    const allEntries: FileSystemEntry[] = [];
+    const readBatch = () => {
+      reader.readEntries((entries) => {
+        if (entries.length === 0) {
+          resolve(allEntries);
+        } else {
+          allEntries.push(...entries);
+          readBatch();
+        }
+      }, reject);
+    };
+    readBatch();
+  });
+}
+
+// File with relative path for folder uploads
+export interface FileWithPath {
+  file: File;
+  relativePath: string; // e.g., "subfolder/nested/document.pdf"
+}
+
+// File/folder item to be uploaded
+export interface UploadFileItem {
+  id: string;
+  name: string;
+  size: number;
+  type: 'file' | 'folder';
+  file?: File;
+  files?: File[]; // Keep for backward compatibility
+  filesWithPaths?: FileWithPath[]; // For folder uploads with path preservation
+}
+
+interface DropZoneProps {
+  type: 'file' | 'folder';
+  onDrop: (items: UploadFileItem[]) => void;
+  isEmpty: boolean;
+  /**
+   * Compact green "+ New" trigger for headers once items are already selected.
+   * Hides the large dashed drop area so lists can use the vertical space.
+   */
+  compact?: boolean;
+}
+
+function DropZone({ type, onDrop, isEmpty, compact = false }: DropZoneProps) {
+  const { t } = useTranslation();
+  const [isDragOver, setIsDragOver] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  }, []);
+
+  const processFiles = useCallback(
+    (files: FileList | File[]) => {
+      const items: UploadFileItem[] = Array.from(files).map((file) => ({
+        id: createUploadItemId('file'),
+        name: file.name,
+        size: file.size,
+        type: 'file' as const,
+        file,
+      }));
+
+      if (items.length > 0) {
+        onDrop(items);
+      }
+    },
+    [onDrop]
+  );
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragOver(false);
+
+      const { items, files } = e.dataTransfer;
+
+      if (type === 'folder' && items) {
+        const folderItems: UploadFileItem[] = [];
+
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const entry = item.webkitGetAsEntry?.();
+
+          if (entry?.isDirectory) {
+            const folderFiles: FileWithPath[] = [];
+            let totalSize = 0;
+
+            const readDirectory = async (
+              dirEntry: FileSystemDirectoryEntry,
+              currentPath: string = ''
+            ): Promise<void> => {
+              const reader = dirEntry.createReader();
+              const entries = await readAllEntries(reader);
+              for (const childEntry of entries) {
+                if (childEntry.isFile) {
+                  const fileEntry = childEntry as FileSystemFileEntry;
+                  const file = await new Promise<File>((res, rej) => {
+                    fileEntry.file((f) => res(f), rej);
+                  });
+                  const relativePath = currentPath
+                    ? `${currentPath}/${file.name}`
+                    : file.name;
+                  folderFiles.push({ file, relativePath });
+                  totalSize += file.size;
+                } else if (childEntry.isDirectory) {
+                  const newPath = currentPath
+                    ? `${currentPath}/${childEntry.name}`
+                    : childEntry.name;
+                  await readDirectory(childEntry as FileSystemDirectoryEntry, newPath);
+                }
+              }
+            };
+
+            await readDirectory(entry as FileSystemDirectoryEntry);
+
+            if (folderFiles.length > 0) {
+              folderItems.push({
+                id: createUploadItemId('folder'),
+                name: entry.name,
+                size: totalSize,
+                type: 'folder',
+                filesWithPaths: folderFiles,
+              });
+            }
+          }
+        }
+
+        if (folderItems.length > 0) {
+          onDrop(folderItems);
+        }
+      } else if (type === 'file' && files) {
+        processFiles(files);
+      }
+    },
+    [type, onDrop, processFiles]
+  );
+
+  const handleClick = useCallback(() => {
+    inputRef.current?.click();
+  }, []);
+
+  const handleInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const { files } = e.target;
+      if (files) {
+        if (type === 'folder') {
+          const folderMap = new Map<string, FileWithPath[]>();
+
+          Array.from(files).forEach((file) => {
+            const pathParts = file.webkitRelativePath.split('/');
+            const folderName = pathParts[0];
+            const relativePath = pathParts.slice(1).join('/');
+
+            if (!folderMap.has(folderName)) {
+              folderMap.set(folderName, []);
+            }
+            folderMap.get(folderName)?.push({ file, relativePath });
+          });
+
+          const items: UploadFileItem[] = [];
+          folderMap.forEach((folderFiles, folderName) => {
+            if (folderFiles.length === 0) return;
+            const totalSize = folderFiles.reduce((sum, f) => sum + f.file.size, 0);
+            items.push({
+              id: createUploadItemId('folder'),
+              name: folderName,
+              size: totalSize,
+              type: 'folder',
+              filesWithPaths: folderFiles,
+            });
+          });
+
+          if (items.length > 0) {
+            onDrop(items);
+          }
+        } else {
+          processFiles(files);
+        }
+      }
+      e.target.value = '';
+    },
+    [type, onDrop, processFiles]
+  );
+
+  const inputProps =
+    type === 'folder'
+      ? { webkitdirectory: '', directory: '', multiple: true }
+      : { multiple: true };
+
+  const hiddenInput = (
+    <input
+      ref={inputRef}
+      type="file"
+      data-testid={`upload-input-${type}${compact ? '-compact' : ''}`}
+      style={{ display: 'none' }}
+      onChange={handleInputChange}
+      {...inputProps}
+    />
+  );
+
+  if (compact) {
+    return (
+      <>
+        {hiddenInput}
+        <Button
+          variant="solid"
+          size="1"
+          onClick={handleClick}
+          aria-label={type === 'file' ? t('kb.upload.addFiles') : t('kb.upload.addFolder')}
+          data-testid={`upload-add-${type}-compact`}
+          style={{
+            cursor: 'pointer',
+            backgroundColor: 'var(--emerald-9)',
+            color: 'white',
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+            padding: '0 var(--space-2)',
+          }}
+        >
+          <MaterialIcon name="add" size={16} color="white" />
+        </Button>
+      </>
+    );
+  }
+
+  return (
+     <Flex
+        style={{
+          padding: 'var(--space-3)',
+          borderRadius: 'var(--radius-1)',
+          background: 'var(--olive-2)',
+          border: '1px solid var(--olive-3)',
+          backdropFilter: 'blur(25px)',
+          flex: 1,
+          height: '100%',
+        }}
+    >
+    <Box
+      role="button"
+      tabIndex={0}
+      aria-label={type === 'file' ? t('kb.upload.addFiles') : t('kb.upload.addFolder')}
+      data-upload-dropzone=""
+      onClick={handleClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          handleClick();
+        }
+      }}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      style={{
+        border: `1px dashed ${isDragOver ? 'var(--accent-9)' : 'var(--slate-9)'}`,
+        borderRadius: 'var(--radius-4)',
+        background: isDragOver ? 'var(--accent-a2)' : 'rgba(255, 255, 255, 0.00)',
+        padding: isEmpty ? 'var(--space-8)' : 'var(--space-4)',
+        cursor: 'pointer',
+        transition: 'all 0.15s ease',
+        height: '100%',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flex: 1,
+      }}
+    >
+      {hiddenInput}
+      <Flex direction="column" align="center" gap="1">
+        <MaterialIcon
+          name="add"
+          size={24}
+          color={isDragOver ? 'var(--accent-9)' : 'var(--slate-9)'}
+        />
+        {isEmpty && (
+          <>
+            <Text size="2" weight="medium" style={{ color: 'var(--slate-12)' }}>
+              {t('action.upload')}
+            </Text>
+            <Text size="1" weight="light" style={{ color: 'var(--slate-12)' }}>
+              {type === 'file' ? t('kb.upload.addFiles') : t('kb.upload.addFolder')}
+            </Text>
+          </>
+        )}
+      </Flex>
+    </Box>
+    </Flex>
+  );
+}
+
+// Scrollable list that surfaces clear affordances (visible scrollbar, edge
+// shadows, and a "more below" chip) so users can tell when there is content
+// above/below the visible area. File/folder items share the same background
+// as the container, so a plain fade-to-bg gradient is invisible - we use a
+// dark inset shadow plus an explicit chip instead.
+interface ScrollableListProps {
+  children: React.ReactNode;
+}
+
+function ScrollableList({ children }: ScrollableListProps) {
+  const { t } = useTranslation();
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [showTopFade, setShowTopFade] = useState(false);
+  const [showBottomFade, setShowBottomFade] = useState(false);
+
+  const updateFades = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const { scrollTop, scrollHeight, clientHeight } = el;
+    const canScroll = scrollHeight > clientHeight + 1;
+    setShowTopFade(canScroll && scrollTop > 4);
+    setShowBottomFade(canScroll && scrollTop + clientHeight < scrollHeight - 4);
+  }, []);
+
+  useLayoutEffect(() => {
+    updateFades();
+  }, [children, updateFades]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(updateFades);
+    ro.observe(el);
+    el.addEventListener('scroll', updateFades, { passive: true });
+    return () => {
+      ro.disconnect();
+      el.removeEventListener('scroll', updateFades);
+    };
+  }, [updateFades]);
+
+  return (
+    <Box
+      style={{
+        position: 'relative',
+        flex: 1,
+        minHeight: 0,
+        minWidth: 0,
+        width: '100%',
+        overflow: 'hidden',
+        display: 'flex',
+        flexDirection: 'column',
+      }}
+    >
+      {showTopFade && (
+        <Box
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            height: '20px',
+            pointerEvents: 'none',
+            zIndex: 1,
+            boxShadow: 'inset 0 12px 12px -8px rgba(0, 0, 0, 0.12)',
+          }}
+        />
+      )}
+      <Box
+        ref={scrollRef}
+        data-upload-scroll-area=""
+        style={{
+          flex: 1,
+          minHeight: 0,
+          minWidth: 0,
+          width: '100%',
+          maxHeight: '100%',
+          overflow: 'auto',
+        }}
+      >
+        <Box style={{ minWidth: '100%', width: 'max-content' }}>{children}</Box>
+      </Box>
+      {showBottomFade && (
+        <>
+          <Box
+            style={{
+              position: 'absolute',
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: '28px',
+              pointerEvents: 'none',
+              zIndex: 1,
+              boxShadow: 'inset 0 -14px 14px -8px rgba(0, 0, 0, 0.14)',
+            }}
+          />
+          <Flex
+            justify="center"
+            style={{
+              position: 'absolute',
+              bottom: '6px',
+              left: 0,
+              right: 0,
+              pointerEvents: 'none',
+              zIndex: 2,
+            }}
+          >
+            <Text
+              size="1"
+              style={{
+                color: 'var(--slate-11)',
+                backgroundColor: 'var(--olive-4)',
+                padding: '2px 8px',
+                borderRadius: '999px',
+                border: '1px solid var(--olive-5)',
+              }}
+            >
+              {t('kb.upload.moreBelow')}
+            </Text>
+          </Flex>
+        </>
+      )}
+    </Box>
+  );
+}
+
+interface UploadedItemProps {
+  item: UploadFileItem;
+  onRemove: (id: string) => void;
+}
+
+function UploadedItem({ item, onRemove }: UploadedItemProps) {
+  const { t } = useTranslation();
+  const [isHovered, setIsHovered] = useState(false);
+
+  return (
+    <Flex
+      align="center"
+      justify="between"
+      data-testid="upload-selected-file-row"
+      data-name={item.name}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      style={{
+        padding: 'var(--space-2) var(--space-3)',
+        background: 'var(--olive-3)',
+        borderRadius: 'var(--radius-2)',
+        border: '1px solid var(--olive-4)',
+        minWidth: '100%',
+        width: 'max-content',
+      }}
+    >
+      <Flex align="center" gap="2" style={{ minWidth: 0, flex: 1 }}>
+        <Box
+          style={{
+            width: '28px',
+            height: '28px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: item.type === 'folder' ? 'var(--accent-a3)' : 'var(--slate-4)',
+            borderRadius: 'var(--radius-1)',
+            flexShrink: 0,
+          }}
+        >
+          {item.type === 'folder' ? (
+            <MaterialIcon name="folder" size={16} color="var(--accent-9)" />
+          ) : (
+            <FileIcon filename={item.name} size={16} />
+          )}
+        </Box>
+        <Flex direction="column" gap="0" style={{ minWidth: 0, flex: 1 }}>
+          <Text
+            size="2"
+            style={{
+              color: 'var(--slate-12)',
+              whiteSpace: 'nowrap',
+            }}
+            title={item.name}
+          >
+            {item.name}
+          </Text>
+          <Text size="1" style={{ color: 'var(--slate-9)' }}>
+            {item.type === 'folder'
+              ? `${item.filesWithPaths?.length ?? 0} files`
+              : formatBytes(item.size)}
+          </Text>
+        </Flex>
+      </Flex>
+      <IconButton
+        variant="ghost"
+        color="gray"
+        size="1"
+        onClick={() => onRemove(item.id)}
+        data-testid="upload-selected-file-remove"
+        aria-label={t('kb.upload.removeNamed', { name: item.name })}
+        style={{ opacity: isHovered ? 1 : 0.5 }}
+      >
+        <MaterialIcon name="close" size={16} color="var(--slate-11)" />
+      </IconButton>
+    </Flex>
+  );
+}
+
+/** Tree node built from a folder upload's relative paths. */
+interface FolderTreeNode {
+  name: string;
+  /** Path relative to the root folder contents (`''` for the root itself). */
+  path: string;
+  kind: 'folder' | 'file';
+  size?: number;
+  children: FolderTreeNode[];
+}
+
+function buildFolderTree(rootName: string, filesWithPaths: FileWithPath[]): FolderTreeNode {
+  const root: FolderTreeNode = {
+    name: rootName,
+    path: '',
+    kind: 'folder',
+    children: [],
+  };
+
+  const folderIndex = new Map<string, FolderTreeNode>([['', root]]);
+
+  const ensureFolder = (folderPath: string): FolderTreeNode => {
+    const existing = folderIndex.get(folderPath);
+    if (existing) return existing;
+
+    const parts = folderPath.split('/').filter(Boolean);
+    const parentPath = parts.slice(0, -1).join('/');
+    const parent = ensureFolder(parentPath);
+    const node: FolderTreeNode = {
+      name: parts[parts.length - 1] ?? folderPath,
+      path: folderPath,
+      kind: 'folder',
+      children: [],
+    };
+    parent.children.push(node);
+    folderIndex.set(folderPath, node);
+    return node;
+  };
+
+  for (const { file, relativePath } of filesWithPaths) {
+    const parts = relativePath.split('/').filter(Boolean);
+    if (parts.length === 0) continue;
+
+    const fileName = parts[parts.length - 1];
+    const parentPath = parts.slice(0, -1).join('/');
+    const parent = ensureFolder(parentPath);
+    parent.children.push({
+      name: fileName,
+      path: relativePath,
+      kind: 'file',
+      size: file.size,
+      children: [],
+    });
+  }
+
+  const sortNodes = (nodes: FolderTreeNode[]) => {
+    nodes.sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === 'folder' ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    nodes.forEach((n) => {
+      if (n.children.length > 0) sortNodes(n.children);
+    });
+  };
+  sortNodes(root.children);
+
+  return root;
+}
+
+interface FolderTreeRowProps {
+  node: FolderTreeNode;
+  depth: number;
+  onRemovePath: (path: string) => void;
+}
+
+function FolderTreeRow({ node, depth, onRemovePath }: FolderTreeRowProps) {
+  const { t } = useTranslation();
+  const [isHovered, setIsHovered] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(true);
+  const isFolder = node.kind === 'folder';
+  const hasChildren = node.children.length > 0;
+
+  return (
+    <>
+      <Flex
+        align="center"
+        justify="between"
+        data-testid="upload-folder-tree-row"
+        data-kind={node.kind}
+        data-path={node.path}
+        data-name={node.name}
+        onMouseEnter={() => setIsHovered(true)}
+        onMouseLeave={() => setIsHovered(false)}
+        style={{
+          padding: 'var(--space-1) var(--space-2)',
+          paddingLeft: `calc(var(--space-2) + ${depth * 16}px)`,
+          borderRadius: 'var(--radius-1)',
+          background: isHovered ? 'var(--olive-4)' : 'transparent',
+          gap: 'var(--space-1)',
+          minWidth: '100%',
+          width: 'max-content',
+        }}
+      >
+        <Flex align="center" gap="1" style={{ minWidth: 0, flex: 1 }}>
+          {isFolder ? (
+            <IconButton
+              variant="ghost"
+              color="gray"
+              size="1"
+              disabled={!hasChildren}
+              onClick={() => hasChildren && setIsExpanded((v) => !v)}
+              style={{
+                width: 20,
+                height: 20,
+                opacity: hasChildren ? 1 : 0,
+                pointerEvents: hasChildren ? 'auto' : 'none',
+                flexShrink: 0,
+              }}
+              aria-label={isExpanded ? t('kb.upload.collapseFolder') : t('kb.upload.expandFolder')}
+            >
+              <MaterialIcon
+                name={isExpanded ? 'expand_more' : 'chevron_right'}
+                size={16}
+                color="var(--slate-11)"
+              />
+            </IconButton>
+          ) : (
+            <Box style={{ width: 20, flexShrink: 0 }} />
+          )}
+          {isFolder ? (
+            <MaterialIcon name="folder" size={16} color="var(--accent-9)" style={{ flexShrink: 0 }} />
+          ) : (
+            <Box style={{ flexShrink: 0, display: 'inline-flex' }}>
+              <FileIcon filename={node.name} size={16} />
+            </Box>
+          )}
+          <Text
+            size="2"
+            style={{
+              color: 'var(--slate-12)',
+              whiteSpace: 'nowrap',
+            }}
+            title={node.name}
+          >
+            {node.name}
+          </Text>
+          {!isFolder && node.size != null && (
+            <Text size="1" style={{ color: 'var(--slate-9)', flexShrink: 0 }}>
+              {formatBytes(node.size)}
+            </Text>
+          )}
+        </Flex>
+        <IconButton
+          variant="ghost"
+          color="gray"
+          size="1"
+          onClick={() => onRemovePath(node.path)}
+          data-testid="upload-folder-tree-remove"
+          style={{ opacity: isHovered ? 1 : 0.45, flexShrink: 0 }}
+          aria-label={t('kb.upload.removeNamed', { name: node.name })}
+        >
+          <MaterialIcon name="close" size={16} color="var(--slate-11)" />
+        </IconButton>
+      </Flex>
+      {isFolder && isExpanded &&
+        node.children.map((child) => (
+          <FolderTreeRow
+            key={`${child.kind}:${child.path}`}
+            node={child}
+            depth={depth + 1}
+            onRemovePath={onRemovePath}
+          />
+        ))}
+    </>
+  );
+}
+
+interface UploadedFolderItemProps {
+  item: UploadFileItem;
+  onRemoveFolder: (id: string) => void;
+  onRemovePath: (folderId: string, path: string) => void;
+}
+
+function UploadedFolderItem({ item, onRemoveFolder, onRemovePath }: UploadedFolderItemProps) {
+  const tree = buildFolderTree(item.name, item.filesWithPaths ?? []);
+  const fileCount = item.filesWithPaths?.length ?? 0;
+
+  return (
+    <Box
+      data-testid="upload-folder-tree"
+      data-folder-name={item.name}
+      style={{
+        background: 'var(--olive-3)',
+        borderRadius: 'var(--radius-2)',
+        border: '1px solid var(--olive-4)',
+        padding: 'var(--space-1) 0',
+        minWidth: '100%',
+        width: 'max-content',
+      }}
+    >
+      <Flex
+        align="center"
+        justify="between"
+        style={{
+          padding: 'var(--space-1) var(--space-3) var(--space-1) var(--space-2)',
+        }}
+      >
+        <Text size="1" style={{ color: 'var(--slate-9)', paddingLeft: 'var(--space-2)' }}>
+          {fileCount} {fileCount === 1 ? 'file' : 'files'} · {formatBytes(item.size)}
+        </Text>
+      </Flex>
+      <FolderTreeRow
+        node={tree}
+        depth={0}
+        onRemovePath={(path) => {
+          if (path === '') {
+            onRemoveFolder(item.id);
+          } else {
+            onRemovePath(item.id, path);
+          }
+        }}
+      />
+    </Box>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export interface UploadDataSidebarProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSave: (items: UploadFileItem[]) => void;
+  isSaving?: boolean;
+  /** Folder levels that can still be added under the upload target. */
+  remainingFolderLevels?: number;
+  maxFolderDepth?: number;
+}
+
+export function UploadDataSidebar({
+  open,
+  onOpenChange,
+  onSave,
+  isSaving = false,
+  remainingFolderLevels = Infinity,
+  maxFolderDepth,
+}: UploadDataSidebarProps) {
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [fileItems, setFileItems] = useState<UploadFileItem[]>([]);
+  const [folderItems, setFolderItems] = useState<UploadFileItem[]>([]);
+  const { maxFileSizeMB } = useUploadLimits();
+
+  const handleAddFiles = useCallback((items: UploadFileItem[]) => {
+    setFileItems((prev) => [...prev, ...items]);
+  }, []);
+
+  const handleAddFolders = useCallback((items: UploadFileItem[]) => {
+    setFolderItems((prev) => [...prev, ...items]);
+  }, []);
+
+  const handleRemoveFile = useCallback((id: string) => {
+    setFileItems((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const handleRemoveFolder = useCallback((id: string) => {
+    setFolderItems((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  /** Remove a file or nested folder path from a selected folder upload. */
+  const handleRemoveFolderPath = useCallback((folderId: string, path: string) => {
+    setFolderItems((prev) =>
+      prev
+        .map((item) => {
+          if (item.id !== folderId) return item;
+          const remaining = (item.filesWithPaths ?? []).filter((f) => {
+            if (f.relativePath === path) return false;
+            // Nested folder: drop every file under this path prefix.
+            if (f.relativePath.startsWith(`${path}/`)) return false;
+            return true;
+          });
+          if (remaining.length === 0) return null;
+          return {
+            ...item,
+            filesWithPaths: remaining,
+            size: remaining.reduce((sum, f) => sum + f.file.size, 0),
+          };
+        })
+        .filter((item): item is UploadFileItem => item != null),
+    );
+  }, []);
+
+  const handleSave = useCallback(() => {
+    const allItems = [...fileItems, ...folderItems];
+    if (allItems.length > 0) {
+      onSave(allItems);
+      setFileItems([]);
+      setFolderItems([]);
+    }
+  }, [fileItems, folderItems, onSave]);
+
+  const handleOpenChange = useCallback(
+    (isOpen: boolean) => {
+      if (!isOpen) {
+        setFileItems([]);
+        setFolderItems([]);
+      }
+      onOpenChange(isOpen);
+    },
+    [onOpenChange]
+  );
+
+  const hasItems = fileItems.length > 0 || folderItems.length > 0;
+
+  // Save stays disabled while the selected folders nest past the limit; the
+  // user trims the selection with the remove buttons until it fits.
+  const exceedsFolderDepth = folderItems.some((item) =>
+    (item.filesWithPaths ?? []).some(
+      (f) => folderLevelsInPath(uploadPathOf(item.name, f.relativePath, f.file.name)) > remainingFolderLevels,
+    ),
+  );
+  const foldersAllowed = remainingFolderLevels > 0;
+  const supportsFolderPicker = useFolderPickerSupport();
+
+  return (
+    <Dialog.Root open={open} onOpenChange={handleOpenChange}>
+      <Dialog.Content
+        data-upload-data-dialog=""
+        onInteractOutside={(event) => event.preventDefault()}
+        // Start on the first drop zone, not the Documentation link in the header.
+        onOpenAutoFocus={(event) => {
+          const zone = (event.currentTarget as HTMLElement | null)?.querySelector<HTMLElement>('[data-upload-dropzone]');
+          if (zone) {
+            event.preventDefault();
+            zone.focus();
+          }
+        }}
+        style={{
+          ...sidePanelFrame(isMobile),
+          padding: 0,
+          margin: 0,
+          background: 'var(--effects-translucent)',
+          border: '1px solid var(--olive-3)',
+          borderRadius: isMobile ? 0 : 'var(--radius-2)',
+          backdropFilter: 'blur(25px)',
+          boxShadow: ' 0 20px 48px 0 rgba(0, 0, 0, 0.25)',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+          minWidth: 0,
+          transform: 'none',
+          animation: 'slideInFromRight 0.2s ease-out',
+        }}
+      >
+        <VisuallyHidden>
+          <Dialog.Title>{t('kb.upload.title')}</Dialog.Title>
+        </VisuallyHidden>
+        {/* Header */}
+        <Flex
+          align="center"
+          justify="between"
+          style={{
+            padding: 'var(--space-2) var(--space-2) var(--space-2) var(--space-4)',
+            borderBottom: '1px solid var(--olive-3)',
+            backdropFilter: 'blur(8px)',
+            backgroundColor: 'var(--effects-translucent)',
+            minWidth: 0,
+            overflow: 'hidden',
+            flexShrink: 0,
+          }}
+        >
+          <Flex align="center" gap="2">
+            <MaterialIcon name="file_upload" size={24} color="var(--slate-12)" />
+            <Text size="2" weight="medium" style={{ color: 'var(--slate-12)' }}>
+              {t('kb.upload.title')}
+            </Text>
+          </Flex>
+          <Flex align="center" gap="3">
+            <Button
+              variant="surface"
+              color="gray"
+              size="2"
+              onClick={() => window.open('https://docs.pipeshub.com', '_blank')}
+            >
+              <MaterialIcon name="open_in_new" size={14} color="var(--slate-11)" />
+              {t('kb.upload.documentation')}
+            </Button>
+            <IconButton
+              variant="ghost"
+              color="gray"
+              size="2"
+              aria-label={t('common.close')}
+              onClick={() => handleOpenChange(false)}
+            >
+              <MaterialIcon name="close" size={16} color="var(--slate-11)" />
+            </IconButton>
+          </Flex>
+        </Flex>
+
+        {/* Content */}
+        <Box
+          style={{
+            flex: 1,
+            display: 'grid',
+            gridTemplateRows: '1fr auto 1fr',
+            gap: '16px',
+            overflow: 'hidden',
+            minWidth: 0,
+            width: '100%',
+            padding: 'var(--space-4)',
+            backgroundColor: 'var(--effects-translucent)',
+            backdropFilter: 'blur(8px)',
+          }}
+        >
+          {/* Upload Files Section */}
+          <Flex
+            direction="column"
+            gap="3"
+            style={{
+              height: '100%',
+              minHeight: 0,
+              minWidth: 0,
+              overflow: 'hidden',
+              padding: 'var(--space-4)',
+              border: '1px solid var(--olive-3)',
+              borderRadius: 'var(--radius-2)',
+              backgroundColor: 'var(--olive-2)',
+            }}
+          >
+            <Flex align="start" justify="between" gap="2">
+              <Flex direction="column" gap="1">
+                <Text size="2" weight="medium" style={{ color: 'var(--slate-12)' }}>
+                  {t('kb.upload.filesTitle')}
+                </Text>
+                <Text size="1" style={{ color: 'var(--slate-9)' }}>
+                  {t('kb.upload.filesHint', { maxMb: maxFileSizeMB })}
+                </Text>
+              </Flex>
+              {fileItems.length > 0 && (
+                <Flex align="center" gap="2" style={{ flexShrink: 0 }}>
+                  <DropZone type="file" onDrop={handleAddFiles} isEmpty={false} compact />
+                  <Text
+                    size="1"
+                    weight="medium"
+                    style={{
+                      color: 'var(--slate-12)',
+                      backgroundColor: 'var(--olive-4)',
+                      padding: '2px 8px',
+                      borderRadius: '999px',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {t('kb.upload.fileCount', { count: fileItems.length })}
+                  </Text>
+                </Flex>
+              )}
+            </Flex>
+            <Box style={{ height: '1px', background: 'var(--olive-3)' }} />
+
+            {fileItems.length > 0 && (
+              <ScrollableList>
+                <Flex direction="column" gap="2" align="start" style={{ paddingBottom: '4px', minWidth: '100%' }}>
+                  {fileItems.map((item) => (
+                    <UploadedItem key={item.id} item={item} onRemove={handleRemoveFile} />
+                  ))}
+                </Flex>
+              </ScrollableList>
+            )}
+
+            {fileItems.length === 0 && (
+              <Box style={{ flex: 1 }}>
+                <DropZone type="file" onDrop={handleAddFiles} isEmpty />
+              </Box>
+            )}
+          </Flex>
+
+          {supportsFolderPicker && (
+            <>
+          <Flex align="center" gap="3">
+            <Box style={{ flex: 1, height: '1px', backgroundColor: 'var(--slate-6)' }} />
+            <Text size="1" style={{ color: 'var(--slate-9)' }}>
+              {t('kb.upload.or')}
+            </Text>
+            <Box style={{ flex: 1, height: '1px', backgroundColor: 'var(--slate-6)' }} />
+          </Flex>
+
+          {/* Upload Folders Section */}
+          <Flex
+            direction="column"
+            gap="3"
+            style={{
+              height: '100%',
+              minHeight: 0,
+              minWidth: 0,
+              overflow: 'hidden',
+              padding: 'var(--space-4)',
+              border: '1px solid var(--olive-3)',
+              borderRadius: 'var(--radius-2)',
+              backgroundColor: 'var(--olive-2)',
+            }}
+          >
+            <Flex align="start" justify="between" gap="2">
+              <Flex direction="column" gap="1">
+                <Text size="2" weight="medium" style={{ color: 'var(--slate-12)' }}>
+                  {t('kb.upload.foldersTitle')}
+                </Text>
+                <Text size="1" style={{ color: 'var(--slate-9)' }}>
+                  {t('kb.upload.foldersHint', { maxMb: maxFileSizeMB })}
+                </Text>
+              </Flex>
+              {folderItems.length > 0 && (
+                <Flex align="center" gap="2" style={{ flexShrink: 0 }}>
+                  <DropZone type="folder" onDrop={handleAddFolders} isEmpty={false} compact />
+                  <Text
+                    size="1"
+                    weight="medium"
+                    style={{
+                      color: 'var(--slate-12)',
+                      backgroundColor: 'var(--olive-4)',
+                      padding: '2px 8px',
+                      borderRadius: '999px',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {t('kb.upload.folderCount', { count: folderItems.length })}
+                  </Text>
+                </Flex>
+              )}
+            </Flex>
+            <Box style={{ height: '1px', background: 'var(--olive-3)' }} />
+
+            {folderItems.length > 0 && (
+              <ScrollableList>
+                <Flex direction="column" gap="2" align="start" style={{ paddingBottom: '4px', minWidth: '100%' }}>
+                  {folderItems.map((item) => (
+                    <UploadedFolderItem
+                      key={item.id}
+                      item={item}
+                      onRemoveFolder={handleRemoveFolder}
+                      onRemovePath={handleRemoveFolderPath}
+                    />
+                  ))}
+                </Flex>
+              </ScrollableList>
+            )}
+
+            {exceedsFolderDepth && (
+              <Text size="1" color="red" data-testid="upload-depth-warning">
+                {t('kb.upload.depthWarning', { count: remainingFolderLevels, max: maxFolderDepth })}
+              </Text>
+            )}
+
+            {folderItems.length === 0 && foldersAllowed && (
+              <Box style={{ flex: 1 }}>
+                <DropZone type="folder" onDrop={handleAddFolders} isEmpty />
+              </Box>
+            )}
+
+            {folderItems.length === 0 && !foldersAllowed && (
+              <Text size="1" style={{ color: 'var(--slate-9)' }} data-testid="upload-folder-limit-reached">
+                {t('kb.upload.folderLimitReached', { max: maxFolderDepth })}
+              </Text>
+            )}
+          </Flex>
+            </>
+          )}
+        </Box>
+
+        {/* Footer */}
+        <Flex
+          align="center"
+          justify="end"
+          gap="3"
+          style={{
+            padding: 'var(--space-3) var(--space-4)',
+            borderTop: '1px solid var(--olive-3)',
+            backgroundColor: 'var(--effects-translucent)',
+            minWidth: 0,
+            overflow: 'hidden',
+            flexShrink: 0,
+          }}
+        >
+          <Button
+            variant="soft"
+            color="gray"
+            size={isMobile ? '3' : '2'}
+            data-testid="upload-sidebar-cancel"
+            onClick={() => handleOpenChange(false)}
+          >
+            {t('action.cancel')}
+          </Button>
+          <LoadingButton
+            variant="solid"
+            size={isMobile ? '3' : '2'}
+            style={touchTarget(isMobile)}
+            data-testid="upload-sidebar-save"
+            onClick={handleSave}
+            disabled={!hasItems || exceedsFolderDepth}
+            loading={isSaving}
+          >
+            {t('action.upload')}
+          </LoadingButton>
+        </Flex>
+      </Dialog.Content>
+    </Dialog.Root>
+  );
+}

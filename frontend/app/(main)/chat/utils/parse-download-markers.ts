@@ -1,0 +1,205 @@
+import type { ChatArtifact } from '../types';
+import { buildChatArtifact } from './build-chat-artifact';
+
+export interface DownloadTask {
+  fileName: string;
+  url: string;
+}
+
+/**
+ * Parse `::download_conversation_task[label](url)` markers out of assistant
+ * content. The backend emits one marker per downloadable artifact (e.g. "the
+ * full CSV of the query result"). We strip them from the rendered markdown and
+ * surface them as Download buttons instead.
+ */
+function parseDownloadMarkers(content: string): {
+  text: string;
+  tasks: DownloadTask[];
+} {
+  const tasks: DownloadTask[] = [];
+  const regex = /::download_conversation_task\[([^\]]+)\]\(([^)]+)\)/g;
+  const text = content.replace(regex, (_, fileName, url) => {
+    tasks.push({ fileName: fileName?.trim() || 'Download', url: (url ?? '').trim() });
+    return '';
+  });
+  return { text: text.trimEnd(), tasks };
+}
+
+/** `(url)` placeholder the backend emits instead of a real (short-lived,
+ * signed) URL once a marker carries a `recordId` — see `_append_task_markers`
+ * (`app/utils/streaming.py`). Exists only to satisfy `parseArtifactMarkers`'s
+ * regex, which requires a non-empty `(...)` segment; never a fetchable URL.
+ * Older persisted markers embed a real signed/relative URL instead — those
+ * keep parsing as before (`isSignedUrl`/`isTrustedApiUrl` still classify them
+ * correctly), so this is purely additive back-compat. */
+const RECORD_PLACEHOLDER_PREFIX = 'record:';
+
+/**
+ * Parse `::artifact[fileName](downloadUrl){mime|documentId|recordId|artifactType|version}`
+ * markers from the assistant's final answer content (the last two segments are
+ * optional — older persisted markers only carry the first three). These are
+ * appended by the backend when sandbox tools (coding / database) generate
+ * output files, and are the persistent record of artifacts once SSE streaming
+ * ends.
+ *
+ * Deduplicates by artifact identity: conversations persisted with repeated
+ * markers for the same artifact version (a model re-running the same code)
+ * render one card per artifact, not one per re-run.
+ */
+function parseArtifactMarkers(content: string): {
+  text: string;
+  artifacts: ChatArtifact[];
+} {
+  const artifacts: ChatArtifact[] = [];
+  const seen = new Set<string>();
+  // Greedy on name/url, but braces are delimited; meta segments may be empty.
+  const regex = /::artifact\[([^\]]+)\]\(([^)]+)\)\{([^}]*)\}/g;
+  let text = content.replace(regex, (_, fileName, url, meta) => {
+    const [mime = '', docId = '', recordId = '', rawType = '', rawVersion = ''] =
+      String(meta).split('|');
+    const cleanName = String(fileName).trim() || 'artifact';
+    const rawUrl = String(url).trim();
+    // A `record:` placeholder is not a real URL at all — normalize it to ''
+    // ("no direct URL") so every downstream consumer keeps using its
+    // existing "falsy downloadUrl" handling instead of needing to special-
+    // case this prefix itself.
+    const cleanUrl = rawUrl.startsWith(RECORD_PLACEHOLDER_PREFIX) ? '' : rawUrl;
+    const cleanMime = mime.trim() || 'application/octet-stream';
+    const cleanRecordId = recordId.trim();
+    const cleanDocId = docId.trim();
+    const cleanType = rawType.trim();
+    const parsedVersion = Number.parseInt(rawVersion.trim(), 10);
+    const version = Number.isNaN(parsedVersion) ? undefined : parsedVersion;
+
+    const dedupeKey = `${cleanRecordId || cleanDocId || cleanUrl}:${version ?? ''}`;
+    if (seen.has(dedupeKey)) return '';
+    seen.add(dedupeKey);
+
+    artifacts.push(
+      buildChatArtifact({
+        id: cleanRecordId || cleanDocId || `artifact-${artifacts.length}-${cleanName}`,
+        fileName: cleanName,
+        mimeType: cleanMime,
+        downloadUrl: cleanUrl,
+        artifactType: cleanType || undefined,
+        recordId: cleanRecordId || undefined,
+        version,
+      }),
+    );
+    return '';
+  });
+  // Strip remnant markers the main regex didn't consume:
+  //   ::artifact[name]{meta}       — mid-form: has meta but no (url)
+  //   ::artifact[name](url)        — short-form: has url but no {meta}
+  //   ::artifact[name]             — bare-form
+  // LLMs sometimes hallucinate these formats; they carry no useful metadata
+  // for rendering a download card, so remove them entirely.
+  text = text.replace(/::artifact\[[^\]]+\](?:\([^)]*\))?(?:\{[^}]*\})?/g, '');
+  return { text: text.trimEnd(), artifacts };
+}
+
+/**
+ * Where marker-bearing text came from, which decides whether its markers may
+ * become cards:
+ *
+ * - `persisted`: a saved answer. The backend strips every model-authored
+ *   marker before saving and appends only its own, so these markers are
+ *   backend-authored and are turned into artifact cards / download tasks.
+ * - `streamed`: live model output. The model can be steered by any document it
+ *   reads, so a marker here may be forged (a genuine-looking card pointing at
+ *   an attacker file). Markers are removed from display and never become
+ *   cards; live cards come only from the typed artifact events instead.
+ */
+export type MarkerSource = 'streamed' | 'persisted';
+
+export interface AnswerMarkers {
+  text: string;
+  artifacts: ChatArtifact[];
+  downloadTasks: DownloadTask[];
+}
+
+// A marker still being typed (no closing segment yet) at the end of the
+// stream. Hidden so it does not flash as raw text before it completes.
+const PARTIAL_MARKER_TAIL = /::artifact\[[^\n}]*$|::download_conversation_task\[[^\n)]*$/;
+
+/** The only entry point for answer markers — every call site states the source. */
+export function extractAnswerMarkers(content: string, source: MarkerSource): AnswerMarkers {
+  const complete = source === 'streamed' ? content.replace(PARTIAL_MARKER_TAIL, '') : content;
+  const { text: withoutArtifacts, artifacts } = parseArtifactMarkers(complete);
+  const { text, tasks } = parseDownloadMarkers(withoutArtifacts);
+  if (source === 'streamed') return { text, artifacts: [], downloadTasks: [] };
+  return { text, artifacts, downloadTasks: tasks };
+}
+
+/** Marker-free display text, for content that never yields cards. */
+export function stripAnswerMarkers(content: string): string {
+  return extractAnswerMarkers(content, 'streamed').text;
+}
+
+/**
+ * Detect S3 / Azure Blob presigned URLs. Presigned URLs carry their own auth
+ * in the query string, so we must NOT attach the user's bearer token — and
+ * the download has to be a direct anchor click, not an axios blob fetch.
+ */
+// The hosts PipesHub's storage backends sign URLs for: S3 (no custom endpoint)
+// and Azure Blob in the public and sovereign clouds. Plain label checks, not a
+// regex: a hostname comes from model output and must not be able to stall the tab.
+// shortcut: an emulator or private-endpoint host is not trusted here; add it if one ships.
+const AZURE_BLOB_SUFFIXES = [
+  '.blob.core.windows.net',
+  '.blob.core.chinacloudapi.cn',
+  '.blob.core.usgovcloudapi.net',
+  '.blob.core.cloudapi.de',
+];
+
+const AWS_SUFFIXES = ['.amazonaws.com', '.amazonaws.com.cn'];
+
+function isS3Host(host: string): boolean {
+  const suffix = AWS_SUFFIXES.find((s) => host.endsWith(s));
+  if (!suffix) return false;
+  return host
+    .slice(0, -suffix.length)
+    .split('.')
+    .some((label) => label === 's3' || label.startsWith('s3-'));
+}
+
+export function isSignedUrl(url: string): boolean {
+  // A marker URL comes from model output, so a signature-shaped query proves
+  // nothing on its own: it must also point at a storage host we sign for.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase();
+  const params = parsed.searchParams;
+  if (isS3Host(host)) return params.has('X-Amz-Signature') || params.has('AWSAccessKeyId');
+  if (AZURE_BLOB_SUFFIXES.some((suffix) => host.endsWith(suffix))) return params.has('sig') && params.has('se');
+  return false;
+}
+
+/**
+ * Marker URLs come from the assistant stream, which is a prompt-injection
+ * surface in a RAG app. Only URLs pointing at OUR configured backend may be
+ * fetched through the authenticated apiClient — anything else must go through
+ * a direct anchor click so the user's bearer token is never attached to a
+ * foreign host.
+ *
+ * Trusted origin = `NEXT_PUBLIC_API_BASE_URL` when set (split deployment /
+ * dev where the Next.js server and backend live on different ports), else
+ * `window.location.origin` (single-origin production build).
+ */
+export function isTrustedApiUrl(url: string): boolean {
+  try {
+    const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? '';
+    const trustedOrigin = apiBase
+      ? new URL(apiBase, window.location.origin).origin
+      : window.location.origin;
+    const resolved = new URL(url, trustedOrigin);
+    return resolved.origin === trustedOrigin;
+  } catch {
+    return false;
+  }
+}

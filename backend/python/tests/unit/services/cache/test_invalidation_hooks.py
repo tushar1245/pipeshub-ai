@@ -1,0 +1,253 @@
+"""The module-level invalidation hooks and the call sites that fire them.
+
+Two properties matter: the hooks are inert until a service registers an
+invalidator (so nothing changes for services that never enable the cache), and
+each write path that makes records appear or disappear actually calls one.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+from app.config.constants.arangodb import Connectors
+from app.connectors.core.base.data_processor.data_source_entities_processor import (
+    DataSourceEntitiesProcessor,
+)
+from app.connectors.core.sync.sync_runner import run_sync_task
+from app.modules.transformers.sink_orchestrator import SinkOrchestrator
+from app.services.cache import invalidation_hooks as hooks
+from app.services.graph_db.neo4j.neo4j_provider import Neo4jProvider
+
+_PROCESSOR_MODULE = (
+    "app.connectors.core.base.data_processor.data_source_entities_processor"
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_hooks():
+    hooks.reset_accessible_records_invalidator()
+    yield
+    hooks.reset_accessible_records_invalidator()
+
+
+def _register() -> MagicMock:
+    invalidator = MagicMock()
+    invalidator.on_connector_sync_completed = AsyncMock()
+    invalidator.on_kb_records_changed = AsyncMock()
+    invalidator.on_record_indexed = AsyncMock()
+    hooks._state["invalidator"] = invalidator
+    return invalidator
+
+
+class TestRegistration:
+    async def test_hooks_are_inert_before_registration(self) -> None:
+        assert hooks.get_accessible_records_invalidator() is None
+        await hooks.notify_connector_sync_completed("conn-1")
+        await hooks.notify_kb_records_changed("kb-1")
+        await hooks.notify_record_indexed(connector_name="KB", connector_id="kb-1")
+
+    def test_init_builds_an_invalidator(self) -> None:
+        hooks.init_accessible_records_invalidator(MagicMock(), MagicMock(), MagicMock())
+        assert hooks.get_accessible_records_invalidator() is not None
+
+    def test_init_replaces_existing_invalidator(self) -> None:
+        hooks.init_accessible_records_invalidator(MagicMock(), MagicMock(), MagicMock())
+        first = hooks.get_accessible_records_invalidator()
+        hooks.init_accessible_records_invalidator(MagicMock(), MagicMock(), MagicMock())
+        assert hooks.get_accessible_records_invalidator() is not first
+
+    async def test_hooks_forward_after_registration(self) -> None:
+        invalidator = _register()
+
+        await hooks.notify_connector_sync_completed("conn-1", "org-1")
+        await hooks.notify_kb_records_changed("kb-1", "org-1")
+        await hooks.notify_record_indexed(connector_name="KB", connector_id="kb-1", org_id="org-1")
+
+        invalidator.on_connector_sync_completed.assert_awaited_once_with("conn-1", "org-1")
+        invalidator.on_kb_records_changed.assert_awaited_once_with("kb-1", "org-1")
+        invalidator.on_record_indexed.assert_awaited_once()
+
+    async def test_a_raising_invalidator_cannot_break_the_caller(self) -> None:
+        invalidator = _register()
+        invalidator.on_connector_sync_completed = AsyncMock(side_effect=RuntimeError("boom"))
+        invalidator.on_kb_records_changed = AsyncMock(side_effect=RuntimeError("boom"))
+        invalidator.on_record_indexed = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await hooks.notify_connector_sync_completed("conn-1")
+        await hooks.notify_kb_records_changed("kb-1")
+        await hooks.notify_record_indexed(connector_name="KB", connector_id="kb-1")
+
+
+class TestSyncCompletionSite:
+    """Every entry path ends in run_sync_task's finalizer, so that is the site.
+
+    The event path and the boot-resume path used to invalidate separately, and
+    one of them could be changed without the other. They now converge here.
+    """
+
+    async def test_fires_after_a_successful_sync(self) -> None:
+        connector = MagicMock()
+        connector.run_sync = AsyncMock()
+        # run_sync_task reads org_id off the processor, not an argument.
+        connector.data_entities_processor = MagicMock(org_id="org-1")
+        graph = AsyncMock()
+
+        with patch.object(hooks, "notify_connector_sync_completed", new=AsyncMock()) as notify:
+            await run_sync_task(connector, "conn-1", graph, logging.getLogger("t"))
+
+        notify.assert_awaited_once_with("conn-1", "org-1")
+
+    async def test_fires_even_when_the_sync_raises(self) -> None:
+        """The finalizer is shielded, so a failed sync still drops the cache."""
+        connector = MagicMock()
+        connector.run_sync = AsyncMock(side_effect=RuntimeError("sync failed"))
+        connector.data_entities_processor = MagicMock(org_id="org-1")
+        graph = AsyncMock()
+
+        with patch.object(hooks, "notify_connector_sync_completed", new=AsyncMock()) as notify:
+            # The failure still propagates; the point is that the finalizer ran
+            # before it did.
+            with pytest.raises(RuntimeError, match="sync failed"):
+                await run_sync_task(connector, "conn-1", graph, logging.getLogger("t"))
+
+        notify.assert_awaited_once_with("conn-1", "org-1")
+
+    async def test_a_registered_invalidator_is_reached(self) -> None:
+        """End to end through the real hook rather than a patch."""
+        connector = MagicMock()
+        connector.run_sync = AsyncMock()
+        # run_sync_task reads org_id off the processor, not an argument.
+        connector.data_entities_processor = MagicMock(org_id="org-1")
+        graph = AsyncMock()
+        invalidator = _register()
+
+        await run_sync_task(connector, "conn-1", graph, logging.getLogger("t"))
+
+        connector.run_sync.assert_awaited_once()
+        invalidator.on_connector_sync_completed.assert_awaited_once_with("conn-1", "org-1")
+
+
+class TestCascadeDeleteSite:
+    @pytest.fixture(autouse=True)
+    def _trash_off(self) -> Iterator[None]:
+        # The cascade reads the soft-delete flag; these cases cover the hard delete.
+        with patch(f"{_PROCESSOR_MODULE}.is_soft_delete_enabled", new=AsyncMock(return_value=False)):
+            yield
+
+    def _processor(self, result):
+        processor = DataSourceEntitiesProcessor.__new__(DataSourceEntitiesProcessor)
+        processor.logger = MagicMock()
+        processor.config_service = MagicMock()
+        processor._publish_delete_events = AsyncMock()
+
+        tx_store = MagicMock()
+        tx_store.delete_records_recursive = AsyncMock(return_value=result)
+        transaction = MagicMock()
+        transaction.__aenter__ = AsyncMock(return_value=tx_store)
+        transaction.__aexit__ = AsyncMock(return_value=False)
+        processor.data_store_provider = MagicMock()
+        processor.data_store_provider.transaction = MagicMock(return_value=transaction)
+        return processor
+
+    async def test_fires_when_records_were_deleted(self) -> None:
+        processor = self._processor({"successfully_deleted": 2, "eventData": None})
+        notify = AsyncMock()
+
+        with patch(
+            f"{_PROCESSOR_MODULE}.notify_kb_records_changed",
+            new=notify,
+        ):
+            await processor.on_records_deleted_cascade(["rec-1", "rec-2"], "kb-1")
+
+        notify.assert_awaited_once_with("kb-1")
+
+    async def test_silent_when_nothing_was_deleted(self) -> None:
+        processor = self._processor({"successfully_deleted": 0, "eventData": None})
+        notify = AsyncMock()
+
+        with patch(
+            f"{_PROCESSOR_MODULE}.notify_kb_records_changed",
+            new=notify,
+        ):
+            await processor.on_records_deleted_cascade(["rec-1"], "kb-1")
+
+        notify.assert_not_called()
+
+    async def test_empty_request_short_circuits(self) -> None:
+        processor = self._processor({"successfully_deleted": 0})
+        notify = AsyncMock()
+
+        with patch(
+            f"{_PROCESSOR_MODULE}.notify_kb_records_changed",
+            new=notify,
+        ):
+            result = await processor.on_records_deleted_cascade([], "kb-1")
+
+        assert result["total_requested"] == 0
+        notify.assert_not_called()
+
+
+class TestIndexingCompletionSite:
+    async def test_fires_when_a_record_becomes_searchable(self) -> None:
+        orchestrator = SinkOrchestrator.__new__(SinkOrchestrator)
+        orchestrator.logger = MagicMock()
+        orchestrator.graph_provider = MagicMock()
+        orchestrator.graph_provider.batch_update_nodes = AsyncMock(return_value=True)
+
+        record = MagicMock()
+        record.id = "rec-1"
+        record.virtual_record_id = "vr-1"
+        record.connector_name = Connectors.KNOWLEDGE_BASE
+        record.connector_id = "kb-1"
+        record.external_record_group_id = None
+        record.org_id = "org-1"
+        ctx = MagicMock()
+        ctx.record = record
+
+        notify = AsyncMock()
+        with patch(
+            "app.modules.transformers.sink_orchestrator.notify_record_indexed", new=notify
+        ):
+            await orchestrator._update_indexing_status(ctx)
+
+        orchestrator.graph_provider.batch_update_nodes.assert_awaited_once()
+        notify.assert_awaited_once_with(
+            connector_name=Connectors.KNOWLEDGE_BASE,
+            connector_id="kb-1",
+            external_record_group_id=None,
+            org_id="org-1",
+        )
+
+
+class TestDeleteRecordResultShape:
+    async def test_success_result_carries_the_invalidation_fields(self) -> None:
+        """The HTTP delete route reads these to invalidate without a re-read."""
+        provider = Neo4jProvider(MagicMock(), MagicMock())
+        provider.client = MagicMock()
+        provider.get_document = AsyncMock(
+            return_value={
+                "id": "rec-1",
+                "connectorId": "conn-1",
+                "orgId": "org-1",
+                "connectorName": "DRIVE",
+                "origin": "CONNECTOR",
+                "virtualRecordId": "vr-1",
+            }
+        )
+        provider.delete_nodes_and_edges = AsyncMock()
+        provider.execute_query = AsyncMock(return_value=[])
+        provider.client.execute_query = AsyncMock(return_value=[])
+
+        result = await provider.delete_record(record_id="rec-1", user_id="user-1", org_id="org-1")
+
+        assert result["success"] is True
+        assert result["connectorId"] == "conn-1"
+        assert result["orgId"] == "org-1"
+        assert result["isKb"] is False

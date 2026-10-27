@@ -1,0 +1,441 @@
+import * as fs from 'fs';
+import * as fsp from 'fs/promises';
+import * as path from 'path';
+import * as crypto from 'crypto';
+import type { WatchEvent } from '../watcher/replay-event-expander';
+
+// Bumped past every previously-shipped value (including the tolerated-on-read
+// "2") so upgrading always discards a pre-existing cache: old entries carry a
+// 4KB-prefix quickHash, not the full-content sha256 this version expects.
+const WATCHER_STATE_VERSION = 3;
+const HASH_STREAM_CHUNK_BYTES = 256 * 1024;
+const SAVE_DEBOUNCE_MS = 5000;
+
+export interface FileSnapshotEntry {
+  inode?: number;
+  size: number;
+  mtimeMs: number;
+  isDirectory: boolean;
+  sha256?: string;
+  /** Inode birth time. Absent when the platform/filesystem doesn't report one. */
+  birthtimeMs?: number;
+}
+
+export type FileSnapshotMap = Record<string, FileSnapshotEntry>;
+export type ScanEntries = Map<string, FileSnapshotEntry> | Record<string, FileSnapshotEntry>;
+
+export interface WatcherStateSnapshot {
+  version: number;
+  syncRoot: string;
+  connectorInstanceId: string;
+  lastScanTimestamp: number;
+  files: FileSnapshotMap;
+}
+
+export interface ScanSyncRootOptions {
+  includeSubfolders?: boolean;
+  // Bookkeeping shortcut only (periodic rescan). Omit on startup/explicit
+  // reconcile so size+mtime cannot hide a same-length content rewrite.
+  previousByRelPath?: Map<string, FileSnapshotEntry>;
+  ignoredPatterns?: ReadonlyArray<RegExp | string>;
+}
+
+export interface WatcherStateStoreArgs {
+  baseDir: string;
+  syncRoot: string;
+  connectorInstanceId: string;
+  saveDebounceMs?: number;
+}
+
+export function connectorFileSegment(connectorInstanceId: unknown): string {
+  const t = String(connectorInstanceId || '').trim();
+  if (!t) return 'unknown';
+  return t.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 200);
+}
+
+function watcherStateFilePath(baseDir: string, connectorInstanceId: string): string {
+  return path.join(baseDir, `watcher_state.${connectorFileSegment(connectorInstanceId)}.json`);
+}
+
+function toPosixRelKey(rel: string): string {
+  return rel.split(path.sep).join('/');
+}
+
+/**
+ * `fs.Stats` times are floats with sub-millisecond precision (NTFS keeps 100ns
+ * ticks), but the connector service's contract is integer epoch ms. Floor
+ * rather than round so the desktop and the server derive the same millisecond
+ * from one stat, and apply it on load too so a snapshot written by an older
+ * build still compares equal to a freshly stat'd file.
+ */
+export function toEpochMs(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.floor(n) : undefined;
+}
+
+export function normalizeRelKey(absPath: string, syncRoot: string): string {
+  const rel = path.relative(syncRoot, absPath);
+  if (rel === '' || rel === '.') return '';
+  // NFC so macOS HFS+/APFS NFD filenames hash identically to user-space
+  // NFC paths on the Python side. Without this, a CREATED in NFC and a
+  // RENAMED whose oldPath chokidar reports in NFD compute different
+  // external_record_ids and the server treats them as unrelated files.
+  return toPosixRelKey(rel).normalize('NFC');
+}
+
+function dirnamePosix(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i <= 0 ? '' : p.slice(0, i);
+}
+
+export function isValidInode(ino: unknown): boolean {
+  if (ino === undefined || ino === null) return false;
+  const n = typeof ino === 'bigint' ? Number(ino) : (ino as number);
+  return Number.isFinite(n) && n > 0;
+}
+
+/** Streams the whole file so a multi-GB file never has to sit in memory at once. */
+function computeFileHash(absFilePath: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: string | undefined): void => {
+      if (settled) return;
+      settled = true;
+      stream.destroy();
+      resolve(value);
+    };
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(absFilePath, { highWaterMark: HASH_STREAM_CHUNK_BYTES });
+    stream.on('data', (chunk: Buffer) => hash.update(chunk));
+    stream.on('end', () => finish(hash.digest('hex')));
+    stream.on('error', () => finish(undefined));
+  });
+}
+
+/**
+ * Full-content SHA-256, not a prefix heuristic — the value callers attach to
+ * outgoing `WatchEvent.sha256` so the server's rename/move handling can trust
+ * revision equality as real content identity.
+ */
+export async function contentFileHash(absPath: string): Promise<string | undefined> {
+  try {
+    const st = await fsp.lstat(absPath);
+    if (!st.isFile()) return undefined;
+    return computeFileHash(absPath);
+  } catch {
+    return undefined;
+  }
+}
+
+function matchesAnyPattern(
+  patterns: ReadonlyArray<RegExp | string>,
+  relPath: string,
+  absPath: string,
+): boolean {
+  for (const p of patterns) {
+    if (p instanceof RegExp) {
+      if (p.test(absPath) || p.test(relPath)) return true;
+    } else if (typeof p === 'string') {
+      if (relPath === p || absPath === p) return true;
+    }
+  }
+  return false;
+}
+
+export async function scanSyncRoot(
+  syncRootAbs: string,
+  options: ScanSyncRootOptions = {},
+): Promise<Map<string, FileSnapshotEntry>> {
+  const includeSubfolders = options.includeSubfolders !== false;
+  const previousByRelPath = options.previousByRelPath;
+  const ignoredPatterns = options.ignoredPatterns || [];
+  const root = path.resolve(syncRootAbs);
+  const out = new Map<string, FileSnapshotEntry>();
+
+  async function visit(dirAbs: string, isRoot = false): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(dirAbs, { withFileTypes: true });
+    } catch (err) {
+      // An unreadable child is skipped, but the root failing means the sync
+      // folder itself is gone. Returning an empty scan there reads as "every
+      // file was deleted" to both applyScan and reconcile.
+      if (isRoot) throw err;
+      return;
+    }
+    for (const ent of entries) {
+      if (ent.name === '.' || ent.name === '..') continue;
+      const abs = path.join(dirAbs, ent.name);
+      const relKey = normalizeRelKey(abs, root);
+      if (matchesAnyPattern(ignoredPatterns, relKey, abs)) continue;
+      let st: fs.Stats;
+      try {
+        st = await fsp.lstat(abs);
+      } catch {
+        continue;
+      }
+      const isDirectory = st.isDirectory();
+      const inode = typeof st.ino === 'bigint' ? Number(st.ino) : st.ino;
+      const size = st.isFile() ? st.size : 0;
+      const mtimeMs = toEpochMs(st.mtimeMs) ?? 0;
+      const birthtimeMs = toEpochMs(st.birthtimeMs);
+      let sha256: string | undefined;
+      if (st.isFile()) {
+        // Size+mtime reuse is for bookkeeping scans only; reconcile callers omit previousByRelPath.
+        const old = previousByRelPath && previousByRelPath.get(relKey);
+        if (old && !old.isDirectory && old.size === size && old.mtimeMs === mtimeMs && old.sha256) {
+          sha256 = old.sha256;
+        } else {
+          sha256 = await computeFileHash(abs);
+        }
+      }
+      out.set(relKey, { inode, size, mtimeMs, isDirectory, sha256, birthtimeMs });
+      if (isDirectory && includeSubfolders) {
+        await visit(abs);
+      }
+    }
+  }
+
+  await visit(root, true);
+  return out;
+}
+
+function emptyState(syncRoot: string, connectorInstanceId: string): WatcherStateSnapshot {
+  return {
+    version: WATCHER_STATE_VERSION,
+    syncRoot,
+    connectorInstanceId,
+    lastScanTimestamp: 0,
+    files: {},
+  };
+}
+
+function parseFileEntry(raw: unknown): FileSnapshotEntry | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  const inode = Number(r.inode);
+  const size = Number(r.size);
+  const mtimeMs = toEpochMs(r.mtimeMs);
+  if (!Number.isFinite(inode) || !Number.isFinite(size) || mtimeMs === undefined) return null;
+  const isDirectory = Boolean(r.isDirectory);
+  const sha256 = typeof r.sha256 === 'string' && r.sha256.length > 0 ? r.sha256 : undefined;
+  const birthtimeMs = toEpochMs(r.birthtimeMs);
+  return { inode, size, mtimeMs, isDirectory, sha256, birthtimeMs };
+}
+
+export class WatcherStateStore {
+  private baseDir: string;
+  private debounceMs: number;
+  private syncRoot: string;
+  private connectorInstanceId: string;
+  private state: WatcherStateSnapshot;
+  private saveTimer: NodeJS.Timeout | null;
+  private dirty: boolean;
+
+  constructor({ baseDir, syncRoot, connectorInstanceId, saveDebounceMs }: WatcherStateStoreArgs) {
+    this.baseDir = path.resolve(baseDir);
+    this.debounceMs = saveDebounceMs != null ? saveDebounceMs : SAVE_DEBOUNCE_MS;
+    this.syncRoot = path.resolve(syncRoot);
+    this.connectorInstanceId = String(connectorInstanceId).trim();
+    this.state = emptyState(this.syncRoot, this.connectorInstanceId);
+    this.saveTimer = null;
+    this.dirty = false;
+  }
+
+  statePath(): string {
+    return watcherStateFilePath(this.baseDir, this.connectorInstanceId);
+  }
+
+  getSnapshot(): WatcherStateSnapshot {
+    return this.state;
+  }
+
+  load(): void {
+    const p = this.statePath();
+    if (!fs.existsSync(p)) {
+      this.state = emptyState(this.syncRoot, this.connectorInstanceId);
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch {
+      this.state = emptyState(this.syncRoot, this.connectorInstanceId);
+      return;
+    }
+    if (typeof parsed !== 'object' || parsed === null) {
+      this.state = emptyState(this.syncRoot, this.connectorInstanceId);
+      return;
+    }
+    const raw = parsed as Record<string, unknown>;
+    const version = Number(raw.version);
+    if (version !== WATCHER_STATE_VERSION) {
+      this.state = emptyState(this.syncRoot, this.connectorInstanceId);
+      return;
+    }
+    const fileSyncRoot = typeof raw.syncRoot === 'string' ? path.resolve(raw.syncRoot) : '';
+    const fileConnectorId = typeof raw.connectorInstanceId === 'string' ? raw.connectorInstanceId.trim() : '';
+    if (fileSyncRoot !== this.syncRoot || fileConnectorId !== this.connectorInstanceId) {
+      this.state = emptyState(this.syncRoot, this.connectorInstanceId);
+      return;
+    }
+    const files: FileSnapshotMap = {};
+    if (raw.files && typeof raw.files === 'object') {
+      for (const [k, v] of Object.entries(raw.files as Record<string, unknown>)) {
+        const norm = k.split('\\').join('/');
+        const entry = parseFileEntry(v);
+        if (entry) files[norm] = entry;
+      }
+    }
+    this.state = {
+      version: WATCHER_STATE_VERSION,
+      syncRoot: this.syncRoot,
+      connectorInstanceId: this.connectorInstanceId,
+      lastScanTimestamp: Number.isFinite(Number(raw.lastScanTimestamp)) ? Number(raw.lastScanTimestamp) : 0,
+      files,
+    };
+  }
+
+  applyScan(entries: ScanEntries): void {
+    const next: FileSnapshotMap = {};
+    if (entries instanceof Map) {
+      for (const [k, v] of entries) next[k.split('\\').join('/')] = { ...v };
+    } else {
+      for (const [k, v] of Object.entries(entries)) next[k.split('\\').join('/')] = { ...v };
+    }
+    this.state.files = next;
+    this.state.syncRoot = this.syncRoot;
+    this.state.connectorInstanceId = this.connectorInstanceId;
+    this.state.lastScanTimestamp = Date.now();
+    this.scheduleSave();
+  }
+
+  reconcile(currentScan: Map<string, FileSnapshotEntry>): WatchEvent[] {
+    const now = Date.now();
+    const oldFiles = this.state.files;
+    const oldPaths = new Set(Object.keys(oldFiles));
+    const newPaths = new Set(currentScan.keys());
+    const events: WatchEvent[] = [];
+    const oldByInode = new Map<number, { paths: string[] }>();
+    const newByInode = new Map<number, { paths: string[] }>();
+
+    for (const p of oldPaths) {
+      const e = oldFiles[p];
+      if (!e || !isValidInode(e.inode)) continue;
+      let g = oldByInode.get(e.inode!);
+      if (!g) { g = { paths: [] }; oldByInode.set(e.inode!, g); }
+      g.paths.push(p);
+    }
+    for (const p of newPaths) {
+      const e = currentScan.get(p);
+      if (!e || !isValidInode(e.inode)) continue;
+      let g = newByInode.get(e.inode!);
+      if (!g) { g = { paths: [] }; newByInode.set(e.inode!, g); }
+      g.paths.push(p);
+    }
+
+    const handledOld = new Set<string>();
+    const handledNew = new Set<string>();
+
+    for (const [ino, oldG] of oldByInode) {
+      const newG = newByInode.get(ino);
+      if (!newG) continue;
+      if (oldG.paths.length !== 1 || newG.paths.length !== 1) continue;
+      const oldPath = oldG.paths[0];
+      const newPath = newG.paths[0];
+      if (oldPath === newPath) continue;
+      const oldEnt = oldFiles[oldPath];
+      const newEnt = currentScan.get(newPath)!;
+      if (oldEnt.isDirectory !== newEnt.isDirectory) continue;
+      const sameDir = dirnamePosix(oldPath) === dirnamePosix(newPath);
+      const type = newEnt.isDirectory
+        ? (sameDir ? 'DIR_RENAMED' : 'DIR_MOVED')
+        : (sameDir ? 'RENAMED' : 'MOVED');
+      events.push({
+        type, path: newPath, oldPath, timestamp: now,
+        size: newEnt.isDirectory ? undefined : newEnt.size,
+        isDirectory: newEnt.isDirectory,
+        sha256: newEnt.isDirectory ? undefined : newEnt.sha256,
+        mtimeMs: newEnt.mtimeMs,
+        birthtimeMs: newEnt.birthtimeMs,
+      });
+      handledOld.add(oldPath);
+      handledNew.add(newPath);
+    }
+
+    for (const p of oldPaths) {
+      if (handledOld.has(p)) continue;
+      if (!newPaths.has(p)) continue;
+      const oldEnt = oldFiles[p];
+      const newEnt = currentScan.get(p)!;
+      if (oldEnt.isDirectory !== newEnt.isDirectory) {
+        events.push({ type: oldEnt.isDirectory ? 'DIR_DELETED' : 'DELETED', path: p, timestamp: now, isDirectory: oldEnt.isDirectory });
+        events.push({ type: newEnt.isDirectory ? 'DIR_CREATED' : 'CREATED', path: p, timestamp: now, size: newEnt.isDirectory ? undefined : newEnt.size, isDirectory: newEnt.isDirectory, sha256: newEnt.isDirectory ? undefined : newEnt.sha256, mtimeMs: newEnt.mtimeMs, birthtimeMs: newEnt.birthtimeMs });
+        handledOld.add(p); handledNew.add(p);
+        continue;
+      }
+      // Inode is only meaningful for rename-detection (matching a path to a
+      // *different* path above) — it's not authoritative here. Windows can
+      // report a different (or momentarily invalid) file ID for the same
+      // physical file across process restarts (e.g. cloud-sync placeholder
+      // files), which previously forced every unchanged file into a spurious
+      // MODIFIED event on every startup reconcile.
+      let metaSame: boolean;
+      if (newEnt.isDirectory) {
+        metaSame = oldEnt.mtimeMs === newEnt.mtimeMs;
+      } else if (oldEnt.sha256 && newEnt.sha256) {
+        metaSame = oldEnt.size === newEnt.size && oldEnt.sha256 === newEnt.sha256;
+      } else {
+        metaSame = oldEnt.size === newEnt.size && oldEnt.mtimeMs === newEnt.mtimeMs;
+      }
+      if (!metaSame) {
+        events.push({ type: 'MODIFIED', path: p, timestamp: now, size: newEnt.isDirectory ? undefined : newEnt.size, isDirectory: newEnt.isDirectory, sha256: newEnt.isDirectory ? undefined : newEnt.sha256, mtimeMs: newEnt.mtimeMs, birthtimeMs: newEnt.birthtimeMs });
+      }
+      handledOld.add(p); handledNew.add(p);
+    }
+
+    for (const p of oldPaths) {
+      if (handledOld.has(p)) continue;
+      const e = oldFiles[p];
+      events.push({ type: e.isDirectory ? 'DIR_DELETED' : 'DELETED', path: p, timestamp: now, isDirectory: e.isDirectory });
+    }
+    for (const p of newPaths) {
+      if (handledNew.has(p)) continue;
+      const e = currentScan.get(p)!;
+      events.push({ type: e.isDirectory ? 'DIR_CREATED' : 'CREATED', path: p, timestamp: now, size: e.isDirectory ? undefined : e.size, isDirectory: e.isDirectory, sha256: e.isDirectory ? undefined : e.sha256, mtimeMs: e.mtimeMs, birthtimeMs: e.birthtimeMs });
+    }
+    return events;
+  }
+
+  commitReconcile(currentScan: Map<string, FileSnapshotEntry>): WatchEvent[] {
+    const ev = this.reconcile(currentScan);
+    this.applyScan(currentScan);
+    this.flushSave();
+    return ev;
+  }
+
+  scheduleSave(): void {
+    this.dirty = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.flushSave();
+    }, this.debounceMs);
+  }
+
+  flushSave(): void {
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
+    if (!this.dirty) return;
+    this.dirty = false;
+    const p = this.statePath();
+    const tmp = `${p}.tmp`;
+    try {
+      fs.mkdirSync(this.baseDir, { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), 'utf8');
+      fs.renameSync(tmp, p);
+    } catch {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  }
+}

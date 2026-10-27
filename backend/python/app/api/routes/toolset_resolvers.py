@@ -1,0 +1,256 @@
+"""Toolset edition resolvers — own-org lookups; EE-only seams are no-ops."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import HTTPException, Request
+
+from app.agents.toolset_store import (
+    AddressNotAllowedError,
+    assert_public_addresses,
+    find_personal_instance,
+)
+from app.api.middlewares.caller_role import fetch_caller_role
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.http_status_code import HttpStatusCode
+from app.config.redaction import (
+    OAUTH_CLIENT_SECRET_FIELDS,
+    REDACTED_PLACEHOLDER,
+    hide_secrets_by_default,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TOOLSET_INSTANCES_PATH = "/services/toolset-instances"
+
+
+def _oauth_config_path(toolset_type: str) -> str:
+    return f"/services/oauths/toolsets/{toolset_type.lower()}"
+
+
+async def get_oauth_credentials_for_toolset(
+    toolset_config: dict[str, Any],
+    config_service: ConfigurationService,
+    logger: logging.Logger | None = None,
+    raw_config_service: Any | None = None,
+    oauth_config_resolver: Any | None = None,
+) -> dict[str, Any]:
+    """Fetch OAuth config for a toolset."""
+    del raw_config_service, oauth_config_resolver
+
+    if not toolset_config:
+        raise ValueError("Toolset configuration is required")
+
+    auth_config = toolset_config.get("auth", {})
+    if auth_config and isinstance(auth_config, dict):
+        has_client_id = auth_config.get("clientId") or auth_config.get("client_id")
+        has_client_secret = auth_config.get("clientSecret") or auth_config.get("client_secret")
+        if has_client_id and has_client_secret:
+            if logger:
+                logger.debug("Using OAuth credentials from toolset auth config (legacy or override)")
+            return dict(auth_config)
+
+    oauth_config_id = toolset_config.get("oauthConfigId")
+    toolset_type = toolset_config.get("toolsetType")
+    instance_id = toolset_config.get("instanceId")
+
+    if not toolset_type:
+        raise ValueError(
+            f"Toolset type not found in config. "
+            f"Config keys: {list(toolset_config.keys())}. "
+            f"This indicates a corrupted toolset configuration."
+        )
+
+    if not oauth_config_id and instance_id:
+        if logger:
+            logger.warning(
+                f"No oauthConfigId in user config for instance {instance_id}. "
+                f"Fetching current instance's OAuth config (admin may have updated it)."
+            )
+        try:
+            instances = await config_service.get_config(DEFAULT_TOOLSET_INSTANCES_PATH, default=[])
+            if isinstance(instances, list):
+                current_instance = next(
+                    (inst for inst in instances if inst.get("_id") == instance_id),
+                    None,
+                )
+                if current_instance:
+                    oauth_config_id = current_instance.get("oauthConfigId")
+                    if logger:
+                        logger.info(
+                            f"Retrieved oauthConfigId from instance {instance_id}"
+                        )
+            if not oauth_config_id:
+                # A personal instance signs in with the client its owner entered on it.
+                personal = await find_personal_instance(config_service, toolset_config.get("orgId"), instance_id)
+                own_app = (personal or {}).get("auth") or {}
+                if own_app.get("clientId") and own_app.get("clientSecret"):
+                    return dict(own_app)
+        except Exception as e:
+            if logger:
+                logger.warning(f"Could not fetch instance to get oauthConfigId: {e}")
+
+    if not oauth_config_id:
+        raise ValueError(
+            f"No oauthConfigId found in toolset config or instance. "
+            f"Config keys: {list(toolset_config.keys())}. "
+            f"Please reauthenticate or ask an administrator to configure OAuth for this toolset."
+        )
+
+    try:
+        oauth_config_path = _oauth_config_path(toolset_type)
+        oauth_configs = await config_service.get_config(oauth_config_path, default=[], use_cache=False)
+        if not isinstance(oauth_configs, list):
+            raise ValueError(f"Invalid OAuth config format for toolset type '{toolset_type}'")
+
+        oauth_config = next(
+            (cfg for cfg in oauth_configs if cfg.get("_id") == oauth_config_id),
+            None,
+        )
+        if not oauth_config:
+            if logger:
+                logger.error(
+                    f"OAuth configuration '{oauth_config_id}' not found for toolset '{toolset_type}'. "
+                    f"Available config count: {len(oauth_configs)}"
+                )
+            raise ValueError(
+                f"OAuth configuration '{oauth_config_id}' not found for toolset '{toolset_type}'. "
+                f"This can happen if:\n"
+                f"  1. The admin deleted the OAuth configuration\n"
+                f"  2. The admin switched the instance to use a different OAuth config\n"
+                f"  3. There's a configuration mismatch\n"
+                f"Please reauthenticate this toolset to use the current OAuth configuration."
+            )
+
+        config_data = oauth_config.get("config", {})
+        if not config_data or not isinstance(config_data, dict):
+            raise ValueError(
+                f"OAuth configuration '{oauth_config_id}' has invalid or empty config data. "
+                f"Please ask an administrator to update the OAuth configuration."
+            )
+
+        client_id = config_data.get("clientId") or config_data.get("client_id")
+        client_secret = config_data.get("clientSecret") or config_data.get("client_secret")
+        if not client_id or not client_secret:
+            raise ValueError(
+                f"OAuth configuration '{oauth_config_id}' is missing clientId or clientSecret. "
+                f"Please ask an administrator to update the OAuth configuration."
+            )
+
+        if logger:
+            logger.debug(
+                f"✅ Fetched complete OAuth config '{oauth_config_id}' "
+                f"for toolset type '{toolset_type}' ({len(config_data)} fields)"
+            )
+        return dict(config_data)
+    except ValueError:
+        raise
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to fetch OAuth credentials: {e}", exc_info=True)
+        raise ValueError(
+            f"Failed to retrieve OAuth credentials for toolset: {str(e)}"
+        ) from e
+
+
+async def get_toolset_by_id(
+    instance_id: str,
+    config_service: ConfigurationService,
+    org_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Fetch a toolset instance by ID, optionally scoped to an org: an org instance, or any user's
+    personal one (tool clients read their settings through this, without the owner at hand)."""
+    try:
+        instances = await config_service.get_config(DEFAULT_TOOLSET_INSTANCES_PATH, default=[])
+        if isinstance(instances, list):
+            for inst in instances:
+                if inst.get("_id") == instance_id:
+                    if org_id is not None and inst.get("orgId") != org_id:
+                        return None
+                    return inst
+        personal = await find_personal_instance(config_service, org_id, instance_id)
+        if personal is None:
+            return None
+        try:
+            # Checked again on every use, not only when saved: a name can start resolving elsewhere.
+            await assert_public_addresses(personal.get("auth") or {})
+        except AddressNotAllowedError as e:
+            logger.warning(f"Not using personal toolset instance {instance_id}: {e}")
+            return None
+        return personal
+    except Exception as e:
+        logger.error(f"Failed to fetch toolset instance '{instance_id}': {e}", exc_info=True)
+        return None
+
+
+async def check_user_is_admin(
+    user_id: str,
+    org_id: str | None,
+    request: Request | None,
+    config_service: ConfigurationService,
+) -> bool:
+    """Whether the caller is an org admin, from the live role Node reports for the
+    caller's own token.
+
+    ``user_id``/``org_id`` stay for the edition seam's signature; the token identifies
+    the user, so no other user's status can be checked instead.
+    """
+    del user_id, org_id
+    if request is None:
+        return False
+    return (await fetch_caller_role(request, config_service)).is_admin
+
+
+async def resolve_inherited_from_org_id(
+    *,
+    toolset_type: str,
+    oauth_config_id: str,
+    org_id: str,
+    config_service: ConfigurationService,
+    oauth_config_resolver: Any | None = None,
+) -> str | None:
+    """No org inheritance."""
+    del toolset_type, oauth_config_id, org_id, config_service, oauth_config_resolver
+    return None
+
+
+def mask_oauth_secrets(
+    cfg_data: dict[str, Any],
+    *,
+    is_inherited: bool = False,
+    reveal: bool = False,
+) -> dict[str, Any]:
+    """Redact secret fields under HIDE_SECRET_CONFIG unless revealed; OSS has no org inheritance."""
+    del is_inherited
+    if reveal or not hide_secrets_by_default():
+        return dict(cfg_data)
+    return {k: (REDACTED_PLACEHOLDER if k in OAUTH_CLIENT_SECRET_FIELDS else v) for k, v in cfg_data.items()}
+
+
+def is_redacted_placeholder(value: Any) -> bool:
+    return value == REDACTED_PLACEHOLDER
+
+
+async def load_instances_for_mutation(
+    org_id: str,
+    config_service: ConfigurationService,
+) -> list[dict[str, Any]]:
+    """Load instances for create/update/delete."""
+    try:
+        instances_data = await config_service.get_config(DEFAULT_TOOLSET_INSTANCES_PATH, default=[])
+        if not isinstance(instances_data, list):
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="Invalid toolset instances data.",
+            )
+        return [i for i in instances_data if isinstance(i, dict) and i.get("orgId") == org_id]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to load toolset instances: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail="Failed to access toolset instances. Please try again or contact support."
+        ) from e

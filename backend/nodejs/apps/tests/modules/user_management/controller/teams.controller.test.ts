@@ -1,0 +1,1101 @@
+import 'reflect-metadata';
+import { expect } from 'chai';
+import sinon from 'sinon';
+import { TeamsController } from '../../../../src/modules/user_management/controller/teams.controller';
+import { AIServiceCommand } from '../../../../src/libs/commands/ai_service/ai.service.command';
+import { UserDisplayPicture } from '../../../../src/modules/user_management/schema/userDp.schema';
+
+describe('TeamsController', () => {
+  let controller: TeamsController;
+  let mockConfig: any;
+  let mockLogger: any;
+  let req: any;
+  let res: any;
+  let next: sinon.SinonStub;
+  let executeStub: sinon.SinonStub;
+
+  beforeEach(() => {
+    mockConfig = {
+      connectorBackend: 'http://localhost:8088',
+    };
+
+    mockLogger = {
+      debug: sinon.stub(),
+      info: sinon.stub(),
+      error: sinon.stub(),
+      warn: sinon.stub(),
+    };
+
+    controller = new TeamsController(mockConfig, mockLogger);
+
+    req = {
+      user: {
+        userId: '507f1f77bcf86cd799439011',
+        orgId: '507f1f77bcf86cd799439012',
+      },
+      params: {},
+      query: {},
+      body: {},
+      headers: {
+        'content-type': 'application/json',
+      },
+      context: { requestId: 'test-request-id' },
+    };
+
+    res = {
+      status: sinon.stub().returnsThis(),
+      json: sinon.stub().returnsThis(),
+    };
+
+    next = sinon.stub();
+  });
+
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  describe('createTeam', () => {
+    it('should create a team successfully', async () => {
+      const mockTeam = { id: 'team1', name: 'Engineering' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 201,
+        data: mockTeam,
+      });
+
+      req.body = { name: 'Engineering' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(res.status.calledWith(201)).to.be.true;
+      expect(res.json.calledWith(mockTeam)).to.be.true;
+    });
+
+    it('should enrich createdByUser.profilePicture when creating team', async () => {
+      const creatorId = '507f1f77bcf86cd799439011';
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 201,
+        data: {
+          id: 'team1',
+          name: 'Engineering',
+          createdByUser: { id: 'graph-creator-key', userId: creatorId, name: 'Alice', email: 'alice@test.com' },
+        },
+      });
+      sinon.stub(UserDisplayPicture, 'find').returns({
+        lean: sinon.stub().returns({
+          exec: sinon.stub().resolves([
+            { userId: creatorId, pic: 'creatorPic', mimeType: 'image/jpeg' },
+          ]),
+        }),
+      } as any);
+
+      req.body = { name: 'Engineering' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(res.status.calledWith(201)).to.be.true;
+      expect(res.json.firstCall.args[0].createdByUser.profilePicture).to.equal(
+        'data:image/jpeg;base64,creatorPic',
+      );
+    });
+
+    it('should call next with BadRequestError when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      const error = next.firstCall.args[0];
+      expect(error).to.be.an('error');
+    });
+
+    it('should call next with BadRequestError when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      const error = next.firstCall.args[0];
+      expect(error).to.be.an('error');
+    });
+
+    it('should handle AI service errors', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(
+        new Error('Service unavailable'),
+      );
+
+      req.body = { name: 'Engineering' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(mockLogger.error.called).to.be.true;
+    });
+  });
+
+  describe('getTeam', () => {
+    it('should get a team by id', async () => {
+      // The entity service wraps the team as { team: {...} } — the real shape.
+      const team = { id: 'team1', name: 'Engineering', orgId: '507f1f77bcf86cd799439012' };
+      const payload = { status: 'success', team };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: payload,
+      });
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeam(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      expect(res.json.calledWith(payload)).to.be.true;
+    });
+
+    it('reports a team from another org as not found', async () => {
+      // Even if the service returned a foreign team (wrapped shape), the
+      // controller must not relay it. Mimics requesting all_<otherOrgId>.
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: { status: 'success', team: { id: 'all_507f1f77bcf86cd799439099', name: 'All', orgId: '507f1f77bcf86cd799439099' } },
+      });
+
+      req.params.teamId = 'all_507f1f77bcf86cd799439099';
+
+      await controller.getTeam(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.false;
+      expect(res.json.called).to.be.false;
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.equal('Team not found');
+    });
+
+    it('should enrich createdByUser.profilePicture when getting team', async () => {
+      const creatorId = '507f1f77bcf86cd799439011';
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: {
+          id: 'team1',
+          name: 'Engineering',
+          orgId: '507f1f77bcf86cd799439012',
+          createdByUser: { id: 'graph-creator-key', userId: creatorId, name: 'Alice', email: 'alice@test.com' },
+        },
+      });
+      sinon.stub(UserDisplayPicture, 'find').returns({
+        lean: sinon.stub().returns({
+          exec: sinon.stub().resolves([
+            { userId: creatorId, pic: 'teamCreatorPic', mimeType: 'image/png' },
+          ]),
+        }),
+      } as any);
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeam(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      expect(res.json.firstCall.args[0].createdByUser.profilePicture).to.equal(
+        'data:image/png;base64,teamCreatorPic',
+      );
+    });
+
+    it('should throw BadRequestError when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      try {
+        await controller.getTeam(req, res, next);
+      } catch (error: any) {
+        expect(error.message).to.equal('Organization ID is required');
+      }
+    });
+
+    it('should throw BadRequestError when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+      req.params.teamId = 'team1';
+
+      try {
+        await controller.getTeam(req, res, next);
+      } catch (error: any) {
+        expect(error.message).to.equal('User ID is required');
+      }
+    });
+
+    it('should handle backend errors from AI service', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects({
+        statusCode: 404,
+        data: { detail: 'Team not found' },
+        message: 'Not found',
+      });
+
+      req.params.teamId = 'nonexistent';
+
+      await controller.getTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+  });
+
+
+
+  describe('updateTeam', () => {
+    it('should update a team', async () => {
+      const mockResult = { id: 'team1', name: 'Updated Team' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: mockResult,
+      });
+
+      req.params.teamId = 'team1';
+      req.body = { name: 'Updated Team' };
+
+      await controller.updateTeam(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should call next with error when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      await controller.updateTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+  });
+
+  describe('deleteTeam', () => {
+    it('should delete a team', async () => {
+      const mockResult = { message: 'Team deleted' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: mockResult,
+      });
+
+      req.params.teamId = 'team1';
+
+      await controller.deleteTeam(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should call next with error when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      await controller.deleteTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+  });
+
+  describe('getUserTeams', () => {
+    it('should return teams data as-is from AI service', async () => {
+      const mockTeams = {
+        teams: [{ id: 'team1', name: 'Team 1', memberCount: 3 }],
+        pagination: { page: 1, limit: 10, total: 1 },
+      };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: mockTeams,
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      expect(res.json.calledWith(mockTeams)).to.be.true;
+    });
+
+    it('should return empty response when AI service returns non-200', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 500,
+        data: null,
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      const responseArg = res.json.firstCall.args[0];
+      expect(responseArg).to.have.property('teams');
+      expect(responseArg.teams).to.deep.equal([]);
+    });
+
+    it('passes a 503 on instead of answering an empty team list', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 503,
+        data: { detail: "We couldn't reach PipesHub's database just now. Please try again in a few seconds." },
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.json.called).to.be.false;
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].statusCode).to.equal(503);
+    });
+
+    it('should call next with error when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+  });
+
+  describe('getTeamUsers', () => {
+    it('should inject profilePicture into team members', async () => {
+      const memberId = '507f1f77bcf86cd799439099';
+      req.params.teamId = 'team1';
+
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: {
+          members: [{ id: 'uuid1', userId: memberId, userName: 'Alice' }],
+        },
+      });
+
+      sinon.stub(UserDisplayPicture, 'find').returns({
+        lean: sinon.stub().returns({
+          exec: sinon.stub().resolves([
+            { userId: memberId, pic: 'base64pic', mimeType: 'image/jpeg' },
+          ]),
+        }),
+      } as any);
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      const responseArg = res.json.firstCall.args[0];
+      expect(responseArg.members[0].profilePicture).to.equal('data:image/jpeg;base64,base64pic');
+    });
+
+    it('should not add profilePicture when user has no DP', async () => {
+      req.params.teamId = 'team1';
+
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: {
+          members: [{ id: 'uuid1', userId: 'noDP', userName: 'Bob' }],
+        },
+      });
+
+      sinon.stub(UserDisplayPicture, 'find').returns({
+        lean: sinon.stub().returns({
+          exec: sinon.stub().resolves([]),
+        }),
+      } as any);
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      const responseArg = res.json.firstCall.args[0];
+      expect(responseArg.members[0]).to.not.have.property('profilePicture');
+    });
+
+    it('should call next with error when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should call next with error when AI service returns no response', async () => {
+      req.params.teamId = 'team1';
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves(undefined);
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(res.status.called).to.be.false;
+    });
+  });
+
+
+
+  // =========================================================================
+  // handleBackendError - various error types
+  // =========================================================================
+  describe('handleBackendError - error branches via createTeam', () => {
+    it('should handle ECONNREFUSED error', async () => {
+      const connError = new Error('fetch failed');
+      (connError as any).cause = { code: 'ECONNREFUSED' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(connError);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      const err = next.firstCall.args[0];
+      expect(err.message).to.include('trouble reaching one of its services');
+    });
+
+    it('should handle fetch failed error message', async () => {
+      const fetchError = new Error('fetch failed');
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(fetchError);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      const err = next.firstCall.args[0];
+      expect(err.message).to.include('trouble reaching one of its services');
+    });
+
+    it('should handle error with statusCode 400', async () => {
+      const error400: any = { statusCode: 400, data: { detail: 'Bad request' }, message: 'Bad' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error400);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with statusCode 401', async () => {
+      const error401: any = { statusCode: 401, data: { reason: 'Unauthorized' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error401);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with statusCode 403', async () => {
+      const error403: any = { statusCode: 403, data: { message: 'Forbidden' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error403);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with statusCode 404', async () => {
+      const error404: any = { statusCode: 404, data: {}, message: 'Not Found' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error404);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with statusCode 409', async () => {
+      const error409: any = { statusCode: 409, data: { detail: 'Conflict' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error409);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with statusCode 500', async () => {
+      const error500: any = { statusCode: 500, data: { detail: 'Server error' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error500);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with unknown statusCode', async () => {
+      const errorUnknown: any = { statusCode: 418, data: { detail: 'Teapot' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(errorUnknown);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with data.reason fallback', async () => {
+      const errReason: any = { statusCode: 400, data: { reason: 'Rate limited' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(errReason);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with data.message fallback', async () => {
+      const errMsg: any = { statusCode: 400, data: { message: 'Custom message' } };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(errMsg);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle error with ECONNREFUSED detail', async () => {
+      const errConn: any = { statusCode: undefined, data: { detail: 'ECONNREFUSED' }, message: 'ECONNREFUSED' };
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(errConn);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      const err = next.firstCall.args[0];
+      expect(err.message).to.include('trouble reaching one of its services');
+    });
+  });
+
+  // =========================================================================
+  // handleAIServiceResponse - branches via various methods
+  // =========================================================================
+  describe('handleAIServiceResponse - non-200 status', () => {
+    it('should throw error when AI service returns 400 from getTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 400,
+        data: { detail: 'Bad request' },
+      });
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should throw error when AI service returns non-200 for createTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 422,
+        data: { detail: 'Validation failed' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should throw error when AI service returns null data for createTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 201,
+        data: null,
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should throw error when AI service returns null data for deleteTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: null,
+      });
+
+      req.params.teamId = 'team1';
+
+      await controller.deleteTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should throw error when AI service returns non-200 for updateTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 403,
+        data: { message: 'Forbidden' },
+      });
+
+      req.params.teamId = 'team1';
+      req.body = { name: 'Updated' };
+
+      await controller.updateTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should throw error when AI service returns null data for updateTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: null,
+      });
+
+      req.params.teamId = 'team1';
+      req.body = { name: 'Updated' };
+
+      await controller.updateTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should return 200 with null data when AI service returns null data for getTeamUsers', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: null,
+      });
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      expect(res.json.calledWith(null)).to.be.true;
+    });
+
+  });
+
+  // =========================================================================
+  // Various methods - AI service errors (different error types)
+  // =========================================================================
+  describe('AI service errors across methods', () => {
+    it('should handle AI service error in getTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(new Error('Service down'));
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle AI service error in updateTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(new Error('Connection lost'));
+
+      req.params.teamId = 'team1';
+      req.body = { name: 'Updated' };
+
+      await controller.updateTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle AI service error in deleteTeam', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(new Error('Delete failed'));
+
+      req.params.teamId = 'team1';
+
+      await controller.deleteTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle AI service error in getTeamUsers', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(new Error('Fetch users failed'));
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle AI service error in getUserTeams', async () => {
+      executeStub = sinon.stub(AIServiceCommand.prototype, 'execute').rejects(new Error('Fetch teams failed'));
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+  });
+
+  // -----------------------------------------------------------------------
+  // Branch coverage: getUserTeams - query param branches and non-200 path
+  // -----------------------------------------------------------------------
+  describe('getUserTeams - query param branches', () => {
+    it('should pass all query params', async () => {
+      req.query = { page: '1', limit: '10', search: 'team' };
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: { teams: [] },
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should work with no query params', async () => {
+      req.query = {};
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: { teams: [] },
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should work with only page', async () => {
+      req.query = { page: '2' };
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: { teams: [] },
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should work with only limit', async () => {
+      req.query = { limit: '20' };
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: { teams: [] },
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should work with only search', async () => {
+      req.query = { search: 'dev' };
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: { teams: [] },
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+    });
+
+    it('should return empty teams when AI service returns non-200', async () => {
+      req.query = {};
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 500,
+        data: null,
+      });
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(res.status.calledWith(200)).to.be.true;
+      expect(res.json.calledOnce).to.be.true;
+      const result = res.json.firstCall.args[0];
+      expect(result).to.have.property('teams');
+      expect(result.teams).to.be.an('array').with.lengthOf(0);
+    });
+
+    it('should throw when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should throw when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+
+      await controller.getUserTeams(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Branch coverage: handleBackendError - errorDetail fallback chain
+  // -----------------------------------------------------------------------
+  describe('handleBackendError - errorDetail fallback branches', () => {
+    it('should use data.reason when data.detail is missing', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 400,
+        data: { reason: 'Bad input' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Bad input');
+    });
+
+    it('should use data.message when data.detail and data.reason are missing', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 400,
+        data: { message: 'Validation failed' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Validation failed');
+    });
+
+    it('should use error.message when data fields are missing', async () => {
+      const error: any = new Error('Direct error message');
+      error.statusCode = 400;
+      error.data = {};
+      sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should return Unknown error when no error details available', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 400,
+        data: {},
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle ECONNREFUSED errorDetail', async () => {
+      const error: any = new Error('ECONNREFUSED');
+      error.statusCode = undefined;
+      error.data = {};
+      sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('should handle status 401', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 401,
+        data: { detail: 'Unauthorized' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Unauthorized');
+    });
+
+    it('should handle status 403', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 403,
+        data: { detail: 'Forbidden' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Forbidden');
+    });
+
+    it('should handle status 404', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 404,
+        data: { detail: 'Not found' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Not found');
+    });
+
+    it('should handle status 409', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 409,
+        data: { detail: 'Conflict' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Conflict');
+    });
+
+    it('should handle status 500', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 500,
+        data: { detail: 'Internal error' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      // A 5xx describes our internals, so the reader gets the plain sentence.
+      expect(next.firstCall.args[0].message).to.include('Something went wrong');
+      expect(next.firstCall.args[0].message).to.not.include('Internal error');
+    });
+
+    it('should handle default unknown status code', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 502,
+        data: { detail: 'Gateway error' },
+      });
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('Something went wrong');
+      expect(next.firstCall.args[0].message).to.not.include('Backend error');
+    });
+
+    it('should handle fetch failed error without ECONNREFUSED cause', async () => {
+      const error = new Error('fetch failed');
+      sinon.stub(AIServiceCommand.prototype, 'execute').rejects(error);
+
+      req.body = { name: 'Team' };
+
+      await controller.createTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('trouble reaching one of its services');
+      // The fault is on the server, so it never asks the reader to check their network.
+      expect(next.firstCall.args[0].message).to.not.match(/your (network|internet)/i);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Branch coverage: handleAIServiceResponse - null data path
+  // -----------------------------------------------------------------------
+  describe('handleAIServiceResponse - null data path', () => {
+    it('should throw NotFoundError when response data is null', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: null,
+      });
+
+      await controller.getTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.include('failed');
+    });
+
+    it('should throw NotFoundError when response data is undefined', async () => {
+      sinon.stub(AIServiceCommand.prototype, 'execute').resolves({
+        statusCode: 200,
+        data: undefined,
+      });
+
+      req.params.teamId = 'team1';
+
+      await controller.getTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Branch coverage: updateTeam/deleteTeam/getTeamUsers - userId missing
+  // -----------------------------------------------------------------------
+  describe('methods - missing orgId and userId branches', () => {
+    it('updateTeam should throw when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      await controller.updateTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('updateTeam should throw when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+      req.params.teamId = 'team1';
+
+      await controller.updateTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('deleteTeam should throw when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      await controller.deleteTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('deleteTeam should throw when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+      req.params.teamId = 'team1';
+
+      await controller.deleteTeam(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('getTeamUsers should throw when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+    it('getTeamUsers should throw when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+      req.params.teamId = 'team1';
+
+      await controller.getTeamUsers(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+    });
+
+  });
+
+  // -----------------------------------------------------------------------
+  // Branch coverage: getTeam - missing orgId and userId throws (before try)
+  // -----------------------------------------------------------------------
+  describe('getTeam - missing params (thrown outside try)', () => {
+    it('should throw BadRequestError when orgId is missing', async () => {
+      req.user = { userId: '507f1f77bcf86cd799439011' };
+      req.params.teamId = 'team1';
+
+      try {
+        await controller.getTeam(req, res, next);
+        // May throw directly since the check is outside try block
+      } catch (error: any) {
+        expect(error.message).to.include('Organization ID is required');
+      }
+    });
+
+    it('should throw BadRequestError when userId is missing', async () => {
+      req.user = { orgId: '507f1f77bcf86cd799439012' };
+      req.params.teamId = 'team1';
+
+      try {
+        await controller.getTeam(req, res, next);
+      } catch (error: any) {
+        expect(error.message).to.include('User ID is required');
+      }
+    });
+  });
+});

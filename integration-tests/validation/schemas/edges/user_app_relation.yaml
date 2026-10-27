@@ -1,0 +1,29 @@
+name: user_app_relation_edge
+description: UserAppRelation edge document (matches Arango userAppRelation collection).
+fields:
+  syncState:
+    required: false
+    type: string
+    enum:
+      - NOT_STARTED
+      - IN_PROGRESS
+      - PAUSED
+      - COMPLETED
+      - FAILED
+  lastSyncUpdate:
+    required: false
+    type: integer
+  sourceUserId:
+    required: false
+    type: string
+  # Written on every user-app edge since #3115: true for someone who reached the app
+  # only through a share, false for an app member.
+  isExternalUser:
+    required: false
+    type: boolean
+  createdAtTimestamp:
+    required: false
+    type: integer
+  updatedAtTimestamp:
+    required: false
+    type: integer

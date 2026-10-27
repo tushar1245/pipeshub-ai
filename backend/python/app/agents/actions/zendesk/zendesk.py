@@ -1,0 +1,628 @@
+import json
+import logging
+from typing import List, Optional, Tuple
+
+from app.agents.actions.utils import run_async
+from app.agent_loop_lib.tools.base import ParameterType, Tag, ToolParameter
+from app.agent_loop_lib.tools.decorators import tool
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
+from app.connectors.core.constants import IconPaths
+from app.connectors.core.registry.connector_builder import CommonFields
+from app.connectors.core.registry.tool_builder import (
+    ToolDefinition,
+    ToolsetBuilder,
+    ToolsetCategory,
+)
+from app.sources.client.zendesk.zendesk import ZendeskClient
+from app.sources.external.zendesk.zendesk import ZendeskDataSource
+
+logger = logging.getLogger(__name__)
+
+# Define tools
+tools: List[ToolDefinition] = [
+    ToolDefinition(
+        name="get_current_user",
+        description="Get current user information",
+        parameters=[],
+        tags=["users", "info"]
+    ),
+    ToolDefinition(
+        name="list_tickets",
+        description="List support tickets",
+        parameters=[
+            {"name": "status", "type": "string", "description": "Ticket status filter", "required": False}
+        ],
+        tags=["tickets", "list"]
+    ),
+    ToolDefinition(
+        name="get_ticket",
+        description="Get ticket details",
+        parameters=[
+            {"name": "ticket_id", "type": "integer", "description": "Ticket ID", "required": True}
+        ],
+        tags=["tickets", "read"]
+    ),
+    ToolDefinition(
+        name="create_ticket",
+        description="Create a new ticket",
+        parameters=[
+            {"name": "subject", "type": "string", "description": "Ticket subject", "required": True},
+            {"name": "description", "type": "string", "description": "Ticket description", "required": True}
+        ],
+        tags=["tickets", "create"]
+    ),
+    ToolDefinition(
+        name="update_ticket",
+        description="Update a ticket",
+        parameters=[
+            {"name": "ticket_id", "type": "integer", "description": "Ticket ID", "required": True}
+        ],
+        tags=["tickets", "update"]
+    ),
+    ToolDefinition(
+        name="delete_ticket",
+        description="Delete a ticket",
+        parameters=[
+            {"name": "ticket_id", "type": "integer", "description": "Ticket ID", "required": True}
+        ],
+        tags=["tickets", "delete"]
+    ),
+    ToolDefinition(
+        name="list_users",
+        description="List users",
+        parameters=[],
+        tags=["users", "list"]
+    ),
+    ToolDefinition(
+        name="get_user",
+        description="Get user details",
+        parameters=[
+            {"name": "user_id", "type": "integer", "description": "User ID", "required": True}
+        ],
+        tags=["users", "read"]
+    ),
+    ToolDefinition(
+        name="search_tickets",
+        description="Search for tickets",
+        parameters=[
+            {"name": "query", "type": "string", "description": "Search query", "required": True}
+        ],
+        tags=["tickets", "search"]
+    ),
+]
+
+
+# Register Zendesk toolset
+@ToolsetBuilder("Zendesk")\
+    .in_group("Customer Support")\
+    .with_description("Zendesk integration for customer support ticket management")\
+    .with_category(ToolsetCategory.APP)\
+    .with_auth([
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Zendesk",
+            authorize_url="https://{subdomain}.zendesk.com/oauth/authorizations/new",
+            token_url="https://{subdomain}.zendesk.com/oauth/tokens",
+            redirect_uri="toolsets/oauth/callback/zendesk",
+            scopes=OAuthScopeConfig(
+                personal_sync=[],
+                team_sync=[],
+                agent=[
+                    "read",
+                    "write"
+                ]
+            ),
+            fields=[
+                CommonFields.client_id("Zendesk OAuth App"),
+                CommonFields.client_secret("Zendesk OAuth App")
+            ],
+            icon_path=IconPaths.connector_icon("zendesk"),
+            app_group="Customer Support",
+            app_description="Zendesk OAuth application for agent integration"
+        ),
+        AuthBuilder.type(AuthType.API_TOKEN).fields([
+            CommonFields.api_token("Zendesk API Token", "your-api-token"),
+            CommonFields.api_token("Zendesk Subdomain", "your-subdomain", field_name="subdomain")
+        ])
+    ])\
+    .with_tools(tools)\
+    .configure(lambda builder: builder.with_icon(IconPaths.connector_icon("zendesk")))\
+    .build_decorator()
+class Zendesk:
+    """Zendesk tool exposed to the agents"""
+    def __init__(self, client: ZendeskClient) -> None:
+        """Initialize the Zendesk tool"""
+        """
+        Args:
+            client: Zendesk client object
+        Returns:
+            None
+        """
+        self.client = ZendeskDataSource(client)
+
+    @tool(
+        path="/tools/zendesk/get_current_user",
+        short_description="Get current user information",
+        description="Get current authenticated Zendesk user information.",
+        parameters=[],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="read")],
+    )
+    async def get_current_user(self) -> Tuple[bool, str]:
+        """Get current user information"""
+        """
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method
+            response = run_async(self.client.show_current_user())
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error getting current user: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/list_tickets",
+        short_description="List tickets",
+        description="List Zendesk tickets with optional sorting and pagination.",
+        parameters=[
+            ToolParameter(
+                name="sort_by",
+                type=ParameterType.STRING,
+                description="Field to sort by",
+                required=False
+            ),
+            ToolParameter(
+                name="sort_order",
+                type=ParameterType.STRING,
+                description="Sort order (asc or desc)",
+                required=False
+            ),
+            ToolParameter(
+                name="per_page",
+                type=ParameterType.INTEGER,
+                description="Number of tickets per page",
+                required=False
+            ),
+            ToolParameter(
+                name="page",
+                type=ParameterType.INTEGER,
+                description="Page number",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="read")],
+    )
+    def list_tickets(
+        self,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        per_page: Optional[int] = None,
+        page: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """List tickets"""
+        """
+        Args:
+            sort_by: Field to sort by
+            sort_order: Sort order (asc or desc)
+            per_page: Number of tickets per page
+            page: Page number
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method
+            response = run_async(self.client.list_tickets(
+                sort_by=sort_by,
+                sort_order=sort_order,
+                per_page=per_page,
+                page=page
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error listing tickets: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/get_ticket",
+        short_description="Get a specific ticket",
+        description="Get details of a specific Zendesk ticket by its ID.",
+        parameters=[
+            ToolParameter(
+                name="ticket_id",
+                type=ParameterType.STRING,
+                description="ID of the ticket to get",
+                required=True
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="read")],
+    )
+    async def get_ticket(self, ticket_id: str) -> Tuple[bool, str]:
+        """Get a specific ticket"""
+        """
+        Args:
+            ticket_id: ID of the ticket to get
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method (coerce ID to int)
+            tid = int(ticket_id)
+            response = run_async(self.client.show_ticket(ticket_id=tid))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error getting ticket: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/create_ticket",
+        short_description="Create a new ticket",
+        description="Create a new Zendesk ticket with subject, description, and optional assignment/priority.",
+        parameters=[
+            ToolParameter(
+                name="subject",
+                type=ParameterType.STRING,
+                description="Subject of the ticket",
+                required=True
+            ),
+            ToolParameter(
+                name="description",
+                type=ParameterType.STRING,
+                description="Description of the ticket",
+                required=True
+            ),
+            ToolParameter(
+                name="requester_id",
+                type=ParameterType.STRING,
+                description="ID of the requester",
+                required=False
+            ),
+            ToolParameter(
+                name="assignee_id",
+                type=ParameterType.STRING,
+                description="ID of the assignee",
+                required=False
+            ),
+            ToolParameter(
+                name="priority",
+                type=ParameterType.STRING,
+                description="Priority of the ticket",
+                required=False
+            ),
+            ToolParameter(
+                name="status",
+                type=ParameterType.STRING,
+                description="Status of the ticket",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="create")],
+    )
+    def create_ticket(
+        self,
+        subject: str,
+        description: str,
+        requester_id: Optional[str] = None,
+        assignee_id: Optional[str] = None,
+        priority: Optional[str] = None,
+        status: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Create a new ticket"""
+        """
+        Args:
+            subject: Subject of the ticket
+            description: Description of the ticket
+            requester_id: ID of the requester
+            assignee_id: ID of the assignee
+            priority: Priority of the ticket
+            status: Status of the ticket
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Map to data source flat params; description -> comment body
+            response = run_async(self.client.create_ticket(
+                subject=subject,
+                comment={"body": description},
+                requester_id=int(requester_id) if requester_id is not None else None,
+                assignee_id=int(assignee_id) if assignee_id is not None else None,
+                priority=priority,
+                status=status
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error creating ticket: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/update_ticket",
+        short_description="Update a ticket",
+        description="Update an existing Zendesk ticket's subject, description, assignee, priority, or status.",
+        parameters=[
+            ToolParameter(
+                name="ticket_id",
+                type=ParameterType.STRING,
+                description="ID of the ticket to update",
+                required=True
+            ),
+            ToolParameter(
+                name="subject",
+                type=ParameterType.STRING,
+                description="New subject of the ticket",
+                required=False
+            ),
+            ToolParameter(
+                name="description",
+                type=ParameterType.STRING,
+                description="New description of the ticket",
+                required=False
+            ),
+            ToolParameter(
+                name="assignee_id",
+                type=ParameterType.STRING,
+                description="New assignee ID",
+                required=False
+            ),
+            ToolParameter(
+                name="priority",
+                type=ParameterType.STRING,
+                description="New priority of the ticket",
+                required=False
+            ),
+            ToolParameter(
+                name="status",
+                type=ParameterType.STRING,
+                description="New status of the ticket",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="update")],
+    )
+    def update_ticket(
+        self,
+        ticket_id: str,
+        subject: Optional[str] = None,
+        description: Optional[str] = None,
+        assignee_id: Optional[str] = None,
+        priority: Optional[str] = None,
+        status: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Update a ticket"""
+        """
+        Args:
+            ticket_id: ID of the ticket to update
+            subject: New subject of the ticket
+            description: New description of the ticket
+            assignee_id: New assignee ID
+            priority: New priority of the ticket
+            status: New status of the ticket
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method with flat params; description -> comment body
+            tid = int(ticket_id)
+            response = run_async(self.client.update_ticket(
+                ticket_id=tid,
+                subject=subject,
+                comment={"body": description} if description is not None else None,
+                assignee_id=int(assignee_id) if assignee_id is not None else None,
+                priority=priority,
+                status=status
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error updating ticket: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/delete_ticket",
+        short_description="Delete a ticket",
+        description="Delete a Zendesk ticket by its ID.",
+        parameters=[
+            ToolParameter(
+                name="ticket_id",
+                type=ParameterType.STRING,
+                description="ID of the ticket to delete",
+                required=True
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="delete")],
+    )
+    async def delete_ticket(self, ticket_id: str) -> Tuple[bool, str]:
+        """Delete a ticket"""
+        """
+        Args:
+            ticket_id: ID of the ticket to delete
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method (coerce ID to int)
+            tid = int(ticket_id)
+            response = run_async(self.client.delete_ticket(ticket_id=tid))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error deleting ticket: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/list_users",
+        short_description="List users",
+        description="List Zendesk users with optional pagination.",
+        parameters=[
+            ToolParameter(
+                name="per_page",
+                type=ParameterType.INTEGER,
+                description="Number of users per page",
+                required=False
+            ),
+            ToolParameter(
+                name="page",
+                type=ParameterType.INTEGER,
+                description="Page number",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="read")],
+    )
+    def list_users(
+        self,
+        role: Optional[str] = None,
+        include: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """List users"""
+        """
+        Args:
+            per_page: Number of users per page
+            page: Page number
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method (supports role/include among others)
+            response = run_async(self.client.list_users(
+                role=role,
+                include=include
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error listing users: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/get_user",
+        short_description="Get a specific user",
+        description="Get details of a specific Zendesk user by their ID.",
+        parameters=[
+            ToolParameter(
+                name="user_id",
+                type=ParameterType.STRING,
+                description="ID of the user to get",
+                required=True
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="read")],
+    )
+    async def get_user(self, user_id: str) -> Tuple[bool, str]:
+        """Get a specific user"""
+        """
+        Args:
+            user_id: ID of the user to get
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method (coerce ID to int)
+            uid = int(user_id)
+            response = run_async(self.client.show_user(user_id=uid))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error getting user: {e}")
+            return False, json.dumps({"error": str(e)})
+
+    @tool(
+        path="/tools/zendesk/search_tickets",
+        short_description="Search tickets",
+        description="Search Zendesk tickets using a query string with optional sorting and pagination.",
+        parameters=[
+            ToolParameter(
+                name="query",
+                type=ParameterType.STRING,
+                description="Search query",
+                required=True
+            ),
+            ToolParameter(
+                name="sort_by",
+                type=ParameterType.STRING,
+                description="Field to sort by",
+                required=False
+            ),
+            ToolParameter(
+                name="sort_order",
+                type=ParameterType.STRING,
+                description="Sort order (asc or desc)",
+                required=False
+            ),
+            ToolParameter(
+                name="per_page",
+                type=ParameterType.INTEGER,
+                description="Number of results per page",
+                required=False
+            ),
+            ToolParameter(
+                name="page",
+                type=ParameterType.INTEGER,
+                description="Page number",
+                required=False
+            )
+        ],
+        tags=[Tag(key="category", value="customer_support"), Tag(key="type", value="search")],
+    )
+    def search_tickets(
+        self,
+        query: str,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Search tickets"""
+        """
+        Args:
+            query: Search query
+            sort_by: Field to sort by
+            sort_order: Sort order (asc or desc)
+            per_page: Number of results per page
+            page: Page number
+        Returns:
+            Tuple[bool, str]: True if successful, False otherwise
+        """
+        try:
+            # Use ZendeskDataSource method (generic search)
+            response = run_async(self.client.search(
+                query=query,
+                sort_by=sort_by,
+                sort_order=sort_order
+            ))
+
+            if response.success:
+                return True, response.to_json()
+            else:
+                return False, response.to_json()
+        except Exception as e:
+            logger.error(f"Error searching tickets: {e}")
+            return False, json.dumps({"error": str(e)})

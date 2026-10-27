@@ -1,0 +1,796 @@
+import { randomBytes } from 'crypto';
+
+import { EncryptionService } from '../../../libs/encryptor/encryptor';
+import { Logger } from '../../../libs/services/logger.service';
+import { ARANGO_DB_NAME, MONGO_DB_NAME } from '../../../libs/enums/db.enum';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import { loadConfigurationManagerConfig } from '../../configuration_manager/config/config';
+import { configPaths } from '../../configuration_manager/paths/paths';
+import { DefaultMcpScopes } from '../../oauth_provider/config/scopes.config';
+import { normalizeUrl } from '../utils/utils';
+
+// Define interfaces for all service configurations
+export interface SmtpConfig {
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  fromEmail: string;
+}
+
+export const SIGNING_SECRET_BYTES = 32;
+export const SIGNING_SECRETS_ROTATE_ID_FIELD = 'signingSecretsRotateId';
+const SIGNING_SECRETS_CAS_MAX_RETRIES = 5;
+
+export const randomKeyGenerator = (): string =>
+  randomBytes(SIGNING_SECRET_BYTES).toString('hex');
+
+export const resolveFrontendPublicUrl = (storedEndpoint = ''): string =>
+  normalizeUrl(process.env.FRONTEND_PUBLIC_URL!) ||
+  normalizeUrl(storedEndpoint) ||
+  `http://localhost:${process.env.PORT ?? 3000}`;
+
+export interface KafkaConfig {
+  brokers: string[];
+  ssl?: boolean;
+  sasl?: {
+    mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
+    username: string;
+    password: string;
+  };
+}
+
+export interface RedisConfig {
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  tls?: boolean;
+  db?: number;
+}
+
+export interface MongoConfig {
+  uri: string;
+  db: string;
+}
+
+export interface QdrantConfig {
+  port: number;
+  apiKey: string;
+  host: string;
+  grpcPort: number;
+}
+
+export interface ArangoConfig {
+  url: string;
+  db: string;
+  username: string;
+  password: string;
+}
+
+export interface EtcdConfig {
+  host: string;
+  port: number;
+  dialTimeout: number;
+}
+
+export interface EncryptionConfig {
+  key: string;
+  algorithm: string;
+}
+
+export interface DefaultStorageConfig {
+  storageType: string;
+  endpoint: string;
+}
+
+// Main Config Service
+export class ConfigService {
+  private static instance: ConfigService;
+  private keyValueStoreService: KeyValueStoreService;
+  private configManagerConfig: any;
+  private encryptionService: EncryptionService;
+
+  private constructor() {
+    this.configManagerConfig = loadConfigurationManagerConfig();
+    this.keyValueStoreService = KeyValueStoreService.getInstance(
+      this.configManagerConfig,
+    );
+    this.encryptionService = EncryptionService.getInstance(
+      this.configManagerConfig.algorithm,
+      this.configManagerConfig.secretKey,
+    );
+  }
+
+  public static getInstance(): ConfigService {
+    if (!ConfigService.instance) {
+      ConfigService.instance = new ConfigService();
+    }
+    return ConfigService.instance;
+  }
+
+  public async connect(): Promise<void> {
+    await this.keyValueStoreService.connect();
+  }
+
+  private async getEncryptedConfig<T>(
+    configPath: string,
+    fallbackEnvVars: Record<string, any>,
+  ): Promise<T> {
+    try {
+      const encryptedConfig =
+        await this.keyValueStoreService.get<string>(configPath);
+
+      // If config exists in ETCD
+      if (encryptedConfig) {
+        return JSON.parse(this.encryptionService.decrypt(encryptedConfig)) as T;
+      }
+      const fallbackConfig = fallbackEnvVars as T;
+      await this.saveConfigToEtcd(configPath, fallbackConfig);
+
+      return fallbackConfig;
+    } catch (error) {
+      return fallbackEnvVars as T;
+    }
+  }
+
+  // Save config to ETCD
+  private async saveConfigToEtcd<T>(
+    configPath: string,
+    config: T,
+  ): Promise<void> {
+    try {
+      // Encrypt the config before saving
+      const encryptedConfig = this.encryptionService.encrypt(
+        JSON.stringify(config),
+      );
+
+      // Save to key-value store
+      await this.keyValueStoreService.set(configPath, encryptedConfig);
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  // SMTP Configuration
+  public async getSmtpConfig(): Promise<SmtpConfig | null> {
+    const encryptedConfig = await this.keyValueStoreService.get<string>(
+      configPaths.smtp,
+    );
+    if (encryptedConfig) {
+      return JSON.parse(this.encryptionService.decrypt(encryptedConfig));
+    }
+    return null;
+  }
+
+  // Kafka Configuration (supports standard Kafka and AWS MSK with SASL/SCRAM)
+  public async getKafkaConfig(): Promise<KafkaConfig> {
+    return this.getEncryptedConfig<KafkaConfig>(configPaths.broker.kafka, {
+      brokers: process.env.KAFKA_BROKERS
+        ? process.env.KAFKA_BROKERS.split(',')
+        : [],
+      ssl: process.env.KAFKA_SSL === 'true',
+      ...(process.env.KAFKA_USERNAME && {
+        sasl: {
+          mechanism: (process.env.KAFKA_SASL_MECHANISM || 'scram-sha-512') as 'plain' | 'scram-sha-256' | 'scram-sha-512',
+          username: process.env.KAFKA_USERNAME,
+          password: process.env.KAFKA_PASSWORD!,
+        },
+      }),
+    });
+  }
+
+  // Redis Configuration
+  public async getRedisConfig(): Promise<RedisConfig> {
+    await this.saveConfigToEtcd(configPaths.keyValueStore.redis, {
+      host: process.env.REDIS_HOST!,
+      port: parseInt(process.env.REDIS_PORT!, 10),
+      username: process.env.REDIS_USERNAME,
+      password: process.env.REDIS_PASSWORD,
+      tls: process.env.REDIS_TLS === 'true',
+      db: parseInt(process.env.REDIS_DB || '0', 10),
+    });
+
+    return this.getEncryptedConfig<RedisConfig>(
+      configPaths.keyValueStore.redis,
+      {
+        host: process.env.REDIS_HOST!,
+        port: parseInt(process.env.REDIS_PORT!, 10),
+        username: process.env.REDIS_USERNAME,
+        password: process.env.REDIS_PASSWORD,
+        tls: process.env.REDIS_TLS === 'true',
+        db: parseInt(process.env.REDIS_DB || '0', 10),
+      },
+    );
+  }
+
+  // MongoDB Configuration
+  public async getMongoConfig(): Promise<MongoConfig> {
+    
+    await this.saveConfigToEtcd(configPaths.db.mongodb, {
+      uri: process.env.MONGO_URI!,
+      db: MONGO_DB_NAME,
+    });
+
+    return this.getEncryptedConfig<MongoConfig>(configPaths.db.mongodb, {
+      uri: process.env.MONGO_URI!,
+      db: MONGO_DB_NAME,
+    });
+  }
+
+  // Qdrant Configuration
+  public async getQdrantConfig(): Promise<QdrantConfig> {
+    await this.saveConfigToEtcd(configPaths.db.qdrant, {
+      apiKey: process.env.QDRANT_API_KEY!,
+      host: process.env.QDRANT_HOST || 'localhost',
+      port: parseInt(process.env.QDRANT_PORT || '6333', 10),
+      grpcPort: parseInt(process.env.QDRANT_GRPC_PORT || '6334', 10),
+    });
+
+    return this.getEncryptedConfig<QdrantConfig>(configPaths.db.qdrant, {
+      apiKey: process.env.QDRANT_API_KEY!,
+      host: process.env.QDRANT_HOST || 'localhost',
+      port: parseInt(process.env.QDRANT_PORT || '6333', 10),
+      grpcPort: parseInt(process.env.QDRANT_GRPC_PORT || '6334', 10),
+    });
+  }
+
+  // Arango Configuration
+  public async getArangoConfig(): Promise<ArangoConfig> {
+    await this.saveConfigToEtcd(configPaths.db.arangodb, {
+      url: process.env.ARANGO_URL!,
+      db: ARANGO_DB_NAME,
+      username: process.env.ARANGO_USERNAME!,
+      password: process.env.ARANGO_PASSWORD!,
+    });
+
+    return this.getEncryptedConfig<ArangoConfig>(configPaths.db.arangodb, {
+      url: process.env.ARANGO_URL!,
+      db: ARANGO_DB_NAME,
+      username: process.env.ARANGO_USERNAME!,
+      password: process.env.ARANGO_PASSWORD!,
+    });
+  }
+
+  // ETCD Configuration
+  public async getEtcdConfig(): Promise<EtcdConfig> {
+    return {
+      host: process.env.ETCD_HOST!,
+      port: parseInt(process.env.ETCD_PORT!, 10),
+      dialTimeout: parseInt(process.env.ETCD_DIAL_TIMEOUT!, 10),
+    };
+  }
+
+  // Get Common Backend URL
+
+  public async getAuthBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.auth = {
+      ...parsedUrl.auth,
+      endpoint:
+        normalizeUrl(parsedUrl.auth?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.auth.endpoint;
+  }
+
+  public async getCommunicationBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.communication = {
+      ...parsedUrl.communication,
+      endpoint:
+        normalizeUrl(parsedUrl.communication?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.communication.endpoint;
+  }
+
+  public async getKbBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.kb = {
+      ...parsedUrl.kb,
+      endpoint:
+        normalizeUrl(parsedUrl.kb?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.kb.endpoint;
+  }
+
+  public async getEsBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.es = {
+      ...parsedUrl.es,
+      endpoint:
+        normalizeUrl(parsedUrl.es?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.es.endpoint;
+  }
+
+  public async getCmBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.cm = {
+      ...parsedUrl.cm,
+      endpoint:
+        normalizeUrl(parsedUrl.cm?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.cm.endpoint;
+  }
+
+  public async getTokenBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.tokenBackend = {
+      ...parsedUrl.tokenBackend,
+      endpoint:
+        normalizeUrl(parsedUrl.tokenBackend?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.tokenBackend.endpoint;
+  }
+
+  public async getConnectorUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.connectors = {
+      ...parsedUrl.connectors,
+      endpoint: normalizeUrl(process.env.CONNECTOR_BACKEND!) || normalizeUrl(parsedUrl.connectors?.endpoint),
+      publicEndpoint:
+        normalizeUrl(process.env.CONNECTOR_PUBLIC_BACKEND!) ||
+        normalizeUrl(parsedUrl.connectors?.publicEndpoint),
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+    return parsedUrl.connectors.endpoint;
+  }
+  public async getConnectorPublicUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+    return normalizeUrl(parsedUrl.connectors.publicEndpoint) || normalizeUrl(process.env.CONNECTOR_PUBLIC_BACKEND!);
+  }
+
+  public async getIndexingUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.indexing = {
+      ...parsedUrl.indexing,
+      endpoint: normalizeUrl(process.env.INDEXING_BACKEND!) || normalizeUrl(parsedUrl.indexing?.endpoint),
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+    return parsedUrl.indexing.endpoint;
+  }
+  public async getIamBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.iam = {
+      ...parsedUrl.iam,
+      endpoint:
+        normalizeUrl(parsedUrl.iam?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.iam.endpoint;
+  }
+  public async getStorageBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.storage = {
+      ...parsedUrl.storage,
+      endpoint:
+        normalizeUrl(parsedUrl.storage?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.storage.endpoint;
+  }
+
+  public async getFrontendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.frontend = {
+      ...parsedUrl.frontend,
+      publicEndpoint: resolveFrontendPublicUrl(
+        parsedUrl.frontend?.publicEndpoint,
+      ),
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.frontend.publicEndpoint;
+  }
+
+  public async getAiBackendUrl(): Promise<string> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.queryBackend = {
+      ...parsedUrl.queryBackend,
+      endpoint:
+        normalizeUrl(process.env.QUERY_BACKEND!) ||
+        normalizeUrl(parsedUrl.queryBackend?.endpoint) ||
+        `http://localhost:8000`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+
+    return parsedUrl.queryBackend.endpoint;
+  }
+
+  public async getStorageConfig(): Promise<DefaultStorageConfig> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    let parsedUrl = JSON.parse(url);
+
+    // Preserve existing `auth` object if it exists, otherwise create a new one
+    parsedUrl.storage = {
+      ...parsedUrl.storage,
+      endpoint:
+        normalizeUrl(parsedUrl.storage?.endpoint) ||
+        `http://localhost:${process.env.PORT ?? 3000}`,
+    };
+
+    // Save the updated object back to configPaths.endpoint
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+    let storageConfig =
+      (await this.keyValueStoreService.get<string>(
+        configPaths.storageService,
+      )) || '{}';
+
+    const parsedConfig = JSON.parse(storageConfig); // Parse JSON string
+    let storageType = parsedConfig.storageType;
+    if (!storageType) {
+      storageType = 'local';
+      await this.keyValueStoreService.set<string>(
+        configPaths.storageService,
+        JSON.stringify({
+          storageType,
+        }),
+      );
+    }
+    return { storageType, endpoint: parsedUrl.storage.endpoint };
+  }
+
+  // Stored secrets are never overwritten on upgrade. install.sh
+  // --rotate-signing-secrets writes a new ROTATE_SIGNING_SECRETS id; that is
+  // the only path that replaces jwtSecret / scopedJwtSecret / cookieSecret.
+  private secretFromEnvOrGenerated(envName: string): string {
+    const seeded = process.env[envName]?.trim();
+    return seeded || randomKeyGenerator();
+  }
+
+  private applySigningSecretsRotation(parsedKeys: Record<string, string>): boolean {
+    const rotateId = process.env.ROTATE_SIGNING_SECRETS?.trim();
+    if (!rotateId || parsedKeys[SIGNING_SECRETS_ROTATE_ID_FIELD] === rotateId) {
+      return false;
+    }
+    // Env JWT_SECRET / SCOPED_JWT_SECRET / COOKIE_SECRET seed first boot only.
+    // Reusing them here would no-op rotation when those vars are still set.
+    parsedKeys.jwtSecret = randomKeyGenerator();
+    parsedKeys.scopedJwtSecret = randomKeyGenerator();
+    parsedKeys.cookieSecret = randomKeyGenerator();
+    parsedKeys[SIGNING_SECRETS_ROTATE_ID_FIELD] = rotateId;
+    Logger.getInstance({ service: 'ConfigService' }).warn(
+      'Rotated JWT/cookie signing secrets (ROTATE_SIGNING_SECRETS). Existing sessions and service tokens are now invalid.',
+    );
+    return true;
+  }
+
+  private async getOrCreateSecret(
+    field: 'jwtSecret' | 'scopedJwtSecret' | 'cookieSecret',
+    envName: string,
+  ): Promise<string> {
+    for (let attempt = 0; attempt < SIGNING_SECRETS_CAS_MAX_RETRIES; attempt++) {
+      const encryptedCurrent =
+        (await this.keyValueStoreService.get<string>(configPaths.secretKeys)) ??
+        null;
+      let parsedKeys: Record<string, string> = {};
+      if (encryptedCurrent) {
+        parsedKeys = JSON.parse(
+          this.encryptionService.decrypt(encryptedCurrent),
+        );
+      }
+
+      let dirty = this.applySigningSecretsRotation(parsedKeys);
+      if (!parsedKeys[field]) {
+        parsedKeys[field] = this.secretFromEnvOrGenerated(envName);
+        dirty = true;
+      }
+      if (!dirty) {
+        return parsedKeys[field];
+      }
+
+      const encryptedUpdated = this.encryptionService.encrypt(
+        JSON.stringify(parsedKeys),
+      );
+      const wrote = await this.keyValueStoreService.compareAndSet(
+        configPaths.secretKeys,
+        encryptedCurrent,
+        encryptedUpdated,
+      );
+      if (wrote) {
+        return parsedKeys[field];
+      }
+
+      if (attempt === SIGNING_SECRETS_CAS_MAX_RETRIES - 1) {
+        throw new Error(
+          'Failed to persist signing secrets due to concurrent modification. Please retry.',
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+
+    throw new Error('Failed to persist signing secrets.');
+  }
+
+  public async getJwtSecret(): Promise<string> {
+    return this.getOrCreateSecret('jwtSecret', 'JWT_SECRET');
+  }
+
+  public async getScopedJwtSecret(): Promise<string> {
+    return this.getOrCreateSecret('scopedJwtSecret', 'SCOPED_JWT_SECRET');
+  }
+
+  public async getCookieSecret(): Promise<string> {
+    return this.getOrCreateSecret('cookieSecret', 'COOKIE_SECRET');
+  }
+
+  public async getOAuthBackendUrl(): Promise<string> {
+    // Assuming the OAuth backend is the same as the auth backend
+    // When oauth is served from different backend, this method should be overridden
+    return this.getAuthBackendUrl();
+  }
+
+  // OAuth Provider Configuration
+
+  /**
+   * Initialize OAuth issuer configuration in the config store.
+   * This should be called once during application startup/setup.
+   * Separating this from the getter prevents race conditions when
+   * multiple service instances start concurrently.
+   */
+  public async initializeOAuthIssuer(): Promise<void> {
+    const url =
+      (await this.keyValueStoreService.get<string>(configPaths.endpoint)) ||
+      '{}';
+
+    const parsedUrl = JSON.parse(url);
+
+    parsedUrl.oauthProvider = {
+      ...parsedUrl.oauthProvider,
+      issuer: await this.getOAuthIssuer(),
+    };
+
+    await this.keyValueStoreService.set<string>(
+      configPaths.endpoint,
+      JSON.stringify(parsedUrl),
+    );
+  }
+
+  /**
+   * Get the OAuth issuer URL.
+   * Priority: OAUTH_ISSUER env var > frontend URL (if it serves the API) > localhost fallback.
+   */
+  public async getOAuthIssuer(): Promise<string> {
+    const explicit = normalizeUrl(process.env.OAUTH_ISSUER!);
+    if (explicit) return explicit;
+
+    const frontendUrl = await this.getFrontendUrl();
+
+    if (frontendUrl.includes('localhost')) {
+      return `http://localhost:${process.env.PORT ?? 3000}`;
+    }
+
+    return frontendUrl;
+  }
+
+  public async getMcpScopes(): Promise<string[]> {
+    const scopes = process.env.MCP_SCOPES;
+    if (!scopes) {
+      return DefaultMcpScopes;
+    }
+    return scopes.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  public async getDeploymentConfig(): Promise<Record<string, string>> {
+    let config: Record<string, string> = {};
+
+    try {
+      const raw = await this.keyValueStoreService.get<string>(configPaths.deployment);
+      if (raw) {
+        let parsed = JSON.parse(raw);
+        if (typeof parsed === 'string') {
+          parsed = JSON.parse(parsed);
+        }
+        if (typeof parsed === 'object' && parsed !== null) {
+          config = parsed;
+        }
+      }
+    } catch {
+      config = {};
+    }
+
+    // Node.js owns messageBrokerType and kvStoreType — always overwrite from env
+    config.messageBrokerType = (process.env.MESSAGE_BROKER || 'redis').toLowerCase();
+    config.kvStoreType = (process.env.KV_STORE_TYPE || 'redis').toLowerCase();
+
+    // dataStoreType and vectorDbType are owned by Python — never set defaults here
+
+    await this.keyValueStoreService.set(configPaths.deployment, JSON.stringify(config));
+
+    return config;
+  }
+
+  public async readDeploymentConfig(): Promise<Record<string, string>> {
+    try {
+      const raw = await this.keyValueStoreService.get<string>(configPaths.deployment);
+      if (raw) {
+        let parsed = JSON.parse(raw);
+        if (typeof parsed === 'string') {
+          parsed = JSON.parse(parsed);
+        }
+        if (typeof parsed === 'object' && parsed !== null) {
+          return parsed;
+        }
+      }
+    } catch {
+      // fall through
+    }
+    return {};
+  }
+
+  // Single source of truth for whether multi-document transactions are usable.
+  // Authoritative via REPLICA_SET_AVAILABLE; unset is treated as 'false' so the
+  // app fails closed onto the non-transactional code path. The previous URI
+  // heuristic was fragile under Helm (hostname is <release>-mongodb, not the
+  // literal `mongodb` that docker-compose used) and could falsely report 'true'
+  // against a standalone mongod, producing "Transaction numbers are only allowed
+  // on a replica set member or mongos" at runtime. Every deployment path
+  // (Helm chart, docker-compose) now sets this env var explicitly.
+  public async getRsAvailable(): Promise<string> {
+    return process.env.REPLICA_SET_AVAILABLE === 'true' ? 'true' : 'false';
+  }
+}

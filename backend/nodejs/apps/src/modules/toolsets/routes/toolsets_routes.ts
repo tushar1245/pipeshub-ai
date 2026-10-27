@@ -1,0 +1,730 @@
+/**
+ * Toolsets Routes
+ * 
+ * RESTful routes for managing toolsets registry, configuration, and OAuth.
+ * Follows the same architectural pattern as connectors routes with DI container integration.
+ * 
+ * @module toolsets/routes
+ */
+
+import { Router } from 'express';
+import { Container } from 'inversify';
+import { z } from 'zod';
+
+import { AuthMiddleware } from '../../../config';
+import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
+import { requireScopes } from '../../../libs/middlewares/require-scopes.middleware';
+import { OAuthScopeNames } from '../../../libs/enums/oauth-scopes.enum';
+import { AppConfig } from '../../tokens_manager/config/config';
+import {
+  getRegistryToolsets,
+  getToolsetSchema,
+  createToolset,
+  getConfiguredToolsets,
+  checkToolsetStatus,
+  getToolsetConfig,
+  saveToolsetConfig,
+  updateToolsetConfig,
+  deleteToolsetConfig,
+  reauthenticateToolset,
+  getOAuthAuthorizationUrl,
+  handleOAuthCallback,
+  // Instance management (new architecture)
+  getToolsetInstances,
+  createToolsetInstance,
+  getToolsetInstance,
+  updateToolsetInstance,
+  deleteToolsetInstance,
+  getMyToolsets,
+  authenticateToolsetInstance,
+  removeToolsetCredentials,
+  reauthenticateToolsetInstance,
+  getInstanceOAuthAuthorizationUrl,
+  getInstanceStatus,
+  getToolsetToolRules,
+  updateToolsetToolRules,
+  listToolsetOAuthConfigs,
+  updateToolsetOAuthConfig,
+  deleteToolsetOAuthConfig,
+  updateUserToolsetInstance,
+  // Agent-scoped toolset management
+  getAgentToolsets,
+  authenticateAgentToolset,
+  updateAgentToolsetCredentials,
+  removeAgentToolsetCredentials,
+  reauthenticateAgentToolset,
+  getAgentToolsetOAuthUrl,
+} from '../controller/toolsets_controller';
+import { guardPathParams } from '../../../libs/middlewares/safe-path-params.middleware';
+import { messageForUnknownOption } from '../../../libs/utils/validation.utils';
+import { integerCheck } from '../../../libs/utils/zod-formats';
+
+// ============================================================================
+// Validation Schemas
+// ============================================================================
+
+/**
+ * Schema for toolset list query parameters
+ */
+const toolsetListSchema = z.object({
+  query: z.object({
+    page: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().check(integerCheck()).min(1))
+      .optional(),
+    limit: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().check(integerCheck()).min(1).max(200))
+      .optional(),
+    search: z.string().optional(),
+    include_tools: z
+      .preprocess((arg) => arg === 'true', z.boolean())
+      .optional(),
+  }),
+});
+
+/**
+ * Schema for toolset type parameter
+ */
+const toolsetTypeParamSchema = z.object({
+  params: z.object({
+    toolsetType: z.string().min(1, 'Toolset type is required'),
+  }),
+});
+
+/**
+ * Schema for toolset ID parameter
+ */
+const toolsetIdParamSchema = z.object({
+  params: z.object({
+    toolsetId: z.string().min(1, 'Toolset ID is required'),
+  }),
+});
+
+/**
+ * Schema for creating a toolset instance
+ */
+const createToolsetInstanceSchema = z.object({
+  body: z.object({
+    instanceName: z.string().min(1, 'Instance name is required'),
+    toolsetType: z.string().min(1, 'Toolset type is required'),
+    authType: z.string().min(1, 'Auth type is required'),
+    authConfig: z.record(z.string(), z.any()).optional(),
+    baseUrl: z.string().optional(),
+    oauthConfigId: z.string().optional(),
+    oauthInstanceName: z.string().optional(),
+    // 'personal' for the caller's own instance; otherwise an administrator's is the org's.
+    scope: z.enum(['org', 'personal']).optional(),
+  }),
+});
+
+/**
+ * Schema for creating a toolset
+ */
+const createToolsetSchema = z.object({
+  body: z.object({
+    name: z.string().min(1, 'Toolset name is required'),
+    displayName: z.string().optional(),
+    type: z.string().optional(),
+    auth: z.object({
+      type: z.string().min(1, 'Auth type is required'),
+      clientId: z.string().optional(),
+      clientSecret: z.string().optional(),
+      apiToken: z.string().optional(),
+      oauthAppId: z.string().optional(),
+      scopes: z.array(z.string()).optional(),
+      tenantId: z.string().optional(),
+    }),
+    baseUrl: z.string().optional(),
+  }),
+});
+
+/**
+ * Schema for saving toolset configuration
+ */
+const saveToolsetConfigSchema = z.object({
+  body: z.object({
+    auth: z.object({
+      type: z.string().min(1, 'Auth type is required'),
+      clientId: z.string().optional(),
+      clientSecret: z.string().optional(),
+      apiToken: z.string().optional(),
+      oauthAppId: z.string().optional(),
+      scopes: z.array(z.string()).optional(),
+      tenantId: z.string().optional(),
+    }),
+    baseUrl: z.string().optional()
+  }),
+  params: z.object({
+    toolsetId: z.string().min(1, 'Toolset ID is required'),
+  }),
+});
+
+/**
+ * Schema for getting OAuth authorization URL
+ */
+const getOAuthAuthorizationUrlSchema = z.object({
+  params: z.object({
+    toolsetId: z.string().min(1, 'Toolset ID is required'),
+  }),
+  query: z.object({
+    base_url: z.string().optional(),
+  }),
+});
+
+/**
+ * Schema for handling OAuth callback
+ */
+const handleOAuthCallbackSchema = z.object({
+  query: z.object({
+    code: z.string().optional(),
+    state: z.string().optional(),
+    error: z.string().optional(),
+    base_url: z.string().optional(),
+  }),
+});
+
+/**
+ * Schema for updating user's credentials for a non-OAuth toolset instance
+ */
+const toolsetToolRulesSchema = z.object({
+  body: z.object({
+    tools: z.record(z.string(), z.enum(['allow', 'ask', 'block'])),
+  }),
+  params: z.object({
+    instanceId: z.string().min(1, 'Instance ID is required'),
+  }),
+});
+
+const updateUserToolsetInstanceSchema = z.object({
+  body: z.object({
+    auth: z.object({
+      email: z.string().optional(),
+      apiToken: z.string().optional(),
+      username: z.string().optional(),
+      password: z.string().optional(),
+    }),
+  }),
+  params: z.object({
+    instanceId: z.string().min(1, 'Instance ID is required'),
+  }),
+});
+
+/**
+ * Schema for updating agent's credentials for a toolset instance.
+ * Auth fields are toolset-schema-defined (dynamic keys); do not restrict to a fixed set.
+ */
+const updateAgentToolsetInstanceSchema = z.object({
+  body: z.object({
+    auth: z.record(z.string(), z.any()),
+  }),
+  params: z.object({
+    instanceId: z.string().min(1, 'Instance ID is required'),
+    agentKey: z.string().min(1, 'Agent Key is required'),
+  }),
+});
+
+
+/**
+ * Schema for getting my toolsets.
+ * HTTP query params always arrive as strings, so numeric fields must be
+ * coerced and boolean fields preprocessed — identical to toolsetListSchema.
+ */
+const getMyToolsetsSchema = z.object({
+  query: z.object({
+    page: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().check(integerCheck()).min(1))
+      .optional(),
+    limit: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().check(integerCheck()).min(1).max(200))
+      .optional(),
+    search: z.string().optional(),
+    includeRegistry: z
+      .preprocess((arg) => arg === 'true', z.boolean())
+      .optional(),
+    /** When set, only instances for this toolset type (forwarded to Python). */
+    toolsetType: z.string().optional(),
+    authStatus: z
+      .enum(['authenticated', 'not-authenticated'])
+      .optional(),
+    /** 'org' leaves the caller's own personal instances out (the admin catalog). */
+    scope: z
+      .enum(['org'], messageForUnknownOption('Scope must be one of: org.'))
+      .optional(),
+  }),
+});
+
+/**
+ * Schema for getting agent-scoped toolsets (service account agents).
+ * Same pagination/search/registry options as my-toolsets; no authStatus filter on agent list.
+ */
+const getAgentToolsetsSchema = z.object({
+  query: z.object({
+    page: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().check(integerCheck()).min(1))
+      .optional(),
+    limit: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().check(integerCheck()).min(1).max(200))
+      .optional(),
+    search: z.string().optional(),
+    includeRegistry: z
+      .preprocess((arg) => arg === 'true', z.boolean())
+      .optional(),
+    toolsetType: z.string().optional(),
+  }),
+});
+
+// ============================================================================
+// Router Factory
+// ============================================================================
+
+/**
+ * Create and configure the toolsets router.
+ * 
+ * @param container - Dependency injection container
+ * @returns Configured Express router
+ */
+export function createToolsetsRouter(container: Container): Router {
+  const router = Router();
+  guardPathParams(
+    router,
+    'toolsetId',
+    'toolsetType',
+    'instanceId',
+    'oauthConfigId',
+    'agentKey',
+  );
+  const config = container.get<AppConfig>('AppConfig');
+  const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
+
+  // ============================================================================
+  // Registry Routes (Read-Only - In-Memory)
+  // ============================================================================
+
+  /**
+   * GET /registry
+   * Get all available toolsets from registry
+   */
+  router.get(
+    '/registry',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    ValidationMiddleware.validate(toolsetListSchema),
+    getRegistryToolsets(config)
+  );
+
+  /**
+   * GET /registry/:toolsetType/schema
+   * Get toolset schema for a specific type
+   */
+  router.get(
+    '/registry/:toolsetType/schema',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    ValidationMiddleware.validate(toolsetTypeParamSchema),
+    getToolsetSchema(config)
+  );
+
+  // ============================================================================
+  // Toolset Instance Routes (Database + etcd)
+  // ============================================================================
+
+  /**
+   * POST /
+   * Create a new toolset (creates node and saves config)
+   */
+  router.post(
+    '/',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(createToolsetSchema),
+    createToolset(config)
+  );
+
+  /**
+   * GET /configured
+   * Get all configured toolsets for the authenticated user
+   * User ID is extracted from auth token
+   */
+  router.get(
+    '/configured',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    getConfiguredToolsets(config)
+  );
+
+  /**
+   * GET /:toolsetId/status
+   * Check toolset authentication status
+   */
+  router.get(
+    '/:toolsetId/status',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    ValidationMiddleware.validate(toolsetIdParamSchema),
+    checkToolsetStatus(config)
+  );
+
+  /**
+   * GET /:toolsetId/config
+   * Get toolset configuration
+   */
+  router.get(
+    '/:toolsetId/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    ValidationMiddleware.validate(toolsetIdParamSchema),
+    getToolsetConfig(config)
+  );
+
+  /**
+   * POST /:toolsetId/config
+   * Save toolset configuration (OAuth credentials, API tokens, etc)
+   * @deprecated Use POST / for create or PUT /:toolsetId/config for update
+   */
+  router.post(
+    '/:toolsetId/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(saveToolsetConfigSchema),
+    saveToolsetConfig(config)
+  );
+
+  /**
+   * PUT /:toolsetId/config
+   * Update toolset configuration (OAuth credentials, API tokens, etc)
+   */
+  router.put(
+    '/:toolsetId/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(saveToolsetConfigSchema),
+    updateToolsetConfig(config)
+  );
+
+  /**
+   * DELETE /:toolsetId/config
+   * Delete toolset configuration (with safe delete check)
+   */
+  router.delete(
+    '/:toolsetId/config',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_DELETE),
+    ValidationMiddleware.validate(toolsetIdParamSchema),
+    deleteToolsetConfig(config)
+  );
+
+  /**
+   * POST /:toolsetId/reauthenticate
+   * Clear toolset OAuth credentials and mark as unauthenticated, requiring re-authentication
+   */
+  router.post(
+    '/:toolsetId/reauthenticate',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(toolsetIdParamSchema),
+    reauthenticateToolset(config)
+  );
+
+  // ============================================================================
+  // OAuth Routes
+  // ============================================================================
+
+  /**
+   * GET /:toolsetId/oauth/authorize
+   * Get OAuth authorization URL for a toolset
+   */
+  router.get(
+    '/:toolsetId/oauth/authorize',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    ValidationMiddleware.validate(getOAuthAuthorizationUrlSchema),
+    getOAuthAuthorizationUrl(config)
+  );
+
+  /**
+   * GET /oauth/callback
+   * Handle OAuth callback (toolset_id is encoded in state parameter)
+   */
+  router.get(
+    '/oauth/callback',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(handleOAuthCallbackSchema),
+    handleOAuthCallback(config)
+  );
+
+  // ============================================================================
+  // Instance Management Routes (Admin-Created Instances)
+  // ============================================================================
+
+  /**
+   * GET /my-toolsets
+   * Merged view: admin instances + current user's auth status
+   */
+  router.get(
+    '/my-toolsets',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    ValidationMiddleware.validate(getMyToolsetsSchema),
+    getMyToolsets(config)
+  );
+
+  /**
+   * GET /instances
+   * List all toolset instances for the organization
+   */
+  router.get(
+    '/instances',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    getToolsetInstances(config)
+  );
+
+  /**
+   * POST /instances
+   * Create a toolset instance: an org instance for an administrator, a personal one otherwise
+   */
+  router.post(
+    '/instances',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(createToolsetInstanceSchema),
+    createToolsetInstance(config)
+  );
+
+  /**
+   * GET /instances/:instanceId
+   * Get a specific toolset instance
+   */
+  router.get(
+    '/instances/:instanceId',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    getToolsetInstance(config)
+  );
+
+  /**
+   * PUT /instances/:instanceId
+   * Update a toolset instance (admin only)
+   */
+  router.put(
+    '/instances/:instanceId',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    updateToolsetInstance(config)
+  );
+
+  /**
+   * DELETE /instances/:instanceId
+   * Delete a toolset instance (admin only)
+   */
+  router.delete(
+    '/instances/:instanceId',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_DELETE),
+    deleteToolsetInstance(config)
+  );
+
+  /**
+   * POST /instances/:instanceId/authenticate
+   * User authenticates an instance (non-OAuth: API token, bearer, username/password)
+   */
+  router.post(
+    '/instances/:instanceId/authenticate',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    authenticateToolsetInstance(config)
+  );
+
+
+  /**
+   * PUT /instances/:instanceId/credentials
+   *  Update user's credentials for an instance (non-OAuth: API token, bearer, username/password)
+   */
+  router.put(
+    '/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(updateUserToolsetInstanceSchema),
+    updateUserToolsetInstance(config) // Reuse the same controller for both create and update of credentials 
+  );
+  
+  /**
+   * DELETE /instances/:instanceId/credentials
+   * Remove user's credentials for an instance
+   */
+  router.delete(
+    '/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_DELETE),
+    removeToolsetCredentials(config)
+  );
+
+  /**
+   * POST /instances/:instanceId/reauthenticate
+   * Clear user's OAuth tokens, forcing re-authentication
+   */
+  router.post(
+    '/instances/:instanceId/reauthenticate',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    reauthenticateToolsetInstance(config)
+  );
+
+  /**
+   * GET /instances/:instanceId/oauth/authorize
+   * Get OAuth authorization URL for a specific instance
+   */
+  router.get(
+    '/instances/:instanceId/oauth/authorize',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    getInstanceOAuthAuthorizationUrl(config)
+  );
+
+  /**
+   * GET /instances/:instanceId/status
+   * Get authentication status of a specific instance for current user
+   */
+  router.get(
+    '/instances/:instanceId/status',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    getInstanceStatus(config)
+  );
+
+  /**
+   * GET /instances/:instanceId/tool-rules
+   * The instance's tool approval rules: everyone reads them, admins change them
+   */
+  router.get(
+    '/instances/:instanceId/tool-rules',
+    authMiddleware.authenticate.bind(authMiddleware),
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    getToolsetToolRules(config),
+  );
+
+  /**
+   * PUT /instances/:instanceId/tool-rules
+   * Replace the instance's tool approval rules (admin only)
+   */
+  router.put(
+    '/instances/:instanceId/tool-rules',
+    authMiddleware.authenticate.bind(authMiddleware),
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    ValidationMiddleware.validate(toolsetToolRulesSchema),
+    updateToolsetToolRules(config),
+  );
+
+  /**
+   * GET /oauth-configs/:toolsetType
+   * List OAuth configs for a toolset type (admin)
+   */
+  router.get(
+    '/oauth-configs/:toolsetType',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_READ),
+    listToolsetOAuthConfigs(config)
+  );
+
+  /**
+   * PUT /oauth-configs/:toolsetType/:oauthConfigId
+   * Update an OAuth config for a toolset type (admin only).
+   * Deauthenticates all affected users in parallel.
+   */
+  router.put(
+    '/oauth-configs/:toolsetType/:oauthConfigId',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_WRITE),
+    updateToolsetOAuthConfig(config)
+  );
+
+  /**
+   * DELETE /oauth-configs/:toolsetType/:oauthConfigId
+   * Delete an OAuth config (admin only). Safe delete: blocked if instances use it.
+   */
+  router.delete(
+    '/oauth-configs/:toolsetType/:oauthConfigId',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.TOOLSET_DELETE),
+    deleteToolsetOAuthConfig(config)
+  );
+
+  // ============================================================================
+  // Agent-Scoped Toolset Routes (Service Account Agents)
+  // ============================================================================
+
+  /**
+   * GET /agents/:agentKey
+   * Get all toolset instances with auth status for a service account agent.
+   * Requires the requesting user to have edit access to the agent.
+   */
+  router.get(
+    '/agents/:agentKey',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.AGENT_READ),
+    ValidationMiddleware.validate(getAgentToolsetsSchema),
+    getAgentToolsets(config)
+  );
+
+  /**
+   * POST /agents/:agentKey/instances/:instanceId/authenticate
+   * Authenticate a toolset instance on behalf of a service account agent
+   * (non-OAuth: API token, bearer, username/password).
+   */
+  router.post(
+    '/agents/:agentKey/instances/:instanceId/authenticate',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.AGENT_WRITE),
+    authenticateAgentToolset(config)
+  );
+
+  /**
+   * PUT /agents/:agentKey/instances/:instanceId/credentials
+   * Update credentials for a toolset instance on behalf of a service account agent.
+   */
+  router.put(
+    '/agents/:agentKey/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.AGENT_WRITE),
+    ValidationMiddleware.validate(updateAgentToolsetInstanceSchema),
+    updateAgentToolsetCredentials(config)
+  );
+
+  /**
+   * DELETE /agents/:agentKey/instances/:instanceId/credentials
+   * Remove credentials for a toolset instance on behalf of a service account agent.
+   */
+  router.delete(
+    '/agents/:agentKey/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.AGENT_WRITE),
+    removeAgentToolsetCredentials(config)
+  );
+
+  /**
+   * POST /agents/:agentKey/instances/:instanceId/reauthenticate
+   * Clear agent's OAuth tokens for an instance, forcing re-authentication.
+   */
+  router.post(
+    '/agents/:agentKey/instances/:instanceId/reauthenticate',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.AGENT_WRITE),
+    reauthenticateAgentToolset(config)
+  );
+
+  /**
+   * GET /agents/:agentKey/instances/:instanceId/oauth/authorize
+   * Get OAuth authorization URL for a toolset instance scoped to a service account agent.
+   */
+  router.get(
+    '/agents/:agentKey/instances/:instanceId/oauth/authorize',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.AGENT_WRITE),
+    getAgentToolsetOAuthUrl(config)
+  );
+
+  return router;
+}
+
+// Backward compatibility export
+export default createToolsetsRouter;

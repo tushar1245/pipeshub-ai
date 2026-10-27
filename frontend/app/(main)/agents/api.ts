@@ -1,0 +1,835 @@
+import { apiClient } from '@/lib/api';
+import { mapApiConversationToConversation, type ForkConversationResult } from '@/chat/api';
+import type { ConversationApiResponse, ConversationsListResponse, Conversation } from '@/chat/types';
+import { CONVERSATION_MESSAGES_PAGE_SIZE } from '@/chat/constants';
+
+// The agent conversations endpoint returns both owned and shared lists in one
+// response, unlike `/api/v1/conversations` which now takes a `source` param.
+type AgentConversationsListApiResponse = {
+  conversations: ConversationApiResponse[];
+  sharedWithMeConversations: ConversationApiResponse[];
+  pagination: ConversationsListResponse['pagination'];
+};
+import type {
+  AgentDetail,
+  AgentsListApiResponse,
+  AgentsListPagination,
+  AgentsListParams,
+  AgentsListResult,
+  AgentToolsListRow,
+  AgentConversationDetailApiResponse,
+  AgentConversationsListResult,
+  CreateAgentApiResponse,
+  FetchAgentConversationResult,
+  GetAgentApiResponse,
+  GetAgentResult,
+  KnowledgeBaseForBuilder,
+  KnowledgeBaseListApiResponse,
+  KnowledgeBasesForBuilderResult,
+  KnowledgeHubAppNode,
+  KnowledgeHubNodesApiResponse,
+  UpdateAgentApiResponse,
+} from './types';
+import type { AgentFormPayload } from './agent-builder/types';
+import type { BuilderSidebarToolset } from '@/app/(main)/toolsets/api';
+
+const AGENTS_BASE_URL = '/api/v1/agents';
+
+const KB_PAGE_MAX = 100;
+
+/**
+ * Fallback `agentPagination.limit` when the grouped archives response omits the envelope.
+ * Must match `AGENT_ARCHIVES_INITIAL_AGENT_LIMIT` in es_controller.ts (not the `parseInt(..., 10)` radix).
+ */
+const DEFAULT_AGENT_ARCHIVES_AGENT_LIMIT = 5;
+const WEB_SEARCH_TOOL_FULL_NAME = 'web_search.search';
+
+/** Stable slug for `tool-*` node types; flow reconstruction matches on `full_name` first. */
+function catalogToolIdFromFullName(fullName: string): string {
+  const s = fullName.trim() || 'tool';
+  return s.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+/**
+ * Flatten tools from toolset registry + configured instances (GET /api/v1/toolsets/...).
+ * Replaces removed GET /api/v1/agents/tools/list.
+ */
+export function buildToolsCatalogFromToolsets(toolsets: BuilderSidebarToolset[]): AgentToolsListRow[] {
+  const rows: AgentToolsListRow[] = [];
+  const seen = new Set<string>();
+  for (const ts of toolsets) {
+    const appName = (ts.toolsetType || ts.normalized_name || ts.name || 'other').trim() || 'other';
+    for (const t of ts.tools || []) {
+      const full_name = (t.fullName || '').trim() || `${appName}.${t.name || 'tool'}`;
+      if (seen.has(full_name)) continue;
+      seen.add(full_name);
+      const tool_name = (t.name || '').trim() || full_name.split('.').pop() || 'tool';
+      rows.push({
+        tool_id: catalogToolIdFromFullName(full_name),
+        app_name: appName,
+        tool_name,
+        full_name,
+        description: (t.description || '').trim(),
+        parameters: [],
+      });
+    }
+  }
+  return rows;
+}
+
+/** Add tools that exist only on the saved agent (e.g. older toolsets) and prefer `_key` as `tool_id` when present. */
+export function mergeToolsFromAgentDetail(
+  agent: AgentDetail | null,
+  catalog: AgentToolsListRow[]
+): AgentToolsListRow[] {
+  const byFull = new Map<string, AgentToolsListRow>();
+  for (const r of catalog) {
+    byFull.set(r.full_name, { ...r });
+  }
+
+  if (!agent?.toolsets?.length) {
+    return Array.from(byFull.values());
+  }
+
+  for (const ts of agent.toolsets) {
+    const appName = (ts.name || ts.type || 'other').trim() || 'other';
+    for (const t of ts.tools || []) {
+      const full_name = (t.fullName || '').trim() || `${appName}.${t.name || 'tool'}`;
+      const prev = byFull.get(full_name);
+      if (prev) {
+        byFull.set(full_name, {
+          ...prev,
+          tool_id: t._key || prev.tool_id,
+          description: (prev.description || t.description || '').trim(),
+        });
+      } else {
+        byFull.set(full_name, {
+          tool_id: t._key || catalogToolIdFromFullName(full_name),
+          app_name: appName,
+          tool_name: (t.name || '').trim() || full_name.split('.').pop() || 'tool',
+          full_name,
+          description: (t.description || '').trim(),
+          parameters: [],
+        });
+      }
+    }
+  }
+  return Array.from(byFull.values());
+}
+
+/**
+ * Collect `fullName` from GET /agents/:id `toolsets[].tools[]` AND `mcpServers[].tools[]`
+ * for stream payloads. This is the "select all" catalog consumed by the chat Actions/MCP
+ * tabs — MCP names MUST be included here, otherwise toggling any single toolset tool off
+ * would diff against a catalog missing MCP names and silently drop every MCP tool too
+ * (see `toggleTool`/`setGroupToolsEnabled` in `agent-scoped-resources-panel.tsx`).
+ */
+export function extractAgentToolFullNames(agent: AgentDetail | null | undefined): string[] {
+  const names: string[] = [];
+  if (agent?.toolsets?.length) {
+    for (const ts of agent.toolsets) {
+      if (!ts?.tools?.length) continue;
+      for (const t of ts.tools) {
+        if (typeof t.fullName === 'string') {
+          names.push(t.fullName);
+        }
+      }
+    }
+  }
+  if (agent?.mcpServers?.length) {
+    for (const server of agent.mcpServers) {
+      if (!server?.tools?.length) continue;
+      for (const t of server.tools) {
+        if (typeof t.fullName === 'string') {
+          names.push(t.fullName);
+        }
+      }
+    }
+  }
+  // Agent-level web search is runtime-enabled as an internal tool. Expose a
+  // stable pseudo fullName so the chat Actions panel can toggle it like other tools.
+  if (agent?.webSearch?.provider) names.push(WEB_SEARCH_TOOL_FULL_NAME);
+  return names;
+}
+
+type KnowledgeGraphEntry = Record<string, unknown>;
+
+function isKnowledgeGraphEntry(value: unknown): value is KnowledgeGraphEntry {
+  return Boolean(value) && typeof value === 'object';
+}
+
+/**
+ * A knowledge graph entry is a Collection (KB) iff the backend resolved it to
+ * `type === 'KB'` — each KB is its own app, identified by its own
+ * `connectorId`. Do not use `filters.recordGroups` for this: that field is a
+ * legacy holdover, always empty for KBs created after the KB-apps migration.
+ */
+function isKbKnowledgeEntry(entry: KnowledgeGraphEntry): boolean {
+  return typeof entry.type === 'string' && entry.type.trim().toUpperCase() === 'KB';
+}
+
+/** Toolset groups for agent chat Actions tab (labels, icons, search metadata). */
+export interface AgentChatToolGroupRow {
+  label: string;
+  toolsetSlug: string;
+  /** Stable id for UI keys — same toolset type may appear multiple times as instances. */
+  instanceId?: string;
+  iconPath?: string;
+  /** An MCP server's catalog type, which picks its logo. */
+  typeId?: string;
+  fullNames: string[];
+  toolDescriptions?: Record<string, string>;
+}
+
+export function buildAgentChatToolGroups(agent: AgentDetail | null | undefined): AgentChatToolGroupRow[] {
+  const groups: AgentChatToolGroupRow[] = [];
+  if (agent?.toolsets?.length) {
+    for (const ts of agent.toolsets) {
+      const fullNames = (ts.tools || [])
+        .map((t) => (typeof t.fullName === 'string' ? t.fullName.trim() : ''))
+        .filter(Boolean);
+      if (fullNames.length === 0) continue;
+
+      const toolDescriptions: Record<string, string> = {};
+      for (const t of ts.tools || []) {
+        const fn = typeof t.fullName === 'string' ? t.fullName.trim() : '';
+        if (!fn) continue;
+        const d = typeof t.description === 'string' ? t.description.trim() : '';
+        if (d) toolDescriptions[fn] = d;
+      }
+
+      const instanceLabel = typeof ts.instanceName === 'string' ? ts.instanceName.trim() : '';
+      const productLabel = (ts.displayName || ts.name || 'Tools').trim();
+      const instanceId = typeof ts.instanceId === 'string' ? ts.instanceId.trim() : '';
+      groups.push({
+        label: instanceLabel || productLabel,
+        toolsetSlug: (typeof ts.name === 'string' ? ts.name : '').trim(),
+        ...(instanceId ? { instanceId } : {}),
+        iconPath:
+          typeof ts.iconPath === 'string' && ts.iconPath.trim() ? ts.iconPath.trim() : undefined,
+        fullNames,
+        toolDescriptions: Object.keys(toolDescriptions).length ? toolDescriptions : undefined,
+      });
+    }
+  }
+
+  if (agent?.webSearch?.provider) {
+    const provider = agent.webSearch.provider.trim();
+    const providerLabel = agent.webSearch.providerLabel?.trim();
+    groups.push({
+      label: providerLabel || 'Web Search',
+      toolsetSlug: 'web_search',
+      instanceId: `web-search:${provider.toLowerCase()}`,
+      fullNames: [WEB_SEARCH_TOOL_FULL_NAME],
+      toolDescriptions: {
+        [WEB_SEARCH_TOOL_FULL_NAME]: `Search the web using ${providerLabel || provider}.`,
+      },
+    });
+  }
+  return groups;
+}
+
+/** MCP server groups for agent chat MCP tab — mirrors `buildAgentChatToolGroups` one-to-one. */
+export function buildAgentChatMcpGroups(agent: AgentDetail | null | undefined): AgentChatToolGroupRow[] {
+  const groups: AgentChatToolGroupRow[] = [];
+  if (!agent?.mcpServers?.length) return groups;
+
+  for (const server of agent.mcpServers) {
+    const fullNames = (server.tools || [])
+      .map((t) => (typeof t.fullName === 'string' ? t.fullName.trim() : ''))
+      .filter(Boolean);
+    if (fullNames.length === 0) continue;
+
+    const toolDescriptions: Record<string, string> = {};
+    for (const t of server.tools || []) {
+      const fn = typeof t.fullName === 'string' ? t.fullName.trim() : '';
+      if (!fn) continue;
+      const d = typeof t.description === 'string' ? t.description.trim() : '';
+      if (d) toolDescriptions[fn] = d;
+    }
+
+    const instanceId = typeof server.instanceId === 'string' ? server.instanceId.trim() : '';
+    groups.push({
+      label: (server.displayName || server.name || 'MCP Server').trim(),
+      toolsetSlug: 'mcp',
+      ...(instanceId ? { instanceId } : {}),
+      typeId: server.typeId?.trim() || undefined,
+      fullNames,
+      toolDescriptions: Object.keys(toolDescriptions).length ? toolDescriptions : undefined,
+    });
+  }
+  return groups;
+}
+
+/** Connector instance ids (non–knowledge-base) from the agent graph `knowledge[]` entry. */
+/** A node a knowledge source is limited to, as a row of the agent chat panel. */
+export interface AgentKnowledgeNode {
+  id: string;
+  name: string;
+  nodeType: string;
+}
+
+/**
+ * The record groups, folders and records a knowledge source is limited to
+ * (`filters.recordGroups` / `filters.records`), named from the `nodes` the
+ * builder saves beside them. Empty for a source used as a whole.
+ */
+export function agentKnowledgeNodes(entry: KnowledgeGraphEntry): {
+  recordGroups: AgentKnowledgeNode[];
+  records: AgentKnowledgeNode[];
+} {
+  const stored = entry.filtersParsed ?? entry.filters;
+  let filters: Record<string, unknown> = {};
+  if (typeof stored === 'string') {
+    try {
+      filters = (JSON.parse(stored) as Record<string, unknown>) ?? {};
+    } catch {
+      filters = {};
+    }
+  } else if (stored && typeof stored === 'object') {
+    filters = stored as Record<string, unknown>;
+  }
+  const sourceId = typeof entry.connectorId === 'string' ? entry.connectorId.trim() : '';
+  const named = new Map<string, AgentKnowledgeNode>();
+  for (const node of Array.isArray(filters.nodes) ? filters.nodes : []) {
+    if (node && typeof node === 'object' && typeof (node as AgentKnowledgeNode).id === 'string') {
+      named.set((node as AgentKnowledgeNode).id, node as AgentKnowledgeNode);
+    }
+  }
+  const nodesOf = (key: 'recordGroups' | 'records', fallbackType: string): AgentKnowledgeNode[] =>
+    (Array.isArray(filters[key]) ? (filters[key] as unknown[]) : [])
+      // Agents saved before each collection became its own source listed the collection here.
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0 && id !== sourceId)
+      .map((id) => ({
+        id,
+        name: named.get(id)?.name || id,
+        nodeType: named.get(id)?.nodeType || fallbackType,
+      }));
+  return { recordGroups: nodesOf('recordGroups', 'recordGroup'), records: nodesOf('records', 'folder') };
+}
+
+function isLimitedKnowledgeEntry(entry: KnowledgeGraphEntry): boolean {
+  const nodes = agentKnowledgeNodes(entry);
+  return nodes.recordGroups.length > 0 || nodes.records.length > 0;
+}
+
+export function extractAgentKnowledgeDefaults(
+  agent: AgentDetail | null | undefined
+): { apps: string[]; kb: string[]; recordGroups: string[]; records: string[] } {
+  const apps: string[] = [];
+  const kb: string[] = [];
+  const recordGroups: string[] = [];
+  const records: string[] = [];
+  const raw = agent?.knowledge;
+  if (!Array.isArray(raw)) return { apps, kb, recordGroups, records };
+
+  for (const entry of raw) {
+    if (!isKnowledgeGraphEntry(entry)) continue;
+    const connectorId = typeof entry.connectorId === 'string' ? entry.connectorId.trim() : '';
+    if (!connectorId) continue;
+
+    const nodes = agentKnowledgeNodes(entry);
+    if (nodes.recordGroups.length > 0 || nodes.records.length > 0) {
+      recordGroups.push(...nodes.recordGroups.map((node) => node.id));
+      records.push(...nodes.records.map((node) => node.id));
+    } else if (isKbKnowledgeEntry(entry)) {
+      kb.push(connectorId);
+    } else {
+      apps.push(connectorId);
+    }
+  }
+
+  return {
+    apps: Array.from(new Set(apps)),
+    kb: Array.from(new Set(kb)),
+    recordGroups: Array.from(new Set(recordGroups)),
+    records: Array.from(new Set(records)),
+  };
+}
+
+/**
+ * App connector rows (instance ids + labels) for agent chat UI — excludes KB-backed sources.
+ * A connector limited to some record groups, folders or records is listed as those nodes.
+ */
+export function extractAgentKnowledgeConnectors(
+  agent: AgentDetail | null | undefined
+): Array<{ id: string; label: string; connectorKind: string; nodeType?: string; source?: LimitedRowSource }> {
+  const rows: Array<{ id: string; label: string; connectorKind: string; nodeType?: string; source?: LimitedRowSource }> = [];
+  const seen = new Set<string>();
+  const raw = agent?.knowledge;
+  if (!Array.isArray(raw)) return rows;
+
+  for (const entry of raw) {
+    if (!isKnowledgeGraphEntry(entry)) continue;
+    const connectorId = typeof entry.connectorId === 'string' ? entry.connectorId.trim() : '';
+    if (!connectorId) continue;
+
+    if (isKbKnowledgeEntry(entry)) continue;
+
+    if (seen.has(connectorId)) continue;
+    seen.add(connectorId);
+
+    const label =
+      typeof entry.displayName === 'string' && entry.displayName.trim()
+        ? entry.displayName.trim()
+        : typeof entry.name === 'string' && entry.name.trim()
+          ? entry.name.trim()
+          : connectorId.split('/').pop() || connectorId;
+    const connectorKind =
+      (typeof entry.type === 'string' && entry.type.trim()) ||
+      (typeof entry.name === 'string' && entry.name.trim()) ||
+      label;
+    if (isLimitedKnowledgeEntry(entry)) {
+      const nodes = agentKnowledgeNodes(entry);
+      const source = { id: connectorId, label, kind: connectorKind };
+      for (const node of [...nodes.recordGroups, ...nodes.records]) {
+        rows.push({ id: node.id, label: node.name, connectorKind, nodeType: node.nodeType, source });
+      }
+      continue;
+    }
+    rows.push({ id: connectorId, label, connectorKind });
+  }
+  return rows;
+}
+
+/** The connector or collection a limited row belongs to, so the rows can be shown under it. */
+export interface LimitedRowSource {
+  id: string;
+  label: string;
+  /** Connector type (`Jira`, `KB`, …), for the icon. */
+  kind: string;
+}
+
+/** Row for agent-scoped Collections UI — id is the KB entry's own `connectorId`. */
+export interface AgentKnowledgeCollectionRow {
+  id: string;
+  name: string;
+  /** Knowledge graph `type` (e.g. `KB`, `Jira`, `Confluence`) — drives row artwork. */
+  sourceType?: string;
+  /** Set on a folder or record a collection is limited to; absent for a whole collection. */
+  nodeType?: string;
+  /** The collection a limited row belongs to. */
+  source?: LimitedRowSource;
+}
+
+/**
+ * Build collection rows from the agent knowledge graph — one row per KB
+ * entry (`type === 'KB'`), keyed by its own `connectorId`. Labels use
+ * `displayName` / `name` on the knowledge entry so the list stays populated
+ * even when ids do not match `/knowledge-hub/nodes` collection roots.
+ */
+export function extractAgentKnowledgeCollectionRows(
+  agent: AgentDetail | null | undefined
+): AgentKnowledgeCollectionRow[] {
+  const rows: AgentKnowledgeCollectionRow[] = [];
+  const seen = new Set<string>();
+  const raw = agent?.knowledge;
+  if (!Array.isArray(raw)) return rows;
+
+  for (const entry of raw) {
+    if (!isKnowledgeGraphEntry(entry)) continue;
+    if (!isKbKnowledgeEntry(entry)) continue;
+
+    const connectorId = typeof entry.connectorId === 'string' ? entry.connectorId.trim() : '';
+    if (!connectorId || seen.has(connectorId)) continue;
+    seen.add(connectorId);
+
+    const name =
+      (typeof entry.displayName === 'string' && entry.displayName.trim()) ||
+      (typeof entry.name === 'string' && entry.name.trim()) ||
+      'Collection';
+
+    const sourceType =
+      typeof entry.type === 'string' && entry.type.trim()
+        ? entry.type.trim()
+        : undefined;
+
+    if (isLimitedKnowledgeEntry(entry)) {
+      const nodes = agentKnowledgeNodes(entry);
+      const source = { id: connectorId, label: name, kind: sourceType ?? 'KB' };
+      for (const node of [...nodes.recordGroups, ...nodes.records]) {
+        rows.push({ id: node.id, name: node.name, sourceType, nodeType: node.nodeType, source });
+      }
+      continue;
+    }
+    rows.push({ id: connectorId, name, sourceType });
+  }
+  return rows;
+}
+
+function emptyPagination(): AgentsListPagination {
+  return {
+    currentPage: 1,
+    limit: 20,
+    totalItems: 0,
+    totalPages: 0,
+    hasNext: false,
+    hasPrev: false,
+  };
+}
+
+export const AgentsApi = {
+  async getAgents(params?: AgentsListParams): Promise<AgentsListResult> {
+    const query: Record<string, string | number> = {};
+    if (params?.page != null) query.page = params.page;
+    if (params?.limit != null) query.limit = params.limit;
+    if (params?.search) query.search = params.search;
+    if (params?.sort) query.sort_by = params.sort;
+    if (params?.order) query.sort_order = params.order;
+
+    const { data } = await apiClient.get<AgentsListApiResponse>(AGENTS_BASE_URL, { params: query });
+    return {
+      agents: data?.agents ?? [],
+      pagination: data?.pagination ?? emptyPagination(),
+    };
+  },
+
+  /**
+   * `quiet` keeps a failed lookup from raising the global error toast, for callers that already cope
+   * with it: someone a chat was shared with may not be allowed to open the agent it belongs to.
+   */
+  async getAgent(agentKey: string, options?: { quiet?: boolean }): Promise<GetAgentResult> {
+    const { data } = await apiClient.get<GetAgentApiResponse>(
+      `${AGENTS_BASE_URL}/${agentKey}`,
+      options?.quiet ? { suppressErrorToast: true } : undefined,
+    );
+    const agent = data?.agent;
+    if (!agent || typeof agent !== 'object') {
+      return { agent: null, toolFullNames: [] };
+    }
+    return {
+      agent,
+      toolFullNames: extractAgentToolFullNames(agent),
+    };
+  },
+
+  /**
+   * Single agent conversation + messages (chat history).
+   * GET /api/v1/agents/:agentId/conversations/:conversationId
+   */
+  async fetchAgentConversation(
+    agentId: string,
+    conversationId: string,
+    options?: { page?: number; limit?: number }
+  ): Promise<FetchAgentConversationResult> {
+    const { data } = await apiClient.get<AgentConversationDetailApiResponse>(
+      `${AGENTS_BASE_URL}/${agentId}/conversations/${conversationId}`,
+      { params: { page: options?.page, limit: options?.limit } },
+    );
+
+    const conv = data?.conversation;
+    if (!conv) {
+      throw new Error('Agent conversation not found');
+    }
+    const messages = conv.messages ?? [];
+    const page = options?.page ?? 1;
+    const pagination = conv.pagination ?? {
+      page,
+          limit: options?.limit ?? CONVERSATION_MESSAGES_PAGE_SIZE,
+      totalCount: 0,
+      totalPages: 1,
+      hasNextPage: false,
+      hasPrevPage: page > 1,
+    };
+    return {
+      conversation: conv,
+      messages,
+      pagination,
+    };
+  },
+
+  /**
+   * List conversations for a single agent (sidebar + more panel).
+   * GET /api/v1/agents/:agentId/conversations
+   */
+  async fetchAgentConversations(
+    agentId: string,
+    params?: { page?: number; limit?: number; search?: string }
+  ): Promise<AgentConversationsListResult> {
+    const query: Record<string, string | number> = {};
+    if (params?.page != null) query.page = params.page;
+    if (params?.limit != null) query.limit = params.limit;
+    if (params?.search) query.search = params.search;
+
+    const { data } = await apiClient.get<AgentConversationsListApiResponse>(
+      `${AGENTS_BASE_URL}/${agentId}/conversations`,
+      { params: query }
+    );
+
+    const pagination = data?.pagination ?? {
+      page: 1,
+      limit: 20,
+      totalCount: 0,
+      totalPages: 0,
+      hasNextPage: false,
+      hasPrevPage: false,
+    };
+
+    return {
+      conversations: (data?.conversations ?? []).map(mapApiConversationToConversation),
+      sharedConversations: (data?.sharedWithMeConversations ?? []).map(mapApiConversationToConversation),
+      pagination,
+    };
+  },
+
+  /**
+   * DELETE /api/v1/agents/:agentId/conversations/:conversationId
+   */
+  async deleteAgentConversation(agentId: string, conversationId: string): Promise<void> {
+    await apiClient.delete(`${AGENTS_BASE_URL}/${agentId}/conversations/${conversationId}`);
+  },
+
+  /**
+   * Copy an agent conversation into a new chat, including every message up to `messageId`.
+   * POST /api/v1/agents/:agentId/conversations/:conversationId/message/:messageId/fork
+   */
+  async forkAgentConversation(
+    agentId: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<ForkConversationResult> {
+    const { data } = await apiClient.post<ForkConversationResult>(
+      `${AGENTS_BASE_URL}/${agentId}/conversations/${conversationId}/message/${messageId}/fork`,
+    );
+    return data;
+  },
+
+  /**
+   * PATCH /api/v1/agents/:agentKey/conversations/:conversationId/title
+   */
+  async renameAgentConversation(agentId: string, conversationId: string, title: string): Promise<void> {
+    await apiClient.patch(`${AGENTS_BASE_URL}/${agentId}/conversations/${conversationId}/title`, { title });
+  },
+
+  /**
+   * GET /api/v1/agents/conversations/show/archives
+   * Returns all archived agent conversations for the current user, grouped by agentKey.
+   */
+  async fetchAllAgentsArchivedConversations(params?: { agentPage?: number; agentLimit?: number }): Promise<{
+    groups: Array<{
+      agentKey: string;
+      conversations: Conversation[];
+      pagination: {
+        page: number;
+        limit: number;
+        totalCount: number;
+        totalPages: number;
+        hasNextPage: boolean;
+        hasPrevPage: boolean;
+      };
+    }>;
+    agentPagination: {
+      page: number;
+      limit: number;
+      totalCount: number;
+      totalPages: number;
+      hasNextPage: boolean;
+      hasPrevPage: boolean;
+    };
+  }> {
+    const query: Record<string, string | number> = {};
+    if (params?.agentPage != null) query.agentPage = params.agentPage;
+    if (params?.agentLimit != null) query.agentLimit = params.agentLimit;
+
+    const { data } = await apiClient.get<{
+      groups: Array<{
+        agentKey: string;
+        conversations: ReturnType<typeof mapApiConversationToConversation>[];
+        pagination: {
+          page: number;
+          limit: number;
+          totalCount: number;
+          totalPages: number;
+          hasNextPage: boolean;
+          hasPrevPage: boolean;
+        };
+      }>;
+      agentPagination: {
+        page: number;
+        limit: number;
+        totalCount: number;
+        totalPages: number;
+        hasNextPage: boolean;
+        hasPrevPage: boolean;
+      };
+    }>(`${AGENTS_BASE_URL}/conversations/show/archives`, { params: query });
+
+    return {
+      groups: (data?.groups ?? []).map((g) => ({
+        agentKey: g.agentKey,
+        conversations: g.conversations.map((c: any) => mapApiConversationToConversation(c)),
+        pagination: g.pagination,
+      })),
+      agentPagination: data?.agentPagination ?? {
+        page: 1,
+        limit: DEFAULT_AGENT_ARCHIVES_AGENT_LIMIT,
+        totalCount: 0,
+        totalPages: 0,
+        hasNextPage: false,
+        hasPrevPage: false,
+      },
+    };
+  },
+
+  /**
+   * GET /api/v1/agents/:agentId/conversations/show/archives
+   * Returns archived conversations for a specific agent (for "See More" pagination).
+   */
+  async fetchAgentArchivedConversations(
+    agentId: string,
+    params?: { page?: number; limit?: number }
+  ): Promise<AgentConversationsListResult> {
+    const query: Record<string, string | number> = {};
+    if (params?.page != null) query.page = params.page;
+    if (params?.limit != null) query.limit = params.limit;
+
+    const { data } = await apiClient.get<{
+      conversations: any[];
+      pagination: ConversationsListResponse['pagination'];
+    }>(`${AGENTS_BASE_URL}/${agentId}/conversations/show/archives`, { params: query });
+
+    return {
+      conversations: (data?.conversations ?? []).map(mapApiConversationToConversation),
+      sharedConversations: [],
+      pagination: data?.pagination ?? {
+        page: 1, limit: 20, totalCount: 0, totalPages: 0, hasNextPage: false, hasPrevPage: false,
+      },
+    };
+  },
+
+  /**
+   * POST /api/v1/agents/:agentKey/conversations/:conversationId/archive
+   */
+  async archiveAgentConversation(agentId: string, conversationId: string): Promise<void> {
+    await apiClient.post(`${AGENTS_BASE_URL}/${agentId}/conversations/${conversationId}/archive`);
+  },
+
+  /**
+   * POST /api/v1/agents/:agentKey/conversations/:conversationId/unarchive
+   */
+  async restoreAgentConversation(agentId: string, conversationId: string): Promise<void> {
+    await apiClient.post(`${AGENTS_BASE_URL}/${agentId}/conversations/${conversationId}/unarchive`);
+  },
+
+  /** POST /api/v1/agents/create */
+  async createAgent(payload: AgentFormPayload): Promise<AgentDetail> {
+    const { data } = await apiClient.post<CreateAgentApiResponse>(`${AGENTS_BASE_URL}/create`, payload);
+    if (!data?.agent) throw new Error('Create agent failed');
+    return data.agent;
+  },
+
+  /**
+   * PUT /api/v1/agents/:agentKey
+   * Some deployments return only `{ status, message }` on success; we then GET the agent.
+   */
+  async updateAgent(agentKey: string, payload: Partial<AgentFormPayload>): Promise<AgentDetail> {
+    const { data } = await apiClient.put<UpdateAgentApiResponse>(`${AGENTS_BASE_URL}/${agentKey}`, payload);
+
+    if (data?.agent && typeof data.agent === 'object') {
+      return data.agent;
+    }
+
+    const { agent } = await this.getAgent(agentKey);
+    if (agent) {
+      return agent;
+    }
+
+    const msg = typeof data?.message === 'string' ? data.message.trim() : '';
+    throw new Error(msg || 'Update agent failed');
+  },
+
+  /** DELETE /api/v1/agents/:agentKey */
+  async deleteAgent(agentKey: string): Promise<void> {
+    await apiClient.delete(`${AGENTS_BASE_URL}/${agentKey}`);
+  },
+
+  /** GET /api/v1/knowledgeBase/ — collections for agent builder (limit 1–100 per request). */
+  async getKnowledgeBasesForBuilder(params?: { page?: number; limit?: number }): Promise<KnowledgeBasesForBuilderResult> {
+    const limit = Math.min(Math.max(params?.limit ?? KB_PAGE_MAX, 1), KB_PAGE_MAX);
+    const page = Math.max(params?.page ?? 1, 1);
+    const { data } = await apiClient.get<KnowledgeBaseListApiResponse>('/api/v1/knowledgeBase/', {
+      params: { page, limit },
+    });
+    return { knowledgeBases: data?.knowledgeBases ?? [] };
+  },
+
+  /** Paginate KB list until exhausted (each page obeys API max limit of 100). */
+  async getAllKnowledgeBasesForBuilder(): Promise<KnowledgeBasesForBuilderResult> {
+    const all: KnowledgeBaseForBuilder[] = [];
+    let page = 1;
+    for (;;) {
+      const { knowledgeBases } = await this.getKnowledgeBasesForBuilder({ page, limit: KB_PAGE_MAX });
+      all.push(...knowledgeBases);
+      if (knowledgeBases.length < KB_PAGE_MAX) break;
+      page += 1;
+      if (page > 500) break;
+    }
+    return { knowledgeBases: all };
+  },
+
+  /**
+   * GET /api/v1/knowledgeBase/knowledge-hub/nodes — fetch root app nodes for agent builder.
+   * Supports pagination, search, and sorting.
+   */
+  async getKnowledgeHubAppNodes(params?: {
+    cursor?: string | null;
+    limit?: number;
+    q?: string;
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
+    flattened?: boolean;
+  }): Promise<{ nodes: KnowledgeHubAppNode[]; nextCursor: string | null }> {
+    const query: Record<string, string | number | boolean> = {};
+    // Only ever hand back a cursor the server issued; inventing one is a 400.
+    if (params?.cursor) query.cursor = params.cursor;
+    query.limit = params?.limit ?? 100;
+    query.sortBy = params?.sortBy ?? 'updatedAt';
+    query.sortOrder = params?.sortOrder ?? 'desc';
+    query.origins = 'CONNECTOR';
+    // Pass flattened=false to get only root connector apps, not nested pages/documents
+    if (params?.flattened !== undefined) {
+      query.flattened = params.flattened;
+    }
+    if (params?.q) query.q = params.q;
+
+    const { data } = await apiClient.get<KnowledgeHubNodesApiResponse>(
+      '/api/v1/knowledgeBase/knowledge-hub/nodes',
+      { params: query }
+    );
+
+    const items = (data?.items ?? []).filter((node) => node?.id);
+
+    return {
+      nodes: items,
+      nextCursor: data?.pagination?.nextCursor ?? null,
+    };
+  },
+
+  /**
+   * Paginate through all knowledge-hub root nodes.
+   * Used by the agent builder to populate the apps palette.
+   */
+  async getAllKnowledgeHubAppNodes(): Promise<KnowledgeHubAppNode[]> {
+    const all: KnowledgeHubAppNode[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (;;) {
+      // Pass flattened=false to get only root connector apps, not all nested documents
+      const { nodes, nextCursor } = await this.getKnowledgeHubAppNodes({
+        cursor,
+        limit: 100,
+        flattened: false,
+      });
+      all.push(...nodes);
+      // The absent cursor is the end of the result, so no page cap is needed.
+      // The repeat guard only defends against a server echoing a cursor back
+      // instead of advancing, which would otherwise spin forever.
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    return all;
+  },
+};
+
+export type { AgentToolsListRow, KnowledgeBaseForBuilder, KnowledgeHubAppNode } from './types';

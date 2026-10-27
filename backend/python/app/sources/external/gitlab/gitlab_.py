@@ -1,0 +1,1471 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
+
+import httpx
+from gitlab import Gitlab
+
+from app.sources.client.gitlab.gitlab import GitLabResponse
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from datetime import datetime
+
+
+class GitLabDataSource:
+    """
+    Strict, typed wrapper over python-gitlab for common GitLab business operations.
+
+    Accepts either a python-gitlab `Gitlab` instance *or* any object with `.get_sdk() -> Gitlab`.
+    Pass ``base_url`` to override the GitLab instance host used for GraphQL and direct
+    HTTP calls (supports self-managed / GitLab EE deployments).
+    """
+
+    def __init__(
+        self,
+        client_or_sdk: Gitlab | object,
+        base_url: str = "https://gitlab.com",
+    ) -> None:
+        # Support a raw SDK or a wrapper that exposes `.get_sdk()`
+        if hasattr(client_or_sdk, "get_sdk"):
+            sdk_obj = getattr(client_or_sdk, "get_sdk")
+            self._sdk: Gitlab = cast(Gitlab, sdk_obj())
+            token = getattr(client_or_sdk, "get_token", None)
+            if token:
+                self.token = token()
+        else:
+            self._sdk = cast(Gitlab, client_or_sdk)
+            self.token = None
+
+        self._base_url = base_url.rstrip("/")
+        # Shared async HTTP client — created lazily, reused across all GraphQL
+        # and direct HTTP calls to avoid per-request TCP+TLS setup overhead.
+        # Callers must not close this client directly; use aclose() to tear it
+        # down when the connector is done with this data source instance.
+        self._http_client: httpx.AsyncClient | None = None
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Lazily-initialised shared async HTTP client."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=30.0,
+            )
+        return self._http_client
+
+    async def aclose(self) -> None:
+        """Close the shared HTTP client. Call when this data source is no longer needed."""
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    def get_user(self, user_id: int | str | None = None) -> GitLabResponse:
+        """Current user when ``user_id`` is omitted; otherwise ``GET /users/:id`` (full profile, ``public_email``)."""
+        try:
+            if user_id is None:
+                self._sdk.auth()
+                user = self._sdk.user
+                return GitLabResponse(success=True, data=user)
+            user = self._sdk.users.get(user_id)
+            return GitLabResponse(success=True, data=user)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    # ---- helpers ----
+    def _project(self, project_id: int | str) -> object:
+        # python-gitlab allows numeric ID or full path for project lookup
+        return self._sdk.projects.get(project_id)
+
+    @staticmethod
+    def _params(**kwargs: object) -> dict[str, object]:
+        # Filter out Nones to avoid overriding SDK defaults
+        out: dict[str, object] = {}
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            # Skip empty containers that GitLab rejects in some endpoints
+            if isinstance(v, (list, dict)) and len(v) == 0:
+                continue
+            out[k] = v
+        return out
+
+    def list_group_projects(
+        self,
+        group_id: int | str,
+        *,
+        include_subgroups: bool = True,
+        search: str | None = None,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+        order_by: str | None = None,
+        sort: str | None = None,
+        simple: bool | None = None,
+    ) -> GitLabResponse:
+        """List projects belonging to a group (optionally including subgroups).
+
+        Pass ``page`` and ``per_page`` (with ``get_all=False``) to request a
+        single page from the API instead of materializing every project.
+        ``simple=True`` returns the smaller project payload which is enough
+        for picker/filter UIs.
+
+        Pass ``iterator=True`` (mutually exclusive with ``get_all=True``)
+        to receive a python-gitlab ``GitlabList`` that fetches pages
+        lazily as you iterate — preferred for large groups where a full
+        materialization would block the worker thread for minutes with
+        no visibility.
+        """
+        try:
+            g = self._sdk.groups.get(group_id, lazy=True)
+            extra: dict[str, object] = {}
+            if iterator is not None:
+                extra["iterator"] = iterator
+            params = self._params(
+                include_subgroups=include_subgroups,
+                search=search,
+                page=page,
+                per_page=per_page,
+                order_by=order_by,
+                sort=sort,
+                simple=simple,
+            )
+            projects = g.projects.list(get_all=get_all, **extra, **params)
+            return GitLabResponse(success=True, data=projects)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_projects(
+        self,
+        search: str | None = None,
+        *,
+        membership: bool | None = None,
+        min_access_level: int | None = None,
+        owned: bool | None = None,
+        starred: bool | None = None,
+        simple: bool | None = None,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+        order_by: str | None = None,
+        sort: str | None = None,
+        pagination: str | None = None,
+        search_namespaces: bool | None = None,
+    ) -> GitLabResponse:
+        """List accessible projects (optionally filtered).  [projects]
+
+        Pass ``page`` and ``per_page`` (with ``get_all=False``) for true
+        server-side pagination instead of fetching every accessible project.
+
+        Pass ``pagination="keyset"`` with ``order_by="id"`` and
+        ``sort="asc"`` for keyset pagination — strongly recommended for
+        full-scan sweeps because per-page cost stays constant regardless
+        of offset depth. python-gitlab follows the keyset ``Link`` headers
+        automatically when ``get_all=True``.
+
+        Pass ``iterator=True`` (mutually exclusive with ``get_all=True``)
+        to receive a python-gitlab ``GitlabList`` that drives keyset/offset
+        pagination lazily. Use this on large tenants so the caller can
+        log progress between pages instead of blocking inside a single
+        opaque ``get_all=True`` call.
+
+        Pass ``min_access_level`` to filter to projects where the current
+        user has at least the given access level (10=Guest, 20=Reporter,
+        30=Developer, 40=Maintainer, 50=Owner). Prefer this over
+        ``membership=True`` for filter-option UIs — on some GitLab
+        versions ``membership`` silently drops Guest-level (10) projects.
+        """
+        try:
+            extra: dict[str, object] = {}
+            if iterator is not None:
+                extra["iterator"] = iterator
+            params = self._params(
+                search=search,
+                membership=membership,
+                min_access_level=min_access_level,
+                owned=owned,
+                starred=starred,
+                simple=simple,
+                page=page,
+                per_page=per_page,
+                order_by=order_by,
+                sort=sort,
+                pagination=pagination,
+                search_namespaces=search_namespaces,
+            )
+            projects = self._sdk.projects.list(get_all=get_all, **extra, **params)
+            return GitLabResponse(success=True, data=projects)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def get_project(self, project_id: int | str) -> GitLabResponse:
+        """Get a single project by ID or path.  [projects]
+
+        Wrapped in ``try/except`` so a ``GitlabGetError`` for a path the
+        OAuth token can't see (404 for renamed/moved projects, 403 for
+        access loss between filter-pick and sync) surfaces as a normal
+        ``success=False`` response. Without this every other read wrapper
+        in this file returns ``success=False`` on error while ``get_project``
+        re-raises — one stale path in ``PROJECT_IDS IN`` then crashes
+        ``_resolve_projects_with_filters`` with no per-path try/except,
+        and the whole ``_sync_projects`` flow aborts.
+        """
+        try:
+            p = self._project(project_id)
+            return GitLabResponse(success=True, data=p)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def create_project(
+        self,
+        name: str,
+        namespace_id: int | None = None,
+        visibility: str | None = None,
+        description: str | None = None,
+        initialize_with_readme: bool | None = None,
+        default_branch: str | None = None,
+    ) -> GitLabResponse:
+        """Create a project.  [projects]"""
+        payload = self._params(
+            name=name,
+            namespace_id=namespace_id,
+            visibility=visibility,
+            description=description,
+            initialize_with_readme=initialize_with_readme,
+            default_branch=default_branch,
+        )
+        proj = self._sdk.projects.create(payload)
+        return GitLabResponse(success=True, data=proj)
+
+    def update_project(
+        self,
+        project_id: int | str,
+        name: str | None = None,
+        description: str | None = None,
+        visibility: str | None = None,
+        default_branch: str | None = None,
+        topics: list[str] | None = None,
+    ) -> GitLabResponse:
+        """Update mutable project fields.  [projects]"""
+        p = self._project(project_id)
+        changed = False
+        if name is not None:
+            setattr(p, "name", name)
+            changed = True
+        if description is not None:
+            setattr(p, "description", description)
+            changed = True
+        if visibility is not None:
+            setattr(p, "visibility", visibility)
+            changed = True
+        if default_branch is not None:
+            setattr(p, "default_branch", default_branch)
+            changed = True
+        if topics is not None and len(topics) > 0:
+            setattr(p, "topics", topics)
+            changed = True
+        if changed:
+            p.save()
+        return GitLabResponse(success=True, data=p)
+
+    def delete_project(self, project_id: int | str) -> GitLabResponse:
+        """Delete project.  [projects]"""
+        p = self._project(project_id)
+        p.delete()
+        return GitLabResponse(success=True, data=True)
+
+    def list_issues(
+        self,
+        project_id: int | str,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        search: str | None = None,
+        author_id: int | None = None,
+        assignee_id: int | None = None,
+        updated_after: datetime | None = None,
+        updated_before: datetime | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        order_by: str | None = None,
+        sort: str | None = None,
+        get_all: bool | None = None,
+    ) -> GitLabResponse:
+        """List project issues with filters.  [issues]"""
+        try:
+            p = self._sdk.projects.get(project_id)
+            params = self._params(
+                state=state,
+                labels=labels,
+                search=search,
+                author_id=author_id,
+                assignee_id=assignee_id,
+                updated_after=updated_after,
+                updated_before=updated_before,
+                created_after=created_after,
+                created_before=created_before,
+                order_by=order_by,
+                sort=sort,
+            )
+            items = p.issues.list(get_all=get_all, **params)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def get_issue(self, project_id: int | str, issue_iid: int) -> GitLabResponse:
+        """Get a single issue by IID.  [issues]"""
+        try:
+            p = self._project(project_id)
+            issue = p.issues.get(issue_iid)
+            return GitLabResponse(success=True, data=issue)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def create_issue(
+        self,
+        project_id: int | str,
+        title: str,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        assignee_ids: list[int] | None = None,
+        milestone_id: int | None = None,
+    ) -> GitLabResponse:
+        """Create an issue.  [issues]"""
+        p = self._project(project_id)
+        payload = self._params(
+            title=title,
+            description=description,
+            labels=labels,
+            assignee_ids=assignee_ids,
+            milestone_id=milestone_id,
+        )
+        issue = p.issues.create(payload)
+        return GitLabResponse(success=True, data=issue)
+
+    def update_issue(
+        self,
+        project_id: int | str,
+        issue_iid: int,
+        title: str | None = None,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        state_event: str | None = None,
+    ) -> GitLabResponse:
+        """Update issue fields; use state_event='close'/'reopen' to change state.  [issues]"""
+        p = self._project(project_id)
+        issue = p.issues.get(issue_iid)
+        changed = False
+        if title is not None:
+            setattr(issue, "title", title)
+            changed = True
+        if description is not None:
+            setattr(issue, "description", description)
+            changed = True
+        if labels is not None and len(labels) > 0:
+            setattr(issue, "labels", labels)
+            changed = True
+        if state_event is not None:
+            setattr(issue, "state_event", state_event)
+            changed = True
+        if changed:
+            issue.save()
+        return GitLabResponse(success=True, data=issue)
+
+    def delete_issue(self, project_id: int | str, issue_iid: int) -> GitLabResponse:
+        """Delete issue.  [issues]"""
+        p = self._project(project_id)
+        p.issues.delete(issue_iid)
+        return GitLabResponse(success=True, data=True)
+
+    def list_merge_requests(
+        self,
+        project_id: int | str,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        search: str | None = None,
+        author_id: int | None = None,
+        assignee_id: int | None = None,
+        order_by: str | None = None,
+        sort: str | None = None,
+        updated_after: datetime | None = None,
+        updated_before: datetime | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        get_all: bool | None = None,
+    ) -> GitLabResponse:
+        """List merge requests with filters.  [mrs]"""
+        try:
+            # p = self._project(project_id)
+            p = self._sdk.projects.get(project_id)
+            params = self._params(
+                state=state,
+                labels=labels,
+                search=search,
+                author_id=author_id,
+                assignee_id=assignee_id,
+                order_by=order_by,
+                sort=sort,
+                updated_after=updated_after,
+                updated_before=updated_before,
+                created_after=created_after,
+                created_before=created_before,
+            )
+            mrs = p.mergerequests.list(get_all=get_all, **params)
+            return GitLabResponse(success=True, data=mrs)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def get_merge_request(self, project_id: int | str, mr_iid: int) -> GitLabResponse:
+        """Get a single merge request by IID.  [mrs]"""
+        try:
+            p = self._project(project_id)
+            mr = p.mergerequests.get(id=mr_iid)
+            return GitLabResponse(success=True, data=mr)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_merge_request_notes(
+        self, project_id: int | str, mr_iid: int, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List merge request notes.  [mrs]"""
+        try:
+            p = self._sdk.projects.get(project_id, lazy=True)
+            mr = p.mergerequests.get(id=mr_iid, lazy=True)
+            notes = mr.notes.list(get_all=get_all)
+            return GitLabResponse(success=True, data=notes)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_merge_request_changes(
+        self, project_id: int | str, mr_iid: int
+    ) -> GitLabResponse:
+        """List merge request changes."""
+        try:
+            p = self._sdk.projects.get(project_id, lazy=True)
+            mr = p.mergerequests.get(id=mr_iid, lazy=True)
+            changes = mr.changes(get_all=True)
+            return GitLabResponse(success=True, data=changes)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_merge_requests_commits(
+        self, project_id: int | str, mr_iid: int, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List commits of a merge request."""
+        try:
+            p = self._sdk.projects.get(project_id, lazy=True)
+            mr = p.mergerequests.get(id=mr_iid, lazy=True)
+            commits = mr.commits(get_all=get_all)
+            return GitLabResponse(success=True, data=commits)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def create_merge_request(
+        self,
+        project_id: int | str,
+        source_branch: str,
+        target_branch: str,
+        title: str,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        assignee_id: int | None = None,
+        assignee_ids: list[int] | None = None,
+        remove_source_branch: bool | None = None,
+        draft: bool | None = None,
+    ) -> GitLabResponse:
+        """Create a merge request.  [mrs]"""
+        p = self._project(project_id)
+        payload = self._params(
+            source_branch=source_branch,
+            target_branch=target_branch,
+            title=title,
+            description=description,
+            labels=labels,
+            assignee_id=assignee_id,
+            assignee_ids=assignee_ids,
+            remove_source_branch=remove_source_branch,
+            draft=draft,
+        )
+        mr = p.mergerequests.create(payload)
+        return GitLabResponse(success=True, data=mr)
+
+    def update_merge_request(
+        self,
+        project_id: int | str,
+        mr_iid: int,
+        title: str | None = None,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        state_event: str | None = None,
+    ) -> GitLabResponse:
+        """Update MR fields; use state_event to close/reopen.  [mrs]"""
+        p = self._project(project_id)
+        mr = p.mergerequests.get(mr_iid)
+        changed = False
+        if title is not None:
+            setattr(mr, "title", title)
+            changed = True
+        if description is not None:
+            setattr(mr, "description", description)
+            changed = True
+        if labels is not None and len(labels) > 0:
+            setattr(mr, "labels", labels)
+            changed = True
+        if state_event is not None:
+            setattr(mr, "state_event", state_event)
+            changed = True
+        if changed:
+            mr.save()
+        return GitLabResponse(success=True, data=mr)
+
+    def delete_merge_request(
+        self, project_id: int | str, mr_iid: int
+    ) -> GitLabResponse:
+        """Delete a merge request.  [mrs]"""
+        p = self._project(project_id)
+        p.mergerequests.delete(mr_iid)
+        return GitLabResponse(success=True, data=True)
+
+    def merge_merge_request(
+        self,
+        project_id: int | str,
+        mr_iid: int,
+        merge_when_pipeline_succeeds: bool | None = None,
+        squash: bool | None = None,
+    ) -> GitLabResponse:
+        """Accept/merge a merge request.  [mrs]"""
+        p = self._project(project_id)
+        mr = p.mergerequests.get(mr_iid)
+        params = self._params(
+            merge_when_pipeline_succeeds=merge_when_pipeline_succeeds, squash=squash
+        )
+        res = mr.merge(**params)
+        return GitLabResponse(success=True, data=res)
+
+    def list_branches(
+        self, project_id: int | str, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List branches for a project.  [branches]"""
+        p = self._project(project_id)
+        items = p.branches.list(get_all=get_all)
+        return GitLabResponse(success=True, data=items)
+
+    def get_branch(self, project_id: int | str, branch: str) -> GitLabResponse:
+        """Get a single branch.  [branches]"""
+        p = self._project(project_id)
+        b = p.branches.get(branch)
+        return GitLabResponse(success=True, data=b)
+
+    def create_branch(
+        self, project_id: int | str, branch: str, ref: str
+    ) -> GitLabResponse:
+        """Create a branch from ref.  [branches]"""
+        p = self._project(project_id)
+        b = p.branches.create({"branch": branch, "ref": ref})
+        return GitLabResponse(success=True, data=b)
+
+    def delete_branch(self, project_id: int | str, branch: str) -> GitLabResponse:
+        """Delete a branch.  [branches]"""
+        p = self._project(project_id)
+        p.branches.delete(branch)
+        return GitLabResponse(success=True, data=True)
+
+    def list_tags(
+        self, project_id: int | str, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List tags."""
+        p = self._project(project_id)
+        items = p.tags.list(get_all=get_all)
+        return GitLabResponse(success=True, data=items)
+
+    def get_tag(self, project_id: int | str, tag_name: str) -> GitLabResponse:
+        """Get a tag."""
+        p = self._project(project_id)
+        t = p.tags.get(tag_name)
+        return GitLabResponse(success=True, data=t)
+
+    def create_tag(
+        self,
+        project_id: int | str,
+        tag_name: str,
+        ref: str,
+        message: str | None = None,
+    ) -> GitLabResponse:
+        """Create a tag."""
+        p = self._project(project_id)
+        payload = self._params(tag_name=tag_name, ref=ref, message=message)
+        t = p.tags.create(payload)
+        return GitLabResponse(success=True, data=t)
+
+    def delete_tag(self, project_id: int | str, tag_name: str) -> GitLabResponse:
+        """Delete a tag."""
+        p = self._project(project_id)
+        p.tags.delete(tag_name)
+        return GitLabResponse(success=True, data=True)
+
+    def list_commits(
+        self,
+        project_id: int | str,
+        ref_name: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        get_all: bool | None = None,
+    ) -> GitLabResponse:
+        """List commits (supports ref_name/since/until).  [commits]
+
+        Wrapped in ``try/except`` to match every other read wrapper here:
+        a transient GitlabListError on a single project must not bubble
+        out of ``_ds_call`` and abort the surrounding sync loop.
+        """
+        try:
+            p = self._project(project_id)
+            params = self._params(ref_name=ref_name, since=since, until=until)
+            items = p.commits.list(get_all=get_all, **params)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def compare_commits(
+        self,
+        project_id: int | str,
+        from_sha: str,
+        to_sha: str,
+        straight: bool = False,
+    ) -> GitLabResponse:
+        """Compare two refs and return changed file diffs.
+
+        Wraps ``GET /projects/:id/repository/compare``. Response includes
+        ``diffs``, ``commits``, and related fields.
+        """
+        try:
+            p = self._project(project_id)
+            result = p.repository_compare(from_sha, to_sha, straight=straight)
+            return GitLabResponse(success=True, data=result)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_commits_for_path(
+        self,
+        project_id: int | str,
+        path: str,
+        ref_name: str | None = None,
+        *,
+        per_page: int = 100,
+    ) -> GitLabResponse:
+        """Newest + oldest commit for a repository path (1–2 REST pages)."""
+        try:
+            p = self._project(project_id)
+            query_data: dict[str, object] = {
+                "path": path,
+                "per_page": per_page,
+                "page": 1,
+            }
+            if ref_name is not None:
+                query_data["ref_name"] = ref_name
+
+            # ``http_get`` returns parsed JSON and drops pagination headers;
+            # ``http_request`` keeps the raw response we need for X-Total-Pages.
+            first_resp = self._sdk.http_request(
+                "get", p.commits.path, query_data=query_data
+            )
+            first_resp.raise_for_status()
+            first_payload = first_resp.json()
+            if not isinstance(first_payload, list):
+                message = (
+                    first_payload.get("message")
+                    if isinstance(first_payload, dict)
+                    else "Unexpected commits response"
+                )
+                return GitLabResponse(success=False, error=str(message))
+            first_page: list[dict[str, object]] = first_payload
+            if not first_page:
+                return GitLabResponse(
+                    success=True,
+                    data={
+                        "newest_committed_date": None,
+                        "oldest_committed_date": None,
+                        "commit_count": 0,
+                    },
+                )
+
+            total_pages = int(first_resp.headers.get("X-Total-Pages") or 1)
+            commit_count = int(first_resp.headers.get("X-Total") or len(first_page))
+            newest = first_page[0]
+            if total_pages <= 1:
+                oldest = first_page[-1]
+            else:
+                last_resp = self._sdk.http_request(
+                    "get",
+                    p.commits.path,
+                    query_data={**query_data, "page": total_pages},
+                )
+                last_resp.raise_for_status()
+                last_payload = last_resp.json()
+                if not isinstance(last_payload, list):
+                    message = (
+                        last_payload.get("message")
+                        if isinstance(last_payload, dict)
+                        else "Unexpected commits response"
+                    )
+                    return GitLabResponse(success=False, error=str(message))
+                last_page: list[dict[str, object]] = last_payload
+                oldest = last_page[-1] if last_page else first_page[-1]
+
+            return GitLabResponse(
+                success=True,
+                data={
+                    "newest_committed_date": newest.get("committed_date"),
+                    "oldest_committed_date": oldest.get("committed_date"),
+                    "commit_count": commit_count,
+                },
+            )
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def get_commit(self, project_id: int | str, sha: str) -> GitLabResponse:
+        """Get a single commit.  [commits]"""
+        p = self._project(project_id)
+        c = p.commits.get(sha)
+        return GitLabResponse(success=True, data=c)
+
+    def create_commit(
+        self,
+        project_id: int | str,
+        branch: str,
+        commit_message: str,
+        actions: list[dict[str, str]],
+    ) -> GitLabResponse:
+        """Create a commit with actions."""
+        p = self._project(project_id)
+        payload = {
+            "branch": branch,
+            "commit_message": commit_message,
+            "actions": actions,
+        }
+        c = p.commits.create(payload)
+        return GitLabResponse(success=True, data=c)
+
+    def list_pipelines(
+        self,
+        project_id: int | str,
+        ref: str | None = None,
+        status: str | None = None,
+        get_all: bool | None = None,
+    ) -> GitLabResponse:
+        """List pipelines."""
+        p = self._project(project_id)
+        params = self._params(ref=ref, status=status)
+        items = p.pipelines.list(get_all=get_all, **params)
+        return GitLabResponse(success=True, data=items)
+
+    def get_pipeline(self, project_id: int | str, pipeline_id: int) -> GitLabResponse:
+        """Get a pipeline."""
+        p = self._project(project_id)
+        pl = p.pipelines.get(pipeline_id)
+        return GitLabResponse(success=True, data=pl)
+
+    def create_pipeline(
+        self,
+        project_id: int | str,
+        ref: str,
+        variables: dict[str, str] | None = None,
+    ) -> GitLabResponse:
+        """Create a pipeline on a ref."""
+        p = self._project(project_id)
+        payload = self._params(ref=ref)
+        if variables is not None and len(variables) > 0:
+            # API expects a list of {key, value} dicts for variables
+            payload["variables"] = [
+                {"key": k, "value": v} for k, v in variables.items()
+            ]
+        pl = p.pipelines.create(payload)
+        return GitLabResponse(success=True, data=pl)
+
+    def delete_pipeline(
+        self, project_id: int | str, pipeline_id: int
+    ) -> GitLabResponse:
+        """Delete a pipeline."""
+        p = self._project(project_id)
+        p.pipelines.delete(pipeline_id)
+        return GitLabResponse(success=True, data=True)
+
+    def list_releases(
+        self, project_id: int | str, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List releases."""
+        p = self._project(project_id)
+        items = p.releases.list(get_all=get_all)
+        return GitLabResponse(success=True, data=items)
+
+    def get_release(self, project_id: int | str, tag_name: str) -> GitLabResponse:
+        """Get a release by tag."""
+        p = self._project(project_id)
+        r = p.releases.get(tag_name)
+        return GitLabResponse(success=True, data=r)
+
+    def create_release(
+        self,
+        project_id: int | str,
+        tag_name: str,
+        name: str,
+        description: str,
+        ref: str | None = None,
+    ) -> GitLabResponse:
+        """Create a release."""
+        p = self._project(project_id)
+        payload = self._params(
+            tag_name=tag_name, name=name, description=description, ref=ref
+        )
+        r = p.releases.create(payload)
+        return GitLabResponse(success=True, data=r)
+
+    def update_release(
+        self,
+        project_id: int | str,
+        tag_name: str,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> GitLabResponse:
+        """Update a release."""
+        p = self._project(project_id)
+        r = p.releases.get(tag_name)
+        changed = False
+        if name is not None:
+            setattr(r, "name", name)
+            changed = True
+        if description is not None:
+            setattr(r, "description", description)
+            changed = True
+        if changed:
+            r.save()
+        return GitLabResponse(success=True, data=r)
+
+    def delete_release(self, project_id: int | str, tag_name: str) -> GitLabResponse:
+        """Delete a release."""
+        p = self._project(project_id)
+        p.releases.delete(tag_name)
+        return GitLabResponse(success=True, data=True)
+
+    def list_milestones(
+        self,
+        project_id: int | str,
+        state: str | None = None,
+        get_all: bool | None = None,
+    ) -> GitLabResponse:
+        """List project milestones."""
+        p = self._project(project_id)
+        params = self._params(state=state)
+        items = p.milestones.list(get_all=get_all, **params)
+        return GitLabResponse(success=True, data=items)
+
+    def get_milestone(self, project_id: int | str, milestone_id: int) -> GitLabResponse:
+        """Get a milestone."""
+        p = self._project(project_id)
+        m = p.milestones.get(milestone_id)
+        return GitLabResponse(success=True, data=m)
+
+    def create_milestone(
+        self,
+        project_id: int | str,
+        title: str,
+        description: str | None = None,
+        due_date: str | None = None,
+        start_date: str | None = None,
+    ) -> GitLabResponse:
+        """Create a milestone."""
+        p = self._project(project_id)
+        payload = self._params(
+            title=title,
+            description=description,
+            due_date=due_date,
+            start_date=start_date,
+        )
+        m = p.milestones.create(payload)
+        return GitLabResponse(success=True, data=m)
+
+    def update_milestone(
+        self,
+        project_id: int | str,
+        milestone_id: int,
+        title: str | None = None,
+        description: str | None = None,
+        state_event: str | None = None,
+        due_date: str | None = None,
+        start_date: str | None = None,
+    ) -> GitLabResponse:
+        """Update a milestone."""
+        p = self._project(project_id)
+        m = p.milestones.get(milestone_id)
+        changed = False
+        for field, val in [
+            ("title", title),
+            ("description", description),
+            ("state_event", state_event),
+            ("due_date", due_date),
+            ("start_date", start_date),
+        ]:
+            if val is not None:
+                setattr(m, field, val)
+                changed = True
+        if changed:
+            m.save()
+        return GitLabResponse(success=True, data=m)
+
+    def delete_milestone(
+        self, project_id: int | str, milestone_id: int
+    ) -> GitLabResponse:
+        """Delete a milestone."""
+        p = self._project(project_id)
+        p.milestones.delete(milestone_id)
+        return GitLabResponse(success=True, data=True)
+
+    def list_labels(
+        self, project_id: int | str, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List labels."""
+        p = self._project(project_id)
+        items = p.labels.list(get_all=get_all)
+        return GitLabResponse(success=True, data=items)
+
+    def create_label(
+        self,
+        project_id: int | str,
+        name: str,
+        color: str,
+        description: str | None = None,
+    ) -> GitLabResponse:
+        """Create a label."""
+        p = self._project(project_id)
+        payload = self._params(name=name, color=color, description=description)
+        lb = p.labels.create(payload)
+        return GitLabResponse(success=True, data=lb)
+
+    def update_label(
+        self,
+        project_id: int | str,
+        current_name: str,
+        new_name: str | None = None,
+        color: str | None = None,
+        description: str | None = None,
+    ) -> GitLabResponse:
+        """Update a label."""
+        p = self._project(project_id)
+        # API expects 'name' for the *current* label when updating via manager
+        payload = self._params(
+            name=current_name, new_name=new_name, color=color, description=description
+        )
+        lb = p.labels.update(payload)
+        return GitLabResponse(success=True, data=lb)
+
+    def delete_label(self, project_id: int | str, name: str) -> GitLabResponse:
+        """Delete a label."""
+        p = self._project(project_id)
+        p.labels.delete(name)
+        return GitLabResponse(success=True, data=True)
+
+    def list_project_members(
+        self, project_id: int | str, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List project members."""
+        try:
+            p = self._project(project_id)
+            items = p.members.list(get_all=get_all)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_project_members_all(
+        self,
+        project_id: str | int,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+    ) -> GitLabResponse:
+        """List project members including inherited ones.
+
+        Pass ``iterator=True`` for streaming pagination on projects with
+        large inherited-membership sets.
+        """
+        try:
+            p = self._project(project_id)
+            extra: dict[str, object] = {}
+            if iterator is not None:
+                extra["iterator"] = iterator
+            items = p.members_all.list(get_all=get_all, **extra)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def add_project_member(
+        self,
+        project_id: int | str,
+        user_id: int,
+        access_level: int,
+        expires_at: str | None = None,
+    ) -> GitLabResponse:
+        """Add member to project."""
+        p = self._project(project_id)
+        payload = self._params(
+            user_id=user_id, access_level=access_level, expires_at=expires_at
+        )
+        m = p.members.create(payload)
+        return GitLabResponse(success=True, data=m)
+
+    def update_project_member(
+        self,
+        project_id: int | str,
+        user_id: int,
+        access_level: int | None = None,
+        expires_at: str | None = None,
+    ) -> GitLabResponse:
+        """Update project member."""
+        p = self._project(project_id)
+        m = p.members.get(user_id)
+        changed = False
+        if access_level is not None:
+            setattr(m, "access_level", access_level)
+            changed = True
+        if expires_at is not None:
+            setattr(m, "expires_at", expires_at)
+            changed = True
+        if changed:
+            m.save()
+        return GitLabResponse(success=True, data=m)
+
+    def remove_project_member(
+        self, project_id: int | str, user_id: int
+    ) -> GitLabResponse:
+        """Remove project member."""
+        p = self._project(project_id)
+        p.members.delete(user_id)
+        return GitLabResponse(success=True, data=True)
+
+    def list_groups(
+        self,
+        search: str | None = None,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+        owned: bool | None = None,
+        min_access_level: int | None = None,
+        all_available: bool | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+        order_by: str | None = None,
+        sort: str | None = None,
+    ) -> GitLabResponse:
+        """List groups.
+
+        ``min_access_level`` filters groups the user has at least the given
+        access level on (10=Guest, 20=Reporter, 30=Developer, 40=Maintainer,
+        50=Owner). Without it (and without ``owned``) the endpoint returns
+        every group visible to the user, including public groups on
+        GitLab.com — usually not what we want.
+
+        ``all_available=True`` widens the result to every group the user can
+        see, including those they have access to via an EE role (Auditor)
+        rather than direct membership. ``min_access_level`` still requires
+        the user to be a Guest+ MEMBER, so an Auditor without membership
+        sees nothing with ``min_access_level=10``; pass ``all_available=True``
+        (and drop ``min_access_level``) when the goal is "every group the
+        caller can read", not "every group the caller is a member of".
+
+        Pass ``page`` and ``per_page`` (with ``get_all=False``) to request a
+        single page from the API instead of materializing every group.
+
+        Note: keyset pagination is intentionally not exposed here. GitLab's
+        ``/groups`` endpoint only supports keyset pagination for
+        **unauthenticated** requests (with ``order_by=name``, ``sort=asc``);
+        for authenticated callers — every connector use case — it is
+        silently ignored and offset pagination is used. To reduce
+        round-trips on full-scan sweeps, pass ``per_page=100`` (the API
+        max) instead.
+
+        Pass ``iterator=True`` (mutually exclusive with ``get_all=True``)
+        for streaming pagination — strongly preferred over ``get_all=True``
+        on large self-managed EE instances where a single Guest+ account
+        can be a member of tens of thousands of groups and ``get_all=True``
+        will block silently for minutes-to-hours with no progress log.
+        """
+        try:
+            extra: dict[str, object] = {}
+            if iterator is not None:
+                extra["iterator"] = iterator
+            params = self._params(
+                search=search,
+                owned=owned,
+                min_access_level=min_access_level,
+                all_available=all_available,
+                page=page,
+                per_page=per_page,
+                order_by=order_by,
+                sort=sort,
+            )
+            groups = self._sdk.groups.list(get_all=get_all, **extra, **params)
+            return GitLabResponse(success=True, data=groups)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_descendant_groups(
+        self,
+        group_id: int | str,
+        search: str | None = None,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+        owned: bool | None = None,
+        min_access_level: int | None = None,
+        all_available: bool | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+        order_by: str | None = None,
+        sort: str | None = None,
+    ) -> GitLabResponse:
+        """List descendant groups of a group (full subtree, parent excluded).
+
+        Wraps ``GET /api/v4/groups/:id/descendant_groups``. Use this to walk
+        the subgroup hierarchy from a known-accessible parent — the caller's
+        membership on ``group_id`` propagates by inheritance, so descendants
+        are returned even when the flat ``GET /groups`` listing misses them.
+
+        Primary use case: an EE Auditor who hits the documented
+        "auditor read access doesn't flow through the listing endpoints"
+        known issue (see ``GitLabConnector._list_groups_scope_kwargs``) and
+        falls back to ``list_groups(min_access_level=10)``. That fallback
+        only returns groups with an explicit member row, missing any
+        subgroup whose access is inherited from an ancestor's Reporter+
+        membership. Walking each fallback group's descendants here closes
+        that gap.
+
+        Returns ``GroupDescendantGroup`` objects, which expose ``id``,
+        ``name``, ``path``, ``full_path``, ``full_name`` and ``parent_id``
+        but not the full ``Group`` manager API. Re-fetch with
+        ``get_group(id)`` if a managed object is needed.
+        """
+        try:
+            g = self._sdk.groups.get(group_id, lazy=True)
+            extra: dict[str, object] = {}
+            if iterator is not None:
+                extra["iterator"] = iterator
+            params = self._params(
+                search=search,
+                owned=owned,
+                min_access_level=min_access_level,
+                all_available=all_available,
+                page=page,
+                per_page=per_page,
+                order_by=order_by,
+                sort=sort,
+            )
+            groups = g.descendant_groups.list(
+                get_all=get_all, **extra, **params
+            )
+            return GitLabResponse(success=True, data=groups)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_group_members(
+        self, group_id: int | str, get_all: bool | None = None
+    ) -> GitLabResponse:
+        """List group members."""
+        try:
+            g = self._sdk.groups.get(group_id)
+            items = g.members.list(get_all=get_all)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_group_members_all(
+        self,
+        group_id: int | str,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+    ) -> GitLabResponse:
+        """List all group members including inherited ones.
+
+        Pass ``iterator=True`` for streaming pagination on groups with
+        large inherited-membership sets.
+        """
+        try:
+            g = self._sdk.groups.get(group_id, lazy=True)
+            extra: dict[str, object] = {}
+            if iterator is not None:
+                extra["iterator"] = iterator
+            items = g.members_all.list(get_all=get_all, **extra)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def get_group(self, group_id: int | str) -> GitLabResponse:
+        """Get a group by ID or full path."""
+        try:
+            g = self._sdk.groups.get(group_id)
+            return GitLabResponse(success=True, data=g)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def create_group(
+        self,
+        name: str,
+        path: str,
+        parent_id: int | None = None,
+        description: str | None = None,
+        visibility: str | None = None,
+    ) -> GitLabResponse:
+        """Create a group or subgroup (see GitLab.com restriction).  [groups]"""
+        payload = self._params(
+            name=name,
+            path=path,
+            parent_id=parent_id,
+            description=description,
+            visibility=visibility,
+        )
+        g = self._sdk.groups.create(payload)
+        return GitLabResponse(success=True, data=g)
+
+    def update_group(
+        self,
+        group_id: int | str,
+        name: str | None = None,
+        description: str | None = None,
+        visibility: str | None = None,
+    ) -> GitLabResponse:
+        """Update group fields.  [groups]"""
+        g = self._sdk.groups.get(group_id)
+        changed = False
+        if name is not None:
+            setattr(g, "name", name)
+            changed = True
+        if description is not None:
+            setattr(g, "description", description)
+            changed = True
+        if visibility is not None:
+            setattr(g, "visibility", visibility)
+            changed = True
+        if changed:
+            g.save()
+        return GitLabResponse(success=True, data=g)
+
+    def delete_group(self, group_id: int | str) -> GitLabResponse:
+        """Delete a group."""
+        g = self._sdk.groups.get(group_id)
+        g.delete()
+        return GitLabResponse(success=True, data=True)
+
+    def list_issue_notes(
+        self, project_id: int | str, issue_iid: int, get_all: bool | None = None
+    ) -> GitLabResponse:
+        try:
+            # p = self._project(project_id)
+            p = self._sdk.projects.get(project_id)
+            issue = p.issues.get(issue_iid)
+            notes = issue.notes.list(get_all=get_all)
+            return GitLabResponse(success=True, data=notes)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def list_repo_tree(
+        self,
+        project_id: int | str,
+        ref: str | None = None,
+        path: str | None = None,
+        recursive: bool | None = None,
+        get_all: bool | None = None,
+        iterator: bool | None = None,
+    ) -> GitLabResponse:
+        """List repository tree.
+
+        Pass ``get_all=True`` to fetch every page in one call (materialises
+        the full list in memory).  Pass ``iterator=True`` to get a
+        ``GitlabList`` lazy iterator back in ``data`` — preferred for large
+        directories because pages are fetched on demand rather than all at
+        once.  ``get_all`` and ``iterator`` are mutually exclusive per the
+        python-gitlab SDK contract.
+        """
+        try:
+            p = self._sdk.projects.get(project_id)
+            payload = self._params(
+                ref=ref,
+                path=path,
+                recursive=recursive,
+                get_all=get_all,
+                iterator=iterator,
+            )
+            items = p.repository_tree(**payload)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    def get_file_content(
+        self, project_id: int | str, file_path: str, ref: str = "HEAD"
+    ) -> GitLabResponse:
+        """Get code file content."""
+        try:
+            # p = self._project(project_id)
+            p = self._sdk.projects.get(project_id)
+            payload = self._params(
+                ref=ref,
+                file_path=file_path,
+            )
+            items = p.files.get(**payload)
+            return GitLabResponse(success=True, data=items)
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    # -----------------------GraphQL API--------------------------------#
+    async def get_repo_tree_g(
+        self, project_id: str, ref: str | None = "HEAD", after_cursor: str = ""
+    ) -> GitLabResponse:
+        """Get repository tree using GraphQL API."""
+        # take cursors as input and return the tree with pagination
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            }
+            url = f"{self._base_url}/api/graphql"
+            query = """
+            query ($fullPath: ID!, $branch: String!, $afterCursor: String!) {
+            project(fullPath: $fullPath) {
+                name
+                repository {
+                rootRef
+                paginatedTree(recursive: true, ref: $branch, after: $afterCursor) {
+                    nodes {
+                    trees {
+                        nodes {
+                        name
+                        path
+                        sha
+                        type
+                        webPath
+                        webUrl
+                        }
+                    }
+                    }
+                    pageInfo {
+                    endCursor
+                    hasNextPage
+                    }
+                }
+                }
+            }
+            }
+            """
+            variables = {
+                "fullPath": project_id,
+                "branch": ref,
+                "afterCursor": after_cursor,
+            }
+            payload = {
+                "query": query,
+                "variables": variables,
+            }
+            try:
+                resp = await self.http_client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                tree_data = resp.content
+                return GitLabResponse(success=True, data=(tree_data))
+            except Exception as e:
+                return GitLabResponse(success=False, error=str(e))
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    async def get_file_tree_g(
+        self,
+        project_id: int | str,
+        ref: str | None = None,
+        after_cursor: str = "",
+    ) -> GitLabResponse:
+        """Get file tree using GraphQL API."""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            }
+            url = f"{self._base_url}/api/graphql"
+            query = """
+            query ($fullPath: ID!, $branch: String!, $afterCursor: String!) {
+            project(fullPath: $fullPath) {
+                name
+                repository {
+                rootRef
+                paginatedTree(recursive: true, ref: $branch, after: $afterCursor) {
+                    nodes {
+                    blobs {
+                        nodes {
+                        name
+                        path
+                        sha
+                        type
+                        webPath
+                        webUrl
+                        }
+                    }
+                    }
+                    pageInfo {
+                    endCursor
+                    hasNextPage
+                    }
+                }
+                }
+            }
+            }
+            """
+            variables = {
+                "fullPath": project_id,
+                "branch": ref,
+                "afterCursor": after_cursor,
+            }
+            payload = {
+                "query": query,
+                "variables": variables,
+            }
+            try:
+                resp = await self.http_client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                tree_data = resp.content
+                return GitLabResponse(success=True, data=(tree_data))
+            except Exception as e:
+                return GitLabResponse(success=False, error=str(e))
+        except Exception as e:
+            return GitLabResponse(success=False, error=str(e))
+
+    # ----------------------Other than SDK calls--------------------------------#
+
+    async def get_img_bytes(self, image_url: str) -> GitLabResponse[bytes] | None:
+        GITLAB_TOKEN = self.token
+        # self.logger.info(f"Fetching image from URL: {image_url}")
+        headers = {
+            "Authorization": f"Bearer {GITLAB_TOKEN}",
+            "Accept": "*/*",
+        }
+        try:
+            resp = await self.http_client.get(image_url, headers=headers)
+            resp.raise_for_status()
+            img_data = resp.content
+            return GitLabResponse(success=True, data=img_data)
+        except httpx.HTTPStatusError as e:
+            return GitLabResponse(
+                success=False,
+                error=f"HTTP {e.response.status_code} fetching image from {image_url}",
+            )
+        except Exception as e:
+            return GitLabResponse(
+                success=False, error=f"Error fetching image from {image_url}: {e}"
+            )
+
+    async def get_attachment_files_content(
+        self, weburl: str
+    ) -> AsyncGenerator[bytes, None]:
+        """Getting file content from weburl for attachments in bytes."""
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/octet-stream",
+        }
+        async with self.http_client.stream(
+            "GET",
+            weburl,
+            headers=headers,
+        ) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes(chunk_size=65536):
+                yield chunk

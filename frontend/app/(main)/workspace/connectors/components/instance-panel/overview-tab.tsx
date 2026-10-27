@@ -1,0 +1,423 @@
+'use client';
+
+import { useState, useCallback, useEffect, useReducer } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useRouter } from 'next/navigation';
+import { Flex, Text, Box } from '@radix-ui/themes';
+import { ConnectorOverviewExtras } from '@/config';
+import { useConnectorsStore } from '../../store';
+import { ConnectorsApi } from '../../api';
+import { fetchInstanceStats } from '../../utils/fetch-instance-stats';
+import { useToastStore } from '@/lib/store/toast-store';
+import { deriveSyncStatus } from '../instance-card/utils';
+import { runConnectorResync, stopConnectorSync } from '../../utils/connector-sync-actions';
+import { ConfirmationDialog } from '@/app/(main)/workspace/components/confirmation-dialog';
+import { isSyncRunning } from '../instance-card/primitives';
+import { CONNECTOR_INSTANCE_STATUS } from '../../constants';
+import { isElectron } from '@/lib/electron';
+import { isLocalFsConnectorType, localFsDesktopToast } from '../../utils/local-fs-helpers';
+import { getElectronLocalSyncStatus } from '../../utils/electron-local-sync';
+import type { IndexingStatus } from '@/app/(main)/knowledge-base/types';
+import type {
+  ConnectorInstance,
+  ConnectorConfig,
+  ConnectorStatsResponse,
+  LocalSyncStatus,
+} from '../../types';
+import { IndexingStatsPanel } from '@/app/components/indexing-stats/indexing-stats-panel';
+import { CodeGraphStatus } from './code-graph-status';
+import { LastRunSummary } from './last-run-summary';
+import { ActionItemsCallout } from './action-items-callout';
+
+// ========================================
+// Props
+// ========================================
+
+interface OverviewTabProps {
+  instance: ConnectorInstance;
+  /** Stats data from GET /connectors/{connectorId}/stats */
+  stats?: ConnectorStatsResponse['data'] | null;
+  /** Initial stats fetch in progress (panel open) */
+  statsLoading?: boolean;
+  /** GET …/config — used to resolve auth type for OAuth-only UI rules */
+  connectorConfig?: ConnectorConfig;
+  /** Local sync runtime status from Electron watcher manager */
+  localSyncStatus?: LocalSyncStatus;
+  /** Portal host from the drawer, so dialogs stack above it rather than behind. */
+  nestedModalHost?: HTMLElement | null;
+}
+
+// ========================================
+// OverviewTab
+// ========================================
+
+export function OverviewTab({
+  instance,
+  stats,
+  statsLoading = false,
+  connectorConfig,
+  localSyncStatus,
+  nestedModalHost,
+}: OverviewTabProps) {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const closeInstancePanel = useConnectorsStore((s) => s.closeInstancePanel);
+  const openPanel = useConnectorsStore((s) => s.openPanel);
+  const setPanelActiveTab = useConnectorsStore((s) => s.setPanelActiveTab);
+  const instanceConfigs = useConnectorsStore((s) => s.instanceConfigs);
+  const setLocalSyncStatus = useConnectorsStore((s) => s.setLocalSyncStatus);
+  const addToast = useToastStore((s) => s.addToast);
+  const bumpCatalogRefresh = useConnectorsStore((s) => s.bumpCatalogRefresh);
+  const [isRefreshStatsBusy, setIsRefreshStatsBusy] = useState(false);
+  const [isHeaderSyncBusy, setIsHeaderSyncBusy] = useState(false);
+  const [isReindexFailedBusy, setIsReindexFailedBusy] = useState(false);
+  const [isManualIndexBusy, setIsManualIndexBusy] = useState(false);
+  const [isRetryClassificationBusy, setIsRetryClassificationBusy] = useState(false);
+  const [isRetryEntitiesBusy, setIsRetryEntitiesBusy] = useState(false);
+  const [isStopBusy, setIsStopBusy] = useState(false);
+
+  // The panel outlives the run, so a stop the backend could not complete
+  // synchronously would otherwise leave this stuck and block the next stop.
+  useEffect(() => {
+    if (!isSyncRunning(instance.status)) setIsStopBusy(false);
+  }, [instance.status]);
+  const [stopConfirmOpen, setStopConfirmOpen] = useState(false);
+  const isFullSyncRunning =
+    (instance.status ?? '').toUpperCase() === CONNECTOR_INSTANCE_STATUS.FULL_SYNCING;
+  const [panelRefreshKey, bumpPanelRefresh] = useReducer((n: number) => n + 1, 0);
+  const configForDerive =
+    connectorConfig ?? (instance._key ? instanceConfigs[instance._key] : undefined);
+  const syncStatus = deriveSyncStatus(instance, stats ?? undefined, configForDerive);
+  const isSyncing = syncStatus === 'syncing';
+
+  // Navigate to All Records page with filters for this connector
+  const navigateToRecords = useCallback(
+    (indexingStatuses?: IndexingStatus[]) => {
+      const connectorId = instance._key;
+      if (!connectorId) return;
+
+      // Build URL with filter params (URL is source of truth)
+      const params = new URLSearchParams();
+      params.set('view', 'all-records');
+      params.set('connectorIds', connectorId);
+      if (indexingStatuses && indexingStatuses.length > 0) {
+        params.set('indexingStatus', indexingStatuses.join(','));
+      }
+
+      // Close the panel and navigate
+      closeInstancePanel();
+      router.push(`/knowledge-base?${params.toString()}`);
+    },
+    [instance._key, closeInstancePanel, router]
+  );
+
+  const handleOverviewRefreshStats = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId || isRefreshStatsBusy) return;
+    try {
+      setIsRefreshStatsBusy(true);
+      await fetchInstanceStats(connectorId, { force: true });
+      bumpPanelRefresh();
+      addToast({
+        variant: 'success',
+        title: t('workspace.connectors.overview.refreshStatsSuccess'),
+      });
+      if (isElectron() && isLocalFsConnectorType(instance.type)) {
+        const status = await getElectronLocalSyncStatus(connectorId);
+        if (status) {
+          setLocalSyncStatus(connectorId, status);
+        }
+      }
+    } catch {
+      addToast({
+        variant: 'error',
+        title: t('workspace.connectors.overview.refreshStatsError'),
+      });
+    } finally {
+      setIsRefreshStatsBusy(false);
+    }
+  }, [
+    instance._key,
+    instance.type,
+    isRefreshStatsBusy,
+    addToast,
+    t,
+    setLocalSyncStatus,
+    fetchInstanceStats,
+  ]);
+
+  const handleOverviewResync = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId || !instance.isActive || isHeaderSyncBusy) return;
+    try {
+      setIsHeaderSyncBusy(true);
+      const outcome = await runConnectorResync({
+        connectorId,
+        connectorType: instance.type,
+      });
+      if (outcome.kind === 'requires-desktop') {
+        addToast(localFsDesktopToast(outcome));
+        return;
+      }
+      addToast({ variant: 'success', title: 'Sync started' });
+      bumpCatalogRefresh();
+    } catch (error) {
+      console.error('Failed to start sync', { connectorId, error });
+      const message =
+        error instanceof Error && error.message.trim()
+          ? error.message.trim()
+          : 'An unexpected error occurred.';
+      addToast({
+        variant: 'error',
+        title: 'Failed to start sync',
+        description: message,
+      });
+    } finally {
+      setIsHeaderSyncBusy(false);
+    }
+  }, [instance._key, instance.type, instance.isActive, isHeaderSyncBusy, addToast, bumpCatalogRefresh]);
+
+  const handleConfirmStopSync = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId) return;
+    setIsStopBusy(true);
+    try {
+      const { stopped } = await stopConnectorSync(connectorId);
+      addToast(
+        stopped
+          ? { variant: 'success', title: 'Sync stopped' }
+          : { variant: 'info', title: 'Stopping sync — it will finish shortly' }
+      );
+      // Left busy while the backend still reports SYNCING: the run is winding
+      // down, and offering Sync again here would only be declined.
+      if (stopped) setIsStopBusy(false);
+    } catch (error) {
+      setIsStopBusy(false);
+      console.error('Failed to stop sync', { connectorId, error });
+      addToast({ variant: 'error', title: 'Failed to stop sync' });
+    } finally {
+      setStopConfirmOpen(false);
+    }
+  }, [instance._key, addToast]);
+
+  const handleReindexFailed = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId || !instance.isActive || isReindexFailedBusy) return;
+    try {
+      setIsReindexFailedBusy(true);
+      await ConnectorsApi.reindexConnector(connectorId, ['FAILED']);
+      addToast({ variant: 'success', title: 'Reindexing failed records…' });
+      await fetchInstanceStats(connectorId, { force: true });
+    } catch (error) {
+      console.error('Failed to reindex failed records', { connectorId, error });
+      addToast({ variant: 'error', title: 'Failed to reindex failed records' });
+    } finally {
+      setIsReindexFailedBusy(false);
+    }
+  }, [instance._key, instance.isActive, isReindexFailedBusy, addToast, fetchInstanceStats]);
+
+  const handleManualIndex = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId || !instance.isActive || isManualIndexBusy) return;
+    try {
+      setIsManualIndexBusy(true);
+      await ConnectorsApi.reindexConnector(connectorId, ['AUTO_INDEX_OFF']);
+      addToast({ variant: 'success', title: 'Indexing manual-indexing records…' });
+      await fetchInstanceStats(connectorId, { force: true });
+    } catch (error) {
+      console.error('Failed to start manual indexing', { connectorId, error });
+      addToast({ variant: 'error', title: 'Failed to start manual indexing' });
+    } finally {
+      setIsManualIndexBusy(false);
+    }
+  }, [instance._key, instance.isActive, isManualIndexBusy, addToast, fetchInstanceStats]);
+
+  // The retry is already queued here: a stats refresh that fails must not read
+  // as a failed retry, or the user repeats a request that went through.
+  const refreshStatsAfterQueuedRetry = useCallback(
+    async (connectorId: string) => {
+      try {
+        await fetchInstanceStats(connectorId, { force: true });
+      } catch (error) {
+        console.warn('Retry queued; refreshing the connector stats failed', { connectorId, error });
+      }
+    },
+    [fetchInstanceStats],
+  );
+
+  const handleRetryFailedClassification = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId || !instance.isActive || isRetryClassificationBusy) return;
+    setIsRetryClassificationBusy(true);
+    try {
+      try {
+        await ConnectorsApi.reindexConnector(connectorId, ['FAILED'], ['classify']);
+      } catch (error) {
+        console.error('Failed to retry classification', { connectorId, error });
+        addToast({ variant: 'error', title: t('workspace.connectors.overview.retryClassificationError') });
+        return;
+      }
+      addToast({ variant: 'success', title: t('workspace.connectors.overview.retryClassificationSuccess') });
+      await refreshStatsAfterQueuedRetry(connectorId);
+    } finally {
+      setIsRetryClassificationBusy(false);
+    }
+  }, [instance._key, instance.isActive, isRetryClassificationBusy, addToast, refreshStatsAfterQueuedRetry, t]);
+
+  const handleRetryFailedEntities = useCallback(async () => {
+    const connectorId = instance._key;
+    if (!connectorId || !instance.isActive || isRetryEntitiesBusy) return;
+    setIsRetryEntitiesBusy(true);
+    try {
+      try {
+        await ConnectorsApi.reindexConnector(connectorId, ['FAILED'], ['entities']);
+      } catch (error) {
+        console.error('Failed to retry entity extraction', { connectorId, error });
+        addToast({ variant: 'error', title: t('workspace.connectors.overview.retryEntitiesError') });
+        return;
+      }
+      addToast({ variant: 'success', title: t('workspace.connectors.overview.retryEntitiesSuccess') });
+      await refreshStatsAfterQueuedRetry(connectorId);
+    } finally {
+      setIsRetryEntitiesBusy(false);
+    }
+  }, [instance._key, instance.isActive, isRetryEntitiesBusy, addToast, refreshStatsAfterQueuedRetry, t]);
+
+  // Show sync progress bar for syncing
+  const showProgressBar = isSyncing && instance.syncProgress;
+
+  return (
+    <Flex direction="column" gap="5" style={{ padding: '0' }}>
+      {/* Sync progress bar */}
+      {showProgressBar && instance.syncProgress && (
+        <Flex direction="column" gap="2">
+          <Flex align="center" justify="between">
+            <Text size="2" weight="medium" style={{ color: 'var(--gray-12)' }}>
+              {t('workspace.connectors.overview.progressPercent', { n: instance.syncProgress.percentage ?? 0 })}
+            </Text>
+          </Flex>
+          <Box
+            style={{
+              width: '100%',
+              height: 6,
+              borderRadius: 'var(--radius-full)',
+              backgroundColor: 'var(--gray-a3)',
+              overflow: 'hidden',
+            }}
+          >
+            <Box
+              style={{
+                width: `${instance.syncProgress.percentage ?? 0}%`,
+                height: '100%',
+                borderRadius: 'var(--radius-full)',
+                backgroundColor: 'var(--jade-9)',
+                transition: 'width 300ms ease',
+              }}
+            />
+          </Box>
+        </Flex>
+      )}
+
+      {/* Local watcher status */}
+      {localSyncStatus && (
+        <Flex align="center" justify="between" style={{ marginBottom: 4 }}>
+          <Text size="1" style={{ color: 'var(--gray-10)' }}>
+            {t('workspace.connectors.overview.localWatcherLabel')}
+          </Text>
+          <Text size="1" style={{ color: 'var(--gray-11)' }}>
+            {t('workspace.connectors.overview.localWatcherStatus', {
+              state: localSyncStatus.watcherState,
+              pending: localSyncStatus.pendingCount,
+              failed: localSyncStatus.failedCount,
+            })}
+          </Text>
+        </Flex>
+      )}
+
+      <ActionItemsCallout
+        instance={instance}
+        onOpenAuthentication={() => {
+          closeInstancePanel();
+          openPanel(instance, instance._key, instance.scope === 'personal' ? 'personal' : 'team');
+          // openPanel picks Configure for an authenticated connector; the fix is on Authenticate.
+          setPanelActiveTab('authenticate');
+        }}
+      />
+
+      {stats?.byRecordType?.some((t) => t.recordType === 'CODE_FILE' && t.total > 0) && (
+        <CodeGraphStatus connectorId={instance._key} />
+      )}
+      <LastRunSummary instance={instance} />
+
+      {/* Shared stats panel */}
+      <IndexingStatsPanel
+        stats={stats}
+        loading={statsLoading}
+        onRefresh={handleOverviewRefreshStats}
+        onReindexFailed={handleReindexFailed}
+        onManualIndex={handleManualIndex}
+        onRetryFailedClassification={handleRetryFailedClassification}
+        onRetryFailedEntities={handleRetryFailedEntities}
+        onNavigateToRecords={navigateToRecords}
+        onSync={
+          instance.isActive && !isSyncRunning(instance.status)
+            ? handleOverviewResync
+            : undefined
+        }
+        onStop={
+          instance.isActive && isSyncRunning(instance.status)
+            ? async () => setStopConfirmOpen(true)
+            : undefined
+        }
+        showSyncActions={instance.isActive}
+        isRefreshBusy={isRefreshStatsBusy}
+        isSyncBusy={isHeaderSyncBusy}
+        isStopBusy={isStopBusy}
+        stopLabel={
+          isFullSyncRunning
+            ? t('workspace.connectors.stopSync.labelFull', {
+                defaultValue: 'Stop full sync',
+              })
+            : t('workspace.connectors.stopSync.label', { defaultValue: 'Stop sync' })
+        }
+        isReindexFailedBusy={isReindexFailedBusy}
+        isManualIndexBusy={isManualIndexBusy}
+        isRetryClassificationBusy={isRetryClassificationBusy}
+        isRetryEntitiesBusy={isRetryEntitiesBusy}
+      />
+
+      <ConfirmationDialog
+        container={nestedModalHost}
+        open={stopConfirmOpen}
+        onOpenChange={setStopConfirmOpen}
+        title={
+          isFullSyncRunning
+            ? t('workspace.connectors.stopSyncConfirm.titleFull', {
+                defaultValue: 'Stop the running full sync?',
+              })
+            : t('workspace.connectors.stopSyncConfirm.title', {
+                defaultValue: 'Stop the running sync?',
+              })
+        }
+        message={t('workspace.connectors.stopSyncConfirm.message', {
+          defaultValue:
+            'Records already synced are kept, but the rest of this run is abandoned. The sync may take a moment to wind down. You can start it again afterwards.',
+        })}
+        confirmLabel={
+          isFullSyncRunning
+            ? t('workspace.connectors.stopSyncConfirm.confirmFull', {
+                defaultValue: 'Stop full sync',
+              })
+            : t('workspace.connectors.stopSyncConfirm.confirm', {
+                defaultValue: 'Stop sync',
+              })
+        }
+        cancelLabel={t('common.cancel', { defaultValue: 'Cancel' })}
+        confirmVariant="danger"
+        isLoading={isStopBusy}
+        onConfirm={() => void handleConfirmStopSync()}
+      />
+      <ConnectorOverviewExtras connectorId={instance._key ?? null} refreshKey={panelRefreshKey} />
+    </Flex>
+  );
+}

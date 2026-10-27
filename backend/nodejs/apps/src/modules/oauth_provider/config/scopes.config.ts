@@ -1,0 +1,509 @@
+export interface ScopeDefinition {
+  name: string;
+  description: string;
+  category: string;
+  requiresUserConsent: boolean;
+}
+
+export const OAuthScopes: Record<string, ScopeDefinition> = {
+  // Organization Management
+  'org:read': {
+    name: 'org:read',
+    description: 'Read organization information',
+    category: 'Organization',
+    requiresUserConsent: true,
+  },
+  'org:write': {
+    name: 'org:write',
+    description: 'Update organization settings',
+    category: 'Organization',
+    requiresUserConsent: true,
+  },
+  'org:admin': {
+    name: 'org:admin',
+    description: 'Full organization administration',
+    category: 'Organization',
+    requiresUserConsent: true,
+  },
+
+  // User Management
+  'user:read': {
+    name: 'user:read',
+    description: 'Read user profiles',
+    category: 'Users',
+    requiresUserConsent: true,
+  },
+  'user:write': {
+    name: 'user:write',
+    description: 'Update user profiles',
+    category: 'Users',
+    requiresUserConsent: true,
+  },
+  'user:invite': {
+    name: 'user:invite',
+    description: 'Invite new users to organization',
+    category: 'Users',
+    requiresUserConsent: true,
+  },
+  'user:delete': {
+    name: 'user:delete',
+    description: 'Delete users from organization',
+    category: 'Users',
+    requiresUserConsent: true,
+  },
+
+  // User Groups
+  'usergroup:read': {
+    name: 'usergroup:read',
+    description: 'Read user groups',
+    category: 'User Groups',
+    requiresUserConsent: true,
+  },
+  'usergroup:write': {
+    name: 'usergroup:write',
+    description: 'Create and manage user groups',
+    category: 'User Groups',
+    requiresUserConsent: true,
+  },
+
+  // Teams
+  'team:read': {
+    name: 'team:read',
+    description: 'Read team information',
+    category: 'Teams',
+    requiresUserConsent: true,
+  },
+  'team:write': {
+    name: 'team:write',
+    description: 'Create and manage teams',
+    category: 'Teams',
+    requiresUserConsent: true,
+  },
+
+  // Knowledge Base
+  'kb:read': {
+    name: 'kb:read',
+    description: 'Read knowledge bases and records',
+    category: 'Knowledge Base',
+    requiresUserConsent: true,
+  },
+  'kb:write': {
+    name: 'kb:write',
+    description: 'Create and update knowledge bases',
+    category: 'Knowledge Base',
+    requiresUserConsent: true,
+  },
+  'kb:delete': {
+    name: 'kb:delete',
+    description: 'Delete knowledge bases and records',
+    category: 'Knowledge Base',
+    requiresUserConsent: true,
+  },
+  'kb:upload': {
+    name: 'kb:upload',
+    description: 'Upload files to knowledge bases',
+    category: 'Knowledge Base',
+    requiresUserConsent: true,
+  },
+
+  // Semantic Search
+  'semantic:read': {
+    name: 'semantic:read',
+    description: 'Read semantic search results and history',
+    category: 'Semantic',
+    requiresUserConsent: true,
+  },
+  'semantic:write': {
+    name: 'semantic:write',
+    description: 'Execute semantic search queries',
+    category: 'Semantic',
+    requiresUserConsent: true,
+  },
+  'semantic:delete': {
+    name: 'semantic:delete',
+    description: 'Delete semantic search history',
+    category: 'Semantic',
+    requiresUserConsent: true,
+  },
+
+  // Conversations
+  'conversation:read': {
+    name: 'conversation:read',
+    description: 'Read conversations',
+    category: 'Conversations',
+    requiresUserConsent: true,
+  },
+  'conversation:write': {
+    name: 'conversation:write',
+    description: 'Create and manage conversations',
+    category: 'Conversations',
+    requiresUserConsent: true,
+  },
+  'conversation:chat': {
+    name: 'conversation:chat',
+    description: 'Send messages in conversations',
+    category: 'Conversations',
+    requiresUserConsent: true,
+  },
+
+  // Agents
+  'agent:read': {
+    name: 'agent:read',
+    description: 'Read AI agents',
+    category: 'Agents',
+    requiresUserConsent: true,
+  },
+  'agent:write': {
+    name: 'agent:write',
+    description: 'Create and manage AI agents',
+    category: 'Agents',
+    requiresUserConsent: true,
+  },
+  'agent:execute': {
+    name: 'agent:execute',
+    description: 'Execute AI agents',
+    category: 'Agents',
+    requiresUserConsent: true,
+  },
+
+  // Agent Skills
+  'skill:read': {
+    name: 'skill:read',
+    description: 'Read custom agent skills',
+    category: 'Agents',
+    requiresUserConsent: true,
+  },
+  'skill:write': {
+    name: 'skill:write',
+    description: 'Create and manage custom agent skills',
+    category: 'Agents',
+    requiresUserConsent: true,
+  },
+
+  // MCP Servers
+  'mcp:read': {
+    name: 'mcp:read',
+    description: 'Read MCP servers and their tools',
+    category: 'MCP Servers',
+    requiresUserConsent: true,
+  },
+  'mcp:write': {
+    name: 'mcp:write',
+    description: 'Add, configure and authenticate MCP servers',
+    category: 'MCP Servers',
+    requiresUserConsent: true,
+  },
+  'mcp:delete': {
+    name: 'mcp:delete',
+    description: 'Remove MCP servers and their credentials',
+    category: 'MCP Servers',
+    requiresUserConsent: true,
+  },
+
+  // Toolsets
+  'toolset:read': {
+    name: 'toolset:read',
+    description: 'Read toolsets and their authentication status',
+    category: 'Toolsets',
+    requiresUserConsent: true,
+  },
+  'toolset:write': {
+    name: 'toolset:write',
+    description: 'Add, configure and authenticate toolsets',
+    category: 'Toolsets',
+    requiresUserConsent: true,
+  },
+  'toolset:delete': {
+    name: 'toolset:delete',
+    description: 'Remove toolsets and their credentials',
+    category: 'Toolsets',
+    requiresUserConsent: true,
+  },
+
+  // Projects
+  'project:read': {
+    name: 'project:read',
+    description: 'Read projects and their conversations',
+    category: 'Projects',
+    requiresUserConsent: true,
+  },
+  'project:write': {
+    name: 'project:write',
+    description: 'Create, update and share projects',
+    category: 'Projects',
+    requiresUserConsent: true,
+  },
+  'project:delete': {
+    name: 'project:delete',
+    description: 'Delete projects',
+    category: 'Projects',
+    requiresUserConsent: true,
+  },
+
+  // Connectors
+  'connector:read': {
+    name: 'connector:read',
+    description: 'Read connector configurations',
+    category: 'Connectors',
+    requiresUserConsent: true,
+  },
+  'connector:write': {
+    name: 'connector:write',
+    description: 'Create and update connectors',
+    category: 'Connectors',
+    requiresUserConsent: true,
+  },
+  'connector:sync': {
+    name: 'connector:sync',
+    description: 'Trigger connector synchronization',
+    category: 'Connectors',
+    requiresUserConsent: true,
+  },
+  'connector:delete': {
+    name: 'connector:delete',
+    description: 'Delete connectors',
+    category: 'Connectors',
+    requiresUserConsent: true,
+  },
+
+  // Code graph
+  'code:read': {
+    name: 'code:read',
+    description: 'Read indexed code repositories and their code graph',
+    category: 'Code',
+    requiresUserConsent: true,
+  },
+
+  // Configuration (Admin only)
+  'config:read': {
+    name: 'config:read',
+    description: 'Read system configuration',
+    category: 'Configuration',
+    requiresUserConsent: true,
+  },
+  'config:write': {
+    name: 'config:write',
+    description: 'Update system configuration',
+    category: 'Configuration',
+    requiresUserConsent: true,
+  },
+
+  // Crawling Manager
+  'crawl:read': {
+    name: 'crawl:read',
+    description: 'Read crawling jobs',
+    category: 'Crawling',
+    requiresUserConsent: true,
+  },
+  'crawl:write': {
+    name: 'crawl:write',
+    description: 'Create and manage crawling jobs',
+    category: 'Crawling',
+    requiresUserConsent: true,
+  },
+  'crawl:delete': {
+    name: 'crawl:delete',
+    description: 'Delete crawling jobs',
+    category: 'Crawling',
+    requiresUserConsent: true,
+  },
+
+  // OpenID Connect standard scopes
+  openid: {
+    name: 'openid',
+    description: 'OpenID Connect authentication',
+    category: 'Identity',
+    requiresUserConsent: false,
+  },
+  profile: {
+    name: 'profile',
+    description: 'User profile information (name, picture)',
+    category: 'Identity',
+    requiresUserConsent: true,
+  },
+  email: {
+    name: 'email',
+    description: 'User email address',
+    category: 'Identity',
+    requiresUserConsent: true,
+  },
+
+  // Offline access
+  offline_access: {
+    name: 'offline_access',
+    description: 'Access when user is offline (refresh tokens)',
+    category: 'Access',
+    requiresUserConsent: true,
+  },
+};
+
+/** Scopes non–org-admin users cannot register on OAuth apps (org admins get all scopes). */
+export const AdminOnlyScopes = new Set<string>([
+  'org:write',
+  'org:admin',
+  'user:invite',
+  'user:delete',
+  'usergroup:write',
+  'team:write',
+  'config:write',
+  'crawl:write',
+  'crawl:delete',
+]);
+
+export const DefaultMcpScopes = [
+  'openid',
+  'profile',
+  'email',
+  'offline_access',
+  'semantic:read',
+  'semantic:write',
+  'conversation:write',
+  'conversation:chat',
+  'kb:read',
+  'kb:write',
+  'kb:upload',
+  'team:read',
+  'user:read',
+  'usergroup:read',
+  'config:read',
+  'agent:read',
+  'agent:execute',
+  'connector:read',
+  'code:read',
+];
+
+/**
+ * Scopes the CLI/agent preset mints. Dynamic Client Registration defaults
+ * to this set, and the first-party device app (`pipeshub-agent`) to this set
+ * plus `offline_access` (`DEVICE_APP_SCOPES`, so device logins get a refresh
+ * token), both intersected with instance MCP_SCOPES. Never grant
+ * `client_credentials` to the first-party device app: the grant carries no
+ * identity of its own, so AuthMiddleware resolves its tokens to the app's
+ * `createdBy` and they run as that person. DCR needs no such care — it
+ * refuses the grant outright, in OAuthDcrService and again in
+ * `createDynamicClient`.
+ */
+export const AgentMcpScopes = [
+  'conversation:chat',
+  'semantic:write',
+  'kb:read',
+  // Lets an agent fill an empty workspace: create a collection and upload into
+  // it. Delete stays out of the preset.
+  'kb:write',
+  'kb:upload',
+  'user:read',
+  'connector:read',
+  'code:read',
+] as const;
+
+/**
+ * The scopes the `/mcp` tools use: the scope each route they call requires,
+ * both in Node and in the Python service it forwards to, plus `offline_access`
+ * so MCP clients get a refresh token. Clients such as Claude Code request
+ * every scope in `scopes_supported`, so discovery advertises only these.
+ * MCP_SCOPES stays the cap on what any token may hold.
+ */
+export const McpToolScopes = [
+  'offline_access',
+  // pipeshub_search: Node accepts semantic:read too, but the Python search
+  // route it forwards to requires semantic:write.
+  'semantic:write',
+  'conversation:chat',
+  'agent:read',
+  'agent:execute',
+  'kb:read',
+  'kb:write',
+  'kb:upload',
+  'connector:read',
+  'config:read',
+  'user:read',
+  'team:read',
+  'usergroup:read',
+  'code:read',
+] as const;
+
+/** The MCP_SCOPES the `/mcp` tools use, in MCP_SCOPES order. */
+export function mcpDiscoveryScopes(mcpScopes: readonly string[]): string[] {
+  const used = new Set<string>(McpToolScopes);
+  return mcpScopes.filter((scope) => used.has(scope));
+}
+
+export const ScopeCategories = [
+  'Identity',
+  'Access',
+  'Organization',
+  'Users',
+  'User Groups',
+  'Teams',
+  'Knowledge Base',
+  'Semantic',
+  'Conversations',
+  'Agents',
+  'MCP Servers',
+  'Toolsets',
+  'Projects',
+  'Connectors',
+  'Code',
+  'Configuration',
+  'Crawling',
+];
+
+export function validateScopes(requestedScopes: string[]): {
+  valid: boolean;
+  invalid: string[];
+} {
+  const validScopeNames = Object.keys(OAuthScopes);
+  const invalid = requestedScopes.filter(
+    (scope) => !validScopeNames.includes(scope),
+  );
+  return {
+    valid: invalid.length === 0,
+    invalid,
+  };
+}
+
+export function getScopesByCategory(category: string): ScopeDefinition[] {
+  return Object.values(OAuthScopes).filter(
+    (scope) => scope.category === category,
+  );
+}
+
+export function getAllScopesGroupedByCategory(): Record<
+  string,
+  ScopeDefinition[]
+> {
+  const grouped: Record<string, ScopeDefinition[]> = {};
+  for (const category of ScopeCategories) {
+    grouped[category] = getScopesByCategory(category);
+  }
+  return grouped;
+}
+
+export function getAllowedScopeNamesForRole(isAdmin: boolean): string[] {
+  if (isAdmin) {
+    return Object.keys(OAuthScopes);
+  }
+  return Object.keys(OAuthScopes).filter((scope) => !AdminOnlyScopes.has(scope));
+}
+
+export function getScopesGroupedByCategoryForRole(
+  isAdmin: boolean,
+): Record<string, ScopeDefinition[]> {
+  const allowedScopeNames = new Set(getAllowedScopeNamesForRole(isAdmin));
+  const grouped = getAllScopesGroupedByCategory();
+  const filtered: Record<string, ScopeDefinition[]> = {};
+
+  for (const [category, scopes] of Object.entries(grouped)) {
+    filtered[category] = scopes.filter((scope) => allowedScopeNames.has(scope.name));
+  }
+
+  return filtered;
+}
+
+export function isValidScope(scope: string): boolean {
+  return scope in OAuthScopes;
+}
+
+export function getScopeDefinition(scope: string): ScopeDefinition | undefined {
+  return OAuthScopes[scope];
+}

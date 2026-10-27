@@ -1,0 +1,326 @@
+"""Broker-agnostic messaging utilities.
+
+Wraps the existing KafkaUtils with broker type detection,
+creating appropriate configs for either Kafka or Redis Streams.
+"""
+from __future__ import annotations
+
+import os
+import uuid
+from typing import TYPE_CHECKING
+
+from app.config.constants.service import config_node_constants
+from app.services.messaging.config import (
+    MessageBrokerType,
+    RedisConfig,
+    RedisStreamsConfig,
+    Topic,
+    get_message_broker_type,
+    messaging_env,
+)
+from app.services.messaging.kafka.config.kafka_config import (
+    KafkaConsumerConfig,
+    KafkaProducerConfig,
+)
+
+if TYPE_CHECKING:
+    from app.config.configuration_service import ConfigurationService
+    from app.containers.connector import ConnectorAppContainer
+    from app.containers.indexing import IndexingAppContainer
+    from app.containers.query import QueryAppContainer
+
+    AppContainer = ConnectorAppContainer | IndexingAppContainer | QueryAppContainer
+
+
+_process_id: str | None = None
+
+
+def _process_identity() -> str:
+    """Identity of THIS process, computed on first use.
+
+    Deliberately not an import-time constant: uvicorn spawns workers today, so each
+    re-imports and gets its own, but under a fork-based supervisor every child would
+    inherit one shared value and the per-process consumer groups would collapse back
+    into one -- reintroducing the stale-LLM bug they exist to prevent.
+    """
+    global _process_id
+    if _process_id is None:
+        _process_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    return _process_id
+
+
+class MessagingUtils:
+    """Broker-agnostic messaging utilities that create appropriate configs."""
+
+    @staticmethod
+    def get_broker_type() -> MessageBrokerType:
+        return get_message_broker_type()
+
+    @staticmethod
+    async def _get_redis_config(app_container: AppContainer) -> RedisConfig:
+        """Get Redis config from the configuration service (the defaults when the broker is PostgreSQL: no Redis server is read)."""
+        if get_message_broker_type() == MessageBrokerType.POSTGRES:
+            return RedisConfig()
+        config_service = app_container.config_service()
+        return await config_service.get_redis_config()
+
+    @staticmethod
+    def _build_redis_streams_config(
+        redis_config: RedisConfig,
+        client_id: str,
+        group_id: str,
+        topics: list[str],
+        batch_size: int | None = None,
+        *,
+        ephemeral_group: bool = False,
+    ) -> RedisStreamsConfig:
+        """Build RedisStreamsConfig with optional batch_size override.
+        
+        Args:
+            redis_config: Base Redis connection config
+            client_id: Consumer client ID
+            group_id: Consumer group ID
+            topics: List of topics/streams to consume
+            batch_size: Optional batch size override (defaults to config default)
+        """
+        config_dict = {
+            "host": redis_config.host,
+            "port": redis_config.port,
+            "password": redis_config.password,
+            "db": redis_config.db,
+            "retention_mode": messaging_env.redis_streams_retention_mode,
+            "max_len": messaging_env.redis_streams_maxlen,
+            "client_id": client_id,
+            "group_id": group_id,
+            "topics": topics,
+            "ephemeral_group": ephemeral_group,
+        }
+        if batch_size is not None:
+            config_dict["batch_size"] = batch_size
+        return RedisStreamsConfig(**config_dict)
+
+    @staticmethod
+    async def _create_kafka_consumer_config(
+        app_container: AppContainer,
+        client_id: str,
+        group_id: str,
+        topics: list[str],
+        *,
+        ephemeral_group: bool = False,
+    ) -> KafkaConsumerConfig:
+        config_service = app_container.config_service()
+        kafka_config = await config_service.get_config(
+            config_node_constants.KAFKA.value
+        )
+        if not kafka_config:
+            raise ValueError("Kafka configuration not found")
+
+        brokers = kafka_config.get("brokers")
+        if not brokers:
+            raise ValueError("Kafka brokers not found in configuration")
+
+        return KafkaConsumerConfig(
+            client_id=client_id,
+            group_id=group_id,
+            # A disposable group is new on every process start, so "earliest" would
+            # replay the whole retention window each time.
+            auto_offset_reset="latest" if ephemeral_group else "earliest",
+            enable_auto_commit=False,
+            bootstrap_servers=brokers,
+            topics=topics,
+            ssl=kafka_config.get("ssl", False),
+            sasl=kafka_config.get("sasl"),
+        )
+
+    @staticmethod
+    async def create_consumer_config(
+        app_container: AppContainer,
+        client_id: str,
+        group_id: str,
+        topics: list[str],
+        is_indexing: bool = False,
+        *,
+        ephemeral_group: bool = False,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        """Create consumer config based on the configured broker type.
+        
+        Args:
+            app_container: Application container
+            client_id: Consumer client ID
+            group_id: Consumer group ID
+            topics: List of topics to consume
+            is_indexing: Whether this is an indexing consumer (affects batch size)
+        """
+        broker_type = get_message_broker_type()
+        if broker_type == MessageBrokerType.KAFKA:
+            return await MessagingUtils._create_kafka_consumer_config(
+                app_container, client_id, group_id, topics, ephemeral_group=ephemeral_group
+            )
+        else:
+            redis_config = await MessagingUtils._get_redis_config(app_container)
+            batch_size = (
+                messaging_env.message_batch_size_indexing
+                if is_indexing
+                else messaging_env.message_batch_size_simple
+            )
+            return MessagingUtils._build_redis_streams_config(
+                redis_config, client_id, group_id, topics, batch_size=batch_size,
+                ephemeral_group=ephemeral_group,
+            )
+
+    @staticmethod
+    async def create_producer_config(
+        app_container: ConnectorAppContainer,
+    ) -> KafkaProducerConfig | RedisStreamsConfig:
+        """Create producer config based on the configured broker type."""
+        broker_type = get_message_broker_type()
+        if broker_type == MessageBrokerType.KAFKA:
+            config_service = app_container.config_service()
+            kafka_config = await config_service.get_config(
+                config_node_constants.KAFKA.value
+            )
+            if not kafka_config:
+                raise ValueError("Kafka configuration not found")
+            return KafkaProducerConfig(
+                bootstrap_servers=kafka_config["brokers"],
+                client_id="messaging_producer_client",
+                ssl=kafka_config.get("ssl", False),
+                sasl=kafka_config.get("sasl"),
+            )
+        else:
+            redis_config = await MessagingUtils._get_redis_config(app_container)
+            return MessagingUtils._build_redis_streams_config(
+                redis_config, "messaging_producer_client", "", []
+            )
+
+    @staticmethod
+    async def create_producer_config_from_service(
+        config_service: ConfigurationService,
+        client_id: str = "messaging_producer_client",
+    ) -> KafkaProducerConfig | RedisStreamsConfig:
+        """Create producer config using a ConfigurationService directly."""
+        broker_type = get_message_broker_type()
+        if broker_type == MessageBrokerType.KAFKA:
+            kafka_config = await config_service.get_config(
+                config_node_constants.KAFKA.value
+            )
+            brokers = kafka_config.get("brokers") or kafka_config.get("bootstrap_servers")
+            if isinstance(brokers, str):
+                brokers = [s.strip() for s in brokers.split(",")]
+            return KafkaProducerConfig(
+                bootstrap_servers=brokers,
+                client_id=client_id,
+                ssl=kafka_config.get("ssl", False),
+                sasl=kafka_config.get("sasl"),
+            )
+        else:
+            redis_config = await config_service.get_redis_config()
+            return MessagingUtils._build_redis_streams_config(
+                redis_config, client_id, "", []
+            )
+
+    @staticmethod
+    async def create_notification_consumer_config(
+        app_container: ConnectorAppContainer,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        """Consumer config for the notification topic/stream (reserved for future use)."""
+        return await MessagingUtils.create_consumer_config(
+            app_container,
+            "notification_consumer_client",
+            "notification-consumer-group",
+            [Topic.NOTIFICATION.value],
+        )
+
+    @staticmethod
+    async def create_entity_consumer_config(
+        app_container: ConnectorAppContainer,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        return await MessagingUtils.create_consumer_config(
+            app_container,
+            "entity_consumer_client",
+            "entity_consumer_group",
+            [Topic.ENTITY_EVENTS.value],
+        )
+
+    @staticmethod
+    async def create_sync_consumer_config(
+        app_container: ConnectorAppContainer,
+        client_id: str | None = None,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        """Sync-events consumer config.
+
+        ``client_id`` must be distinct per consumer and stable across restarts.
+        Redis Streams keys the pending-entries list by consumer name, so N
+        consumers sharing one name means each reads *every* other's in-flight
+        message on boot, and XAUTOCLAIM can never reclaim from a crashed one
+        because it skips same-name entries. The group id stays shared — that is
+        what gives each message exactly one consumer.
+        """
+        config = await MessagingUtils.create_consumer_config(
+            app_container,
+            client_id or "sync_consumer_client",
+            "sync_consumer_group",
+            [Topic.SYNC_EVENTS.value],
+        )
+        if isinstance(config, RedisStreamsConfig):
+            # One at a time, or a single consumer grabs a batch and the capacity
+            # gate has nothing left to hand the idle ones.
+            config.batch_size = 1
+        else:
+            # A sync outlives its message by minutes. Auto-commit would let an
+            # offset be committed for a message whose sync then dies, losing it
+            # with no redelivery.
+            config.enable_auto_commit = False
+        return config
+
+    @staticmethod
+    async def create_code_graph_consumer_config(
+        app_container: ConnectorAppContainer,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        return await MessagingUtils.create_consumer_config(
+            app_container,
+            "code_graph_consumer_client",
+            "code_graph_consumer_group",
+            [Topic.CODE_GRAPH_EVENTS.value],
+        )
+
+    @staticmethod
+    async def create_record_consumer_config(
+        app_container: IndexingAppContainer,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        # lane_topics_for returns [record-events] unless laning is on. With
+        # Redis lanes it also keeps the pre-lane stream subscribed, so an
+        # install that enables laning drains whatever was written before the
+        # switch instead of stranding it.
+        from app.services.messaging.messaging_factory import lane_topics_for
+
+        # Resolved here and passed in, rather than letting lane_topics_for
+        # look it up itself: the subscription has to describe the same broker
+        # this config is being built for. A Kafka lane is a partition (one
+        # topic), a Redis lane is its own stream (many), so a disagreement
+        # would either miss every laned stream or subscribe a Kafka consumer
+        # to topics that do not exist.
+        broker_type = get_message_broker_type()
+        return await MessagingUtils.create_consumer_config(
+            app_container,
+            "records_consumer_client",
+            "records_consumer_group",
+            lane_topics_for(Topic.RECORD_EVENTS.value, broker_type),
+            is_indexing=True,  # Use indexing batch size
+        )
+
+    @staticmethod
+    async def create_aiconfig_consumer_config(
+        app_container: QueryAppContainer,
+    ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        # An AI-config change must reach EVERY query process, but a consumer group
+        # delivers each message to only one member. So each process joins a group of
+        # its own -- otherwise the workers that miss the event keep serving the
+        # previously cached LLM (see `retrieval_service.llm`) until they restart.
+        return await MessagingUtils.create_consumer_config(
+            app_container,
+            "aiconfig_consumer_client",
+            f"aiconfig_consumer_group-{_process_identity()}",
+            [Topic.AI_CONFIG_EVENTS.value],
+            ephemeral_group=True,
+        )

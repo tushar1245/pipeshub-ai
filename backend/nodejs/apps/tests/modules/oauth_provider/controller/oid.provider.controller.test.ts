@@ -1,0 +1,246 @@
+import 'reflect-metadata'
+import { expect } from 'chai'
+import sinon from 'sinon'
+import crypto from 'crypto'
+import { OIDCProviderController } from '../../../../src/modules/oauth_provider/controller/oid.provider.controller'
+
+describe('OIDCProviderController', () => {
+  let controller: OIDCProviderController
+  let mockOAuthTokenService: any
+  let mockScopeValidatorService: any
+  let mockAppConfig: any
+  let mockFirstPartyDeviceAppService: any
+  let mockRes: any
+  let mockNext: any
+
+  beforeEach(() => {
+    delete process.env.PIPESHUB_ENABLE_DCR
+    delete process.env.PIPESHUB_ENABLE_DEVICE_GRANT
+    mockOAuthTokenService = {
+      getAlgorithm: sinon.stub().returns('HS256'),
+      getPublicKey: sinon.stub().returns(undefined),
+      getKeyId: sinon.stub().returns(undefined),
+      verifyAccessToken: sinon.stub(),
+    }
+    mockScopeValidatorService = {
+      getAllScopes: sinon.stub().returns([
+        { name: 'org:read', description: 'Read org', category: 'Organization', requiresUserConsent: true },
+      ]),
+    }
+    mockAppConfig = {
+      oauthIssuer: 'http://localhost:3000',
+      mcpScopes: ['org:read'],
+    }
+    mockFirstPartyDeviceAppService = {
+      getOrCreate: sinon.stub().resolves('pipeshub-agent'),
+    }
+    // Built as the Enterprise edition does, so the shared discovery logic is
+    // exercised; the Community answer has its own test below.
+    controller = new OIDCProviderController(
+      mockOAuthTokenService,
+      mockScopeValidatorService,
+      mockAppConfig,
+      mockFirstPartyDeviceAppService,
+      true,
+    )
+    mockRes = { json: sinon.stub(), status: sinon.stub().returnsThis(), setHeader: sinon.stub() }
+    mockNext = sinon.stub()
+  })
+
+  afterEach(() => {
+    sinon.restore()
+    delete process.env.PIPESHUB_ENABLE_DCR
+    delete process.env.PIPESHUB_ENABLE_DEVICE_GRANT
+  })
+
+  describe('openidConfiguration', () => {
+    it('should return valid OIDC configuration', async () => {
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.issuer).to.equal('http://localhost:3000')
+      expect(config.authorization_endpoint).to.include('/authorize')
+      expect(config.token_endpoint).to.include('/token')
+      expect(config.userinfo_endpoint).to.include('/userinfo')
+      expect(config.response_types_supported).to.deep.equal(['code'])
+      expect(config.grant_types_supported).to.include('authorization_code')
+      // Advertised where delegation exists.
+      expect(config.grant_types_supported).to.include(
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      )
+      expect(config.grant_types_supported).to.include(
+        'urn:ietf:params:oauth:grant-type:device_code',
+      )
+      expect(config.registration_endpoint).to.equal(undefined)
+      expect(config.device_authorization_endpoint).to.include(
+        '/device_authorization',
+      )
+      expect(config.token_endpoint_auth_methods_supported).to.include('none')
+    })
+
+    it('does not advertise delegation where the edition does not offer it', async () => {
+      const community = new OIDCProviderController(
+        mockOAuthTokenService,
+        mockScopeValidatorService,
+        mockAppConfig,
+        mockFirstPartyDeviceAppService,
+        false,
+      )
+
+      await community.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+
+      // Listing a grant the token endpoint will always refuse would send an
+      // integrator down a road that ends in an error.
+      expect(config.grant_types_supported).to.not.include(
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      )
+      // The rest of discovery is unchanged.
+      expect(config.grant_types_supported).to.include('authorization_code')
+      expect(config.code_challenge_methods_supported).to.deep.equal(['S256'])
+      expect(config.pipeshub_device_client_id).to.equal('pipeshub-agent')
+    })
+
+    it('should omit pipeshub_device_client_id when the instance has no org yet', async () => {
+      mockFirstPartyDeviceAppService.getOrCreate.resolves(null)
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.pipeshub_device_client_id).to.equal(undefined)
+      expect(config.device_authorization_endpoint).to.include(
+        '/device_authorization',
+      )
+    })
+
+    it('should advertise registration_endpoint only when DCR is enabled', async () => {
+      process.env.PIPESHUB_ENABLE_DCR = 'true'
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.registration_endpoint).to.include('/register')
+    })
+
+    it('should omit device grant metadata when the device grant is disabled', async () => {
+      process.env.PIPESHUB_ENABLE_DEVICE_GRANT = 'false'
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.device_authorization_endpoint).to.equal(undefined)
+      expect(config.grant_types_supported).to.not.include(
+        'urn:ietf:params:oauth:grant-type:device_code',
+      )
+      expect(config.pipeshub_device_client_id).to.equal(undefined)
+      expect(mockFirstPartyDeviceAppService.getOrCreate.called).to.be.false
+    })
+
+    it('should not advertise registration_endpoint for truthy values other than true', async () => {
+      for (const value of ['TRUE', '1', 'yes', 'on']) {
+        process.env.PIPESHUB_ENABLE_DCR = value
+        mockRes.json.resetHistory()
+        await controller.openidConfiguration({} as any, mockRes, mockNext)
+        const config = mockRes.json.firstCall.args[0]
+        expect(config.registration_endpoint, value).to.equal(undefined)
+      }
+    })
+  })
+
+  describe('oauthProtectedResource', () => {
+    it('should return protected resource metadata', async () => {
+      await controller.oauthProtectedResource({} as any, mockRes, mockNext)
+      const meta = mockRes.json.firstCall.args[0]
+      expect(meta.resource).to.include('/mcp')
+      expect(meta.authorization_servers).to.deep.equal(['http://localhost:3000'])
+      expect(meta.bearer_methods_supported).to.deep.equal(['header'])
+      expect(meta.pipeshub_device_client_id).to.equal('pipeshub-agent')
+    })
+
+    it('should list only the MCP_SCOPES the MCP tools use', async () => {
+      mockAppConfig.mcpScopes = ['openid', 'email', 'offline_access', 'semantic:write', 'conversation:write', 'kb:read']
+      await controller.oauthProtectedResource({} as any, mockRes, mockNext)
+      const meta = mockRes.json.firstCall.args[0]
+      expect(meta.scopes_supported).to.deep.equal(['offline_access', 'semantic:write', 'kb:read'])
+    })
+
+    it('should omit pipeshub_device_client_id when the device grant is disabled', async () => {
+      process.env.PIPESHUB_ENABLE_DEVICE_GRANT = 'false'
+      await controller.oauthProtectedResource({} as any, mockRes, mockNext)
+      const meta = mockRes.json.firstCall.args[0]
+      expect(meta.pipeshub_device_client_id).to.equal(undefined)
+      expect(mockFirstPartyDeviceAppService.getOrCreate.called).to.be.false
+    })
+  })
+
+  describe('jwks', () => {
+    it('should return empty keys for HS256', async () => {
+      await controller.jwks({} as any, mockRes, mockNext)
+      const jwks = mockRes.json.firstCall.args[0]
+      expect(jwks.keys).to.deep.equal([])
+    })
+
+    it('should return JWK for RS256 with valid public key', async () => {
+      const { publicKey } = crypto.generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      })
+      mockOAuthTokenService.getAlgorithm.returns('RS256')
+      mockOAuthTokenService.getPublicKey.returns(publicKey)
+      mockOAuthTokenService.getKeyId.returns('test-kid')
+
+      await controller.jwks({} as any, mockRes, mockNext)
+      const jwks = mockRes.json.firstCall.args[0]
+      expect(jwks.keys).to.have.lengthOf(1)
+      expect(jwks.keys[0].kty).to.equal('RSA')
+      expect(jwks.keys[0].kid).to.equal('test-kid')
+    })
+
+    it('should return empty keys for RS256 without public key', async () => {
+      mockOAuthTokenService.getAlgorithm.returns('RS256')
+      mockOAuthTokenService.getPublicKey.returns(undefined)
+      mockOAuthTokenService.getKeyId.returns(undefined)
+
+      await controller.jwks({} as any, mockRes, mockNext)
+      const jwks = mockRes.json.firstCall.args[0]
+      expect(jwks.keys).to.deep.equal([])
+    })
+  })
+
+  describe('userInfo', () => {
+    it('should return 401 when user not found', async () => {
+      const Users = require('../../../../src/modules/user_management/schema/users.schema').Users
+      sinon.stub(Users, 'findById').resolves(null)
+
+      const req = {
+        oauth: {
+          scopes: ['profile', 'email'],
+          payload: { userId: 'user-1' },
+        },
+      } as any
+
+      await controller.userInfo(req, mockRes, mockNext)
+      expect(mockRes.status.calledWith(401)).to.be.true
+    })
+
+    it('should return user info with profile and email scopes', async () => {
+      const Users = require('../../../../src/modules/user_management/schema/users.schema').Users
+      const mockUser = {
+        _id: 'user-1',
+        firstName: 'John',
+        lastName: 'Doe',
+        email: 'john@example.com',
+        hasLoggedIn: true,
+        updatedAt: new Date(),
+      }
+      sinon.stub(Users, 'findById').resolves(mockUser)
+
+      const req = {
+        oauth: {
+          scopes: ['profile', 'email'],
+          payload: { userId: 'user-1' },
+        },
+      } as any
+
+      await controller.userInfo(req, mockRes, mockNext)
+      const userInfo = mockRes.json.firstCall.args[0]
+      expect(userInfo.name).to.equal('John Doe')
+      expect(userInfo.email).to.equal('john@example.com')
+      expect(userInfo.email_verified).to.be.true
+    })
+  })
+})

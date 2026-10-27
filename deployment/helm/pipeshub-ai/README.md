@@ -1,0 +1,333 @@
+# PipesHub-AI Helm Chart
+
+Production-ready Helm chart for deploying PipesHub-AI with optional enterprise features.
+
+## Prerequisites
+
+- Kubernetes 1.24+
+- Helm 3.11+
+- (Optional) External Secrets Operator for `secretManagement.externalSecrets`
+
+## Configuration presets
+
+Two ready-to-use values files live next to this chart. Pick the one that
+matches your target environment and override secrets/hosts via `--set` (or
+your own values file layered on top).
+
+| Preset | File | Use for | Footprint |
+|--------|------|---------|-----------|
+| Local  | `values-local.yaml` | kind, minikube, k3d, k3s, Docker Desktop | 1× app, 1× Mongo/Kafka/Redis/Qdrant/Neo4j, RWO storage |
+| AWS EKS | `values-eks.yaml` | Amazon EKS. No NFS. One command: `deployment/helm/aws/deploy.sh --domain HOST --region REGION`. Guide: [docs/deployment/aws-eks.md](../../../docs/deployment/aws-eks.md) | gp3 per database, MongoDB ×3, Redis master+replica, Qdrant ×3, Neo4j ×1 |
+| Cloud HA | `values-cloud.yaml` | GKE, AKS, any cluster that already has RWX storage | 2× app + HPA, Bitnami Mongo, Kafka. Not for EKS |
+
+Both files document the required `--set` overrides at the top.
+
+## Quick start
+
+### 1. Build chart dependencies
+
+MongoDB and Redis are vendored in `deployment/helm/vendor`. This packages those local charts. It does not log in to Docker Hub.
+
+```bash
+helm dependency build ./deployment/helm/pipeshub-ai
+```
+
+### 2a. Local (single replica)
+
+> The release name below (`pipeshub-ai`) is intentional: it matches the chart
+> name so the rendered Service is also `pipeshub-ai` (otherwise the chart's
+> fullname template prefixes the release name and you get
+> `<release>-pipeshub-ai`). All sample `port-forward` / ingress snippets below
+> assume this convention.
+
+```bash
+helm upgrade --install pipeshub-ai ./deployment/helm/pipeshub-ai \
+  --namespace pipeshub-local --create-namespace \
+  -f ./deployment/helm/pipeshub-ai/values-local.yaml \
+  --set secretKey="$(openssl rand -hex 32)" \
+  --set mongodb.auth.rootPassword="change-me" \
+  --set redis.auth.password="change-me" \
+  --set neo4j.auth.password="change-me" \
+  --set "mongodb.auth.usernames[0]=pipeshub" \
+  --set "mongodb.auth.passwords[0]=$(openssl rand -hex 16)" \
+  --set "mongodb.auth.databases[0]=pipeshub"
+```
+
+To use the slim image (~1.3 GB smaller; models download on first use), add:
+
+```bash
+  --set image.tag=slim
+```
+
+For kind/minikube the image must be loaded into the cluster first:
+
+```bash
+kind load docker-image pipeshubai/pipeshub-ai:slim --name pipeshub      # kind
+minikube image load pipeshubai/pipeshub-ai:slim                         # minikube
+```
+
+Or use the bundled bootstrap script which handles cluster creation + image
+loading + Helm install in one go:
+
+```bash
+# Defaults: cluster=pipeshub, namespace=pipeshub-local, image=pipeshubai/pipeshub-ai:latest
+./deployment/helm/local-setup-kind-cluster.sh
+
+# Override image / namespace / preset via env vars:
+APP_IMAGE=pipeshubai/pipeshub-ai:slim \
+NAMESPACE=pipeshub-dev \
+./deployment/helm/local-setup-kind-cluster.sh
+
+# Layer custom overrides on top of values-local.yaml:
+EXTRA_HELM_ARGS="-f my-overrides.yaml --set neo4j.enabled=false" \
+./deployment/helm/local-setup-kind-cluster.sh
+
+# Wipe namespace + PVCs and reinstall from scratch:
+FORCE_FRESH=1 ./deployment/helm/local-setup-kind-cluster.sh
+```
+
+Re-running the bootstrap script **reuses existing secrets** when the release is already installed, so MongoDB/Neo4j PVC passwords stay in sync. Use `FORCE_FRESH=1` only when you want a clean slate.
+
+**Local access (port-forward from your laptop):**
+
+```bash
+# UI + API — enough for everyday use
+kubectl port-forward -n pipeshub-local svc/pipeshub-ai 3001:3001
+
+# Add 8088 only for connector OAuth / integration setup
+kubectl port-forward -n pipeshub-local svc/pipeshub-ai 3001:3001 8088:8088
+```
+
+Query (8000), indexing (8091), embedding (8002), and docling (8081) run inside the pod; the Node API on 3001 calls them in-cluster. You do not need to forward those ports for normal UI use.
+
+### 2b. Cloud (HA)
+
+```bash
+helm upgrade --install pipeshub-ai ./deployment/helm/pipeshub-ai \
+  --namespace pipeshub --create-namespace \
+  -f ./deployment/helm/pipeshub-ai/values-cloud.yaml \
+  --set global.storageClass=<block-class> \
+  --set persistence.storageClass=<rwx-class> \
+  --set ingress.className=<alb|gce|nginx> \
+  --set 'ingress.hosts[0].host=pipeshub.example.com' \
+  --set 'ingress.hosts[0].paths[0].path=/' \
+  --set 'ingress.hosts[0].paths[0].pathType=Prefix' \
+  --set config.frontendPublicUrl=https://pipeshub.example.com \
+  --set config.allowedOrigins=https://pipeshub.example.com \
+  --set secretKey="$(openssl rand -hex 32)" \
+  --set mongodb.auth.rootPassword="..." \
+  --set redis.auth.password="..." \
+  --set neo4j.auth.password="..." \
+  --set "mongodb.auth.usernames[0]=pipeshub" \
+  --set "mongodb.auth.passwords[0]=..." \
+  --set "mongodb.auth.databases[0]=pipeshub"
+```
+
+The ingress template defaults `serviceName` to the chart's rendered Service
+name and `port` to `3001`, so you do not need to override either unless you
+want to point at a different Service or expose port 8088 (see below).
+
+### Public exposure
+
+Only **port 3001** (UI + Node API) is exposed via the Ingress by default. Query (8000), indexing (8091), embedding (8002), docling (8081), and connector (8088) stay on the in-cluster `ClusterIP` Service because the Node API calls them directly inside the cluster.
+
+**When to expose 8088:** if you use OAuth-based connectors (Google, Microsoft, Slack, ...) or receive provider webhooks. Add a second ingress host *and* set `config.connectorPublicBackend` to that public URL so OAuth callbacks resolve correctly:
+
+```bash
+  --set 'ingress.hosts[1].host=pipeshub-connector.example.com' \
+  --set 'ingress.hosts[1].paths[0].path=/' \
+  --set 'ingress.hosts[1].paths[0].pathType=Prefix' \
+  --set 'ingress.hosts[1].paths[0].port=8088' \
+  --set config.connectorPublicBackend=https://pipeshub-connector.example.com
+```
+
+If you don't use OAuth/webhooks, omit `config.connectorPublicBackend` entirely — it's optional and only consumed when something external needs to call port 8088.
+
+Provider-specific values for the storage classes:
+
+| Provider | `global.storageClass` (block, stateful pods) | `persistence.storageClass` (RWX, shared app PVC) |
+|----------|----------------------------------------------|--------------------------------------------------|
+| AWS EKS | use [values-eks.yaml](values-eks.yaml); do not create an EFS class | not used |
+| GCP GKE  | `standard-rwo`                               | `filestore-csi`                                  |
+| Azure AKS| `managed-csi`                                | `azurefile-csi`                                  |
+| On-prem  | any block (Longhorn/Ceph)                    | any RWX (NFS, CephFS, GlusterFS)                 |
+
+The chart **refuses to install** when `replicaCount > 1` and persistence is not
+`ReadWriteMany` — to avoid silently leaving replicas stuck on `Multi-Attach`.
+
+## Redis: standalone, self-hosted cluster, or AWS MemoryDB
+
+By default the chart deploys the bundled Bitnami `redis` subchart in
+`replication` mode (`redis.mode: standalone`) — no extra configuration
+needed.
+
+To point at ElastiCache with cluster mode disabled (one primary, automatic
+failover, and a primary endpoint the app can use as a normal Redis), skip
+in-cluster Redis and set the host. Celery uses the same endpoint:
+
+```bash
+helm upgrade --install pipeshub-ai ./deployment/helm/pipeshub-ai \
+  ... \
+  --set redis.enabled=false \
+  --set redis.builtin.enabled=false \
+  --set redis.mode=standalone \
+  --set redis.external.enabled=true \
+  --set redis.external.host=master.my-redis.abc.use1.cache.amazonaws.com \
+  --set redis.clientTls.enabled=true \
+  --set redis.auth.password="<the AUTH token>"
+```
+
+To point at a self-hosted Redis Cluster or AWS MemoryDB instead, skip the
+bundled subchart and give the app the external endpoints. Cluster mode has
+no Celery transport, so also set `celery.brokerUrl` to a standalone Redis:
+
+```bash
+helm upgrade --install pipeshub-ai ./deployment/helm/pipeshub-ai \
+  ... \
+  --set redis.enabled=false \
+  --set redis.mode=cluster \
+  --set redis.external.enabled=true \
+  --set redis.external.clusterEndpoints="my-cluster.abcdef.memorydb.us-east-1.amazonaws.com:6379" \
+  --set redis.clientTls.enabled=true \
+  --set redis.auth.password="<the cluster/MemoryDB AUTH token>"
+```
+
+| Value | Purpose |
+|---|---|
+| `redis.enabled` | Set `false` to skip deploying the Bitnami subchart entirely (wired via `condition: redis.enabled` in `Chart.yaml`). Leave `true` for the default bundled Redis. |
+| `redis.mode` | `standalone` (default) or `cluster`. Any other value is resolved via `redis.providerModule`, e.g. an enterprise-only MemoryDB provider that adds IAM auth rotation. |
+| `redis.external.enabled` / `redis.external.host` | Standalone primary, such as ElastiCache with cluster mode disabled. Requires `redis.mode=standalone`. Do not set `clusterEndpoints` as well. |
+| `redis.external.clusterEndpoints` | External Redis Cluster or MemoryDB. Comma-separated `host:port` list. Requires a cluster-capable `redis.mode`. |
+| `redis.clientTls.*` | TLS for the app's client connection to `redis.external.host` or `redis.external.clusterEndpoints`. Deliberately not named `redis.tls` — that key is reserved by the Bitnami subchart for its own in-cluster server TLS and configures a different thing. |
+| `redis.keyNamespace` | Prefix applied inside key builders (not a client-level prefix) so multiple releases/tenants can share one Redis/MemoryDB. Covers the config KV store and its invalidation channel, the session/app cache, the accessible-records cache, retry counters, leases, and the BullMQ crawling queue. It does **not** cover Redis Streams topic or consumer-group names, so setting it together with `MESSAGE_BROKER=redis` is **rejected at startup** rather than silently letting two releases consume each other's messages. Use a separate Redis per deployment for the stream broker, or `MESSAGE_BROKER=kafka`. |
+| `redis.clusterScaleReads` | `master` (default) \| `slave` \| `all` — cluster-mode read distribution. |
+| `redis.providerModule` | npm/Python module path for a `REDIS_MODE` this chart doesn't know natively (enterprise providers). |
+| `celery.brokerUrl` / `celery.resultBackend` | Celery has no Redis Cluster transport; required whenever `redis.mode` isn't `standalone` — point these at a plain standalone Redis (can be a small dedicated instance, does not need to be the same backend as the KV/cache/streams Redis). |
+
+Redis Cluster and MemoryDB never support `SELECT` (`REDIS_DB`); it is only
+honoured when `redis.mode` is `standalone` (and a non-standalone `redis.mode` requires `redis.external.enabled=true` — the bundled subchart is a replication deployment, not a Redis Cluster). Use `redis.keyNamespace` for
+isolation instead.
+
+## Secret Management Modes
+
+- `inline` (default): chart creates Kubernetes Secret from values
+- `existingSecrets`: reference pre-created Kubernetes Secret names
+- `externalSecrets`: use External Secrets Operator to create target secret
+
+### Existing Secrets Example
+
+```bash
+helm upgrade --install pipeshub-ai ./deployment/helm/pipeshub-ai \
+  --set secretManagement.existingSecrets.enabled=true \
+  --set secretManagement.existingSecrets.appSecretName="pipeshub-secrets" \
+  --set secretManagement.existingSecrets.mongodbSecretName="pipeshub-secrets" \
+  --set secretManagement.existingSecrets.redisSecretName="pipeshub-secrets" \
+  --set secretManagement.existingSecrets.neo4jSecretName="pipeshub-secrets" \
+  --set secretManagement.existingSecrets.qdrantSecretName="pipeshub-secrets"
+```
+
+### External Secrets Example
+
+```bash
+helm upgrade --install pipeshub-ai ./deployment/helm/pipeshub-ai \
+  --set secretManagement.externalSecrets.enabled=true \
+  --set secretManagement.externalSecrets.secretStoreRef.name="cluster-secrets" \
+  --set secretManagement.externalSecrets.remoteRefs.secretKey="pipeshub/secret-key" \
+  --set secretManagement.externalSecrets.remoteRefs.mongodbUsername="pipeshub/mongodb/username" \
+  --set secretManagement.externalSecrets.remoteRefs.mongodbPassword="pipeshub/mongodb/password" \
+  --set secretManagement.externalSecrets.remoteRefs.redisPassword="pipeshub/redis/password" \
+  --set secretManagement.externalSecrets.remoteRefs.neo4jPassword="pipeshub/neo4j/password" \
+  --set secretManagement.externalSecrets.remoteRefs.qdrantApiKey="pipeshub/qdrant/api-key"
+```
+
+## Coding sandbox
+
+`config.sandboxMode` picks where `run_code` executes: `docker` (default),
+`e2b` (off-cluster), or `local` (no isolation, development only, needs
+`config.sandboxAllowLocal=true`). `docker` needs a daemon, and the chart
+refuses to install without one:
+
+- `sandbox.dind.enabled=true` (the `values-eks.yaml` default) adds two sidecars.
+  `dind` is a **privileged** Docker daemon that listens only on a unix socket
+  in the `dind-sock` emptyDir. `docker-proxy` runs `python -m app.docker_proxy_main`
+  from the application image, which is the same policy proxy the Compose
+  stacks use. It listens on `127.0.0.1:<sandbox.dind.port>` (the app's
+  `DOCKER_HOST`) and admits only sandbox-shaped requests: creates from the
+  allowed images (`config.sandboxDockerImage`, or `sandbox.proxy.allowedImages`)
+  with no privileged mode, host mounts, devices or host namespaces, acting
+  only on containers it created. Only `dind` and `docker-proxy` mount
+  `dind-sock`. The application container cannot reach the daemon directly.
+- `config.dockerHost` points at a daemon you run. Put the same proxy in front
+  of it. Never expose a raw dockerd.
+
+Mounting a container-runtime socket into the application container would give
+the app, and any code it runs, root on the node. At render time the chart refuses
+`extraVolumes`/`volumes` and `extraVolumeMounts`/`volumeMounts` that:
+
+- use a `hostPath` of type `Socket`;
+- use a `hostPath` that is a Docker, containerd (including k3s), CRI-O, podman or
+  cri-dockerd socket, or a directory that holds one, such as `/`, `/run` or
+  `/var/run`;
+- name one of those sockets in `mountPath`, `subPath` or `subPathExpr`.
+
+These checks are best-effort, not a security boundary. A runtime socket in an
+unusual place, or one reached through a symlink, is not recognised. Review any
+custom `hostPath`. Where you can, enforce it in the cluster too, for example with
+a Kyverno or Gatekeeper policy that forbids `hostPath` volumes on the application
+pod.
+
+**Image requirement:** the `docker-proxy` sidecar needs an application image
+that contains `app.docker_proxy_main` (the release that added the Compose
+Docker proxy, or later). On an older `image.tag` the sidecar crash-loops and
+`run_code` fails. Upgrade `image.tag`, or set `sandbox.proxy.image` to a newer
+image.
+
+## High-Value Features
+
+- Secret validation with fail-fast messages
+- Optional startup/readiness/liveness probe tuning
+- Optional extra volumes and mounts
+- Optional service account creation
+- Optional PDB, NetworkPolicy
+- Product telemetry switch: `telemetry.collection.enabled: false` sets `TELEMETRY_COLLECTION_FLAG=false`
+
+## Metrics
+
+The chart exposes no scrape port: the services push product telemetry to the collector (see `telemetry.collection.enabled`) and do not serve `/metrics`. The earlier `metrics`, `monitoring.serviceMonitor` and `telemetry.otlp` values configured nothing and were removed.
+
+## Validation
+
+```bash
+helm lint ./deployment/helm/pipeshub-ai
+helm template pipeshub-ai ./deployment/helm/pipeshub-ai \
+  -f ./deployment/helm/pipeshub-ai/values-local.yaml \
+  --set secretKey="test" \
+  --set mongodb.auth.rootPassword="test" \
+  --set redis.auth.password="test" \
+  --set neo4j.auth.password="test" \
+  --set "mongodb.auth.usernames[0]=pipeshub" \
+  --set "mongodb.auth.passwords[0]=test" \
+  --set "mongodb.auth.databases[0]=pipeshub"
+```
+
+CI runs two broader checks on every pull request that touches the chart, and
+weekly (`.github/workflows/helm-chart.yml`). Both run locally too:
+
+```bash
+# Lint, render and schema-check every supported configuration, and confirm
+# the misconfigurations the chart refuses are still refused (helm, kubeconform)
+bash deployment/helm/tests/check_chart.sh
+
+# Install into a throwaway single-node kind cluster and wait for every core
+# service to report healthy (kind, kubectl, helm, docker)
+bash deployment/helm/tests/kind_smoke.sh
+SMOKE_VARIANT=arangodb-redis bash deployment/helm/tests/kind_smoke.sh
+```
+
+## Production Checklist
+
+- Set all passwords and `secretKey` securely
+- Configure ingress/TLS
+- Enable `podDisruptionBudget` for HA
+- Enable `networkPolicy` with cluster-specific rules
+- Validate upgrade path in non-production first

@@ -1,0 +1,373 @@
+"""ToolSurfaces — single resolved snapshot of what capability surfaces are available.
+
+Collapses `_composed_code_tool`, `_web_reference`, `_internal_knowledge_reference`,
+`sandbox_network_enabled()`, and the eight `_has_*_tools(state)` calls in
+`prompt_builder.py` into one immutable value computed once per turn and threaded
+into every section builder.  This makes "never name an ungranted tool" mechanically
+checkable and removes the eight separate boolean re-computations.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
+
+from app.modules.agents.context.tool_names import granted, granted_any
+
+# Module-level import so tests can patch `tool_surface.sandbox_network_enabled`.
+# The try/except keeps the module importable in test environments that don't
+# have the full agent runtime installed.
+try:
+    from app.agents.agent_loop.sandbox_bridge import sandbox_network_enabled
+except ImportError:  # pragma: no cover
+    def sandbox_network_enabled() -> bool:  # type: ignore[misc]
+        return False
+
+
+_EXPLORATION_DELEGATE = "internal_exploration_agent"
+
+
+@dataclass(frozen=True)
+class ToolSurfaces:
+    """What capability surfaces are available for one agent turn.
+
+    All surface names are tool names exactly as they appear in ``spec.tool_names``.
+    ``None`` means the surface is not granted this turn.
+    """
+
+    retrieval: str | None
+    """Flat ``retrieval__search_internal_knowledge`` or composed
+    ``internal_exploration_agent``, or ``None`` when no knowledge is configured."""
+
+    web_names: tuple[str, ...]
+    """Granted web-tool names in the form they appear in ``spec.tool_names``.
+
+    ``("dynamic__web_search", "dynamic__fetch_url")`` for flat web tools,
+    ``("web_agent",)`` for the composed delegate, or ``()`` when no web
+    tool is granted this turn (web search may still be *available* via
+    ``has_web_search`` when only ``web_search_config`` is set — but no
+    callable name exists to print in the prompt).
+    """
+
+    code: str | None
+    """`"run_code"` or `"coding_agent"`, or `None` when code execution is
+    not available."""
+
+    code_networked: bool
+    """True iff `code` is not None and the sandbox has network access."""
+
+    graph: bool
+    """True iff a knowledgegraph tool is in `tool_names`."""
+
+    code_graph: bool
+    """True iff a codegraph tool is in `tool_names`.
+
+    Distinct from `code`, which is code *execution* (sandbox). This is the
+    indexed call/import graph of the org's own repositories, and the only
+    surface that returns relationships between symbols rather than matching
+    text — which is why it needs naming separately from `retrieval`.
+
+    Resolved from granted names, so it goes False on its own whenever the
+    dynamic tools are not built for this request.
+    """
+
+    live_api_apps: tuple[str, ...]
+    """App type keys with live-API service tools (e.g. `("jira", "confluence")`).
+    Derived from `agent_toolsets` AND the `_has_*_tools(state)` connector flags —
+    whichever non-empty set is available."""
+
+    can_ask_user: bool
+    """True iff `internaltools__ask_user_question` is in `tool_names`."""
+
+    can_fetch_full_record: bool
+    """True iff `dynamic_fetch_full_record` is in `tool_names`."""
+
+    has_knowledge: bool
+    """True iff the state indicates indexed knowledge is available
+    (`state["has_knowledge"]` or `agent_knowledge` is non-empty)."""
+
+    has_web_search: bool
+    """True iff web search is available — either via granted tool names in
+    `web_names` OR via the `web_search_config` state flag (chat/web_search
+    mode sets this flag even before tool names are populated)."""
+
+    has_service_tools: bool
+    """Convenience — True iff `live_api_apps` is non-empty."""
+
+    calculator_tools: tuple[str, ...] = ()
+    """Granted exact-calculation tools (expression, date difference, text
+    count, in that order); `()` when none is granted."""
+
+    @property
+    def search_tool(self) -> str | None:
+        """`retrieval` when this agent writes the search query itself; None
+        when retrieval goes through the exploration delegate, which takes a
+        goal and writes the queries in its own child run."""
+        if self.retrieval is None or self.retrieval == _EXPLORATION_DELEGATE:
+            return None
+        return self.retrieval
+
+    @classmethod
+    def resolve(
+        cls,
+        tool_names: Sequence[str],
+        state: Mapping[str, Any],
+    ) -> "ToolSurfaces":
+        """Compute surfaces from the granted tool set and agent state.
+
+        This is the single call site that reads connector flags and sandbox
+        state — no other code needs to repeat those checks.
+
+        Every name stored in the returned ``ToolSurfaces`` is the exact
+        spelling from ``tool_names`` (or the registry), never a guessed
+        separator form — so anything the prompt prints is callable.
+        """
+        names_set = set(tool_names)
+
+        # ── Retrieval surface ────────────────────────────────────────────────
+        # Prefer the composed exploration delegate; fall back to the flat tool
+        # (new name first, then legacy for backward-compat with old sessions).
+        retrieval = (
+            granted(_EXPLORATION_DELEGATE, names_set)
+            or granted("knowledgegraph.search", names_set)
+            or granted("retrieval.search_internal_knowledge", names_set)
+        )
+
+        # ── Web surface ──────────────────────────────────────────────────────
+        # Also check state["web_search_config"] — the chat/web_search mode sets
+        # this flag even when tool names haven't been populated yet (e.g. the
+        # test helper sets the flag without adding tools to spec.tool_names).
+        web_search_config = bool(state.get("web_search_config"))
+
+        web_agent = granted("web_agent", names_set)
+        if web_agent:
+            web_names: tuple[str, ...] = (web_agent,)
+        else:
+            web_names = granted_any(["web_search", "fetch_url"], names_set)
+
+        has_web_search = bool(web_names) or web_search_config
+
+        # ── Code surface ─────────────────────────────────────────────────────
+        code = (
+            granted("coding_agent", names_set)
+            or granted("run_code", names_set)
+        )
+
+        # Uses the module-level `sandbox_network_enabled` import so tests can patch it.
+        code_networked = False
+        if code is not None:
+            code_networked = sandbox_network_enabled()
+
+        # ── Graph surface ────────────────────────────────────────────────────
+        graph = bool(granted_any(
+            ["knowledgegraph.navigate", "knowledgegraph.lookup_record"],
+            names_set,
+        ))
+
+        # ── Code-graph surface ───────────────────────────────────────────────
+        # All four, not just the two entry points: an agent configured with a
+        # hand-picked subset would otherwise report no code-graph surface at all.
+        code_graph = bool(granted_any(
+            [
+                "codegraph.query_code_graph",
+                "codegraph.get_neighbour",
+                "codegraph.read_code",
+                "codegraph.find_symbol_path",
+            ],
+            names_set,
+        ))
+
+        # ── Live-API connector apps ──────────────────────────────────────────
+        live_api_apps = _resolve_live_api_apps(state, names_set)
+
+        # ── User-interaction tools ───────────────────────────────────────────
+        can_ask_user = granted("internaltools__ask_user_question", names_set) is not None
+        can_fetch_full_record = (
+            granted("knowledgegraph__fetch_record", names_set) is not None
+            or granted("dynamic_fetch_full_record", names_set) is not None
+        )
+
+        # ── Knowledge flag ───────────────────────────────────────────────────
+        has_knowledge = bool(
+            state.get("has_knowledge")
+            or (state.get("agent_knowledge") or [])
+        )
+
+        has_service_tools = bool(live_api_apps)
+
+        calculator_tools = granted_any(
+            ["calculator.evaluate_expression", "calculator.date_difference", "calculator.count_text"],
+            names_set,
+        )
+
+        return cls(
+            retrieval=retrieval,
+            web_names=web_names,
+            code=code,
+            code_networked=code_networked,
+            graph=graph,
+            code_graph=code_graph,
+            live_api_apps=live_api_apps,
+            can_ask_user=can_ask_user,
+            can_fetch_full_record=can_fetch_full_record,
+            has_knowledge=has_knowledge,
+            has_web_search=has_web_search,
+            has_service_tools=has_service_tools,
+            calculator_tools=calculator_tools,
+        )
+
+    # ── Convenience formatters ────────────────────────────────────────────────
+
+    def web_md(self) -> str:
+        """Backtick-wrapped markdown reference(s) to the granted web tools.
+
+        Returns ``""`` when ``web_names`` is empty (config-only web search
+        with no granted tool names this turn).
+        """
+        if not self.web_names:
+            return ""
+        return "/".join(f"`{n}`" for n in self.web_names)
+
+    def retrieval_md(self) -> str:
+        """Backtick-wrapped markdown reference to the retrieval surface.
+
+        Returns ``""`` when ``retrieval`` is ``None`` — callers must guard
+        on ``retrieval is not None`` before calling this.
+        """
+        if self.retrieval is None:
+            return ""
+        return f"`{self.retrieval}`"
+
+    def code_md(self) -> str:
+        """Backtick-wrapped markdown reference to the code surface."""
+        if self.code is None:
+            return ""
+        return f"`{self.code}`"
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+_CONNECTOR_FLAG_APP_MAP: dict[str, str] = {
+    "has_jira_connector": "jira",
+    "has_confluence_connector": "confluence",
+    "has_onedrive_connector": "onedrive",
+    "has_outlook_connector": "outlook",
+    "has_slack_connector": "slack",
+    "has_teams_connector": "teams",
+    "has_github_connector": "github",
+    "has_clickup_connector": "clickup",
+}
+
+
+def _resolve_live_api_apps(
+    state: Mapping[str, Any],
+    names_set: set[str],
+) -> tuple[str, ...]:
+    """Collect app type keys that have live-API tools available this turn.
+
+    Two sources: the `agent_toolsets` list (agent route) and the legacy
+    `has_<app>_connector` boolean flags that `connector_detection.py` sets
+    on the state dict.  Use whichever is populated.
+    """
+    apps: set[str] = set()
+
+    # Source 1: agent_toolsets (agent route)
+    for ts in state.get("agent_toolsets", []) or []:
+        if not isinstance(ts, dict):
+            continue
+        ts_name = (ts.get("name") or "").strip().lower()
+        if not ts_name or ts_name in ("retrieval", "knowledgehub", "knowledgegraph", "calculator"):
+            continue
+        ts_key = ts_name.split()[0]
+        apps.add(ts_key)
+
+    # Source 2: connector-detection flags (chat route / bridge)
+    if not apps:
+        for flag, app_key in _CONNECTOR_FLAG_APP_MAP.items():
+            if state.get(flag):
+                apps.add(app_key)
+
+    # Source 3: service-specific tool names in the granted set
+    # (covers any case not handled by the two sources above)
+    internal = _internal_toolset_keys()
+    for name in names_set:
+        if "__" in name:
+            prefix = name.split("__", 1)[0]
+            if _prefix_key(prefix) not in internal:
+                apps.add(prefix)
+
+    return tuple(sorted(apps))
+
+
+# Prefixes that are never a live-API connector but cannot be read off the
+# registry (dynamic tools are assembled per request, not registered).
+# `codegraph` is here for exactly that reason: its tools are built by
+# `_build_dynamic_tools`, so the registry has nothing to report and Source 3
+# would otherwise read the prefix as a connector and tell the model the code
+# graph is a live service to query instead of an index over its own records.
+_NON_CONNECTOR_PREFIXES = frozenset({"dynamic", "skills", "codegraph"})
+
+# Used only while the registry is empty. Kept in sync by the test that asserts
+# it equals the registry's own `isInternal` set once discovery has run.
+_FALLBACK_INTERNAL_KEYS = frozenset({
+    "artifactmanager", "calculator", "codegraph", "codingsandbox",
+    "databasesandbox", "datecalculator", "imagegenerator", "internaltools",
+    "knowledgegraph", "knowledgehub", "retrieval",
+})
+# Tool-name prefixes of internal toolsets that no key normalises to (the
+# Artifact Manager's tools live under /tools/artifacts/). Same sync test.
+_FALLBACK_INTERNAL_PREFIXES = frozenset({"artifacts"})
+
+
+def _prefix_key(name: str) -> str:
+    """Compare a tool-name prefix the way the registry keys its toolsets.
+
+    Prefixes come from the tool path and keep underscores (`date_calculator`);
+    registry keys drop them (`datecalculator`).
+    """
+    return name.lower().replace(" ", "").replace("_", "")
+
+
+def _tool_prefixes(toolset_class: type | None) -> set[str]:
+    """The `<app>` of each `/tools/<app>/<tool>` path a toolset declares."""
+    prefixes: set[str] = set()
+    for attr in vars(toolset_class or object).values():
+        meta = getattr(getattr(attr, "__func__", attr), "_agent_tool_meta", None)
+        parts = (getattr(meta, "path", "") or "").rsplit("/", 2)
+        if len(parts) == 3 and parts[-2]:
+            prefixes.add(_prefix_key(parts[-2]))
+    return prefixes
+
+
+def _internal_toolset_keys() -> frozenset[str]:
+    """Toolset keys that are internal, read from the registry.
+
+    Keys are compared in `_prefix_key` form and include each internal
+    toolset's own tool-path prefixes, since a tool's prefix need not be its
+    toolset's name (`artifacts` vs `artifactmanager`).
+
+    A hardcoded list went stale the moment the registry started normalising
+    names: it said `database_sandbox` / `date_calculator` / `artifacts` while
+    the registry had produced `databasesandbox` / `datecalculator` /
+    `artifactmanager`, so six internal toolsets were being described to the
+    model as live-API connectors. The registry is the fact; ask it.
+
+    An *empty* registry is not the fact, though — it means `auto_discover_
+    toolsets` has not run yet, and answering "nothing is internal" from that
+    would relabel every internal toolset as a live connector.
+    """
+    try:
+        from app.agents.registry.toolset_registry import get_toolset_registry
+
+        registry = get_toolset_registry().get_all_toolsets()
+    except Exception:  # pragma: no cover - registry unavailable in some tests
+        registry = {}
+    if not registry:
+        return _NON_CONNECTOR_PREFIXES | _FALLBACK_INTERNAL_KEYS | _FALLBACK_INTERNAL_PREFIXES
+    keys: set[str] = set()
+    for name, meta in registry.items():
+        if meta.get("isInternal"):
+            keys.add(_prefix_key(name))
+            keys |= _tool_prefixes(meta.get("class"))
+    return _NON_CONNECTOR_PREFIXES | frozenset(keys)

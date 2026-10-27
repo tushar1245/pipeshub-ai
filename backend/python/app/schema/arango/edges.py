@@ -1,0 +1,665 @@
+from enum import Enum
+from typing import List, Type
+
+from app.config.constants.arangodb import (
+    EntityRelations,
+    RecordRelations,
+)
+
+
+def _get_enum_values(enum_class: Type[Enum]) -> List[str]:
+    """Helper function to extract enum values from an enum class"""
+    return [item.value for item in enum_class]
+
+
+node_relations_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "relationshipType": {
+                "type": "string",
+                "enum": _get_enum_values(RecordRelations),
+            },
+            "customRelationshipTag": {
+                "type": "string",
+                "description": "Optional custom relationship tag (use relationshipType directly instead of this field)"
+            },
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the file relations schema.",
+}
+
+# Links only: a hierarchy type can never land here.
+record_links_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "relationshipType": {
+                "type": "string",
+                "enum": [
+                    t for t in _get_enum_values(RecordRelations)
+                    if t not in (RecordRelations.PARENT_CHILD.value, RecordRelations.ATTACHMENT.value)
+                ],
+            },
+            "constraintName": {"type": "string"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["relationshipType"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the record links schema.",
+}
+
+entity_relations_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "edgeType": {
+                "type": "string",
+                "enum": _get_enum_values(EntityRelations),
+            },
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "sourceTimestamp": {"type": "number"},
+        },
+        "required": ["edgeType", "createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the entity relations schema.",
+}
+
+is_of_type_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+    },
+    "level": "strict",
+    "message": "Document does not match the relations schema.",
+}
+
+user_drive_relation_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "access_level": {"type": "string"},
+        },
+        "required": ["access_level"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the user drive relation schema.",
+}
+
+# Tasks belongs to Workflow
+# User belongs to *
+# Record belongs to *
+belongs_to_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "entityType": {
+                "type": ["string", "null"],
+                "enum": ["GROUP", "DOMAIN", "ORGANIZATION", "KB", "WORKFLOW", "USER"],
+            },
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the belongsTo schema.",
+}
+
+# Org -> Org: prospect relationship (Account start to first won opportunity)
+prospect_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "rating": {"type": ["string", "null"]},
+            "type": {"type": ["string", "null"]},
+            "externalId": {"type": ["string", "null"]},
+            "startTime": {"type": ["number", "null"]}, # When Account was made in Salesforce (epoch ms)
+            "endTime": {"type": ["number", "null"]}, # When first opportunity was won (epoch ms)
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the prospect schema.",
+}
+
+# Org -> Org: customer relationship
+customer_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "rating": {"type": ["string", "null"]},
+            "type": {"type": ["string", "null"]},
+            "activeCustomer": {"type": "boolean"},
+            "externalId": {"type": ["string", "null"]},
+            "since": {"type": ["number", "null"]}, # When customer relationship started (epoch ms)
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the customer schema.",
+}
+
+# Org -> Person: lead (until converted to contact)
+lead_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "company": {"type": ["string", "null"]},
+            "title": {"type": ["string", "null"]},
+            "status": {"type": ["string", "null"]},
+            "rating": {"type": ["string", "null"]},
+            "industry": {"type": ["string", "null"]},
+            "leadSource": {"type": ["string", "null"]},
+            "annualRevenue": {"type": ["number", "null"]},
+            "externalId": {"type": ["string", "null"]},
+            "startTime": {"type": ["number", "null"]},  # When contact was made in Salesforce (epoch ms)
+            "endTime": {"type": ["number", "null"]},   # When lead was converted to contact (epoch ms)
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the lead schema.",
+}
+
+# Org -> Person: contact relationship
+contact_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "description": {"type": ["string", "null"]},
+            "leadSource": {"type": ["string", "null"]},
+            "since": {"type": ["number", "null"]},  # When contact was made in Salesforce (epoch ms)
+            "externalId": {"type": ["string", "null"]},  # Salesforce Contact Id for mapping leads
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the contact schema.",
+}
+
+# Org -> Deal: opportunity/deal relationship
+deal_info_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "stage": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the deal info schema.",
+}
+
+# Deal -> Org: deal belongs to organization
+deal_of_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the dealOf schema.",
+}
+
+# Product -> Deal: product sold in deal.
+#
+# Parallel arrays (quantities, unitPrices, totalPrices, isDeletedFlags) store all
+# OLI rows for a (Product2, Opportunity) pair. Arrays are always written atomically
+# (delete + batch_create), so length parity is guaranteed by construction.
+sold_in_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "quantities": {
+                "type": "array",
+                "items": {"type": ["number", "null"]},
+            },
+            "unitPrices": {
+                "type": "array",
+                "items": {"type": ["number", "null"]},
+            },
+            "totalPrices": {
+                "type": "array",
+                "items": {"type": ["number", "null"]},
+            },
+            "isDeletedFlags": {
+                "type": "array",
+                "items": {"type": "boolean"},
+            },
+            "sourceUpdatedAtTimestamp": {"type": ["number", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the soldIn schema.",
+}
+
+# Person -> Org: membership (Title, Department)
+member_of_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "title": {"type": ["string", "null"]},
+            "department": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the memberOf schema.",
+}
+
+# This is when records/record groups inherit permissions from parent record groups
+inherit_permissions_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the inheritPermissions schema.",
+}
+
+permissions_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "externalPermissionId": {"type": ["string", "null"]},
+            # ORGANIZATION: the org's read grant on a service account's chat upload
+            # (utils/record_access.py), kept apart from ORG so it grants nothing else.
+            "type": {"type": ["string", "null"], "enum": ["USER", "GROUP", "DOMAIN", "TEAM", "ORG", "ROLE", "ORGANIZATION"]},
+            "role": {
+                "type": "string",
+                "enum": [
+                    "OWNER",
+                    "ORGANIZER",
+                    "FILEORGANIZER",
+                    "WRITER",
+                    "COMMENTER",
+                    "READER",
+                    "OTHERS",
+                ],
+            },
+            "sourceRoleType": {"type": ["string", "null"]},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "lastUpdatedTimestampAtSource": {"type": "number"},
+        },
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the permissions schema.",
+}
+
+user_app_relation_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "syncState": {
+                "type": "string",
+                "enum": ["NOT_STARTED", "IN_PROGRESS", "PAUSED", "COMPLETED", "FAILED"],
+            },
+            "lastSyncUpdate": {"type": "number"},
+            "sourceUserId": {"type": "string"},
+            # Set on principals who reached this app only through a share, not through
+            # app membership. Gates the browse-hoisting branches.
+            "isExternalUser": {"type": "boolean"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["syncState", "lastSyncUpdate"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the user app relation schema.",
+}
+
+# User (connector creator) -> User (source account the connector authenticated as)
+authenticated_as_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "connectorId": {"type": "string", "minLength": 1},
+            "orgId": {"type": "string"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["connectorId", "createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the authenticatedAs schema.",
+}
+
+# Agent -> Tool, Model, Workflow
+# Task -> agent
+basic_edge_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the basic edge schema.",
+}
+
+mentions_entity_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "orgId": {"type": "string"},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+            "mentionCount": {"type": "integer"},
+            "maxEvidence": {"type": "number"},
+            "extractors": {"type": "array", "items": {"type": "string"}},
+            "extractedNames": {"type": "array", "items": {"type": "string"}},
+            "blockIndexes": {"type": "array", "items": {"type": "integer"}},
+            "blockIds": {"type": "array", "items": {"type": "string"}},
+            "extractorVersion": {"type": "string"},
+            "mergedFrom": {"type": ["string", "null"]},
+            "migratedFrom": {"type": ["string", "null"]},
+        },
+        "required": ["orgId", "createdAtTimestamp", "mentionCount"],
+        # Open, as nodeRelations and entityRelations are: see named_entity_schema.
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the mentionsEntity schema.",
+}
+
+# Record -> category / subcategory / language / topic. Carries the raw name the
+# model extracted for that record, so a wrong merge can be undone per record.
+taxonomy_edge_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "extractedName": {"type": ["string", "null"]},
+            # Every spelling the record used for the node, extractedName first.
+            "extractedNames": {"type": ["array", "null"], "items": {"type": "string"}},
+            # The node this edge was moved from by a taxonomy merge or
+            # migration (app.modules.entity_resolution.consolidation).
+            "mergedFrom": {"type": ["string", "null"]},
+            # The legacy node a migration moved this edge from.
+            "migratedFrom": {"type": ["string", "null"]},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": False,
+    },
+    "level": "strict",
+    "message": "Document does not match the taxonomy edge schema.",
+}
+
+# User -> Agent
+# User -> Agent Template
+role_based_edge_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "role": {"type": "string", "enum": ["OWNER", "MEMBER"]},
+        },
+        "required": ["role", "createdAtTimestamp"],
+        "additionalProperties": True,
+    }
+}
+
+# Agent -> Memory
+source_edge_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "source": {"type": "string", "enum": ["CONVERSATION", "KNOWLEDGE_BASE", "APPS"]},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    }
+}
+
+# Agent -> Toolset
+agent_has_toolset_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent has toolset schema.",
+}
+
+# Agent -> Knowledge
+agent_has_knowledge_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent has knowledge schema.",
+}
+
+# Toolset -> Tool
+toolset_has_tool_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the toolset has tool schema.",
+}
+
+
+# Skill -> Skill (agentSkillRelation) — the skill-to-skill connectedness
+# graph materialized from `SkillMetadata.related`/`requires`/`replaced_by`
+# on every create/update (see GraphSkillStore). `type` distinguishes the
+# three relation kinds so a traversal can pick just one direction of the
+# graph (e.g. "requires" for a hierarchy walk) without a second collection.
+agent_skill_relation_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "enum": ["related", "requires", "replaced_by"]},
+            "createdAtTimestamp": {"type": "number"},
+        },
+        "required": ["type", "createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent skill relation schema.",
+}
+
+# Agent -> Skill (agentHasSkill) — per-agent skill assignment, mirrors
+# agent_has_toolset_schema/agent_has_knowledge_schema exactly.
+agent_has_skill_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent has skill schema.",
+}
+
+# Agent -> MCP Server — per-agent MCP server attachment, mirrors
+# agent_has_toolset_schema exactly.
+agent_has_mcp_server_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the agent has MCP server schema.",
+}
+
+# MCP Server -> Tool — mirrors toolset_has_tool_schema exactly; tool nodes
+# live in the same AGENT_TOOLS collection as toolset tools.
+mcp_server_has_tool_schema = {
+    "rule": {
+        "type": "object",
+        "properties": {
+            "_from": {"type": "string", "minLength": 1},
+            "_to": {"type": "string", "minLength": 1},
+            "createdAtTimestamp": {"type": "number"},
+            "updatedAtTimestamp": {"type": "number"},
+        },
+        "required": ["createdAtTimestamp"],
+        "additionalProperties": True,
+    },
+    "level": "strict",
+    "message": "Document does not match the MCP server has tool schema.",
+}
+
+
+# future schema
+
+# task_action_edge_schema = {
+#     "rule": {
+#         "type": "object",
+#         "properties": {
+#             "_from": {"type": "string", "minLength": 1},
+#             "_to": {"type": "string", "minLength": 1},
+#             "createdAtTimestamp": {"type": "number"},
+#             "approvers": {
+#                 "type": "array", "items":{
+#                 "type": "object",
+#                     "properties": {
+#                         "userId": {"type": "array", "items": {"type": "string"}},
+#                         "userGroupsIds": {"type": "array", "items": {"type": "string"}},
+#                         "order": {"type": "number"},
+#                     },
+#                 "required": ["userId", "order"],
+#                 "additionalProperties": True,
+#             }},
+#             "reviewers": {
+#                 "type": "array", "items":{
+#                 "type": "object",
+#                 "properties": {
+#                     "userId": {"type": "array", "items": {"type": "string"}},
+#                     "userGroupsIds": {"type": "array", "items": {"type": "string"}},
+#                     "order": {"type": "number"},
+#                 },
+#                 "required": ["userId", "order"],
+#                 "additionalProperties": True,
+#             }},
+#         },
+#     },
+#     "level": "strict",
+#     "message": "Document does not match the agent action edge schema.",
+# }

@@ -1,0 +1,494 @@
+"""Conversations API clients for integration tests."""
+
+from typing import Any
+
+import requests
+
+from helper.http.api_client import APIClient
+
+
+def _request_options(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split HTTP options from payload/query kwargs."""
+    options: dict[str, Any] = {}
+    for key in ("auth", "headers", "timeout", "params", "stream"):
+        if key in kwargs:
+            options[key] = kwargs.pop(key)
+    if "auth" not in options:
+        options["auth"] = True
+    return options, kwargs
+
+
+def _sse_headers(options: dict[str, Any], *, stream: bool) -> None:
+    if not stream:
+        return
+    headers = dict(options.get("headers") or {})
+    headers.setdefault("Accept", "text/event-stream")
+    options["headers"] = headers
+    options["stream"] = True
+
+
+def _merge_json_body(
+    *,
+    query: str | None,
+    json: dict[str, Any] | None,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    body = dict(json) if json is not None else {}
+    if query is not None:
+        body.setdefault("query", query)
+    body.update(payload)
+    return body
+
+
+class ConversationsClient(APIClient):
+    """Client for /api/v1/conversations endpoints (non-agent chat)."""
+
+    BASE = "/api/v1/conversations"
+
+    def list_conversations(self, **kwargs: Any) -> requests.Response:
+        """List conversations (GET /)."""
+        return self._list_get("/", **kwargs)
+
+    def get_conversation(self, conversation_id: str, **kwargs: Any) -> requests.Response:
+        """Get conversation by id."""
+        options, params = _request_options(kwargs)
+        if params:
+            options["params"] = params
+        return self.get(f"/{conversation_id}", **options)
+
+    def delete_conversation(self, conversation_id: str, **kwargs: Any) -> requests.Response:
+        """Delete a conversation."""
+        return self.delete(f"/{conversation_id}", **kwargs)
+
+    def create_conversation(
+        self,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Start a conversation and wait for the full answer (POST /create)."""
+        options, payload = _request_options(kwargs)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        return self.post("/create", json=body, **options)
+
+    def add_message(
+        self,
+        conversation_id: str,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Add a message and wait for the full answer (POST /{id}/messages)."""
+        options, payload = _request_options(kwargs)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        return self.post(f"/{conversation_id}/messages", json=body, **options)
+
+    def stream_conversation(
+        self,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        stream: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Start conversation stream (POST /stream)."""
+        options, payload = _request_options(kwargs)
+        _sse_headers(options, stream=stream)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        if json is None:
+            body.setdefault("chatMode", "internal_search")
+        return self.post(
+            "/stream",
+            json=body,
+            **options,
+        )
+
+    def stream_message(
+        self,
+        conversation_id: str,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        stream: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Add message via SSE stream."""
+        options, payload = _request_options(kwargs)
+        _sse_headers(options, stream=stream)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        if json is None:
+            body.setdefault("chatMode", "internal_search")
+        return self.post(
+            f"/{conversation_id}/messages/stream",
+            json=body,
+            **options,
+        )
+
+    def archive_conversation(self, conversation_id: str, **kwargs: Any) -> requests.Response:
+        """Archive a conversation (PATCH /{id}/archive)."""
+        return self.patch(f"/{conversation_id}/archive", **kwargs)
+
+    def unarchive_conversation(self, conversation_id: str, **kwargs: Any) -> requests.Response:
+        """Unarchive a conversation (PATCH /{id}/unarchive)."""
+        return self.patch(f"/{conversation_id}/unarchive", **kwargs)
+
+    def update_title(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        json: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Update conversation title (PATCH /{id}/title)."""
+        options, payload = _request_options(kwargs)
+        body = dict(json) if json is not None else {}
+        if title is not None:
+            body.setdefault("title", title)
+        body.update(payload)
+        return self.patch(f"/{conversation_id}/title", json=body, **options)
+
+    def share_conversation(
+        self,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Share a conversation (POST /{id}/share)."""
+        options, payload = _request_options(kwargs)
+        return self.post(f"/{conversation_id}/share", json=payload, **options)
+
+    def unshare_conversation(
+        self,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Unshare a conversation (POST /{id}/unshare)."""
+        options, payload = _request_options(kwargs)
+        return self.post(f"/{conversation_id}/unshare", json=payload, **options)
+
+    def list_archived_conversations(self, **kwargs: Any) -> requests.Response:
+        """List archived conversations (GET /show/archives)."""
+        return self._list_get("/show/archives", **kwargs)
+
+    def search_archived_conversations(self, **kwargs: Any) -> requests.Response:
+        """Search archived conversations (GET /show/archives/search)."""
+        return self._list_get("/show/archives/search", **kwargs)
+
+    def regenerate_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        json: dict[str, Any] | None = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Regenerate a message (POST /{id}/message/{messageId}/regenerate)."""
+        options, payload = _request_options(kwargs)
+        _sse_headers(options, stream=stream)
+        body = dict(json) if json is not None else {}
+        body.update(payload)
+        return self.post(
+            f"/{conversation_id}/message/{message_id}/regenerate",
+            json=body,
+            **options,
+        )
+
+    def submit_message_feedback(
+        self,
+        conversation_id: str,
+        message_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Submit feedback for a message."""
+        options, payload = _request_options(kwargs)
+        return self.post(
+            f"/{conversation_id}/message/{message_id}/feedback",
+            json=payload,
+            **options,
+        )
+
+    def set_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Link/unlink a conversation to a project (PUT /{id}/project)."""
+        return self.put(
+            f"/{conversation_id}/project", json={"projectId": project_id}, **kwargs
+        )
+
+    def set_project_visibility(
+        self,
+        conversation_id: str,
+        visibility: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Override a conversation's project visibility (PATCH /{id}/project-visibility)."""
+        return self.patch(
+            f"/{conversation_id}/project-visibility",
+            json={"visibility": visibility},
+            **kwargs,
+        )
+
+    def _list_get(self, path: str, **kwargs: Any) -> requests.Response:
+        options, params = _request_options(kwargs)
+        if params:
+            options["params"] = params
+        return self.get(path, **options)
+
+
+class AgentConversationsClient(APIClient):
+    """Client for /api/v1/agents/{agentKey}/conversations/* endpoints."""
+
+    BASE = "/api/v1/agents"
+
+    def list_conversations(self, agent_key: str, **kwargs: Any) -> requests.Response:
+        """List agent conversations (GET /{agentKey}/conversations)."""
+        return self._list_get(f"/{agent_key}/conversations", **kwargs)
+
+    def list_grouped_archives(self, **kwargs: Any) -> requests.Response:
+        """List grouped archived conversations (GET /conversations/show/archives)."""
+        return self._list_get("/conversations/show/archives", **kwargs)
+
+    def list_archived_conversations(self, agent_key: str, **kwargs: Any) -> requests.Response:
+        """List archived conversations for an agent."""
+        return self._list_get(f"/{agent_key}/conversations/show/archives", **kwargs)
+
+    def get_conversation(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Get conversation by id."""
+        options, params = _request_options(kwargs)
+        if params:
+            options["params"] = params
+        return self.get(f"/{agent_key}/conversations/{conversation_id}", **options)
+
+    def delete_conversation(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Delete a conversation."""
+        return self.delete(f"/{agent_key}/conversations/{conversation_id}", **kwargs)
+
+    def archive_conversation(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Archive a conversation."""
+        return self.post(f"/{agent_key}/conversations/{conversation_id}/archive", **kwargs)
+
+    def unarchive_conversation(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Unarchive a conversation."""
+        return self.post(
+            f"/{agent_key}/conversations/{conversation_id}/unarchive",
+            **kwargs,
+        )
+
+    def update_title(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        json: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Update conversation title (PATCH /{id}/title)."""
+        options, payload = _request_options(kwargs)
+        body = dict(json) if json is not None else {}
+        if title is not None:
+            body.setdefault("title", title)
+        body.update(payload)
+        return self.patch(
+            f"/{agent_key}/conversations/{conversation_id}/title",
+            json=body,
+            **options,
+        )
+
+    def create_conversation(
+        self,
+        agent_key: str,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Start an agent conversation and wait for the full answer (POST /{agentKey}/conversations)."""
+        options, payload = _request_options(kwargs)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        return self.post(f"/{agent_key}/conversations", json=body, **options)
+
+    def add_message(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Add a message and wait for the full answer (POST /{agentKey}/conversations/{id}/messages)."""
+        options, payload = _request_options(kwargs)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        return self.post(
+            f"/{agent_key}/conversations/{conversation_id}/messages",
+            json=body,
+            **options,
+        )
+
+    def stream_conversation(
+        self,
+        agent_key: str,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        stream: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Start agent conversation stream (POST /{agentKey}/conversations/stream)."""
+        options, payload = _request_options(kwargs)
+        _sse_headers(options, stream=stream)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        if json is None:
+            body.setdefault("chatMode", "quick")
+        return self.post(
+            f"/{agent_key}/conversations/stream",
+            json=body,
+            **options,
+        )
+
+    def stream_message(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        *,
+        query: str | None = None,
+        json: dict[str, Any] | None = None,
+        stream: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Add message via SSE stream."""
+        options, payload = _request_options(kwargs)
+        _sse_headers(options, stream=stream)
+        body = _merge_json_body(query=query, json=json, payload=payload)
+        if json is None:
+            body.setdefault("chatMode", "quick")
+        return self.post(
+            f"/{agent_key}/conversations/{conversation_id}/messages/stream",
+            json=body,
+            **options,
+        )
+
+    def regenerate_message(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        message_id: str,
+        *,
+        json: dict[str, Any] | None = None,
+        stream: bool = True,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Regenerate a message (POST .../message/{messageId}/regenerate)."""
+        options, payload = _request_options(kwargs)
+        _sse_headers(options, stream=stream)
+        body = dict(json) if json is not None else {}
+        body.update(payload)
+        if json is None:
+            body.setdefault("chatMode", "quick")
+        return self.post(
+            f"/{agent_key}/conversations/{conversation_id}/message/{message_id}/regenerate",
+            json=body,
+            **options,
+        )
+
+    def submit_message_feedback(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        message_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Submit feedback for a message."""
+        options, payload = _request_options(kwargs)
+        return self.post(
+            f"/{agent_key}/conversations/{conversation_id}/message/{message_id}/feedback",
+            json=payload,
+            **options,
+        )
+
+    def upload_attachments(
+        self,
+        agent_key: str,
+        *,
+        files: Any,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Upload chat attachments (multipart)."""
+        return self.post(
+            f"/{agent_key}/conversations/attachments/upload",
+            files=files,
+            **kwargs,
+        )
+
+    def delete_attachment(
+        self,
+        agent_key: str,
+        record_id: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Delete an uploaded attachment by record id."""
+        return self.delete(
+            f"/{agent_key}/conversations/attachments/{record_id}",
+            **kwargs,
+        )
+
+    def set_project(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        project_id: str | None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Link/unlink an agent conversation to a project (PUT .../project)."""
+        return self.put(
+            f"/{agent_key}/conversations/{conversation_id}/project",
+            json={"projectId": project_id},
+            **kwargs,
+        )
+
+    def set_project_visibility(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        visibility: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Override an agent conversation's project visibility (PATCH .../project-visibility)."""
+        return self.patch(
+            f"/{agent_key}/conversations/{conversation_id}/project-visibility",
+            json={"visibility": visibility},
+            **kwargs,
+        )
+
+    def _list_get(self, path: str, **kwargs: Any) -> requests.Response:
+        options, params = _request_options(kwargs)
+        if params:
+            options["params"] = params
+        return self.get(path, **options)

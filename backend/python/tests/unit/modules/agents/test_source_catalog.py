@@ -1,0 +1,497 @@
+"""Tests for `SourceCatalog` and `build_routing_guidance`.
+
+Covers the plan's test requirements:
+  - Rendering for kb-only / app-only / mixed / no-ID KB / duplicate app types
+  - `list_files_param` correctness per kind
+  - `live_only_apps` returns Slack when Slack has tools but no knowledge,
+    and NOT when Slack is indexed (regression guard for hardcoded list)
+  - `ids_actionable=False` emits no UUID anywhere (chat-route regression, Finding H)
+  - `build_routing_guidance` basic behavior
+"""
+
+from __future__ import annotations
+
+import re
+
+import pytest
+
+from app.modules.agents.context.retrieval_routing import build_routing_guidance
+from app.modules.agents.context.source_catalog import (
+    DEMO_ONLY_SOURCE_NOTE,
+    DEMO_SOURCE_NOTE,
+    ORG_HAS_REAL_DATA_KEY,
+    SourceCatalog,
+    SourceKind,
+)
+
+# ---------------------------------------------------------------------------
+# Fixtures / helpers
+# ---------------------------------------------------------------------------
+
+KB_ID   = "aabbccdd-1111-1111-1111-aabbccdd0001"
+CONF_ID = "aabbccdd-2222-2222-2222-aabbccdd0002"
+JIRA_ID = "aabbccdd-3333-3333-3333-aabbccdd0003"
+JIRA_ID_2 = "aabbccdd-5555-5555-5555-aabbccdd0005"
+SLACK_ID = "aabbccdd-6666-6666-6666-aabbccdd0006"
+
+
+def _make_kb_entry(label: str, cid: str = "") -> dict:
+    return {"displayName": label, "type": "KB", "connectorId": cid}
+
+
+def _make_app_entry(label: str, app_type: str, cid: str, filters: dict | None = None) -> dict:
+    entry: dict = {"displayName": label, "type": app_type, "connectorId": cid}
+    return entry
+
+
+def _catalog_from_knowledge(entries: list[dict]) -> SourceCatalog:
+    """Build a catalog directly from raw knowledge entries."""
+    state: dict = {"agent_knowledge": entries}
+    return SourceCatalog.from_state(state)
+
+
+def _no_uuid_in(text: str) -> bool:
+    """Returns True if the text contains no UUID-like tokens."""
+    return not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", text, re.I)
+
+
+# ---------------------------------------------------------------------------
+# SourceCatalog.from_state
+# ---------------------------------------------------------------------------
+
+class TestFromState:
+
+    def test_empty_knowledge_and_connectors_yields_empty(self) -> None:
+        catalog = SourceCatalog.from_state({})
+        assert catalog.is_empty()
+        assert catalog.ids_actionable is False
+
+    def test_agent_knowledge_yields_actionable(self) -> None:
+        catalog = _catalog_from_knowledge([_make_kb_entry("KB", KB_ID)])
+        assert catalog.ids_actionable is True
+
+    def test_available_connectors_only_yields_not_actionable(self) -> None:
+        state = {
+            "agent_knowledge": [],
+            "available_connectors": [{"type": "confluence"}],
+        }
+        catalog = SourceCatalog.from_state(state)
+        assert not catalog.is_empty()
+        assert catalog.ids_actionable is False
+
+    def test_kb_entry_classified_as_kb(self) -> None:
+        catalog = _catalog_from_knowledge([_make_kb_entry("My KB", KB_ID)])
+        assert len(catalog.sources) == 1
+        assert catalog.sources[0].kind == SourceKind.KB
+
+    def test_app_entry_classified_as_app(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        assert len(catalog.sources) == 1
+        assert catalog.sources[0].kind == SourceKind.APP
+        assert catalog.sources[0].app == "confluence"
+
+    def test_mixed_kb_and_app(self) -> None:
+        entries = [
+            _make_kb_entry("Private KB", KB_ID),
+            _make_app_entry("Jira", "jira", JIRA_ID),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        assert len(catalog.kb_sources()) == 1
+        assert len(catalog.app_sources()) == 1
+
+    def test_app_without_connector_id_skipped(self) -> None:
+        entries = [_make_app_entry("Broken", "jira", "")]  # empty connectorId
+        catalog = _catalog_from_knowledge(entries)
+        assert catalog.is_empty()
+
+    def test_kb_without_id_included(self) -> None:
+        """A KB with no id is still a valid source (omit connector_ids to search it)."""
+        catalog = _catalog_from_knowledge([_make_kb_entry("Company Wiki", "")])
+        assert not catalog.is_empty()
+        assert catalog.sources[0].source_id == ""
+
+
+# ---------------------------------------------------------------------------
+# SourceCatalog.render — IDs appear exactly once
+# ---------------------------------------------------------------------------
+
+class TestRender:
+
+    def test_empty_catalog_returns_empty_string(self) -> None:
+        catalog = SourceCatalog.from_state({})
+        assert catalog.render() == ""
+
+    def test_kb_with_id_rendered_once(self) -> None:
+        catalog = _catalog_from_knowledge([_make_kb_entry("Private KB", KB_ID)])
+        rendered = catalog.render()
+        assert rendered.count(KB_ID) == 1, f"Expected 1 occurrence, got {rendered.count(KB_ID)}"
+
+    def test_app_id_rendered_once(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render()
+        assert rendered.count(CONF_ID) == 1
+
+    def test_multiple_sources_each_id_once(self) -> None:
+        entries = [
+            _make_kb_entry("KB", KB_ID),
+            _make_app_entry("Confluence", "confluence", CONF_ID),
+            _make_app_entry("Jira", "jira", JIRA_ID),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        rendered = catalog.render()
+        for cid in (KB_ID, CONF_ID, JIRA_ID):
+            assert rendered.count(cid) == 1, f"{cid} appears {rendered.count(cid)} times"
+
+    def test_kb_no_id_shows_omit_guidance(self) -> None:
+        catalog = _catalog_from_knowledge([_make_kb_entry("Company Wiki", "")])
+        rendered = catalog.render()
+        assert "omit" in rendered.lower() or "connector_ids" in rendered
+
+    def test_render_includes_list_files_param_note(self) -> None:
+        """The source_ids parameter must be mentioned in the render output."""
+        entries = [
+            _make_kb_entry("KB", KB_ID),
+            _make_app_entry("Confluence", "confluence", CONF_ID),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        rendered = catalog.render()
+        assert "source_ids" in rendered
+
+
+# ---------------------------------------------------------------------------
+# ids_actionable=False: no UUIDs on the chat route (Finding H regression)
+# ---------------------------------------------------------------------------
+
+class TestIdsNotActionable:
+
+    def test_chat_route_emits_no_uuids(self) -> None:
+        """When ids_actionable=False, render() must produce zero UUID-like tokens."""
+        state = {
+            "agent_knowledge": [],
+            "available_connectors": [
+                {"type": "confluence"},
+                {"type": "jira"},
+            ],
+        }
+        catalog = SourceCatalog.from_state(state)
+        rendered = catalog.render()
+        assert _no_uuid_in(rendered), (
+            f"Chat-route render contains UUIDs: {re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}', rendered, re.I)}"
+        )
+
+    def test_chat_route_still_renders_type_names(self) -> None:
+        state = {
+            "agent_knowledge": [],
+            "available_connectors": [{"type": "confluence"}, {"type": "jira"}],
+        }
+        catalog = SourceCatalog.from_state(state)
+        rendered = catalog.render()
+        assert "CONFLUENCE" in rendered or "confluence" in rendered
+
+
+# ---------------------------------------------------------------------------
+# list_files_param property
+# ---------------------------------------------------------------------------
+
+class TestListFilesParam:
+
+    def test_kb_source_uses_record_group_ids(self) -> None:
+        catalog = _catalog_from_knowledge([_make_kb_entry("KB", KB_ID)])
+        kb = catalog.kb_sources()[0]
+        assert kb.list_files_param == "record_group_ids"
+
+    def test_app_source_uses_connector_ids(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Jira", "jira", JIRA_ID)])
+        app = catalog.app_sources()[0]
+        assert app.list_files_param == "connector_ids"
+
+
+# ---------------------------------------------------------------------------
+# duplicate_apps
+# ---------------------------------------------------------------------------
+
+class TestDuplicateApps:
+
+    def test_no_duplicates(self) -> None:
+        entries = [
+            _make_app_entry("Confluence", "confluence", CONF_ID),
+            _make_app_entry("Jira", "jira", JIRA_ID),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        assert catalog.duplicate_apps() == ()
+
+    def test_same_type_returns_type_key(self) -> None:
+        entries = [
+            _make_app_entry("Jira Prod", "jira", JIRA_ID),
+            _make_app_entry("Jira Staging", "jira", JIRA_ID_2),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        assert "jira" in catalog.duplicate_apps()
+
+
+# ---------------------------------------------------------------------------
+# live_only_apps
+# ---------------------------------------------------------------------------
+
+class TestLiveOnlyApps:
+
+    def test_slack_live_only_when_no_slack_knowledge(self) -> None:
+        """Slack is live-only when it has toolset tools but no indexed entry."""
+        entries = [_make_app_entry("Jira", "jira", JIRA_ID)]  # only Jira indexed
+        catalog = _catalog_from_knowledge(entries)
+        # Slack has toolsets but no knowledge
+        toolset_apps = frozenset(["slack", "jira"])
+        live_only = catalog.live_only_apps(toolset_apps)
+        assert "slack" in live_only
+
+    def test_slack_not_live_only_when_indexed(self) -> None:
+        """Slack is NOT live-only when it IS indexed as a knowledge source."""
+        entries = [_make_app_entry("Slack", "slack", SLACK_ID)]
+        catalog = _catalog_from_knowledge(entries)
+        toolset_apps = frozenset(["slack"])
+        live_only = catalog.live_only_apps(toolset_apps)
+        assert "slack" not in live_only
+
+    def test_empty_toolset_apps_returns_empty(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Jira", "jira", JIRA_ID)])
+        assert catalog.live_only_apps(frozenset()) == ()
+
+
+# ---------------------------------------------------------------------------
+# build_routing_guidance
+# ---------------------------------------------------------------------------
+
+class TestCanonicalKnowledgeBlock:
+    """Phase 7: Verify the canonical knowledge-system block emits the
+    'ranked sample' wording unconditionally on the agent route (ids_actionable=True),
+    regardless of whether knowledgegraph__fetch_record has been granted."""
+
+    def test_ranked_sample_present_without_fetch_record_granted(self) -> None:
+        """Turn 1: only search is granted — ranked sample must still appear."""
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render(tool_names=["knowledgegraph__search"])
+        assert "ranked sample" in rendered.lower()
+
+    def test_ranked_sample_present_after_fetch_record_granted(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render(tool_names=["knowledgegraph__search", "knowledgegraph__fetch_record"])
+        assert "ranked sample" in rendered.lower()
+
+    def test_search_described_as_content_tool(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Jira", "jira", JIRA_ID)])
+        rendered = catalog.render()
+        # The canonical block says search gives content
+        assert "content" in rendered.lower()
+        assert "metadata" in rendered.lower()
+
+    def test_canonical_block_always_rendered(self) -> None:
+        """The canonical knowledge-system block is rendered for all routes."""
+        state = {
+            "agent_knowledge": [],
+            "available_connectors": [{"type": "confluence"}],
+        }
+        catalog = SourceCatalog.from_state(state)
+        rendered = catalog.render()
+        assert "knowledge system" in rendered.lower()
+
+    def test_combining_them_section_present_on_agent_route(self) -> None:
+        """The 'Combining them' paragraph must be in the canonical block."""
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render()
+        assert "Combining them" in rendered
+
+    def test_entities_paragraph_absent_without_search_entities_grant(self) -> None:
+        """The exploration child renders the catalog without tool names and
+        has no entity tools, so it must not be told to call them."""
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        assert "**Entities.**" not in catalog.render()
+        assert "search_entities" not in catalog.render(tool_names=["knowledgegraph__search"])
+
+    def test_entities_paragraph_names_both_tools_when_granted(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render(
+            tool_names=["knowledgegraph__search", "knowledgegraph__search_entities"],
+        )
+        assert "**Entities.**" in rendered
+        assert "knowledgegraph__search_entities(query=...)" in rendered
+        assert "knowledgegraph__find_records_by_entity(entity_id=...)" in rendered
+        assert "`knowledgegraph__search(query=..., entity_ids=[...])`" in rendered
+
+    def test_entities_paragraph_is_stable_when_find_records_unlocks(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        before = catalog.render(tool_names=["knowledgegraph__search", "knowledgegraph__search_entities"])
+        after = catalog.render(tool_names=[
+            "knowledgegraph__search",
+            "knowledgegraph__search_entities",
+            "knowledgegraph__find_records_by_entity",
+        ])
+        assert before == after
+
+    def test_entities_paragraph_only_names_real_entity_types_and_tools(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render(
+            tool_names=["knowledgegraph__search", "knowledgegraph__search_entities"],
+        )
+        for stale in ("people", "expand_neighbors", "get_relationships", "connectedEntities"):
+            assert stale not in rendered
+
+    def test_composed_top_level_delegates_entity_content_search(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Confluence", "confluence", CONF_ID)])
+        rendered = catalog.render(
+            tool_names=["knowledgegraph__search_entities", "internal_exploration_agent"],
+        )
+        assert "ask `internal_exploration_agent`" in rendered
+
+
+class TestBuildRoutingGuidance:
+    """`build_routing_guidance` now states ONLY the duplicate-connector
+    disambiguation note — parallel-per-source and naming-narrows-not-skips
+    are each stated exactly once elsewhere now: the first in
+    `retrieval.search_internal_knowledge`'s own schema, the second as the
+    single generalized precedence rule in `finding_information`
+    (`prompt_builder.py`)."""
+
+    def test_empty_catalog_returns_empty(self) -> None:
+        catalog = SourceCatalog.from_state({})
+        assert build_routing_guidance(catalog) == ""
+
+    def test_no_duplicates_returns_empty(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Jira", "jira", JIRA_ID)])
+        assert build_routing_guidance(catalog) == ""
+
+    def test_duplicate_app_note_included(self) -> None:
+        entries = [
+            _make_app_entry("Jira Prod", "jira", JIRA_ID),
+            _make_app_entry("Jira Staging", "jira", JIRA_ID_2),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        guidance = build_routing_guidance(catalog)
+        assert "jira" in guidance.lower()
+        assert "same type" in guidance.lower() or "multiple connectors" in guidance.lower()
+
+
+class TestRenderEmbedsRoutingGuidance:
+    """`render()` is the sole call site for `build_routing_guidance` now —
+    no separate "## Retrieval Routing" section exists to keep in sync."""
+
+    def test_render_includes_duplicate_note_when_duplicates_exist(self) -> None:
+        entries = [
+            _make_app_entry("Jira Prod", "jira", JIRA_ID),
+            _make_app_entry("Jira Staging", "jira", JIRA_ID_2),
+        ]
+        catalog = _catalog_from_knowledge(entries)
+        rendered = catalog.render()
+        assert "Multiple connectors of the same type" in rendered
+
+    def test_render_omits_note_without_duplicates(self) -> None:
+        catalog = _catalog_from_knowledge([_make_app_entry("Jira", "jira", JIRA_ID)])
+        rendered = catalog.render()
+        assert "Multiple connectors of the same type" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Demo data note
+# ---------------------------------------------------------------------------
+
+DEMO_ID = "aabbccdd-7777-7777-7777-aabbccdd0007"
+
+
+class TestDemoSourceNote:
+    """The sample data describes Acme Corp, whatever the workspace's organization is called.
+
+    The prompt names the workspace's organization, and a model can decline to
+    answer from records about a differently named company.
+    """
+
+    def test_agent_route_explains_the_demo_source(self) -> None:
+        cat = _catalog_from_knowledge([
+            _make_app_entry("Acme Corp demo data: GitHub, Jira, Slack, Google Drive and ServiceNow", "Demo", DEMO_ID),
+            _make_app_entry("Engineering Jira", "JIRA", JIRA_ID),
+        ])
+        text = cat.render()
+        assert DEMO_SOURCE_NOTE in text
+        assert text.count(DEMO_SOURCE_NOTE) == 1
+
+    def test_chat_route_explains_it_too(self) -> None:
+        cat = SourceCatalog.from_state({"available_connectors": [{"type": "Demo"}, {"type": "SLACK"}]})
+        assert DEMO_SOURCE_NOTE in cat.render()
+
+    def test_no_note_without_the_demo(self) -> None:
+        cat = _catalog_from_knowledge([_make_app_entry("Engineering Jira", "JIRA", JIRA_ID)])
+        assert "Acme Corp" not in cat.render()
+
+    def test_only_demo_records_are_acme_corps(self) -> None:
+        # Asked about Acme Corp, a model labelled the user's own uploaded policy as Acme's.
+        assert "Only records from the Demo source are Acme Corp's" in DEMO_SOURCE_NOTE
+        assert "never call a record from any other source" in DEMO_SOURCE_NOTE
+
+    def test_the_note_sits_with_the_sources_not_in_place_of_them(self) -> None:
+        cat = _catalog_from_knowledge([_make_app_entry("Acme Corp demo data", "Demo", DEMO_ID)])
+        text = cat.render()
+        assert text.index(DEMO_ID) < text.index(cat.demo_note())
+
+
+class TestDemoOnly:
+    """With nothing real to search, the demo answers "our" questions; beside real
+    data it stays #3500's named fallback, so Acme facts never pass as the org's."""
+
+    def test_an_agent_on_the_demo_alone(self) -> None:
+        cat = _catalog_from_knowledge([_make_app_entry("Acme Corp demo data", "Demo", DEMO_ID)])
+        assert cat.demo_only()
+        assert DEMO_ONLY_SOURCE_NOTE in cat.render()
+        assert DEMO_SOURCE_NOTE not in cat.render()
+
+    @pytest.mark.parametrize("other", [_make_kb_entry("Policies", KB_ID), _make_app_entry("Engineering Jira", "JIRA", JIRA_ID)])
+    def test_an_agent_with_a_real_source_too(self, other: dict) -> None:
+        cat = _catalog_from_knowledge([_make_app_entry("Acme Corp demo data", "Demo", DEMO_ID), other])
+        assert not cat.demo_only()
+        assert DEMO_SOURCE_NOTE in cat.render()
+        assert DEMO_ONLY_SOURCE_NOTE not in cat.render()
+
+    def test_chat_in_a_workspace_with_no_real_data(self) -> None:
+        cat = SourceCatalog.from_state({"available_connectors": [{"type": "Demo"}], ORG_HAS_REAL_DATA_KEY: False})
+        assert cat.demo_only()
+        assert DEMO_ONLY_SOURCE_NOTE in cat.render()
+
+    @pytest.mark.parametrize("state_extra", [{}, {ORG_HAS_REAL_DATA_KEY: True}])
+    def test_chat_assumes_real_collections_unless_told_otherwise(self, state_extra: dict) -> None:
+        # The chat route searches Collections without listing them.
+        cat = SourceCatalog.from_state({"available_connectors": [{"type": "Demo"}], **state_extra})
+        assert not cat.demo_only()
+        assert DEMO_SOURCE_NOTE in cat.render()
+
+    def test_the_assistants_empty_collection_does_not_count(self) -> None:
+        # The universal agent lists every Collection, and every user owns one.
+        knowledge = [_make_kb_entry("Bob's Private", KB_ID), _make_app_entry("Acme Corp demo data", "Demo", DEMO_ID)]
+        empty = SourceCatalog.from_state({"agent_knowledge": knowledge, ORG_HAS_REAL_DATA_KEY: False})
+        assert empty.demo_only()
+        for state_extra in ({}, {ORG_HAS_REAL_DATA_KEY: True}):
+            assert not SourceCatalog.from_state({"agent_knowledge": knowledge, **state_extra}).demo_only()
+
+    def test_another_connector_counts_even_with_nothing_indexed(self) -> None:
+        knowledge = [_make_app_entry("Acme Corp demo data", "Demo", DEMO_ID), _make_app_entry("Engineering Jira", "JIRA", JIRA_ID)]
+        assert not SourceCatalog.from_state({"agent_knowledge": knowledge, ORG_HAS_REAL_DATA_KEY: False}).demo_only()
+
+    def test_chat_with_another_connector(self) -> None:
+        cat = SourceCatalog.from_state(
+            {"available_connectors": [{"type": "Demo"}, {"type": "SLACK"}], ORG_HAS_REAL_DATA_KEY: False}
+        )
+        assert not cat.demo_only()
+
+    def test_no_demo(self) -> None:
+        cat = SourceCatalog.from_state({"available_connectors": [{"type": "SLACK"}], ORG_HAS_REAL_DATA_KEY: False})
+        assert not cat.demo_only()
+        assert cat.demo_note() == ""
+
+    def test_both_notes_keep_the_org_name_out_of_demo_searches_only(self) -> None:
+        for note in (DEMO_SOURCE_NOTE, DEMO_ONLY_SOURCE_NOTE):
+            assert note.endswith("Leave the organization's name out of searches of the Demo source.")
+
+    def test_the_mixed_note_keeps_3500s_rules(self) -> None:
+        assert "never present an Acme Corp fact as the user's organization's" in DEMO_SOURCE_NOTE
+        assert "name Acme Corp" in DEMO_SOURCE_NOTE
+
+    def test_the_demo_only_note_answers_our_questions_and_says_it_is_demo_data(self) -> None:
+        assert "as from this workspace's own data" in DEMO_ONLY_SOURCE_NOTE
+        assert "In the Acme Corp demo data" in DEMO_ONLY_SOURCE_NOTE
+        assert "never decline Demo records" in DEMO_ONLY_SOURCE_NOTE

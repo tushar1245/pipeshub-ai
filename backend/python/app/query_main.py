@@ -1,0 +1,664 @@
+import asyncio
+import logging
+import os
+import sys
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+import app.utils.runtime_threads  # noqa: E402 - must precede all ML library imports
+from app.api.middlewares.admin_gate import require_admin_caller
+from app.api.middlewares.request_context import RequestContextMiddleware
+from app.api.routes.chatbot import warm_up_entity_vector_store
+from app.api.routes.records import router as records_router
+from app.core.envelope import configure_from_config as configure_envelope
+from app.core.org_context import spawn_detached
+from app.edition_config import (
+    agent_router,
+    agent_sharing_router,
+    authMiddleware,
+    chatbot_router,
+    ensure_org_context,
+    search_router,
+)
+from app.services.model_identity.principal import service_principal
+from app.services.model_identity.runtime import call_scope
+from app.services.model_identity.workload import Workload
+from app.utils.log_redaction import log_safe_validation_errors
+from app.utils.logger import install_log_redaction
+from app.utils.request_context import set_service_suffix
+
+set_service_suffix("-qs")
+from app.api.routes.ai_models_registry import router as ai_models_registry_router
+from app.api.routes.code_graph import router as code_graph_router  # noqa: E402 - after set_service_suffix(), like the imports around it
+from app.api.routes.health import router as health_router
+from app.api.routes.openai_models import router as openai_models_router
+from app.api.routes.skills import router as skills_router
+from app.api.routes.speech import router as speech_router
+from app.api.routes.toolsets import router as toolsets_router
+from app.edition_containers import QueryAppContainer
+from app.edition_services import (  # noqa: E402 - like the imports around it, after set_service_suffix()
+    configure_app,
+    register_extra_toolsets,
+)
+from app.health.health import Health
+from app.services.messaging.config import get_message_broker_type
+from app.services.messaging.kafka.utils.utils import KafkaUtils
+from app.services.messaging.messaging_factory import MessagingFactory
+from app.services.messaging.utils import MessagingUtils
+from app.telemetry.setup import setup_telemetry
+from app.utils.llm_api_mode_store import get_llm_api_mode_store
+from app.utils.process_hardening import mark_process_non_dumpable
+from app.utils.time_conversion import get_epoch_timestamp_in_ms
+from app.utils.url_redaction import redact_sensitive_query_params
+from app.utils.validation_messages import friendly_validation_errors
+from app.utils.worker_scaling import set_process_worker_count
+
+container = QueryAppContainer.init("query_service")
+
+
+async def initialize_container(container: QueryAppContainer) -> bool:
+    """Initialize container resources"""
+    logger = container.logger()
+    logger.info("🚀 Initializing application resources")
+
+    try:
+        # Ensure connector service is healthy before starting query service
+        logger.info("Checking Connector service health before startup")
+        await Health.health_check_connector_service(container)
+
+        # Ensure Graph Database Provider is initialized (connection is handled in the resource factory)
+        logger.info("Ensuring Graph Database Provider is initialized")
+        graph_provider = await container.graph_provider()
+        if not graph_provider:
+            raise Exception("Failed to initialize Graph Database Provider")
+
+        # Store the resolved graph_provider in the container to avoid coroutine reuse
+        container._graph_provider = graph_provider
+        logger.info("✅ Graph Database Provider initialized and connected")
+
+        # Load previously-learned LLM API-mode facts (Responses vs. Chat
+        # Completions) before any request can build a model — see
+        # `app/utils/llm_api_mode_store.py`. Best-effort: a failed load
+        # just means the heuristic-only path is used until the next
+        # `llmConfigured` event refreshes it.
+        await get_llm_api_mode_store(container.config_service()).load()
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize resources: {str(e)}")
+        raise
+
+
+async def get_initialized_container() -> QueryAppContainer:
+    """Dependency provider for initialized container"""
+    if not hasattr(get_initialized_container, "initialized"):
+        await initialize_container(container)
+        container.wire(
+            modules=[
+                "app.api.routes.search",
+                "app.api.routes.chatbot",
+                "app.modules.retrieval.retrieval_service"
+            ]
+        )
+        get_initialized_container.initialized = True
+    return container
+
+async def start_kafka_consumers(app_container: QueryAppContainer) -> list:
+    """Start all message consumers at application level"""
+    logger = app_container.logger()
+    consumers = []
+    broker_type = get_message_broker_type()
+
+    try:
+        # Create RetryManager for persistent failure retry tracking
+        redis_config = await MessagingUtils._get_redis_config(app_container)
+        retry_manager = MessagingFactory.create_retry_manager(logger, redis_config)
+        await retry_manager.initialize()
+        logger.info("✅ RetryManager initialized for %s consumer", broker_type.value)
+
+        logger.info(f"🚀 Starting AI Config Consumer (broker: {broker_type})...")
+        aiconfig_config = await MessagingUtils.create_aiconfig_consumer_config(app_container)
+        aiconfig_consumer = MessagingFactory.create_consumer(
+            broker_type=broker_type,
+            logger=logger,
+            config=aiconfig_config,
+            retry_manager=retry_manager
+        )
+        aiconfig_message_handler = await KafkaUtils.create_aiconfig_message_handler(app_container)
+        await aiconfig_consumer.start(aiconfig_message_handler)
+        consumers.append(("aiconfig", aiconfig_consumer))
+        logger.info("✅ AI Config consumer started")
+
+        logger.info(f"✅ All {len(consumers)} message consumers started successfully")
+        return consumers
+
+    except Exception as e:
+        logger.error(f"❌ Error starting message consumers: {str(e)}")
+        # Cleanup any started consumers
+        for name, consumer in consumers:
+            try:
+                await consumer.stop()
+                logger.info(f"Stopped {name} consumer during cleanup")
+            except Exception as cleanup_error:
+                logger.error(f"Error stopping {name} consumer during cleanup: {cleanup_error}")
+        raise
+
+async def stop_kafka_consumers(container: QueryAppContainer) -> bool|None:
+    """Stop all Kafka consumers"""
+    logger = container.logger()
+    consumers = getattr(container, 'kafka_consumers', [])
+    for name, consumer in consumers:
+        try:
+            await consumer.stop()
+            logger.info(f"✅ {name.title()} message consumer stopped")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error stopping {name} consumer: {str(e)}")
+            return False
+        finally:
+            # Clear the consumers list
+            if hasattr(container, 'kafka_consumers'):
+                container.kafka_consumers = []
+    return None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Lifespan context manager for FastAPI"""
+    mark_process_non_dumpable()
+    install_log_redaction()
+
+    # Before anything builds a pool or semaphore off a per-process budget.
+    set_process_worker_count(configured_worker_count())
+
+    # Initialize container
+    app_container = await get_initialized_container()
+    # Store container in app state for access in dependencies
+    app.container = app_container
+
+    logger = app.container.logger()
+    logger.debug("🚀 Starting retrieval application")
+
+    await configure_envelope(app_container.config_service())
+
+    from app.agents.actions.storage_search.storage_search import (
+        sweep_orphan_views_at_startup,
+    )
+
+    await sweep_orphan_views_at_startup(app_container.config_service())
+
+    try:
+        await telemetry.bind(app_container.config_service(), logger).start()
+    except Exception as e:
+        logger.warning(f"❌ Failed to start telemetry pusher: {e}")
+
+    # Get the already-resolved graph_provider from container (set during initialization)
+    # This avoids coroutine reuse error
+    graph_provider = getattr(app_container, '_graph_provider', None)
+    if not graph_provider:
+        # Fallback: if not set during initialization, resolve it now
+        graph_provider = await app_container.graph_provider()
+    app.state.graph_provider = graph_provider
+
+    # KB uploads made through chat index in this process, so it invalidates too.
+    try:
+        from app.services.cache.invalidation_hooks import (
+            init_accessible_records_invalidator,
+        )
+        init_accessible_records_invalidator(
+            logger, await app_container.accessible_records_cache(), graph_provider
+        )
+    except Exception as e:
+        logger.warning(f"❌ Failed to register accessible-records invalidator: {e}")
+
+    # Start all message consumers centrally
+    try:
+        consumers = await start_kafka_consumers(app_container)
+        app_container.kafka_consumers = consumers
+        logger.info("✅ All message consumers started successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to start message consumers: {str(e)}")
+        raise
+
+    # Get all organizations
+    orgs = await graph_provider.get_all_orgs()
+    if not orgs:
+        logger.info("No organizations found in the system")
+    else:
+        logger.info("Found organizations in the system")
+        retrieval_service = await container.retrieval_service()
+
+        # Warm up the embedding model in the background. The default
+        # HuggingFace model (BAAI/bge-large-en-v1.5) can take minutes to
+        # download and load on a cold cache, which would otherwise block the
+        # FastAPI lifespan and prevent the service from accepting traffic
+        # (including health checks) until it finishes. Kick it off as a
+        # background task; callers of `get_embedding_model_instance()` will
+        # await/coordinate via the internal lock and lazy-load on first use
+        # if the warmup hasn't completed yet.
+        async def _warmup_embedding_model() -> None:
+            try:
+                logger.info("🔥 Warming up embedding model in background")
+                async with call_scope(
+                    service_principal("warmup"),
+                    Workload.SYSTEM,
+                    config_service=container.config_service(),
+                    container=container,
+                ):
+                    await retrieval_service.get_embedding_model_instance()
+                logger.info("✅ Embedding model warmup complete")
+            except Exception as warmup_error:
+                logger.error(
+                    f"❌ Embedding model warmup failed (will retry on first use): {warmup_error}"
+                )
+
+        app.state.embedding_warmup_task = spawn_detached(_warmup_embedding_model())
+
+        # Builtin skill packs are seeded here, once per org per pack version,
+        # instead of being checked on every agent request.
+        try:
+            from app.agents.agent_loop.skills_wiring import skills_enabled
+            from app.services.featureflag.platform_settings import is_skills_enabled
+
+            if skills_enabled() and await is_skills_enabled(container.config_service()):
+                from app.agents.agent_loop.skills.manager_factory import (
+                    reconcile_builtin_skills_for_orgs,
+                )
+
+                app.state.skills_seed_task = asyncio.create_task(
+                    reconcile_builtin_skills_for_orgs(graph_provider, orgs)
+                )
+        except Exception as e:
+            logger.warning(f"Builtin skill seeding not scheduled at startup (requests will retry): {e}")
+
+        # For OpenSearch: pre-load the k-NN HNSW graphs into the OS page cache
+        # so that the first search after a restart or force-merge is not blocked
+        # by mmap I/O. This is a best-effort operation — a non-OpenSearch provider
+        # or a missing collection (first run, no data yet) simply skips silently.
+        async def _warmup_knn_index() -> None:
+            try:
+                vector_db_svc = await container.vector_db_service()
+                if not hasattr(vector_db_svc, "warmup"):
+                    return
+                managed = await retrieval_service.collection_registry.list_managed_collections()
+                if not managed:
+                    logger.info("k-NN warmup skipped — nothing indexed yet")
+                    return
+                for entry in managed:
+                    if not await vector_db_svc.collection_exists(entry.name):
+                        continue
+                    logger.info(
+                        f"🔥 Warming up k-NN index for collection '{entry.name}'"
+                    )
+                    await vector_db_svc.warmup(entry.name)
+                logger.info("✅ k-NN index warmup complete")
+            except Exception as warmup_error:
+                logger.warning(
+                    f"k-NN index warmup failed (non-fatal, search will still work): {warmup_error}"
+                )
+
+        app.state.knn_warmup_task = spawn_detached(_warmup_knn_index())
+
+        app.state.entity_store_warmup_task = spawn_detached(
+            warm_up_entity_vector_store(app_container, logger)
+        )
+
+        # Collections created before keyword scoring was fixed (Qdrant IDF,
+        # OpenSearch stemming) are updated in place. A deployment that only
+        # serves search never reaches the indexing write path that would
+        # otherwise do it, so it has to happen here too.
+        async def _reconcile_lexical_scoring() -> None:
+            try:
+                changed = await retrieval_service.collection_registry.reconcile_lexical_scoring()
+                if changed:
+                    logger.info(f"Updated keyword scoring on collection(s) {changed}")
+            except Exception as reconcile_error:
+                logger.warning(f"Keyword-scoring reconcile failed (non-fatal): {reconcile_error}")
+
+        app.state.lexical_reconcile_task = spawn_detached(_reconcile_lexical_scoring())
+
+    # Prepare the coding sandbox backend before a user needs it. On Docker
+    # that means pulling the sandbox image and creating the egress network —
+    # otherwise the first `run_code` of a deployment pays for both inside a
+    # user's request. Background and best-effort, like the warmups above: a
+    # backend that is misconfigured or unreachable must not stop the service
+    # from serving everything else, and the reason is recorded on app.state
+    # so it can be read back without re-probing the daemon on every health
+    # check.
+    async def _warmup_coding_sandbox() -> None:
+        from app.agent_loop_lib.sandbox.coding.base import SandboxContext
+        from app.agent_loop_lib.sandbox.coding.registry import build_default_registry
+        from app.agent_loop_lib.sandbox.coding.settings import (
+            EnvSandboxSettingsLoader,
+            SharedSandboxConfig,
+        )
+
+        try:
+            settings = await EnvSandboxSettingsLoader().load(SandboxContext())
+            registry = build_default_registry(
+                shared_config=SharedSandboxConfig(max_lifetime_s=settings.max_lifetime_s),
+                backend_options=settings.backend_options,
+            )
+            factory = registry.get(settings.backend)
+            health = await factory.health_check()
+            app.state.sandbox_health = {
+                "backend": settings.backend,
+                "available": health.available,
+                "reason": health.reason,
+            }
+            if not health.available:
+                logger.warning(
+                    "Coding sandbox backend %r unavailable: %s",
+                    settings.backend, health.reason,
+                )
+                return
+            logger.info("🔥 Warming up coding sandbox backend %r", settings.backend)
+            await factory.warmup()
+            logger.info("✅ Coding sandbox warmup complete (%s)", settings.backend)
+        except Exception as warmup_error:
+            app.state.sandbox_health = {
+                "backend": (os.getenv("SANDBOX_MODE") or "").strip().lower() or "unset",
+                "available": False,
+                "reason": f"{type(warmup_error).__name__}: {warmup_error}",
+            }
+            logger.warning(
+                "Coding sandbox warmup failed (will retry on first use): %s",
+                warmup_error,
+            )
+
+    app.state.sandbox_warmup_task = spawn_detached(_warmup_coding_sandbox())
+
+    # Initialize toolset registry for agent tool execution.
+    # auto_discover_toolsets() imports ~20 heavy SDK modules (Google, Microsoft,
+    # Slack, …) synchronously. Offload to a worker thread so the event loop
+    # stays responsive and the lifespan completes faster.
+    logger.info("🔄 Initializing in-memory toolset registry for agents...")
+    from app.agents.registry.toolset_registry import get_toolset_registry
+
+    toolset_registry = get_toolset_registry()
+    await asyncio.to_thread(toolset_registry.auto_discover_toolsets)
+    register_extra_toolsets(toolset_registry)
+    app.state.toolset_registry = toolset_registry
+    logger.info(f"✅ Loaded {len(toolset_registry.list_toolsets())} toolsets in memory")
+
+    # Initialize MCP catalog registry (mirrors the toolset registry above) — needed
+    # by `get_assistant_agent`'s `mcpServers` resolution and by the agent-loop
+    # runtime's `MCPToolProvider`/`MCPAccessResolver`. Lightweight (no heavy SDK
+    # imports, unlike the toolset registry), so no `to_thread` offload needed.
+    logger.info("🔄 Initializing in-memory MCP server registry for agents...")
+    from app.agents.mcp.registry import get_mcp_registry
+
+    mcp_registry = get_mcp_registry()
+    mcp_registry.auto_discover_templates()
+    app.state.mcp_registry = mcp_registry
+    logger.info(f"✅ Loaded {len(mcp_registry.list_templates())} MCP server templates in memory")
+
+    yield
+    # Shutdown
+    logger.info("🔄 Shutting down application")
+
+    if telemetry.pusher is not None:
+        await telemetry.pusher.stop()
+
+    # Cancel background warmup tasks if still running.
+    for _warmup_attr in (
+        "embedding_warmup_task", "knn_warmup_task", "sandbox_warmup_task",
+        "lexical_reconcile_task", "entity_store_warmup_task", "skills_seed_task",
+    ):
+        warmup_task: asyncio.Task | None = getattr(app.state, _warmup_attr, None)
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            try:
+                await warmup_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # Stop all message consumers
+    try:
+        await stop_kafka_consumers(app_container)
+        logger.info("✅ All message consumers stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping message consumers: {str(e)}")
+
+    # Close configuration service (stops Redis Pub/Sub subscription)
+    try:
+        config_service = app_container.config_service()
+        await config_service.close()
+    except Exception as e:
+        logger.error(f"❌ Error closing configuration service: {e}")
+
+    try:
+        from app.modules.parsers.pdf.pdf_rasterizer import shutdown_pdf_raster_pool
+        if shutdown_pdf_raster_pool():
+            logger.info("✅ PDF rasterization process pool shut down")
+    except Exception as e:
+        logger.error(f"❌ Error shutting down PDF rasterization pool: {e}")
+
+    try:
+        from app.modules.transformers.blob_storage import (
+            close_shared_redis,
+            close_shared_session,
+        )
+        await close_shared_session()
+        await close_shared_redis()
+        logger.info("✅ Blob storage session closed")
+    except Exception as e:
+        logger.error(f"❌ Error closing blob storage session: {e}")
+
+    try:
+        accessible_records_cache = await app_container.accessible_records_cache()
+        await accessible_records_cache.close()
+        logger.info("✅ Accessible-records cache closed")
+    except Exception as e:
+        logger.error(f"❌ Error closing accessible-records cache: {e}")
+
+
+# Create FastAPI app with lifespan
+_app_dependencies = [Depends(get_initialized_container)]
+if ensure_org_context is not None:
+    _app_dependencies.append(Depends(ensure_org_context))
+
+app = FastAPI(
+    title="Retrieval API",
+    description="API for retrieving information from vector store",
+    version="1.0.0",
+    lifespan=lifespan,
+    redirect_slashes=False,
+    dependencies=_app_dependencies,
+)
+configure_app(app, "query")
+
+EXCLUDE_PATHS = ["/health"]  # Exclude health endpoint from authentication for monitoring purposes
+
+
+@app.middleware("http")
+async def authenticate_requests(request: Request, call_next) -> JSONResponse:
+    # Check if path should be excluded from authentication
+    if any(request.url.path.startswith(path) for path in EXCLUDE_PATHS):
+        return await call_next(request)
+
+    try:
+        # Apply authentication
+        authenticated_request = await authMiddleware(request)
+        # Continue with the request
+        return await call_next(authenticated_request)
+
+    except HTTPException as exc:
+        # Handle authentication errors
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    except Exception:
+        # Handle unexpected errors. This wraps every route, so an uncaught
+        # exception anywhere in the app ends up here: log it with its
+        # traceback, otherwise the only trace of a crashing route is a
+        # generic 500 and nothing in the server logs.
+        container.logger().exception(
+            "Unhandled exception while processing %s %s",
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error"},
+        )
+
+
+# Trace context — outermost, before auth.
+app.add_middleware(RequestContextMiddleware)
+telemetry = setup_telemetry(app, service_name="query_service")
+
+
+@app.get("/health")
+async def health_check() -> JSONResponse:
+    """Health check endpoint for the query service itself"""
+    try:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "healthy",
+                "timestamp": get_epoch_timestamp_in_ms(),
+            },
+        )
+    except Exception:
+        logging.getLogger(__name__).error("Health check failed", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "unhealthy",
+                "timestamp": get_epoch_timestamp_in_ms(),
+            },
+        )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Answer a malformed request in plain words, keeping FastAPI's ``detail`` list shape."""
+    errors = jsonable_encoder(exc.errors())
+    logging.getLogger(__name__).warning(
+        "Request validation failed for %s %s: %s",
+        request.method,
+        redact_sensitive_query_params(str(request.url)),
+        log_safe_validation_errors(errors),
+    )
+    message, detail = friendly_validation_errors(errors)
+    return JSONResponse(status_code=422, content={"message": message, "detail": detail})
+
+
+# Include routes from routes.py
+app.include_router(search_router, prefix="/api/v1")
+app.include_router(records_router, prefix="/api/v1")
+app.include_router(chatbot_router, prefix="/api/v1")
+app.include_router(speech_router, prefix="/api/v1")
+app.include_router(agent_router, prefix="/api/v1/agent")
+app.include_router(skills_router, prefix="/api/v1/skills")
+app.include_router(toolsets_router)
+app.include_router(code_graph_router, prefix="/api/v1")
+# These routes call whatever provider URL the body names, so only admins may reach them.
+app.include_router(health_router, prefix="/api/v1", dependencies=[Depends(require_admin_caller)])
+app.include_router(ai_models_registry_router, prefix="/api/v1")
+# OpenAI clients call ``{base}/models``. Base may be ``{origin}/v1`` or the
+# query service's ``{origin}/api/v1``.
+app.include_router(openai_models_router, prefix="/v1")
+app.include_router(openai_models_router, prefix="/api/v1")
+if agent_sharing_router is not None:
+    app.include_router(agent_sharing_router, prefix="/api/v1/agent")
+
+_EXEC_SENTINEL = "QUERY_UVICORN_EXECED"
+
+
+def configured_worker_count() -> int:
+    """Worker count for this process, tolerant of a malformed value.
+
+    A bad value must not raise: this is read at the top of ``lifespan`` too, so a
+    ``ValueError`` there would crash the service before it serves and leave
+    process_monitor.sh restart-looping it behind an opaque traceback.
+
+    ``WEB_CONCURRENCY`` is honoured as a fallback because uvicorn reads it whenever
+    ``workers`` is left unset, which is what this module used to do.
+    """
+    for var in ("QUERY_UVICORN_WORKERS", "WEB_CONCURRENCY"):
+        raw = (os.getenv(var) or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                "%s=%r is not an integer; falling back to a single worker", var, raw,
+            )
+            return 1
+    return 1
+
+
+def run(host: str = "0.0.0.0", port: int = 8000, *, workers: int | None = None, reload: bool = True) -> None:
+    """Run the application"""
+    import warnings
+    workers = workers or configured_worker_count()
+    if reload and workers > 1:
+        warnings.warn(
+            "QUERY_UVICORN_WORKERS>1 is not compatible with reload=True; falling back to 1 worker.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        workers = 1
+    # Each worker re-imports this module in its own process and sizes its budgets from
+    # the env var, so publish the count actually used — otherwise run(workers=N), or the
+    # reload downgrade above, leaves the children scaling for a different number.
+    os.environ["QUERY_UVICORN_WORKERS"] = str(workers)
+    if workers > 1 and getattr(sys, "frozen", False):
+        # A PyInstaller build cannot do either half of this: sys.executable is the app
+        # binary and its bootloader ignores "-m uvicorn", and falling through to
+        # uvicorn.run(workers=N) needs multiprocessing.freeze_support(). Refuse rather
+        # than crash-loop. backend/python/Dockerfile produces such a build; no compose
+        # file uses it today.
+        logging.getLogger(__name__).warning(
+            "QUERY_UVICORN_WORKERS=%s ignored: multiple workers are unsupported in a "
+            "frozen build; serving with one worker", workers,
+        )
+        workers = 1
+        os.environ["QUERY_UVICORN_WORKERS"] = "1"
+    from app.utils.env_utils import uvicorn_worker_healthcheck_timeout
+
+    if workers > 1 and not os.getenv(_EXEC_SENTINEL):
+        # uvicorn spawns workers, and a spawned child re-imports the parent's __main__.
+        # Reached via `python -m app.query_main`, __main__ IS this module, so every child
+        # imports the whole app twice -- once as __mp_main__, once for the app string --
+        # and dies silently before serving, leaving the supervisor respawning forever.
+        # Hand off to the uvicorn CLI so __main__ is uvicorn's own module. execvp keeps
+        # the PID, so process_monitor.sh's restart-on-death loop still tracks us.
+        # The sentinel makes a second exec impossible: in a frozen build sys.executable
+        # is the app binary itself, which would otherwise re-enter here forever.
+        os.environ[_EXEC_SENTINEL] = "1"
+        argv = [
+            sys.executable, "-m", "uvicorn", "app.query_main:app",
+            "--host", host, "--port", str(port),
+            "--log-level", "info", "--workers", str(workers),
+            "--timeout-worker-healthcheck", str(uvicorn_worker_healthcheck_timeout()),
+        ]
+        try:
+            os.execvp(sys.executable, argv)
+            return  # execvp never returns; this only keeps mocked tests honest
+        except OSError:
+            # Falling through serves on a single worker, which beats not serving.
+            logging.getLogger(__name__).exception(
+                "Could not exec the uvicorn CLI (%s); continuing with one worker", argv,
+            )
+            os.environ.pop(_EXEC_SENTINEL, None)
+            workers = 1
+            os.environ["QUERY_UVICORN_WORKERS"] = "1"
+    uvicorn.run(
+        "app.query_main:app",
+        host=host,
+        port=port,
+        log_level="info",
+        reload=reload,
+        workers=workers,
+        timeout_worker_healthcheck=uvicorn_worker_healthcheck_timeout(),
+    )
+
+if __name__ == "__main__":
+    run(reload=False)

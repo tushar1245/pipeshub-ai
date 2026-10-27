@@ -1,0 +1,331 @@
+import mongoose, { Schema, Model } from 'mongoose';
+import {
+  IConversation,
+  IMessage,
+  IFeedback,
+  IMessageCitation,
+  IFollowUpQuestion,
+} from '../types/conversation.interfaces';
+import {
+  CONFIDENCE_LEVELS,
+  REASONING_EFFORT_VALUES,
+} from '../constants/constants';
+
+const toolCallItemSchema = new Schema(
+  {
+    toolName: { type: String, required: true },
+    toolResult: { type: Schema.Types.Mixed },
+  },
+  { _id: false },
+);
+
+// Chain-of-thought turns (opt-out on the Python side — see reasoning_persistence.py).
+const reasoningTurnSchema = new Schema(
+  {
+    messageId: { type: String },
+    turnIndex: { type: Number },
+    content: { type: String, required: true },
+  },
+  { _id: false },
+);
+
+const followUpQuestionSchema = new Schema<IFollowUpQuestion>(
+  {
+    question: { type: String, required: true },
+    confidence: { type: String, enum: CONFIDENCE_LEVELS, required: true },
+    reasoning: { type: String },
+  },
+  { _id: false },
+);
+
+const messageCitationSchema = new Schema<IMessageCitation>(
+  {
+    citationId: { type: Schema.Types.ObjectId, ref: 'citations' },
+    relevanceScore: { type: Number, min: 0, max: 1 },
+    excerpt: { type: String },
+    context: { type: String },
+  },
+  { _id: false },
+);
+
+const feedbackSchema = new Schema<IFeedback>(
+  {
+    isHelpful: { type: Boolean },
+    ratings: {
+      accuracy: { type: Number, min: 1, max: 5 },
+      relevance: { type: Number, min: 1, max: 5 },
+      completeness: { type: Number, min: 1, max: 5 },
+      clarity: { type: Number, min: 1, max: 5 },
+    },
+    categories: [
+      {
+        type: String,
+        enum: [
+          'incorrect_information',
+          'missing_information',
+          'irrelevant_information',
+          'unclear_explanation',
+          'poor_citations',
+          'excellent_answer',
+          'helpful_citations',
+          'well_explained',
+          'other',
+        ],
+      },
+    ],
+    comments: {
+      positive: { type: String },
+      negative: { type: String },
+      suggestions: { type: String },
+    },
+    citationFeedback: [
+      {
+        citationId: { type: Schema.Types.ObjectId, ref: 'citations' },
+        isRelevant: { type: Boolean },
+        relevanceScore: { type: Number, min: 1, max: 5 },
+        comment: { type: String },
+      },
+    ],
+    followUpQuestionsHelpful: { type: Boolean },
+    unusedFollowUpQuestions: [{ type: String }],
+    source: {
+      type: String,
+      enum: ['user', 'system', 'admin', 'auto'],
+      default: 'user',
+    },
+    feedbackProvider: { type: Schema.Types.ObjectId },
+    timestamp: { type: Number, default: Date.now },
+    revisions: [
+      {
+        updatedFields: [{ type: String }],
+        previousValues: { type: Map, of: Schema.Types.Mixed },
+        updatedBy: { type: Schema.Types.ObjectId },
+        updatedAt: { type: Number, default: Date.now },
+      },
+    ],
+    metrics: {
+      timeToFeedback: { type: Number },
+      userInteractionTime: { type: Number },
+      feedbackSessionId: { type: String },
+      userAgent: { type: String },
+      platform: { type: String },
+    },
+  },
+  { _id: false },
+);
+
+// Schema for reference data items (IDs for follow-up queries)
+const referenceDataItemSchema = new Schema(
+  {
+    name: { type: String, required: false }, // Display name
+    id: { type: String, required: false }, // Technical ID (numeric ID, UUID, etc.) - Optional
+    type: { type: String }, // Item type (e.g., "project", "issue", "file", "notebook", "page")
+    app: { type: String }, // Application name (jira, confluence, sharepoint, slack, etc.)
+    webUrl: { type: String }, // Web URL to open the item in the browser
+    metadata: { type: Map, of: String }, // App-specific fields (e.g. key for Jira, siteId for SharePoint)
+  },
+  { _id: false },
+);
+
+const attachmentRefSchema = new Schema(
+  {
+    recordId: { type: String, required: true },
+    recordName: { type: String },
+    mimeType: { type: String },
+    extension: { type: String },
+    virtualRecordId: { type: String },
+    // Origin metadata ('upload' | 'paste-text') — see IChatAttachmentRef.source.
+    source: { type: String, enum: ['upload', 'paste-text'] },
+  },
+  { _id: false },
+);
+
+const messageSchema = new Schema<IMessage>(
+  {
+    messageType: {
+      type: String,
+      enum: [
+        'user_query',
+        'bot_response',
+        'error',
+        'feedback',
+        'system',
+        'tool_call',
+      ],
+      required: true,
+    },
+    content: { type: String, default: '' },
+    contentFormat: {
+      type: String,
+      enum: ['MARKDOWN', 'JSON', 'HTML'],
+      default: 'MARKDOWN',
+    },
+    citations: [messageCitationSchema],
+    confidence: { type: String, enum: CONFIDENCE_LEVELS },
+    followUpQuestions: [followUpQuestionSchema],
+    feedback: [feedbackSchema],
+    metadata: {
+      processingTimeMs: { type: Number },
+      modelVersion: { type: String },
+      aiTransactionId: { type: String },
+    },
+    modelInfo: {
+      modelKey: { type: String },
+      modelName: { type: String },
+      modelProvider: { type: String },
+      chatMode: { type: String, default: 'quick' },
+      modelFriendlyName: { type: String },
+      reasoningEffort: { type: String, enum: REASONING_EFFORT_VALUES },
+    },
+    appliedFilters: {
+      apps: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      kb: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      recordGroups: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      records: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      recordsExact: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+    },
+    attachments: [attachmentRefSchema],
+    // Reference data for follow-up queries (stores IDs from tool responses)
+    referenceData: [referenceDataItemSchema],
+    // Tool call data for tool_call messageType
+    tools: [toolCallItemSchema],
+    // Persisted chain-of-thought (additive, opt-out — see reasoningTurnSchema).
+    reasoning: [reasoningTurnSchema],
+    // Ordered agent-activity transcript (additive, `agui` protocol only) --
+    // now populated for internal_search/web_search/universal-agent turns
+    // too, since all three run through the same agent loop as agent-key
+    // conversations. `Mixed` for the same reason as agent.conversation.
+    // schema.ts's identical field: shape varies by `type`, and `sub_agent`
+    // nests the same shape recursively.
+    parts: [Schema.Types.Mixed],
+  },
+  { timestamps: true },
+);
+
+// Schema for the overall conversation/thread
+const conversationSchema = new Schema<IConversation>(
+  {
+    userId: { type: Schema.Types.ObjectId, required: true, index: true },
+    orgId: { type: Schema.Types.ObjectId, required: true, index: true },
+    title: { type: String },
+    initiator: { type: Schema.Types.ObjectId, required: true, index: true },
+    messages: [messageSchema],
+    isShared: { type: Boolean, default: false },
+    shareLink: { type: String },
+    sharedWith: [
+      {
+        userId: { type: Schema.Types.ObjectId },
+        accessLevel: { type: String, enum: ['read', 'write'], default: 'read' },
+      },
+      { _id: false },
+    ],
+    isDeleted: { type: Boolean, default: false },
+    deletedBy: { type: Schema.Types.ObjectId },
+    isArchived: { type: Boolean, default: false },
+    archivedBy: { type: Schema.Types.ObjectId },
+    lastActivityAt: { type: Number, default: Date.now },
+    status: {
+      type: String,
+      enum: ['None', 'Inprogress', 'Complete', 'Failed', 'Stopped'],
+    },
+    failReason: { type: String },
+    // Model information used for this conversation
+    modelInfo: {
+      modelKey: { type: String },
+      modelName: { type: String },
+      modelProvider: { type: String },
+      chatMode: { type: String, default: 'quick' },
+      modelFriendlyName: { type: String },
+      reasoningEffort: { type: String, enum: REASONING_EFFORT_VALUES },
+    },
+    // Errors array to track errors during conversation
+    conversationErrors: [
+      {
+        message: { type: String, required: true },
+        errorType: { type: String },
+        timestamp: { type: Date, default: Date.now },
+        messageId: { type: Schema.Types.ObjectId },
+        stack: { type: String },
+        metadata: { type: Map, of: Schema.Types.Mixed },
+      },
+    ],
+    // Additional metadata for useful information
+    metadata: {
+      type: Map,
+      of: Schema.Types.Mixed,
+    },
+    // Phase 2 migration bookkeeping: set once this document has been copied
+    // into chatSessions/chatSessionMessages (see chat_sessions.migration.ts).
+    // Declared on the schema (not just written via the native driver) so
+    // `strictQuery` cannot silently drop the `{isMigrated: {$ne: true}}`
+    // scan filter or the completion write.
+    isMigrated: { type: Boolean, index: true },
+  },
+  { timestamps: true },
+);
+
+// Create additional indexes as needed
+conversationSchema.index({ orgId: 1, initiator: 1 });
+conversationSchema.index({ isShared: 1 });
+conversationSchema.index({ 'messages.content': 'text' });
+
+// Export the model
+export const Conversation: Model<IConversation> = mongoose.model<IConversation>(
+  'conversations',
+  conversationSchema,
+);

@@ -1,0 +1,477 @@
+"""Knowledge Base Request and Response Models"""
+
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+from app.config.constants.arangodb import ProgressStatus
+
+
+class PermissionRole(str, Enum):
+    """Roles a stored KB grant may carry.
+
+    ORGANIZER, FILEORGANIZER and COMMENTER cannot be granted (see
+    GrantablePermissionRole); they stay here so grants already stored with them
+    still deserialise and read as access.
+    """
+    OWNER = "OWNER"
+    ORGANIZER = "ORGANIZER"
+    FILEORGANIZER = "FILEORGANIZER"
+    WRITER = "WRITER"
+    COMMENTER = "COMMENTER"
+    READER = "READER"
+
+
+class GrantablePermissionRole(str, Enum):
+    """Roles a new grant may use."""
+    OWNER = "OWNER"
+    WRITER = "WRITER"
+    READER = "READER"
+
+
+class RecordType(str, Enum):
+    """Valid record types"""
+    FILE = "FILE"
+    DRIVE = "DRIVE"
+    WEBPAGE = "WEBPAGE"
+    COMMENT = "COMMENT"
+    MESSAGE = "MESSAGE"
+    MAIL = "MAIL"
+    OTHERS = "OTHERS"
+
+
+
+
+class SortOrder(str, Enum):
+    """Valid sort order values"""
+    ASC = "asc"
+    DESC = "desc"
+
+
+class SourceType(str, Enum):
+    """Valid source types for record filtering"""
+    ALL = "all"
+    LOCAL = "local"
+    CONNECTOR = "connector"
+
+
+# Request Models
+class CreateKnowledgeBaseRequest(BaseModel):
+    """Request model for creating a knowledge base"""
+    name: str = Field(..., description="Name of the knowledge base", min_length=1, max_length=255)
+
+
+
+class UpdateKnowledgeBaseRequest(BaseModel):
+    """Request model for updating a knowledge base"""
+    name: Optional[str] = Field(None, description="Name of the knowledge base", min_length=1, max_length=255)
+    description: Optional[str] = Field(None, description="Description of the knowledge base", max_length=2000)
+
+
+class CreateFolderRequest(BaseModel):
+    """Request model for creating a folder"""
+    userId: str = Field(..., description ="User id", min_length=1)
+    orgId: str = Field(..., description ="Org id", min_length=1)
+    name: str = Field(..., description="Name of the folder", min_length=1, max_length=255)
+
+
+class UpdateFolderRequest(BaseModel):
+    """Request model for updating a folder"""
+    name: str = Field(..., description="Name of the folder", min_length=1, max_length=255)
+
+
+class CreatePermissionRequest(BaseModel):
+    """Request model for creating permissions"""
+    requesterId : str = Field(..., description ="User id granting others access", min_length=1)
+    userIds: Optional[List[str]] = Field(None, description="List of user IDs to grant permissions to", min_items=0)
+    teamIds: Optional[List[str]] = Field(None, description="List of team IDs to grant permissions to", min_items=0)
+    role: GrantablePermissionRole = Field(..., description="Role to grant")
+
+
+class UpdatePermissionRequest(BaseModel):
+    """Request model for updating a permission"""
+    requesterId : str = Field(..., description ="User id granting others access", min_length=1)
+    userIds : Optional[List[str]] = Field(None, description ="User id", min_items=0)
+    teamIds : Optional[List[str]] = Field(None, description ="Team id", min_items=0)
+    role: GrantablePermissionRole = Field(..., description="New role")
+
+class RemovePermissionRequest(BaseModel):
+    """Request model for removing a permission"""
+    requesterId : str = Field(..., description ="User id granting others access", min_length=1)
+    userIds : Optional[List[str]] = Field(None, description ="User id", min_items=0)
+    teamIds : Optional[List[str]] = Field(None, description ="Team id", min_items=0)
+
+
+class UpdateRecordRequest(BaseModel):
+    """Request model for updating a record in a folder"""
+    userId : str = Field(..., description ="User id", min_length=1)
+    updates: Dict[str, Any] = Field(..., description="Fields to update in the record")
+    fileMetadata: Optional[Dict[str, Any]] = Field(None, description="Optional file metadata for file update")
+
+class DeleteRecordRequest(BaseModel):
+    """Request model for updating a record in a folder"""
+    userId : str = Field(..., description ="User id", min_length=1)
+    recordIds: List[str] = Field(..., description="List of user IDs to grant permissions to",min_items=1)
+
+# Response Models
+class FileRecordResponse(BaseModel):
+    """Response model for file record information"""
+    id: str = Field(..., description="File record ID")
+    name: str = Field(..., description="File name")
+    extension: Optional[str] = Field(None, description="File extension")
+    mimeType: Optional[str] = Field(None, description="MIME type")
+    sizeInBytes: Optional[int] = Field(None, description="File size in bytes")
+    isFile: bool = Field(..., description="Whether this is a file")
+    webUrl: Optional[str] = Field(None, description="Web URL")
+
+class FolderResponse(BaseModel):
+    """Response model for folder information"""
+    id: str = Field(..., description="Folder ID")
+    name: str = Field(..., description="Folder name")
+    createdAtTimestamp: Optional[int] = Field(None, description="Creation timestamp")
+    # path: Optional[str] = Field(None, description="Folder path")
+    webUrl: Optional[str] = Field(None, description="Web URL")
+
+class PermissionContents(BaseModel):
+    """Response model for permission information"""
+    role: Optional[PermissionRole] = Field(None, description="Permission role (None for team permissions)")
+    type: str = Field(..., description="Permission type")
+
+
+class RecordResponse(BaseModel):
+    """Response model for record information"""
+    id: str = Field(..., description="Record ID")
+    externalRecordId: str = Field(..., description="External record ID")
+    externalRevisionId: Optional[str] = Field(None, description="External revision ID")
+    recordName: str = Field(..., description="Record name")
+    recordType: RecordType = Field(..., description="Record type")
+    origin: str = Field(..., description="Origin")
+    connectorName: Optional[str] = Field(..., description="Connector name")
+    indexingStatus: ProgressStatus = Field(..., description="Indexing status")
+    createdAtTimestamp: int = Field(..., description="Creation timestamp")
+    updatedAtTimestamp: int = Field(..., description="Update timestamp")
+    sourceCreatedAtTimestamp: Optional[int] = Field(None, description="Source creation timestamp")
+    sourceLastModifiedTimestamp: Optional[int] = Field(None, description="Source modification timestamp")
+    orgId: str = Field(..., description="Organization ID")
+    version: int = Field(..., description="Version")
+    isDeleted: bool = Field(..., description="Deletion status")
+    deletedByUserId: Optional[str] = Field(None, description="User who deleted")
+    isLatestVersion: Optional[bool] = Field(..., description="Whether this is the latest version")
+    webUrl: Optional[str] = Field(None, description="Web URL")
+    fileRecord: Optional[FileRecordResponse] = Field(None, description="Associated file record")
+    folder: Optional[FolderResponse] = Field(None, description="Folder information")
+    permission: Optional[PermissionContents] = Field(None, description="Permission information")
+
+class KnowledgeBaseResponse(BaseModel):
+    """Response model for knowledge base information"""
+    id: str = Field(..., description="Knowledge base ID")
+    name: str = Field(..., description="Knowledge base name")
+    connectorId: Optional[str] = Field(None, description="KB connector instance ID (UUID of the KB app)")
+    createdAtTimestamp: int = Field(..., description="Creation timestamp")
+    updatedAtTimestamp: int = Field(..., description="Update timestamp")
+    createdBy: str = Field(..., description="Created by user ID")
+    userRole: Optional[str] = Field(None, description="User's role in this KB")
+    folders: Optional[List[FolderResponse]] = Field(None, description="List of folders")
+
+class KnowledgeBasePaginationResponse(BaseModel):
+    """Response model for knowledge base pagination information"""
+    page: int = Field(..., description="Current page number")
+    limit: int = Field(..., description="Items per page")
+    totalCount: int = Field(..., description="Total number of knowledge bases")
+    totalPages: int = Field(..., description="Total number of pages")
+    hasNext: bool = Field(..., description="Whether there is a next page")
+    hasPrev: bool = Field(..., description="Whether there is a previous page")
+
+
+class KnowledgeBaseFiltersResponse(BaseModel):
+    """Response model for knowledge base filters"""
+    applied: Dict[str, Any] = Field(..., description="Currently applied filters")
+    available: Dict[str, List[str]] = Field(..., description="Available filter options")
+
+
+class ListKnowledgeBaseResponse(BaseModel):
+    """Response model for paginated knowledge base listing"""
+    knowledgeBases: List[KnowledgeBaseResponse] = Field(..., description="List of knowledge bases")
+    pagination: KnowledgeBasePaginationResponse = Field(..., description="Pagination information")
+    filters: KnowledgeBaseFiltersResponse = Field(..., description="Filter information")
+
+
+class PermissionResponse(BaseModel):
+    """Response model for permission information"""
+    id: str = Field(..., description="UUID")
+    userId: Optional[str] = Field(None, description="User ID")
+    email: Optional[str] = Field(None, description="User email")
+    name: Optional[str] = Field(None, description="User name")
+    role: Optional[PermissionRole] = Field(None, description="Permission role (None for team permissions)")
+    type: str = Field(..., description="Permission type")
+    createdAtTimestamp: int = Field(..., description="Creation timestamp")
+    updatedAtTimestamp: int = Field(..., description="Update timestamp")
+
+
+class PaginationResponse(BaseModel):
+    """Response model for pagination information"""
+    page: int = Field(..., description="Current page")
+    limit: int = Field(..., description="Records per page")
+    totalCount: int = Field(..., description="Total number of records")
+    totalPages: int = Field(..., description="Total number of pages")
+
+
+class AppliedFiltersResponse(BaseModel):
+    """Response model for applied filters"""
+    search: Optional[str] = Field(None, description="Search term")
+    recordTypes: Optional[List[str]] = Field(None, description="Applied record type filters")
+    origins: Optional[List[str]] = Field(None, description="Applied origin filters")
+    connectors: Optional[List[str]] = Field(None, description="Applied connector filters")
+    indexingStatus: Optional[List[str]] = Field(None, description="Applied indexing status filters")
+    permissions: Optional[List[str]] = Field(None, description="Applied permission filters")
+    source: Optional[str] = Field(None, description="Applied source filter")
+    dateRange: Optional[Dict[str, Optional[int]]] = Field(None, description="Applied date range")
+
+
+class AvailableFiltersResponse(BaseModel):
+    """Response model for available filters"""
+    recordTypes: List[str] = Field(..., description="Available record types")
+    origins: List[str] = Field(..., description="Available origins")
+    connectors: List[str] = Field(..., description="Available connectors")
+    indexingStatus: List[str] = Field(..., description="Available indexing statuses")
+    permissions: List[str] = Field(..., description="Available permissions")
+
+
+class FiltersResponse(BaseModel):
+    """Response model for filters"""
+    applied: AppliedFiltersResponse = Field(..., description="Applied filters")
+    available: AvailableFiltersResponse = Field(..., description="Available filters")
+
+
+class ListRecordsResponse(BaseModel):
+    """Response model for listing records"""
+    records: List[RecordResponse] = Field(..., description="List of records")
+    pagination: PaginationResponse = Field(..., description="Pagination information")
+    filters: FiltersResponse = Field(..., description="Filter information")
+
+
+class CreateKnowledgeBaseResponse(BaseModel):
+    """Response model for creating a knowledge base"""
+    id: str = Field(..., description="Knowledge base ID")
+    name: str = Field(..., description="Knowledge base name")
+    createdAtTimestamp: int = Field(..., description="Creation timestamp")
+    updatedAtTimestamp: int = Field(..., description="Update timestamp")
+    userRole: str = Field(..., description="User's role in this KB")
+
+class CreateFolderResponse(BaseModel):
+    """Response model for creating a folder"""
+    id: str = Field(..., description="Folder ID")
+    name: str = Field(..., description="Folder name")
+    webUrl: str = Field(..., description="Web URL")
+    # path: str = Field(..., description="Folder path")
+    # parentFolderId: int = Field(..., description="Creation timestamp")
+
+
+class UpdateRecordResponse(BaseModel):
+    """
+    Response model for a successful record update operation.
+    Reflects the detailed context returned by the service.
+    """
+    success: bool = Field(..., description="Indicates if the operation was successful.")
+    updatedRecord: Dict[str, Any] = Field(..., description="The full document of the updated record.")
+    fileUpdated: bool = Field(..., description="True if the associated file metadata was also updated, otherwise False.")
+    updatedFile: Optional[Dict[str, Any]] = Field(None, description="The full document of the updated file record, if applicable.")
+    recordId: str = Field(..., description="The ID of the record that was updated.")
+    timestamp: int = Field(..., description="The epoch timestamp (in ms) of when the update occurred.")
+    location: str = Field(..., description="The location of the record, e.g., 'kb_root' or 'folder'.")
+    folderId: Optional[str] = Field(None, description="The ID of the parent folder, if the record is in a folder.")
+    kb: Dict[str, Any] = Field(..., description="Information about the knowledge base containing the record.")
+    userPermission: str = Field(..., description="The permission role of the user who performed the update.")
+
+class DeleteRecordResponse(BaseModel):
+    """Response model for deleting a record"""
+    success: bool = Field(..., description="Success status")
+    message: str = Field(..., description="Response message")
+    deleteType: str = Field(..., description="Type of deletion")
+
+
+class CreatePermissionsResponse(BaseModel):
+    """Response model for creating permissions"""
+    success: bool = Field(..., description="Success status")
+    grantedCount: int = Field(..., description="Number of users granted permissions")
+    grantedUsers: List[str] = Field(..., description="List of users granted permissions")
+    grantedTeams: List[str] = Field(..., description="List of teams granted permissions")
+    role: str = Field(..., description="Granted role")
+    kbId: str = Field(..., description="Knowledge base ID")
+    details: Dict[str, Any] = Field(..., description="Details of the permissions created")
+
+
+class UpdatePermissionResponse(BaseModel):
+    """Response model for updating a permission"""
+    success: bool = Field(..., description="Success status")
+    userIds: List[str] = Field(..., description="User ID")
+    teamIds: List[str] = Field(..., description="Team ID")
+    newRole: str = Field(..., description="New role")
+    kbId: str = Field(..., description="Knowledge base ID")
+
+
+class RemovePermissionResponse(BaseModel):
+    """Response model for removing a permission"""
+    success: bool = Field(..., description="Success status")
+    userIds: List[str] = Field(..., description="User ID")
+    teamIds: List[str] = Field(..., description="Team ID")
+    kbId: str = Field(..., description="Knowledge base ID")
+
+
+class ListPermissionsResponse(BaseModel):
+    """Response model for listing permissions"""
+    success: bool = Field(..., description="Success status")
+    permissions: List[PermissionResponse] = Field(..., description="List of permissions")
+    kbId: str = Field(..., description="Knowledge base ID")
+    totalCount: int = Field(..., description="Total number of permissions")
+
+
+class ErrorResponse(BaseModel):
+    """Response model for errors"""
+    success: bool = Field(False, description="Success status")
+    reason: str = Field(..., description="Error reason")
+    code: str = Field(..., description="Error code")
+
+
+class SuccessResponse(BaseModel):
+    """Response model for successful operations"""
+    success: bool = Field(True, description="Success status")
+    message: Optional[str] = Field(None, description="Success message")
+
+class RestoredRecord(BaseModel):
+    """One item brought back from the trash"""
+    recordId: str = Field(..., description="Record id")
+    name: str | None = Field(None, description="Name it has now")
+    renamedFrom: str | None = Field(
+        None, description="Its name before restore, when another item next to it had taken that name"
+    )
+
+
+class RestoreRecordResponse(BaseModel):
+    """Response model for restoring a deleted item and everything deleted with it"""
+    success: bool = Field(True, description="Success status")
+    message: str = Field(..., description="What happened")
+    batchId: str | None = Field(None, description="The delete batch that was restored")
+    restoredRecords: list[RestoredRecord] = Field(default_factory=list, description="Items restored")
+    reindexPending: bool | None = Field(None, description="Some restored files are not queued for indexing yet")
+    reindexPendingRecordIds: list[str] | None = Field(None, description="Files to reindex by hand")
+    reindexPendingReason: str | None = Field(None, description="What to do about them")
+    renamePendingRecordIds: list[str] | None = Field(
+        None, description="Items restored under a name another item next to them has"
+    )
+    renamePendingReason: str | None = Field(None, description="What to do about them")
+
+
+class RestoreRecordsRequest(BaseModel):
+    """Request model for restoring several deleted items"""
+    recordIds: list[str] = Field(..., min_length=1, max_length=100, description="Items to restore")
+
+
+class RestoreRecordsResponse(BaseModel):
+    """Response model for restoring several deleted items; each id has its own outcome"""
+    success: bool = Field(..., description="True when every item was restored")
+    restoredCount: int = Field(..., description="Items restored, counting those restored with them")
+    failedCount: int = Field(..., description="Ids that could not be restored")
+    results: list[dict[str, Any]] = Field(..., description="Outcome per requested id")
+
+
+class TrashDeletedBy(BaseModel):
+    """The user who deleted an item"""
+    name: str | None = Field(None, description="Their name")
+    email: str | None = Field(None, description="Their email address")
+
+
+class TrashItem(BaseModel):
+    """What one delete action put in the trash (a folder with its contents, or a whole
+    multi-select); restoring it brings back all of it"""
+    id: str = Field(..., description="Record id to restore")
+    name: str | None = Field(None, description="Name when it was deleted")
+    recordType: str | None = Field(None, description="Record type")
+    isFolder: bool = Field(..., description="A folder, deleted with everything in it")
+    mimeType: str | None = Field(None, description="File type, for files")
+    sizeInBytes: int | None = Field(None, description="File size, for files")
+    parentId: str | None = Field(None, description="Folder it was in; none at the collection's top level")
+    parentName: str | None = Field(None, description="Name of that folder")
+    parentInTrash: bool = Field(..., description="That folder is in the trash too and must be restored first")
+    itemCount: int = Field(..., description="Records the delete removed, all of which a restore brings back")
+    rootCount: int = Field(1, description="Items selected in the delete: more than one for a multi-select")
+    otherRootNames: list[str] = Field(
+        default_factory=list, description="Names of some of the other items selected with this one"
+    )
+    deletedAtTimestamp: int = Field(..., description="When it was deleted (epoch ms)")
+    deletedBy: TrashDeletedBy | None = Field(None, description="Who deleted it, when known")
+    removableAfterTimestamp: int | None = Field(
+        None, description="From when the scheduled cleanup may remove it for good (epoch ms); none when unknown"
+    )
+
+
+class TrashRetention(BaseModel):
+    """How long the trash keeps items"""
+    minAgeMs: int = Field(..., description="Items stay at least this long before the cleanup may remove them")
+
+
+class ListTrashResponse(BaseModel):
+    """One page of a collection's recently deleted items"""
+    success: bool = Field(True, description="Success status")
+    items: list[TrashItem] = Field(..., description="Deleted items, newest first")
+    pagination: PaginationResponse = Field(..., description="Pagination information")
+    retention: TrashRetention | None = Field(None, description="Retention; none when it can't be read")
+class FileUploadResponse(BaseModel):
+    """Response model for file upload"""
+    success: bool = Field(..., description="Success status")
+    fileId: Optional[str] = Field(None, description="Uploaded file ID")
+    fileName: Optional[str] = Field(None, description="File name")
+    fileSize: Optional[int] = Field(None, description="File size in bytes")
+    message: Optional[str] = Field(None, description="Response message")
+    error: Optional[str] = Field(None, description="Error message if any")
+
+
+class FileData(BaseModel):
+    record: dict
+    fileRecord: dict
+    filePath: str
+    lastModified: int
+
+class UploadRecordsInKBRequest(BaseModel):
+    userId: str
+    orgId: str
+    files: List[FileData]
+
+class FolderInfo(BaseModel):
+    # path: str
+    id: str
+
+class SkippedFileInfo(BaseModel):
+    filePath: str = Field("", description="Path of the skipped file")
+    name: str = Field("", description="Name of the skipped file")
+    reason: str = Field("DUPLICATE_NAME", description="Why the file was skipped")
+
+
+class UploadRecordsinKBResponse(BaseModel):
+    success: bool = Field(..., description="Success status")
+    message: str = Field(None, description="Message")
+    totalCreated: int = Field(None, description="Total created files")
+    foldersCreated: int = Field(None, description="Total created folders")
+    createdFolders: List[FolderInfo] = Field(None, description="Created folders info")
+    failedFiles : List[str] = Field(None, description="Failed files")
+    skippedFiles: List[SkippedFileInfo] = Field(default_factory=list, description="Files skipped because a record with the same name already exists")
+    kbId : str = Field(None, description="Knowledge base id")
+    parentFolderId : Optional[str] = Field(None, description="Parent folder Id")
+
+
+class UploadRecordsInFolderRequest(BaseModel):
+    userId: str
+    orgId: str
+    files: List[FileData]
+
+class UploadRecordsinFolderResponse(BaseModel):
+    success: bool = Field(..., description="Success status")
+    message: str = Field(None, description="Message")
+    totalCreated: int = Field(None, description="Total created files")
+    foldersCreated: int = Field(None, description="Total created folders")
+    createdFolders: List[FolderInfo] = Field(None, description="Created folders info")
+    failedFiles : List[str] = Field(None, description="Failed files")
+    skippedFiles: List[SkippedFileInfo] = Field(default_factory=list, description="Files skipped because a record with the same name already exists")
+    kbId : str = Field(None, description="Knowledge base id")
+    parentFolderId : Optional[str] = Field(None, description="Parent folder Id")

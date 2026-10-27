@@ -1,0 +1,536 @@
+from abc import ABC, abstractmethod
+from logging import Logger
+from typing import TYPE_CHECKING, Any, AsyncContextManager, Optional
+
+from app.models.entities import (
+    AppMetadata,
+    AppRole,
+    AppUser,
+    AppUserGroup,
+    FileRecord,
+    Org,
+    Person,
+    Record,
+    RecordGroup,
+    User,
+    UserGroup,
+)
+from app.models.permission import Permission
+from app.services.graph_db.common.record_visibility import RecordVisibility
+
+if TYPE_CHECKING:
+    from app.connectors.core.base.sync_point.sync_point import SyncPoint
+
+class DataStoreProvider(ABC):
+    logger: Logger
+
+    def __init__(self, logger: Logger) -> None:
+        self.logger = logger
+
+    """Base class for all data store providers"""
+    @abstractmethod
+    async def transaction(self, *, explicit: bool | None = None) -> AsyncContextManager["TransactionStore"]:
+        """
+        Return a transaction store context manager.
+
+        ``explicit=True`` asks for one real transaction for the block where the
+        backend would otherwise commit each statement; None is the backend setting.
+
+        Usage:
+            async with datastore.transaction() as tx_store:
+                tx_store.batch_upsert_records(records)
+                tx_store.batch_upsert_record_permissions(record_id, permissions)
+                # Automatically commits on success, rolls back on exception
+        """
+        pass
+
+    def is_transient_error(self, error: BaseException) -> bool:
+        """Whether a transaction that failed with *error* rolled back cleanly
+        and can simply be run again (a deadlock or a write-write conflict)."""
+        return False
+
+    @abstractmethod
+    async def compare_and_set_indexing_status(
+        self, record_ids: list[str], expected: str, new_status: str
+    ) -> list[str]:
+        """
+        Set each id's indexingStatus, but only while that id still holds `expected`.
+        Returns the ids actually updated; ids that held some other status are absent,
+        which is a normal outcome. Pass a one-element list for a single record.
+
+        Deliberately not transactional: it races the indexing service, so it must
+        read and write in one statement and be visible immediately.
+        """
+        pass
+
+    @abstractmethod
+    async def get_existing_record_keys(self, record_ids: list[str]) -> set[str]:
+        """Return the subset of record_ids that exist, in one round-trip."""
+        pass
+
+    @abstractmethod
+    async def execute_in_transaction(self, func, *args, **kwargs) -> None:
+        """
+        Execute a function within a transaction.
+
+        Usage:
+            async def bulk_update(tx_store):
+                tx_store.batch_upsert_records(records)
+                tx_store.batch_upsert_record_permissions(record_id, permissions)
+
+            await datastore.execute_in_transaction(bulk_update)
+        """
+        pass
+
+class BaseDataStore(ABC):
+    """Base class for all data stores"""
+
+    @abstractmethod
+    async def get_record_by_key(self, key: str, *, raise_on_error: bool = False) -> Optional[dict]:
+        """The stored record document, not a ``Record``, or None when no record has this key.
+
+        A failed read raises only with ``raise_on_error``.
+        """
+        pass
+
+    @abstractmethod
+    async def get_record_by_external_id(
+        self, connector_id: str, external_id: str, visibility: RecordVisibility = RecordVisibility.ALL
+    ) -> Optional[Record]:
+        pass
+
+    @abstractmethod
+    async def get_record_by_external_revision_id(self, connector_id: str, external_revision_id: str) -> Optional[Record]:
+        """Get record by external revision ID (e.g., etag for S3)."""
+        pass
+
+    @abstractmethod
+    async def get_record_by_issue_key(self, connector_id: str, issue_key: str) -> Optional[Record]:
+        """Get record by Jira issue key (e.g., PROJ-123) by searching weburl pattern."""
+        pass
+
+    @abstractmethod
+    async def get_records_by_parent(
+        self,
+        connector_id: str,
+        parent_external_record_id: str,
+        record_type: Optional[str] = None,
+        *,
+        visibility: RecordVisibility = RecordVisibility.LIVE,
+    ) -> list[Record]:
+        """Get all child records for a parent record by parent_external_record_id. Optionally filter by record_type."""
+        pass
+
+    @abstractmethod
+    async def get_records_by_record_type(
+        self,
+        connector_id: str,
+        record_type: str,
+    ) -> list[Record]:
+        """Return this connector's records of ``record_type``."""
+        pass
+
+    @abstractmethod
+    async def get_record_path(self, record_id: str) -> Optional[str]:
+        """
+        Get full hierarchical path for a record by traversing parent-child edges.
+
+        Args:
+            record_id: The record _key to get the path for.
+
+        Returns:
+            Optional[str]: Path string (e.g. "Folder1/Subfolder/File.txt") or None.
+        """
+        pass
+
+    @abstractmethod
+    async def get_record_path_segments(self, record_id: str) -> list[str]:
+        """Return individual record names from root ancestor to this record."""
+        pass
+
+    @abstractmethod
+    async def get_records_by_status(
+        self,
+        org_id: str,
+        connector_id: str,
+        status_filters: list[str],
+        limit: Optional[int] = None,
+        offset: int = 0,
+        record_group_id: Optional[str] = None,
+        is_placeholder: Optional[bool] = None,
+        after_key: Optional[str] = None,
+        exclude_statuses: Optional[list[str]] = None,
+        visibility: RecordVisibility = RecordVisibility.LIVE,
+    ) -> list[Record]:
+        """Get records by their indexing status with pagination support. Returns typed Record instances.
+
+        Optionally scope to a record group and/or filter on the placeholder flag.
+        Pass after_key for keyset pagination instead of offset when the result set
+        mutates while being iterated.
+
+        An empty list means no record matched. A listing that could not be read
+        raises GraphQueryError - callers must not read that as "nothing found".
+        """
+        pass
+
+    @abstractmethod
+    async def get_record_group_by_external_id(self, connector_id: str, external_id: str) -> Optional[RecordGroup]:
+        pass
+
+    @abstractmethod
+    async def take_back_kept_record_group(self, group_id: str) -> bool:
+        """Clear a group's kept-for-the-trash mark; False when the group is gone."""
+        pass
+
+    @abstractmethod
+    async def find_slack_burst_record_by_ts(
+        self,
+        connector_id: str,
+        channel_id: str,
+        ts: str,
+    ) -> Optional[Record]:
+        """
+        Find the Slack burst MessageRecord whose startTs <= ts <= endTs
+        for the given connector and channel.
+        """
+        pass
+
+    @abstractmethod
+    async def create_record_groups_relation(self, child_id: str, parent_id: str) -> None:
+        pass
+
+
+    @abstractmethod
+    async def create_user_group_membership(self, user_source_id: str, group_external_id: str, connector_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    async def get_user_by_email(self, email: str, *, raise_on_error: bool = False) -> Optional[User]:
+        pass
+
+    @abstractmethod
+    async def get_user_by_source_id(
+        self, source_user_id: str, connector_id: str, *, raise_on_error: bool = False
+    ) -> Optional[User]:
+        """A failed read raises only with ``raise_on_error``; otherwise it answers None."""
+        pass
+
+    @abstractmethod
+    async def get_user_by_user_id(self, user_id: str, *, raise_on_error: bool = False) -> Optional[User]:
+        pass
+
+    @abstractmethod
+    async def get_user_group_by_external_id(
+        self, connector_id: str, external_id: str, *, raise_on_error: bool = False
+    ) -> Optional[AppUserGroup]:
+        pass
+
+    @abstractmethod
+    async def get_app_role_by_external_id(
+        self, connector_id: str, external_id: str, *, raise_on_error: bool = False
+    ) -> Optional[AppRole]:
+        pass
+
+    @abstractmethod
+    async def get_app_by_id(self, connector_id: str) -> Optional[AppMetadata]:
+        pass
+
+    @abstractmethod
+    async def get_app_users(
+        self, org_id: str, connector_id: str, *, raise_on_error: bool = False
+    ) -> list[AppUser]:
+        """A failed read raises only with ``raise_on_error``; otherwise it answers ``[]``."""
+        pass
+
+    @abstractmethod
+    async def get_app_user_by_email(self, email: str, connector_id: str) -> Optional[AppUser]:
+        pass
+
+    @abstractmethod
+    async def get_file_record_by_id(self, id: str) -> Optional[FileRecord]:
+        pass
+
+    @abstractmethod
+    async def get_first_user_with_permission_to_node(self, node_id: str, node_collection: str) -> Optional[User]:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_people(self, people: list[Person]) -> None:
+        pass
+
+    @abstractmethod
+    async def get_person_by_email(
+        self, email: str, org_id: str, *, raise_on_error: bool = False
+    ) -> Optional[Person]:
+        pass
+
+    @abstractmethod
+    async def upsert_person_by_email(self, person: Person, *, raise_on_error: bool = False) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    async def ensure_app_membership(
+        self,
+        principal_id: str,
+        principal_collection: str,
+        connector_id: str,
+        *,
+        is_external: bool,
+        source_user_id: str | None = None,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def reap_stale_external_app_relations(self, connector_id: str) -> int:
+        pass
+
+    @abstractmethod
+    async def batch_create_edges(self, edges: list[dict[str, Any]], collection: str) -> None:
+        pass
+
+    @abstractmethod
+    async def create_edges_if_absent(self, edges: list[dict], collection: str) -> None:
+        pass
+
+    @abstractmethod
+    async def get_users(self, org_id: str, active: bool = True) -> list[User]:
+        pass
+
+    @abstractmethod
+    async def get_user_groups(
+        self, connector_id: str, org_id: str, *, raise_on_error: bool = False
+    ) -> list[UserGroup]:
+        pass
+
+    @abstractmethod
+    async def delete_record_by_key(self, key: str) -> None:
+        pass
+
+    @abstractmethod
+    async def delete_record_by_external_id(
+        self, connector_id: str, external_id: str, user_id: str | None = None, *, soft_delete: bool = False,
+    ) -> dict | None:
+        pass
+
+    @abstractmethod
+    async def get_record_by_conversation_index(self, connector_id: str, conversation_index: str, thread_id: str, org_id: str, user_id: str) -> Optional[Record]:
+        pass
+
+    @abstractmethod
+    async def remove_user_access_to_record(self, connector_id: str, external_id: str, user_id: str) -> None:
+        pass
+
+    async def remove_user_access_to_connector(self, connector_id: str, user_id: str) -> int:
+        """Delete the user's own PERMISSION edges to this connector's records, record groups and user groups.
+        Returns how many were deleted."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_user_group_by_id(self, group_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def get_record_owner_source_user_email(
+        self, record_id: str, *, raise_on_error: bool = False
+    ) -> str | None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_records(
+        self, records: list[Record], *, release_trashed_external_ids: bool = False
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_record_groups(self, record_groups: list[RecordGroup]) -> None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_record_permissions(self, record_id: str, permissions: list[Permission]) -> None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_record_group_permissions(self, record_group_id: str, permissions: list[Permission], connector_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_user_groups(self, user_groups: list[UserGroup]) -> None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_app_users(self, users: list[AppUser]) -> None:
+        pass
+
+    @abstractmethod
+    async def batch_upsert_orgs(self, orgs: list[Org]) -> None:
+        pass
+
+    @abstractmethod
+    async def create_record_relation(
+        self,
+        from_record_id: str,
+        to_record_id: str,
+        relation_type: str
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def create_record_group_relation(self, record_id: str, record_group_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def create_sync_point(self, sync_point: "SyncPoint") -> None:
+        pass
+
+    @abstractmethod
+    async def delete_sync_point(self, sync_point: "SyncPoint") -> None:
+        pass
+
+    @abstractmethod
+    async def read_sync_point(self, sync_point: "SyncPoint") -> None:
+        pass
+
+    @abstractmethod
+    async def update_sync_point(self, sync_point: "SyncPoint") -> None:
+        pass
+
+    @abstractmethod
+    async def get_edges_from_node(self, from_node_id: str, edge_collection: str) -> list[dict]:
+        pass
+
+    @abstractmethod
+    async def get_edges_from_node_with_target_name(
+        self, from_node_id: str, edge_collection: str, *, raise_on_error: bool = False
+    ) -> list[dict]:
+        pass
+    
+    @abstractmethod
+    async def get_edge(
+        self,
+        from_id: str,
+        from_collection: str,
+        to_id: str,
+        to_collection: str,
+        collection: str,
+        *,
+        raise_on_error: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    async def delete_edge(self, from_id: str, from_collection: str, to_id: str, to_collection: str, collection: str) -> None:
+        pass
+
+    @abstractmethod
+    async def delete_edges_by_relationship_types(
+        self,
+        from_id: str,
+        from_collection: str,
+        collection: str,
+        relationship_types: list[str]
+    ) -> int:
+        """
+        Delete edges from a record by relationship types.
+
+        Args:
+            from_id: Source record ID
+            from_collection: Source record collection name
+            collection: Edge collection name
+            relationship_types: List of relationship type values to delete
+
+        Returns:
+            int: Number of edges deleted
+        """
+        pass
+
+    @abstractmethod
+    async def delete_parent_child_edge_to_record(self, record_id: str) -> int:
+        """
+        Delete PARENT_CHILD edges pointing to a specific target record.
+
+        Args:
+            record_id: The record_id for which the parent_child edge has to be deleted
+
+        Returns:
+            int: Number of edges deleted
+        """
+        pass
+
+    @abstractmethod
+    async def delete_edges_between_collections(
+        self, from_id: str, from_collection: str, edge_collection: str, to_collection: str
+    ) -> None:
+        pass
+
+    @abstractmethod
+    async def ensure_team_app_edge(self, connector_id: str, org_id: str) -> None:
+        """
+        Ensure the org's "All" team has an edge to the app in userAppRelation.
+        Idempotent. Used by TEAM-scope connectors.
+        """
+        pass
+
+    @abstractmethod
+    async def upsert_authenticated_as(
+        self, creator_key: str, source_user_key: str, connector_id: str, org_id: str
+    ) -> None:
+        """Link the connector creator to the source-account user it authenticated as (one per connector)."""
+        pass
+
+    @abstractmethod
+    async def remove_authenticated_as(self, connector_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    async def get_record_by_weburl(self, weburl: str, org_id: Optional[str] = None) -> Optional[Record]:
+        pass
+
+    @abstractmethod
+    async def get_org_apps(self, org_id: str) -> list[dict]:
+        """Every app of the org, active or not; see IGraphDBProvider.get_org_apps."""
+        pass
+
+    @abstractmethod
+    async def get_records_by_weburls(self, weburls: list[str], org_id: str) -> list[dict]:
+        """Records of the org stored under any of ``weburls``; see IGraphDBProvider."""
+        pass
+
+    @abstractmethod
+    async def get_issue_sites(self, org_id: str, connector_names: list[str]) -> list[str]:
+        """The Jira sites the org syncs; see IGraphDBProvider."""
+        pass
+
+    @abstractmethod
+    async def get_records_linking_to_weburls(
+        self,
+        weburls: list[str],
+        org_id: str,
+        connector_names: list[str],
+        limit: int = 100,
+        after: Optional[str] = None,
+    ) -> list[str]:
+        """Records holding a link to any of ``weburls``; see IGraphDBProvider."""
+        pass
+
+    @abstractmethod
+    async def delete_records_and_relations(self, record_key: str, hard_delete: bool = False) -> None:
+        pass
+
+    @abstractmethod
+    async def get_app_creator_user(self, connector_id: str) -> Optional[User]:
+        pass
+
+
+class TransactionStore(BaseDataStore):
+    """Abstract transaction-aware data store that operates within a transaction context"""
+
+    @abstractmethod
+    async def commit(self) -> None:
+        """Commit the transaction"""
+        pass
+
+    @abstractmethod
+    async def rollback(self) -> None:
+        """Rollback the transaction"""
+        pass
+

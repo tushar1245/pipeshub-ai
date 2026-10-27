@@ -1,0 +1,426 @@
+import { i18n } from '@/lib/i18n';
+import type { AgentDetail } from '../types';
+import type {
+  AgentFormPayload,
+  AgentWebSearchAttachment,
+  KnowledgeReference,
+  McpServerReference,
+  SkillReference,
+  ToolsetReference,
+} from './types';
+import type { WebSearchProviderType } from '../../workspace/web-search/types';
+import { changedAttachments, isApiToolsetNode } from './api-toolset-attachments';
+
+interface ToolsetDataInternal {
+  name: string;
+  displayName: string;
+  type: string;
+  instanceId?: string;
+  instanceName?: string;
+  tools: { name: string; fullName: string; description?: string }[];
+}
+
+interface KnowledgeDataInternal {
+  connectorId: string;
+  filters: { recordGroups?: string[]; records?: string[]; [key: string]: unknown };
+  category: 'knowledge' | 'action';
+}
+
+export function extractAgentConfigFromFlow(
+  agentName: string,
+  nodes: { id: string; data: { type?: string; label?: string; config?: Record<string, unknown> } }[],
+  edges: {
+    source: string;
+    target: string;
+    targetHandle?: string | null;
+    sourceHandle?: string | null;
+  }[],
+  currentAgent?: AgentDetail | null,
+  shareWithOrg?: boolean,
+  isServiceAccount?: boolean,
+  /**
+   * The service account to search as, by `userId`; `null` clears an existing
+   * binding. `undefined` leaves whatever is stored alone, which is what every
+   * caller that does not offer the choice wants.
+   */
+  serviceAccountUserId?: string | null
+): AgentFormPayload {
+  const toolsetsInternal: ToolsetDataInternal[] = [];
+  const knowledgeInternal: KnowledgeDataInternal[] = [];
+  const models: { provider: string; modelName: string; isReasoning: boolean; modelKey: string }[] = [];
+  const apiToolsetTools: string[] = [];
+
+  const addToolsetWithTools = (
+    toolsetName: string,
+    displayName: string,
+    toolsetType: string,
+    toolsToAdd: { name: string; fullName: string; description?: string }[],
+    instanceId?: string,
+    instanceName?: string
+  ) => {
+    if (!toolsetName || toolsToAdd.length === 0) return;
+    const normalizedName = toolsetName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const existingIndex = instanceId
+      ? toolsetsInternal.findIndex((ts) => ts.instanceId === instanceId)
+      : toolsetsInternal.findIndex((ts) => ts.name === normalizedName);
+    if (existingIndex >= 0) {
+      toolsToAdd.forEach((tool) => {
+        if (!toolsetsInternal[existingIndex].tools.find((t) => t.fullName === tool.fullName)) {
+          toolsetsInternal[existingIndex].tools.push(tool);
+        }
+      });
+      const inName = instanceName?.trim();
+      if (inName && !toolsetsInternal[existingIndex].instanceName) {
+        toolsetsInternal[existingIndex].instanceName = inName;
+      }
+    } else {
+      toolsetsInternal.push({
+        name: normalizedName,
+        displayName: displayName || toolsetName,
+        type: toolsetType || 'app',
+        instanceId: instanceId || undefined,
+        instanceName: instanceName?.trim() || undefined,
+        tools: toolsToAdd,
+      });
+    }
+  };
+
+  const addKnowledgeSource = (
+    connectorId: string,
+    filters: { recordGroups?: string[]; records?: string[]; [key: string]: unknown },
+    category: 'knowledge' | 'action' = 'knowledge'
+  ) => {
+    if (!connectorId) return;
+    const normalizedFilters = {
+      recordGroups: Array.isArray(filters?.recordGroups) ? filters.recordGroups : [],
+      records: Array.isArray(filters?.records) ? filters.records : [],
+      ...filters,
+    };
+    const existingIndex = knowledgeInternal.findIndex((k) => k.connectorId === connectorId);
+    if (existingIndex >= 0) {
+      const existing = knowledgeInternal[existingIndex];
+      const existingRecordGroups = Array.isArray(existing.filters?.recordGroups)
+        ? existing.filters.recordGroups
+        : [];
+      const existingRecords = Array.isArray(existing.filters?.records) ? existing.filters.records : [];
+      knowledgeInternal[existingIndex] = {
+        connectorId,
+        filters: {
+          ...existing.filters,
+          ...normalizedFilters,
+          recordGroups: Array.from(
+            new Set([...existingRecordGroups, ...normalizedFilters.recordGroups])
+          ),
+          records: Array.from(new Set([...existingRecords, ...normalizedFilters.records])),
+        },
+        category,
+      };
+    } else {
+      knowledgeInternal.push({ connectorId, filters: normalizedFilters, category });
+    }
+  };
+
+  const connectedToolsetNodeIds = new Set<string>();
+  edges.forEach((edge) => {
+    const sourceNode = nodes.find((n) => n.id === edge.source);
+    const targetNode = nodes.find((n) => n.id === edge.target);
+    const st = sourceNode?.data?.type ?? '';
+    const tt = targetNode?.data?.type ?? '';
+    if (st.startsWith('toolset-') && tt === 'agent-core') connectedToolsetNodeIds.add(sourceNode!.id);
+    if (tt.startsWith('toolset-') && st === 'agent-core') connectedToolsetNodeIds.add(targetNode!.id);
+  });
+
+  nodes.forEach((node) => {
+    const nt = node.data?.type ?? '';
+    if (!nt.startsWith('toolset-') || !connectedToolsetNodeIds.has(node.id)) return;
+    const toolsetConfig = node.data.config ?? {};
+    const toolsetName =
+      (toolsetConfig.toolsetName as string) ||
+      (toolsetConfig.name as string) ||
+      node.data.label ||
+      '';
+    const productDisplayName = (toolsetConfig.displayName as string) || toolsetName;
+    const instanceName = String(toolsetConfig.instanceName ?? '').trim() || undefined;
+    const toolsetType = (toolsetConfig.type as string) || (toolsetConfig.category as string) || 'app';
+    const instanceId = toolsetConfig.instanceId as string | undefined;
+    const toolsFromConfig: { name: string; fullName: string; description?: string }[] = [];
+    const toolsArr = toolsetConfig.tools as unknown[] | undefined;
+    if (toolsArr && Array.isArray(toolsArr)) {
+      toolsArr.forEach((tool: unknown) => {
+        const t = tool as { name?: string; toolName?: string; fullName?: string; description?: string };
+        const toolName = t.name || t.toolName || '';
+        const normalizedToolsetName = toolsetName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const toolFullName = t.fullName || `${normalizedToolsetName}.${toolName}`;
+        if (toolFullName && toolName) {
+          toolsFromConfig.push({ name: toolName, fullName: toolFullName, description: t.description || '' });
+        }
+      });
+    }
+    if (toolsFromConfig.length === 0 && Array.isArray(toolsetConfig.selectedTools)) {
+      (toolsetConfig.selectedTools as string[]).forEach((selectedToolName) => {
+        const tool = (toolsArr as { name?: string; toolName?: string; fullName?: string; description?: string }[] | undefined)?.find(
+          (x) => x.name === selectedToolName || x.toolName === selectedToolName
+        );
+        const normalizedToolsetName = toolsetName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const toolFullName = tool?.fullName || `${normalizedToolsetName}.${selectedToolName}`;
+        if (!toolsFromConfig.find((x) => x.fullName === toolFullName)) {
+          toolsFromConfig.push({
+            name: tool?.name || tool?.toolName || selectedToolName,
+            fullName: toolFullName,
+            description: tool?.description || '',
+          });
+        }
+      });
+    }
+    if (isApiToolsetNode(toolsetConfig)) {
+      apiToolsetTools.push(...toolsFromConfig.map((tool) => tool.fullName));
+    } else if (toolsFromConfig.length > 0) {
+      addToolsetWithTools(toolsetName, productDisplayName, toolsetType, toolsFromConfig, instanceId, instanceName);
+    }
+  });
+
+  const connectedKnowledgeNodeIds = new Set<string>();
+  const connectedLLMNodeIds = new Set<string>();
+  edges.forEach((edge) => {
+    const sourceNode = nodes.find((n) => n.id === edge.source);
+    const targetNode = nodes.find((n) => n.id === edge.target);
+    const st = sourceNode?.data?.type ?? '';
+    if (
+      (st.startsWith('kb-') && st !== 'kb-group') ||
+      (st.startsWith('app-') && st !== 'app-group')
+    ) {
+      if (targetNode?.data?.type === 'agent-core' && edge.targetHandle === 'knowledge' && sourceNode) {
+        connectedKnowledgeNodeIds.add(sourceNode.id);
+      }
+    }
+    if (st.startsWith('llm-')) {
+      if (targetNode?.data?.type === 'agent-core' && edge.targetHandle === 'llms' && sourceNode) {
+        connectedLLMNodeIds.add(sourceNode.id);
+      }
+    }
+  });
+
+  nodes.forEach((node) => {
+    const nt = node.data?.type ?? '';
+    const cfg = node.data.config ?? {};
+    if (nt.startsWith('llm-')) {
+      if (connectedLLMNodeIds.has(node.id)) {
+        models.push({
+          provider: (cfg.provider as string) || '',
+          modelName: (cfg.modelName as string) || (cfg.model as string) || '',
+          isReasoning: Boolean(cfg.isReasoning),
+          modelKey: (cfg.modelKey as string) || '',
+        });
+      }
+    } else if (nt.startsWith('kb-') && nt !== 'kb-group') {
+      if (connectedKnowledgeNodeIds.has(node.id)) {
+        const kbId = cfg.kbId as string | undefined;
+        if (kbId) {
+          // Each collection is its own knowledge entry keyed by kbId as connectorId,
+          // so multiple collections never collapse into a single connector entry on save.
+          const nodeFilters = (cfg.filters as Record<string, unknown>) || {};
+          const records =
+            (cfg.selectedRecords as string[]) || (nodeFilters.records as string[]) || [];
+          addKnowledgeSource(kbId, { ...nodeFilters, records }, 'knowledge');
+        }
+      }
+    } else if (nt.startsWith('app-') && nt !== 'app-group') {
+      if (connectedKnowledgeNodeIds.has(node.id)) {
+        const connectorInstanceId = (cfg.connectorInstanceId as string) || (cfg.id as string);
+        if (connectorInstanceId) {
+          const nodeFilters = (cfg.filters as Record<string, unknown>) || {};
+          const filters = {
+            ...nodeFilters,
+            recordGroups: (cfg.selectedRecordGroups as string[]) || (nodeFilters.recordGroups as string[]) || [],
+            records: (cfg.selectedRecords as string[]) || (nodeFilters.records as string[]) || [],
+          };
+          addKnowledgeSource(connectorInstanceId, filters, 'knowledge');
+        }
+      }
+    }
+  });
+
+  const appKnowledgeGroupNode = nodes.find((n) => n.data?.type === 'app-group');
+  if (appKnowledgeGroupNode) {
+    const isAppGroupConnected = edges.some((edge) => {
+      const sourceNode = nodes.find((n) => n.id === edge.source);
+      const targetNode = nodes.find((n) => n.id === edge.target);
+      return (
+        sourceNode?.id === appKnowledgeGroupNode.id &&
+        targetNode?.data?.type === 'agent-core' &&
+        edge.targetHandle === 'knowledge'
+      );
+    });
+    const cfg = appKnowledgeGroupNode.data.config ?? {};
+    const selectedApps = cfg.selectedApps as string[] | undefined;
+    if (isAppGroupConnected && selectedApps) {
+      const appFilters = (cfg.appFilters as Record<string, { recordGroups?: string[]; records?: string[] }>) || {};
+      selectedApps.forEach((connectorInstanceId) => {
+        const connectorFilters = appFilters[connectorInstanceId] || { recordGroups: [], records: [] };
+        addKnowledgeSource(connectorInstanceId, connectorFilters, 'knowledge');
+      });
+    }
+  }
+
+  const kbGroupNode = nodes.find((n) => n.data?.type === 'kb-group');
+  if (kbGroupNode) {
+    const isKBGroupConnected = edges.some((edge) => {
+      const sourceNode = nodes.find((n) => n.id === edge.source);
+      const targetNode = nodes.find((n) => n.id === edge.target);
+      return (
+        sourceNode?.id === kbGroupNode.id &&
+        targetNode?.data?.type === 'agent-core' &&
+        edge.targetHandle === 'knowledge'
+      );
+    });
+    const cfg = kbGroupNode.data.config ?? {};
+    const selectedKBs = cfg.selectedKBs as string[] | undefined;
+    if (isKBGroupConnected && selectedKBs) {
+      selectedKBs.forEach((kbId) => {
+        const kbSpecificFilters = (cfg.kbFilters as Record<string, Record<string, unknown>>)?.[kbId] || {};
+        // Key each collection by its own kbId so collections stay separate entries.
+        addKnowledgeSource(
+          kbId,
+          { ...kbSpecificFilters, records: (kbSpecificFilters.records as string[]) || [] },
+          'knowledge'
+        );
+      });
+    }
+  }
+
+  const agentCoreNode = nodes.find((n) => n.data?.type === 'agent-core');
+  const coreCfg = agentCoreNode?.data?.config ?? {};
+
+  let webSearch: AgentWebSearchAttachment | null = null;
+  const webSearchNode = nodes.find((n) => n.data?.type === 'web-search');
+  if (webSearchNode && agentCoreNode) {
+    const isConnected = edges.some(
+      (edge) =>
+        edge.source === webSearchNode.id &&
+        edge.target === agentCoreNode.id &&
+        edge.targetHandle === 'toolsets',
+    );
+    if (isConnected) {
+      const cfg = webSearchNode.data.config ?? {};
+      const provider = (cfg.provider as string) || '';
+      if (provider) {
+        webSearch = {
+          provider: provider as WebSearchProviderType,
+          providerKey: (cfg.providerKey as string) || '',
+          providerLabel: (cfg.providerLabel as string) || undefined,
+          iconPath: (cfg.iconPath as string) || undefined,
+        };
+      }
+    }
+  }
+
+  const skillNames = new Set<string>();
+  if (agentCoreNode) {
+    edges.forEach((edge) => {
+      if (edge.target !== agentCoreNode.id || edge.targetHandle !== 'skills') return;
+      const sourceNode = nodes.find((n) => n.id === edge.source);
+      const st = sourceNode?.data?.type ?? '';
+      if (!st.startsWith('skill-')) return;
+      const skillName = (sourceNode!.data.config?.skillName as string) || st.slice('skill-'.length);
+      if (skillName) skillNames.add(skillName);
+    });
+  }
+  const skills: SkillReference[] = Array.from(skillNames).map((name) => ({ name }));
+
+  const mcpServersByInstanceId = new Map<string, McpServerReference>();
+  if (agentCoreNode) {
+    edges.forEach((edge) => {
+      if (edge.target !== agentCoreNode.id || edge.targetHandle !== 'mcpServers') return;
+      const sourceNode = nodes.find((n) => n.id === edge.source);
+      const st = sourceNode?.data?.type ?? '';
+      if (!st.startsWith('mcp-')) return;
+      const cfg = (sourceNode!.data.config || {}) as Record<string, unknown>;
+      const instanceId = (cfg.instanceId as string) || st.slice('mcp-'.length);
+      if (!instanceId || mcpServersByInstanceId.has(instanceId)) return;
+      const name = (cfg.name as string) || (cfg.displayName as string) || sourceNode!.data.label || '';
+      if (!name) return;
+      const toolsCfg = (cfg.tools as { name?: string; fullName?: string; description?: string }[]) || [];
+      mcpServersByInstanceId.set(instanceId, {
+        instanceId,
+        name,
+        displayName: (cfg.displayName as string) || undefined,
+        typeId: (cfg.typeId as string) || undefined,
+        allTools: cfg.allTools === true,
+        tools: toolsCfg
+          .filter((tool) => tool.name)
+          .map((tool) => ({
+            name: tool.name!,
+            // Empty when unknown: the server fills in the name discovery gives the tool.
+            fullName: tool.fullName || '',
+            description: tool.description || '',
+          })),
+      });
+    });
+  }
+  const mcpServers: McpServerReference[] = Array.from(mcpServersByInstanceId.values());
+
+  const toolsets: ToolsetReference[] = toolsetsInternal.map((ts) => ({
+    id: ts.instanceId || ts.name,
+    instanceId: ts.instanceId,
+    instanceName: ts.instanceName,
+    name: ts.name,
+    displayName: ts.displayName,
+    type: ts.type,
+    tools: ts.tools,
+  }));
+
+  const knowledge: KnowledgeReference[] = knowledgeInternal.map((k) => ({
+    connectorId: k.connectorId,
+    filters: k.filters,
+  }));
+
+  return {
+    name: agentName,
+    description:
+      (coreCfg.description as string) ||
+      currentAgent?.description ||
+      i18n.t('agentBuilder.extractDefaultDescription'),
+    startMessage:
+      (coreCfg.startMessage as string) ||
+      currentAgent?.startMessage ||
+      i18n.t('agentBuilder.extractDefaultStartMessage'),
+    systemPrompt:
+      (coreCfg.systemPrompt as string) ||
+      currentAgent?.systemPrompt ||
+      i18n.t('agentBuilder.extractDefaultSystemPrompt'),
+    instructions: agentCoreNode
+      ? (coreCfg.instructions as string | undefined)
+      : currentAgent?.instructions,
+    defaultReasoningEffort: agentCoreNode
+      ? ((coreCfg.defaultReasoningEffort as AgentFormPayload['defaultReasoningEffort']) ?? null)
+      : (currentAgent?.defaultReasoningEffort ?? null),
+    sendUserContext: agentCoreNode
+      ? (coreCfg.sendUserContext as boolean | undefined) !== false
+      : currentAgent?.sendUserContext !== false,
+    toolsets,
+    knowledge,
+    skills,
+    // When the server couldn't read them, the canvas never showed the agent's MCP servers:
+    // sending the empty list would detach them all. Left out, the save keeps what is stored.
+    ...(currentAgent?.mcpServersUnavailable ? {} : { mcpServers }),
+    ...changedAttachments(apiToolsetTools, currentAgent?.apiToolsetTools),
+    models,
+    webSearch,
+    tags: currentAgent?.tags?.length ? currentAgent.tags : ['flow-based', 'visual-workflow'],
+    shareWithOrg: shareWithOrg !== undefined ? shareWithOrg : (currentAgent?.shareWithOrg ?? false),
+    isServiceAccount:
+      currentAgent?.isServiceAccount === true
+        ? true
+        : isServiceAccount !== undefined
+          ? isServiceAccount
+          : false,
+    // Only a service agent has an identity to bind, and only when the choice
+    // was actually offered. Sent as null to clear, omitted to leave alone —
+    // sending undefined-as-empty would unbind an agent whose builder never
+    // showed the control.
+    ...(serviceAccountUserId !== undefined &&
+    (currentAgent?.isServiceAccount === true || isServiceAccount === true)
+      ? { serviceAccountUserId }
+      : {}),
+  };
+}

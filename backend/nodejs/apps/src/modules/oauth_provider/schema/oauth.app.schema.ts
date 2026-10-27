@@ -1,0 +1,170 @@
+import mongoose, { Document, Schema, Model, Types } from 'mongoose'
+import { generateUniqueSlug } from '../../../libs/utils/counter'
+import { KnowledgeLimit } from '../types/oauth.types';
+import { knowledgeLimitField } from './knowledge_limit.schema';
+
+export enum OAuthAppStatus {
+  ACTIVE = 'active',
+  SUSPENDED = 'suspended',
+  REVOKED = 'revoked',
+}
+
+export enum OAuthGrantType {
+  AUTHORIZATION_CODE = 'authorization_code',
+  CLIENT_CREDENTIALS = 'client_credentials',
+  REFRESH_TOKEN = 'refresh_token',
+  DEVICE_CODE = 'urn:ietf:params:oauth:grant-type:device_code',
+  /**
+   * RFC 8693 token exchange, used only by service-account delegation.
+   *
+   * Never added to an app's `allowedGrantTypes`: the exchange authenticates
+   * with the service token itself rather than with client credentials, so
+   * there is no registered client whose grant list could permit it.
+   */
+  TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
+}
+
+export interface IOAuthApp extends Document {
+  slug: string
+  clientId: string
+  clientSecretEncrypted: string
+  name: string
+  description?: string
+  orgId: Types.ObjectId
+  createdBy: Types.ObjectId
+  /**
+   * The identity this app's `client_credentials` tokens act as.
+   *
+   * Absent means the app's creator, which is how every app behaved before
+   * this field existed and how every app behaves until an administrator
+   * points it at a service account.
+   *
+   * Kept separate from `createdBy` on purpose. `createdBy` is who manages the
+   * app, and it is what the Developer Settings queries filter on — moving it
+   * to a service account would leave the app visible to nobody, since no
+   * person can sign in as one. Who an app acts as and who looks after it are
+   * genuinely different questions, so they are genuinely different fields.
+   */
+  tokenIdentityUserId?: Types.ObjectId
+  redirectUris: string[]
+  allowedGrantTypes: OAuthGrantType[]
+  allowedScopes: string[]
+  status: OAuthAppStatus
+  logoUrl?: string
+  homepageUrl?: string
+  privacyPolicyUrl?: string
+  termsOfServiceUrl?: string
+  isConfidential: boolean
+  /** RFC 7591 Dynamic Client Registration. Hidden from the developer-apps UI. */
+  isDynamic?: boolean
+  /** What every token of this app may reach, picked by its creator. Absent
+   * means everything the connecting user can see. */
+  knowledgeLimit?: KnowledgeLimit;
+  accessTokenLifetime: number
+  refreshTokenLifetime: number
+  isDeleted: boolean
+  /** User who performed the soft-delete (audit). */
+  deletedBy?: Types.ObjectId
+  createdAt: Date
+  updatedAt: Date
+}
+
+const OAuthAppSchema = new Schema<IOAuthApp>(
+  {
+    slug: { type: String, unique: true },
+    clientId: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    clientSecretEncrypted: { type: String, required: true },
+    name: {
+      type: String,
+      required: [true, 'App name is required'],
+      trim: true,
+      maxlength: 100,
+    },
+    description: {
+      type: String,
+      trim: true,
+      maxlength: 500,
+    },
+    orgId: {
+      type: Schema.Types.ObjectId,
+      ref: 'org',
+      required: true,
+      index: true,
+    },
+    createdBy: {
+      type: Schema.Types.ObjectId,
+      ref: 'users',
+      required: true,
+    },
+    tokenIdentityUserId: {
+      type: Schema.Types.ObjectId,
+      ref: 'users',
+      required: false,
+    },
+    redirectUris: {
+      type: [String],
+      default: [],
+      validate: {
+        validator: function (uris: string[]) {
+          return uris.length <= 10
+        },
+        message: 'Must have at most 10 redirect URIs',
+      },
+    },
+    allowedGrantTypes: {
+      type: [String],
+      enum: Object.values(OAuthGrantType),
+      default: [OAuthGrantType.AUTHORIZATION_CODE, OAuthGrantType.REFRESH_TOKEN],
+    },
+    allowedScopes: {
+      type: [String],
+      required: true,
+      validate: {
+        validator: function (scopes: string[]) {
+          return scopes.length > 0
+        },
+        message: 'At least one scope is required',
+      },
+    },
+    status: {
+      type: String,
+      enum: Object.values(OAuthAppStatus),
+      default: OAuthAppStatus.ACTIVE,
+    },
+    logoUrl: { type: String },
+    homepageUrl: { type: String },
+    privacyPolicyUrl: { type: String },
+    termsOfServiceUrl: { type: String },
+    isConfidential: { type: Boolean, default: true },
+    isDynamic: { type: Boolean, default: false, index: true },
+    knowledgeLimit: knowledgeLimitField,
+    accessTokenLifetime: { type: Number, default: 3600 },
+    refreshTokenLifetime: { type: Number, default: 2592000 },
+    isDeleted: { type: Boolean, default: false },
+    deletedBy: { type: Schema.Types.ObjectId, ref: 'users' },
+  },
+  { timestamps: true },
+)
+
+OAuthAppSchema.index({ orgId: 1, isDeleted: 1 })
+/** Supports creator-scoped listing (`buildAppFilter`) with `sort({ createdAt: -1 })` — deploy with syncIndexes/migrate as needed. */
+OAuthAppSchema.index({ orgId: 1, createdBy: 1, isDeleted: 1, createdAt: -1 })
+OAuthAppSchema.index({ clientId: 1, status: 1 })
+
+OAuthAppSchema.pre<IOAuthApp>('save', async function () {
+  // Mongoose 9: async hooks signal failure by throwing, with no next callback.
+  if (!this.slug) {
+    this.slug = await generateUniqueSlug('OAuthApp')
+  }
+})
+
+export const OAuthApp: Model<IOAuthApp> = mongoose.model<IOAuthApp>(
+  'oauthApp',
+  OAuthAppSchema,
+  'oauthApps',
+)

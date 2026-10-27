@@ -1,0 +1,529 @@
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "pipeshub-ai.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+If release name contains chart name it will be used as a full name.
+*/}}
+{{- define "pipeshub-ai.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "pipeshub-ai.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels
+*/}}
+{{- define "pipeshub-ai.labels" -}}
+helm.sh/chart: {{ include "pipeshub-ai.chart" . }}
+{{ include "pipeshub-ai.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.global.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Component-specific labels for main app
+*/}}
+{{- define "pipeshub-ai.app.labels" -}}
+{{ include "pipeshub-ai.labels" . }}
+app.kubernetes.io/component: app
+{{- end }}
+
+{{/*
+Component-specific labels for MongoDB
+*/}}
+{{- define "pipeshub-ai.mongodb.labels" -}}
+{{ include "pipeshub-ai.labels" . }}
+app.kubernetes.io/component: mongodb
+{{- end }}
+
+{{/*
+Component-specific labels for Redis
+*/}}
+{{- define "pipeshub-ai.redis.labels" -}}
+{{ include "pipeshub-ai.labels" . }}
+app.kubernetes.io/component: redis
+{{- end }}
+
+{{/*
+Component-specific labels for Neo4j
+*/}}
+{{- define "pipeshub-ai.neo4j.labels" -}}
+{{ include "pipeshub-ai.labels" . }}
+app.kubernetes.io/component: neo4j
+{{- end }}
+
+{{/*
+Image helper with registry support
+Usage: include "pipeshub-ai.image" (dict "image" .Values.image "global" .Values.global "context" $)
+*/}}
+{{- define "pipeshub-ai.image" -}}
+{{- $registry := .global.imageRegistry | default "" -}}
+{{- $repository := .image.repository -}}
+{{- $tag := .image.tag | toString -}}
+{{- if $registry }}
+{{- printf "%s/%s:%s" $registry $repository $tag }}
+{{- else }}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+{{- end }}
+
+{{/*
+Service account name helper
+*/}}
+{{- define "pipeshub-ai.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "pipeshub-ai.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Drop null entries. Helm keeps a null when a later values file clears a key,
+and a nodeSelector value of null is not a label.
+*/}}
+{{- define "pipeshub-ai.compactMap" -}}
+{{- $clean := dict -}}
+{{- range $key, $value := . -}}
+{{- if not (kindIs "invalid" $value) -}}
+{{- $_ := set $clean $key $value -}}
+{{- end -}}
+{{- end -}}
+{{- if $clean -}}
+{{- toYaml $clean -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Selector labels
+*/}}
+{{- define "pipeshub-ai.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "pipeshub-ai.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Helper functions for secret management
+*/}}
+
+{{/*
+Determine if we should create secrets (not using external or existing secrets)
+*/}}
+{{- define "pipeshub-ai.createSecrets" -}}
+{{- if and (not .Values.secretManagement.externalSecrets.enabled) (not .Values.secretManagement.existingSecrets.enabled) }}
+true
+{{- end }}
+{{- end }}
+
+{{/*
+Get the name of the secret containing application secrets (secretKey, etc.)
+*/}}
+{{- define "pipeshub-ai.secretName" -}}
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+{{- .Values.secretManagement.existingSecrets.appSecretName }}
+{{- else if .Values.secretManagement.externalSecrets.enabled }}
+{{- default (printf "%s-secrets" (include "pipeshub-ai.fullname" .)) .Values.secretManagement.externalSecrets.targetSecretName }}
+{{- else }}
+{{- printf "%s-secrets" (include "pipeshub-ai.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Get the name of the secret containing MongoDB credentials
+*/}}
+{{- define "pipeshub-ai.mongodbSecretName" -}}
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+{{- .Values.secretManagement.existingSecrets.mongodbSecretName | default (include "pipeshub-ai.secretName" .) }}
+{{- else }}
+{{- printf "%s-secrets" (include "pipeshub-ai.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Get the name of the secret containing Redis credentials
+*/}}
+{{- define "pipeshub-ai.redisSecretName" -}}
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+{{- .Values.secretManagement.existingSecrets.redisSecretName | default (include "pipeshub-ai.secretName" .) }}
+{{- else }}
+{{- printf "%s-secrets" (include "pipeshub-ai.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Get the name of the secret containing Neo4j credentials
+*/}}
+{{- define "pipeshub-ai.neo4jSecretName" -}}
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+{{- .Values.secretManagement.existingSecrets.neo4jSecretName | default (include "pipeshub-ai.secretName" .) }}
+{{- else }}
+{{- printf "%s-secrets" (include "pipeshub-ai.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Get the name of the secret containing ArangoDB credentials
+*/}}
+{{- define "pipeshub-ai.arangoSecretName" -}}
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+{{- .Values.secretManagement.existingSecrets.arangoSecretName | default (include "pipeshub-ai.secretName" .) }}
+{{- else }}
+{{- printf "%s-secrets" (include "pipeshub-ai.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Get the name of the secret containing Qdrant credentials
+*/}}
+{{- define "pipeshub-ai.qdrantSecretName" -}}
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+{{- .Values.secretManagement.existingSecrets.qdrantSecretName | default (include "pipeshub-ai.secretName" .) }}
+{{- else }}
+{{- printf "%s-secrets" (include "pipeshub-ai.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Validate required secrets are provided when not using external or existing secrets
+This helper is called during template rendering to fail fast with clear error messages
+*/}}
+{{- define "pipeshub-ai.validateRequiredSecrets" -}}
+{{- if not .Values.secretManagement.externalSecrets.enabled }}
+  {{- if not .Values.secretManagement.existingSecrets.enabled }}
+    {{- if not .Values.secretKey }}
+      {{- fail "secretKey is required when not using external secrets or existing secrets. Generate with: openssl rand -hex 32" }}
+    {{- end }}
+    
+    {{- /* Validate MongoDB credentials */ -}}
+    {{- if and .Values.mongodb.auth.enabled (not .Values.mongodb.auth.rootPassword) }}
+      {{- fail "mongodb.auth.rootPassword is required when MongoDB auth is enabled. Set via --set mongodb.auth.rootPassword=<password>" }}
+    {{- end }}
+    
+    {{- /* Validate Redis credentials */ -}}
+    {{- if and .Values.redis.auth.enabled (not .Values.redis.auth.password) }}
+      {{- fail "redis.auth.password is required when Redis auth is enabled. Set via --set redis.auth.password=<password>" }}
+    {{- end }}
+    
+    {{- /* Validate Neo4j credentials */ -}}
+    {{- if .Values.neo4j.enabled }}
+      {{- if not .Values.neo4j.auth.password }}
+        {{- fail "neo4j.auth.password is required when Neo4j is enabled. Set via --set neo4j.auth.password=<password>" }}
+      {{- end }}
+      {{- if eq .Values.neo4j.auth.password "your_password" }}
+        {{- fail "neo4j.auth.password must not use default placeholder 'your_password'. Set a secure password." }}
+      {{- end }}
+    {{- end }}
+    
+    {{- /* Validate ArangoDB credentials */ -}}
+    {{- if and .Values.arango.enabled (not .Values.arango.auth.rootPassword) }}
+      {{- fail "arango.auth.rootPassword is required when ArangoDB is enabled. Set via --set arango.auth.rootPassword=<password>" }}
+    {{- end }}
+  {{- end }}
+{{- else }}
+  {{- if not .Values.secretManagement.externalSecrets.secretStoreRef.name }}
+    {{- fail "secretManagement.externalSecrets.secretStoreRef.name is required when externalSecrets is enabled" }}
+  {{- end }}
+{{- end }}
+
+{{- if .Values.secretManagement.existingSecrets.enabled }}
+  {{- if not .Values.secretManagement.existingSecrets.appSecretName }}
+    {{- fail "secretManagement.existingSecrets.appSecretName is required when existingSecrets is enabled" }}
+  {{- end }}
+{{- end }}
+
+{{- /* Validate persistence vs replica count
+       The main app Deployment shares ONE PVC across all pods. With a ReadWriteOnce
+       volume (the default on EKS gp2/gp3, GKE pd-standard, AKS managed-disk) only
+       one pod can attach the volume and the remaining replicas will be stuck Pending
+       with "Multi-Attach error". Block the install with a clear message instead.
+*/ -}}
+{{- $effectiveReplicas := .Values.replicaCount | int }}
+{{- if .Values.autoscaling.enabled }}
+  {{- $effectiveReplicas = max $effectiveReplicas (.Values.autoscaling.minReplicas | int) }}
+{{- end }}
+{{- if and .Values.persistence.enabled (gt $effectiveReplicas 1) }}
+  {{- $modes := .Values.persistence.accessModes | default (list) }}
+  {{- $hasRWX := has "ReadWriteMany" $modes }}
+  {{- if not $hasRWX }}
+    {{- fail (printf "persistence requires ReadWriteMany when running >1 replica (effective replicas: %d). The app Deployment shares one PVC across all pods; with ReadWriteOnce (EBS gp2/gp3, GKE pd-standard, AKS managed-disk) only one pod can attach and the rest stay Pending with Multi-Attach error. Fix one of: (a) use an RWX StorageClass (EFS on EKS / Filestore on GKE / Azure Files on AKS) with --set 'persistence.accessModes={ReadWriteMany}' --set persistence.storageClass=<rwx-class>; (b) single replica: --set replicaCount=1 --set autoscaling.enabled=false; (c) disable shared persistence: --set persistence.enabled=false." $effectiveReplicas) }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Validate that SANDBOX_MODE=docker actually has a daemon to reach, and that
+SANDBOX_MODE=local carries the dev flag the service would otherwise refuse it
+without.
+
+Without one, `run_code` fails at provision with an opaque Docker error in the
+middle of a user's conversation. Failing here instead makes the operator
+choose how code execution is isolated, at install time, with the options in
+front of them.
+
+Also refuses a Docker socket mounted into the application container: that is
+the raw daemon API with no policy in between, i.e. root on the node.
+*/}}
+{{- define "pipeshub-ai.validateSandbox" -}}
+{{- if and (eq (include "pipeshub-ai.sandboxMode" .) "local") (ne (include "pipeshub-ai.sandboxAllowLocal" .) "true") }}
+  {{- fail "config.sandboxMode is \"local\", which runs generated code as a subprocess of this pod with no container isolation, and the service refuses it unless config.sandboxAllowLocal=true. Set that only on a single-tenant development cluster; otherwise use docker or e2b." }}
+{{- end }}
+{{- $socketError := "mounts a Docker socket into the application container, which gives it, and any code it runs, root on the node. Use --set sandbox.dind.enabled=true (the app then reaches the daemon only through the docker-proxy policy sidecar) or --set config.sandboxMode=e2b." }}
+{{- range $mounts := list .Values.extraVolumeMounts .Values.volumeMounts }}
+  {{- range $mounts }}
+    {{- if kindIs "map" . }}
+      {{- $named := list (.mountPath | default "") (.subPath | default "") (.subPathExpr | default "") }}
+      {{- if or (eq (toString (.name | default "")) "dind-sock") (include "pipeshub-ai.namesRuntimeSocket" $named) }}
+        {{- fail (printf "extraVolumeMounts/volumeMounts %s" $socketError) }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- range $volumes := list .Values.extraVolumes .Values.volumes }}
+  {{- range $volumes }}
+    {{- if and (kindIs "map" .) (kindIs "map" .hostPath) }}
+      {{- if or (eq (toString (.hostPath.type | default "")) "Socket") (include "pipeshub-ai.hostPathReachesRuntimeSocket" (toString (.hostPath.path | default ""))) }}
+        {{- fail (printf "extraVolumes/volumes %s" $socketError) }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- if eq (include "pipeshub-ai.sandboxMode" .) "docker" }}
+  {{- if not (or .Values.sandbox.dind.enabled .Values.config.dockerHost) }}
+    {{- fail "config.sandboxMode is \"docker\" but no Docker daemon is configured, so run_code would fail at runtime. Pick one: (a) --set sandbox.dind.enabled=true to run a Docker-in-Docker sidecar behind the docker-proxy policy sidecar (needs a PRIVILEGED container - see sandbox.dind in values.yaml); (b) --set config.dockerHost=tcp://<host>:2375 to use a daemon you run, behind the same policy proxy (python -m app.docker_proxy_main); (c) --set config.sandboxMode=e2b with an E2B_API_KEY to execute off-cluster; or (d) --set config.sandboxMode=local --set config.sandboxAllowLocal=true to run generated code as a subprocess of this pod - NO container isolation, acceptable only for single-tenant development clusters." }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Container-runtime sockets on a node. Any of them is as good as the Docker API:
+whoever can write to it can start a privileged container. Each is listed once
+under /run and expanded to the /var/run spelling as well, because /var/run is
+usually a symlink to /run and a hostPath under either reaches the same socket.
+*/}}
+{{- define "pipeshub-ai.runtimeSocketPaths" -}}
+{{- $paths := list -}}
+{{- range list "/run/docker.sock" "/run/containerd/containerd.sock" "/run/k3s/containerd/containerd.sock" "/run/crio/crio.sock" "/run/podman/podman.sock" "/run/dockershim.sock" "/run/cri-dockerd.sock" -}}
+  {{- $paths = append (append $paths .) (printf "/var%s" .) -}}
+{{- end -}}
+{{- $paths | toJson -}}
+{{- end -}}
+
+{{/*
+"true" when any of the given strings names a runtime socket file. Used on mount
+paths and subPaths, where only the file name is visible.
+*/}}
+{{- define "pipeshub-ai.namesRuntimeSocket" -}}
+{{- $hit := false -}}
+{{- $sockets := include "pipeshub-ai.runtimeSocketPaths" . | fromJsonArray -}}
+{{- range $value := . -}}
+  {{- range $socket := $sockets -}}
+    {{- if and $value (contains (base $socket) (toString $value)) -}}
+      {{- $hit = true -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if $hit }}true{{ end -}}
+{{- end -}}
+
+{{/*
+"true" when a hostPath is a runtime socket or a directory that holds one, so /,
+/run and /var/run are caught as well as the socket file itself.
+*/}}
+{{- define "pipeshub-ai.hostPathReachesRuntimeSocket" -}}
+{{- $hit := false -}}
+{{- if . -}}
+  {{- $path := clean . -}}
+  {{- range $socket := include "pipeshub-ai.runtimeSocketPaths" . | fromJsonArray -}}
+    {{- if or (eq $path "/") (eq $path $socket) (hasPrefix (printf "%s/" $path) $socket) (contains (base $socket) $path) -}}
+      {{- $hit = true -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if $hit }}true{{ end -}}
+{{- end -}}
+
+{{/*
+Canonical `config.sandboxMode`, validated against what the service accepts.
+
+The runtime loader upper-cases before matching, so DOCKER/Docker/docker all
+select the Docker backend there. Comparing the raw value in the chart meant
+`sandboxMode: DOCKER` skipped the daemon validation below while the service
+still chose Docker — the install succeeded and run_code failed at provision.
+Emitting the canonical spelling into the env var keeps both layers reading
+the same thing.
+*/}}
+{{- define "pipeshub-ai.sandboxMode" -}}
+{{- $raw := .Values.config.sandboxMode | toString -}}
+{{- $mode := $raw | trim | lower -}}
+{{- if not (has $mode (list "local" "docker" "e2b")) -}}
+  {{- fail (printf "config.sandboxMode=%q is not a supported coding sandbox. Use one of: local, docker, e2b." $raw) -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
+
+{{/*
+Canonical `config.sandboxAllowLocal`: "true" or "false".
+
+Parsed the way the service parses SANDBOX_ALLOW_LOCAL (1/true/yes/on, any
+case), so the install check and the rendered env var cannot disagree. A plain
+truthiness test let `--set-string config.sandboxAllowLocal=false` (a
+non-empty string) past the check, and the service then refused local anyway.
+*/}}
+{{- define "pipeshub-ai.sandboxAllowLocal" -}}
+{{- $raw := .Values.config.sandboxAllowLocal | default false | toString | trim | lower -}}
+{{- ternary "true" "false" (has $raw (list "1" "true" "yes" "on")) -}}
+{{- end -}}
+
+{{/*
+Effective DOCKER_HOST, or "" when no daemon is configured.
+
+Single source for the precedence so the deployment's env var and the NOTES
+description cannot disagree: an explicitly configured daemon wins, otherwise
+the docker-proxy sidecar's loopback address if DinD is being deployed. The
+proxy binds 127.0.0.1 only, so "localhost" resolving to ::1 first would miss.
+*/}}
+{{- define "pipeshub-ai.dockerHost" -}}
+{{- if .Values.config.dockerHost -}}
+{{- .Values.config.dockerHost -}}
+{{- else if .Values.sandbox.dind.enabled -}}
+{{- printf "tcp://127.0.0.1:%v" .Values.sandbox.dind.port -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+How run_code actually executes: local | e2b | dind | external.
+
+Deploying the sidecar and USING it are independent — `sandbox.dind.enabled`
+creates a privileged container whatever the backend is, while
+`config.sandboxMode` and `config.dockerHost` decide what run_code talks to.
+Describing one in terms of the other is how the notes came to claim
+Docker-in-Docker for an e2b deployment.
+*/}}
+{{- define "pipeshub-ai.sandboxPath" -}}
+{{- $mode := include "pipeshub-ai.sandboxMode" . -}}
+{{- if ne $mode "docker" -}}
+{{- $mode -}}
+{{- else if .Values.config.dockerHost -}}
+external
+{{- else -}}
+dind
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate the Redis wiring before anything renders.
+
+external.enabled needs either host (standalone, for example ElastiCache with
+cluster mode disabled) or clusterEndpoints (Redis Cluster). Mixing them, or
+pairing host with a cluster mode, used to render REDIS_HOST empty while
+REDIS_MODE=standalone, and the client then connected to localhost.
+*/}}
+{{- define "pipeshub-ai.validateRedis" -}}
+{{- if and .Values.redis.builtin.enabled .Values.redis.external.enabled -}}
+  {{- fail "redis.builtin.enabled and redis.external.enabled cannot both be true." -}}
+{{- end -}}
+{{- $external := .Values.redis.external -}}
+{{- $redisMode := .Values.redis.mode | default "standalone" -}}
+{{- if $external.enabled -}}
+  {{- if and $external.host $external.clusterEndpoints -}}
+    {{- fail "redis.external.host and redis.external.clusterEndpoints cannot both be set. Use host for a standalone Redis (ElastiCache with cluster mode disabled) or clusterEndpoints for Redis Cluster." -}}
+  {{- end -}}
+  {{- if and $external.host (ne $redisMode "standalone") -}}
+    {{- fail "redis.external.host requires redis.mode=standalone. A cluster-mode client ignores the host and needs redis.external.clusterEndpoints." -}}
+  {{- end -}}
+  {{- if and (not $external.host) (not $external.clusterEndpoints) -}}
+    {{- fail "redis.external.enabled=true requires redis.external.host (standalone) or redis.external.clusterEndpoints (comma-separated host:port list)." -}}
+  {{- end -}}
+  {{- if and $external.clusterEndpoints (eq $redisMode "standalone") -}}
+    {{- fail "redis.external.enabled=true requires a cluster-capable redis.mode (set redis.mode=cluster, or an EE mode supplied via redis.providerModule). REDIS_MODE=standalone ignores redis.external.clusterEndpoints and would connect to localhost." -}}
+  {{- end -}}
+  {{- if .Values.redis.enabled -}}
+    {{- fail "redis.external.enabled=true also requires redis.enabled=false, otherwise the bundled Redis subchart is deployed and left unused." -}}
+  {{- end -}}
+{{- else if and (not .Values.redis.enabled) .Values.redis.builtin.enabled -}}
+  {{- if ne (.Values.redis.mode | default "standalone") "standalone" -}}
+    {{- fail "redis.builtin is a replication deployment, not a Redis Cluster. Use redis.mode=standalone with it. Redis Cluster still requires redis.external.enabled=true and redis.external.clusterEndpoints." -}}
+  {{- end -}}
+{{- else if and .Values.redis.enabled .Values.redis.builtin.enabled -}}
+  {{- fail "redis.enabled and redis.builtin.enabled cannot both be true. Use redis.enabled=true for the Bitnami subchart or redis.enabled=false with redis.builtin.enabled=true for the chart-owned master and replica." -}}
+{{- else if not .Values.redis.enabled -}}
+  {{- fail "redis.enabled=false requires redis.external.enabled=true with redis.external.host or redis.external.clusterEndpoints, or redis.builtin.enabled=true; otherwise nothing provides Redis." -}}
+{{- else if ne (.Values.redis.mode | default "standalone") "standalone" -}}
+  {{- /*
+    The bundled Bitnami subchart is *replication*, not Redis Cluster. Pointing
+    a cluster-mode client at `<release>-redis-master` makes it attempt cluster
+    discovery (CLUSTER SLOTS) against a server that has none, so it fails to
+    connect -- and with no REDIS_CLUSTER_ENDPOINTS emitted there is nothing
+    else for it to talk to. A non-standalone mode only makes sense with an
+    external endpoint.
+  */ -}}
+  {{- fail (printf "redis.mode=%s requires redis.external.enabled=true with redis.external.clusterEndpoints. The bundled Redis subchart is a replication deployment, not a Redis Cluster, so a cluster-mode client cannot connect to it. Use redis.mode=standalone with the bundled chart." (.Values.redis.mode | default "standalone")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate that each store the app is told to use is actually deployed.
+
+The services default DATA_STORE to arangodb and read KV_STORE_TYPE as given,
+so a missing graph database or an etcd store with no etcd renders cleanly and
+only fails once the pod is crash-looping. An ExternalSecret with no secretKey
+mapping likewise renders, and the pod then waits forever on a key that the
+synced Secret never gets.
+*/}}
+{{- define "pipeshub-ai.validateStores" -}}
+{{- if and (not .Values.neo4j.enabled) (not .Values.arango.enabled) -}}
+  {{- fail "No graph database is enabled. Set neo4j.enabled=true (default) or arango.enabled=true." -}}
+{{- end -}}
+{{- if and (eq (.Values.config.kvStoreType | default "redis") "etcd") (not .Values.etcd.enabled) -}}
+  {{- fail "config.kvStoreType=etcd requires etcd.enabled=true; otherwise the app has no etcd to connect to." -}}
+{{- end -}}
+{{- if and .Values.neo4j.enabled (gt (int .Values.neo4j.replicaCount) 1) (not (contains "enterprise" (.Values.neo4j.image.tag | toString))) -}}
+  {{- fail "neo4j.replicaCount > 1 requires an Enterprise image (image.tag must contain \"enterprise\"). Neo4j Community has no clustering; extra replicas are separate databases and split writes. Keep replicaCount at 1, or switch neo4j.image.tag to an enterprise build you are licensed for." -}}
+{{- end -}}
+{{- if and .Values.mongodb.enabled .Values.mongodb.builtin.enabled -}}
+  {{- fail "mongodb.enabled and mongodb.builtin.enabled cannot both be true. Use mongodb.enabled=true for the Bitnami subchart (existing installs) or mongodb.enabled=false and mongodb.builtin.enabled=true for the chart-owned replica set (new installs)." -}}
+{{- end -}}
+{{- if and (not .Values.mongodb.enabled) (not .Values.mongodb.builtin.enabled) -}}
+  {{- fail "MongoDB is not deployed. Set mongodb.enabled=true (Bitnami subchart) or mongodb.builtin.enabled=true (chart-owned replica set)." -}}
+{{- end -}}
+{{- if and .Values.secretManagement.externalSecrets.enabled (not .Values.secretManagement.externalSecrets.remoteRefs.secretKey) -}}
+  {{- fail "secretManagement.externalSecrets.remoteRefs.secretKey is required when externalSecrets is enabled; the app cannot start without secret-key." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Most app replicas this release can run: replicaCount, or the autoscaler's
+ceiling when autoscaling is on.
+*/}}
+{{- define "pipeshub-ai.maxReplicas" -}}
+{{- $replicas := .Values.replicaCount | int -}}
+{{- if .Values.autoscaling.enabled -}}
+{{- $replicas = max $replicas (.Values.autoscaling.maxReplicas | int) -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end -}}

@@ -1,0 +1,178 @@
+import { Router } from 'express'
+import { Container } from 'inversify'
+import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware'
+import { AuthMiddleware } from '../../../config'
+import { createOAuthClientRateLimiter } from '../../../libs/middlewares/rate-limit.middleware'
+import { requireSessionAuth } from '../../../libs/middlewares/require-session-auth.middleware'
+import { Logger } from '../../../libs/services/logger.service'
+import { OAuthAppController } from '../controller/oauth.app.controller'
+import { userAdminCheck } from '../../user_management/middlewares/userAdminCheck'
+import { refuseServiceAccountCaller } from '../../user_management/middlewares/refuseServiceAccountCaller'
+import { requireScopes } from '../../../libs/middlewares/require-scopes.middleware'
+import { OAuthScopeNames } from '../../../libs/enums/oauth-scopes.enum'
+import { AppConfig } from '../../tokens_manager/config/config'
+import {
+  appIdParamsSchema,
+  setAppTokenIdentitySchema,
+  createAppSchema,
+  updateAppSchema,
+  listAppsQuerySchema,
+} from '../validators/oauth.validators'
+
+export function createOAuthClientsRouter(container: Container): Router {
+  const router = Router()
+  const controller = container.get<OAuthAppController>('OAuthAppController')
+  const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware')
+  const logger = container.get<Logger>('Logger')
+  const appConfig = container.get<AppConfig>('AppConfig')
+
+  // Rate limiter for OAuth client management
+  const oauthClientRateLimiter = createOAuthClientRateLimiter(logger, appConfig.maxOAuthClientRequestsPerMinute)
+
+  // All routes require an interactive user session: a bearer token issued to
+  // a client must not be able to register or reconfigure clients.
+  router.use(authMiddleware.authenticate.bind(authMiddleware))
+  router.use(requireSessionAuth)
+  // All routes are rate limited
+  router.use(oauthClientRateLimiter)
+  // And none of them are for service accounts. Registering an app is another
+  // way to obtain a credential: `agent:execute` is not admin-only and members
+  // may ask for `client_credentials`, so a read-only service token could
+  // otherwise register its way to a write-capable one.
+  router.use(refuseServiceAccountCaller)
+
+  /**
+   * GET /oauth-clients
+   * List all OAuth apps for the organization
+   */
+  router.get(
+    '/',
+    ValidationMiddleware.validate(listAppsQuerySchema),
+    (req, res, next) => controller.listApps(req, res, next),
+  )
+
+  /**
+   * POST /oauth-clients
+   * Create a new OAuth app.
+   * Not admin-only: any authenticated member of the org may create an
+   * app. Being an admin widens the scopes on offer rather than gating
+   * the route — see getAllowedScopeNamesForRole in OAuthAppService.
+   * Rate limited along with every route on this router.
+   */
+  router.post(
+    '/',
+    ValidationMiddleware.validate(createAppSchema),
+    (req, res, next) => controller.createApp(req, res, next),
+  )
+
+  /**
+   * PUT /oauth-clients/:appId/token-identity
+   * Point this app's client_credentials tokens at a service account, or pass
+   * serviceAccountId: null to put them back to acting as the app's creator.
+   *
+   * Admin-only: it decides whose documents the app's tokens can reach.
+   */
+  router.put(
+    '/:appId/token-identity',
+    // Both gates, as on /service-accounts: the admin check asks about the
+    // person, the scope check asks what the credential may do, and neither
+    // covers the other. Without the second, an administrator's narrowly
+    // scoped token could change whose documents this application's tokens
+    // reach — including passing null to point them back at the administrator.
+    requireScopes(OAuthScopeNames.USER_WRITE),
+    userAdminCheck,
+    ValidationMiddleware.validate(setAppTokenIdentitySchema),
+    (req, res, next) => controller.setTokenIdentity(req, res, next),
+  )
+
+  /**
+   * GET /oauth-clients/scopes
+   * List all available scopes
+   */
+  router.get(
+    '/scopes',
+    (req, res, next) => controller.listScopes(req, res, next),
+  )
+
+  /**
+   * GET /oauth-clients/:appId
+   * Get OAuth app details
+   */
+  router.get(
+    '/:appId',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.getApp(req, res, next),
+  )
+
+  /**
+   * PUT /oauth-clients/:appId
+   * Update OAuth app
+   */
+  router.put(
+    '/:appId',
+    ValidationMiddleware.validate(updateAppSchema),
+    (req, res, next) => controller.updateApp(req, res, next),
+  )
+
+  /**
+   * DELETE /oauth-clients/:appId
+   * Delete OAuth app (soft delete)
+   */
+  router.delete(
+    '/:appId',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.deleteApp(req, res, next),
+  )
+
+  /**
+   * POST /oauth-clients/:appId/regenerate-secret
+   * Regenerate client secret
+   */
+  router.post(
+    '/:appId/regenerate-secret',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.regenerateSecret(req, res, next),
+  )
+
+  /**
+   * POST /oauth-clients/:appId/suspend
+   * Suspend an OAuth app
+   */
+  router.post(
+    '/:appId/suspend',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.suspendApp(req, res, next),
+  )
+
+  /**
+   * POST /oauth-clients/:appId/activate
+   * Reactivate a suspended OAuth app
+   */
+  router.post(
+    '/:appId/activate',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.activateApp(req, res, next),
+  )
+
+  /**
+   * GET /oauth-clients/:appId/tokens
+   * List active tokens for an app
+   */
+  router.get(
+    '/:appId/tokens',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.listAppTokens(req, res, next),
+  )
+
+  /**
+   * POST /oauth-clients/:appId/revoke-all-tokens
+   * Revoke all tokens for an app
+   */
+  router.post(
+    '/:appId/revoke-all-tokens',
+    ValidationMiddleware.validate(appIdParamsSchema),
+    (req, res, next) => controller.revokeAllTokens(req, res, next),
+  )
+
+  return router
+}

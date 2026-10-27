@@ -1,0 +1,279 @@
+import asyncio
+import logging
+import os
+import sys
+from collections.abc import Callable
+
+from httpx import URL
+
+from app.utils.log_redaction import redact_secrets_in_text, refresh_env_secrets
+from app.utils.request_context import NO_CONTEXT, current_display_id, get_context
+from app.utils.url_redaction import redact_sensitive_query_params, redact_url
+
+# ``%(trace)s`` expands to ``[req:<id> thr:<thread> task:<task>] `` only when a
+# context is in flight, so startup/background lines stay clean.
+LOG_FORMAT = (
+    "%(asctime)s - %(name)s - %(levelname)s - "
+    "%(trace)s[%(filename)s:%(lineno)d] - %(message)s"
+)
+
+
+def _make_record_factory(
+    base_factory: Callable[..., logging.LogRecord],
+) -> Callable[..., logging.LogRecord]:
+    # base_factory is captured in the closure, not a module global, so reloading
+    # this module cannot rebind it to ourselves and cause infinite recursion.
+    def _record_factory(*args: object, **kwargs: object) -> logging.LogRecord:
+        record = base_factory(*args, **kwargs)  # type: ignore[arg-type]
+
+        if get_context() is None:
+            record.request_id = ""
+            record.task = NO_CONTEXT
+            record.trace = ""
+            return record
+
+        try:
+            task = asyncio.current_task()
+            task_name = task.get_name() if task is not None else NO_CONTEXT
+        except RuntimeError:
+            task_name = NO_CONTEXT
+
+        display_id = current_display_id()
+        record.request_id = display_id
+        record.task = task_name
+        record.trace = f"[req:{display_id} thr:{record.threadName} task:{task_name}] "
+        return record
+
+    _record_factory._pipeshub_trace = True  # type: ignore[attr-defined]
+    _record_factory._pipeshub_base = base_factory  # type: ignore[attr-defined]
+    return _record_factory
+
+
+# On reload, reuse the original base our installed factory already captured
+# rather than wrapping the installed factory (which would recurse).
+_existing_factory = logging.getLogRecordFactory()
+if getattr(_existing_factory, "_pipeshub_trace", False):
+    _base_record_factory = getattr(
+        _existing_factory, "_pipeshub_base", logging.LogRecord
+    )
+else:
+    _base_record_factory = _existing_factory
+
+_record_factory = _make_record_factory(_base_record_factory)
+if not getattr(_existing_factory, "_pipeshub_trace", False):
+    logging.setLogRecordFactory(_record_factory)
+
+
+class RedactingFormatter(logging.Formatter):
+    """Masks credentials in the finished line (see app/utils/log_redaction.py).
+
+    Redacting the formatted string, not ``record.msg``, covers f-strings,
+    ``%``-args, ``exc_info`` tracebacks and ``stack_info`` alike.
+    """
+
+    # Checked by attribute, not isinstance, so a reload of this module does
+    # not wrap the formatters it already installed a second time.
+    _pipeshub_redacting = True
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets_in_text(super().format(record))
+
+
+class _RedactingWrapper(logging.Formatter):
+    """Redacts what another formatter produced, for handlers this module did
+    not create (uvicorn's), whose own formatting is kept."""
+
+    _pipeshub_redacting = True
+
+    def __init__(self, inner: logging.Formatter) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets_in_text(self.inner.format(record))
+
+
+def install_log_redaction() -> None:
+    """Make every handler in the process redact its output.
+
+    ``create_logger`` handlers already do. This covers the root handler and
+    the ones uvicorn installs when it configures logging, which happens after
+    this module is imported, so each service calls it again at startup. It
+    also re-reads the secret env values, which may have been loaded since.
+    """
+    refresh_env_secrets()
+    loggers = [logging.getLogger()]
+    loggers += [lg for lg in logging.Logger.manager.loggerDict.values() if isinstance(lg, logging.Logger)]
+    for lg in loggers:
+        for handler in lg.handlers:
+            if not getattr(handler.formatter, "_pipeshub_redacting", False):
+                handler.setFormatter(_RedactingWrapper(handler.formatter or logging.Formatter()))
+
+
+class ColoredFormatter(RedactingFormatter):
+    """Formatter that adds colors for WARNING (yellow) and ERROR (red) in console output."""
+
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    RESET = "\033[0m"
+
+    COLORS = {
+        logging.WARNING: YELLOW,
+        logging.ERROR: RED,
+        logging.CRITICAL: RED,
+    }
+
+    def format(self, record) -> str:
+        formatted = super().format(record)
+        color = self.COLORS.get(record.levelno)
+        if color:
+            return f"{color}{formatted}{self.RESET}"
+        return formatted
+
+
+class HttpxSuccessFilter(logging.Filter):
+    """Drop httpx's per-request INFO log for successful responses.
+
+    httpx logs *every* request at INFO ("HTTP Request: POST <url> \"HTTP/1.1 200
+    OK\""), which at indexing volumes buries everything else. Raising the
+    logger to WARNING would silence failures too, since httpx logs those at INFO
+    as well — so filter on the status code instead and keep 3xx/4xx/5xx.
+
+    The status is read from ``record.args`` rather than the formatted message:
+    httpx passes it as an int, so this does not depend on message wording.
+
+    Lines that are kept have their request URL redacted: the query string of a
+    signed URL, or the userinfo of any URL, is a credential.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not isinstance(record.args, (tuple, list)):
+            return True
+        # args are (method, url, http_version, status_code, reason_phrase); scan
+        # for the status rather than indexing, so a signature change downgrades
+        # to "log it" instead of raising.
+        for arg in record.args:
+            if isinstance(arg, bool):
+                continue
+            if isinstance(arg, int) and 100 <= arg <= 599:
+                if 200 <= arg < 300:
+                    return False
+                break
+        record.args = tuple(
+            redact_url(str(arg)) if isinstance(arg, URL) else arg for arg in record.args
+        )
+        return True
+
+
+class HealthCheckFilter(logging.Filter):
+    """Suppress successful uvicorn access log entries for /health* endpoints.
+
+    Failed health checks (non-2xx) are still logged so genuine service problems
+    remain visible. Only 2xx responses are suppressed since those are routine
+    process_monitor polling noise.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn access log args: (client_addr, method, path, http_version, status_code)
+        if isinstance(record.args, (tuple, list)) and len(record.args) >= 5:
+            try:
+                path = str(record.args[2])
+                status_code = int(record.args[4])
+                return not (path.startswith("/health") and 200 <= status_code < 300)
+            except (ValueError, TypeError):
+                pass
+        # Fallback for any non-standard formatting
+        msg = record.getMessage()
+        return not ("/health" in msg and '" 2' in msg)
+
+
+class AccessLogRedactionFilter(logging.Filter):
+    """Redact credentials from the request path uvicorn writes to its access log.
+
+    Signed download URLs carry their JWT in ``?token=``, so logging the raw path
+    would hand a working download link to anyone who can read the logs.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn access log args: (client_addr, method, path, http_version, status_code)
+        if isinstance(record.args, tuple) and len(record.args) >= 3:
+            args = list(record.args)
+            args[2] = redact_sensitive_query_params(str(args[2]))
+            record.args = tuple(args)
+        return True
+
+
+# Ensure log directory exists
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+
+# Force UTF-8 for stdout/stderr in Windows
+if sys.platform == "win32":
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+# Configure base logging settings
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    encoding="utf-8",
+)
+
+install_log_redaction()
+
+# Suppress Neo4j notification warnings (missing labels, etc.)
+data_store = os.getenv("DATA_STORE", "arangodb").lower()
+if data_store == "neo4j":
+    neo4j_notifications_logger = logging.getLogger("neo4j.notifications")
+    neo4j_notifications_logger.setLevel(logging.ERROR)  # Only show errors, suppress warnings
+
+# Suppress opensearch-py transport INFO logs (logs every HTTP request at INFO level).
+# Errors and warnings are still visible.
+logging.getLogger("opensearch").setLevel(logging.WARNING)
+
+# Suppress /health* endpoint noise from uvicorn access logs (process_monitor polling)
+logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+logging.getLogger("uvicorn.access").addFilter(AccessLogRedactionFilter())
+
+# httpx logs every outbound request at INFO. Keep the failures, drop the 2xx.
+logging.getLogger("httpx").addFilter(HttpxSuccessFilter())
+
+
+def create_logger(service_name: str) -> logging.Logger:
+    """
+    Create a logger for a specific service with file and console handlers
+    """
+    # Create logger
+    logging_level = os.getenv("LOG_LEVEL", "info").lower()
+    logger = logging.getLogger(service_name)
+    if logging_level == "debug":
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
+    # Prevent DUPLICATE handlers
+    if not logger.handlers:
+        # Enhanced format: request id + thread/task + filename and line number
+        log_format = LOG_FORMAT
+
+        # File handler with enhanced format
+        file_handler = logging.FileHandler(
+            os.path.join(log_dir, f"{service_name}.log"),
+            encoding="utf-8",  # Explicitly set encoding here too
+        )
+        file_handler.setFormatter(RedactingFormatter(log_format))
+
+        # Console handler with colored format
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(ColoredFormatter(log_format))
+
+        # Add handlers
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        logger.propagate = False
+
+    return logger

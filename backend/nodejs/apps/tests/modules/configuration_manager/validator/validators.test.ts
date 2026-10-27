@@ -1,0 +1,424 @@
+import 'reflect-metadata'
+import { expect } from 'chai'
+import sinon from 'sinon'
+import {
+  baseStorageSchema,
+  s3ConfigSchema,
+  s3ConfigSchemaRefined,
+  storageValidationSchema,
+  azureBlobConfigSchema,
+  providerType,
+  addProviderRequestSchema,
+  batchAddModelsRequestSchema,
+  configurationSchema,
+  githubAuthConfigSchema,
+  rotateConnectionCredentialsSchema,
+} from '../../../../src/modules/configuration_manager/validator/validators'
+
+describe('configuration_manager/validator/validators', () => {
+  afterEach(() => {
+    sinon.restore()
+  })
+
+  describe('baseStorageSchema', () => {
+    it('should accept local storage type', () => {
+      const result = baseStorageSchema.safeParse({ storageType: 'local' })
+      expect(result.success).to.be.true
+    })
+
+    it('should accept s3 storage type', () => {
+      const result = baseStorageSchema.safeParse({ storageType: 's3' })
+      expect(result.success).to.be.true
+    })
+
+    it('should accept azureBlob storage type', () => {
+      const result = baseStorageSchema.safeParse({ storageType: 'azureBlob' })
+      expect(result.success).to.be.true
+    })
+
+    it('should reject invalid storage type', () => {
+      const result = baseStorageSchema.safeParse({ storageType: 'gcs' })
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('s3ConfigSchema', () => {
+    it('should accept valid S3 config', () => {
+      const data = {
+        storageType: 's3',
+        s3AccessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+        s3SecretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        s3Region: 'us-east-1',
+        s3BucketName: 'my-bucket',
+      }
+      const result = s3ConfigSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject a config with only s3SecretAccessKey', () => {
+      const data = {
+        storageType: 's3',
+        s3SecretAccessKey: 'secret',
+        s3Region: 'us-east-1',
+        s3BucketName: 'my-bucket',
+      }
+      const result = s3ConfigSchemaRefined.safeParse(data)
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.error.issues[0]?.path).to.deep.equal(['s3AccessKeyId'])
+      }
+    })
+
+    it('should reject a config with only s3AccessKeyId', () => {
+      const data = {
+        storageType: 's3',
+        s3AccessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+        s3SecretAccessKey: '   ',
+        s3Region: 'us-east-1',
+        s3BucketName: 'my-bucket',
+      }
+      const result = s3ConfigSchemaRefined.safeParse(data)
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.error.issues[0]?.path).to.deep.equal(['s3SecretAccessKey'])
+      }
+    })
+
+    it('should reject partial credentials through the storage route schema', () => {
+      const result = storageValidationSchema.safeParse({
+        body: {
+          storageType: 's3',
+          s3AccessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+          s3Region: 'us-east-1',
+          s3BucketName: 'my-bucket',
+        },
+      })
+      expect(result.success).to.be.false
+    })
+
+    it('should accept both credentials omitted through the storage route schema', () => {
+      const result = storageValidationSchema.safeParse({
+        body: {
+          storageType: 's3',
+          s3Region: 'us-east-1',
+          s3BucketName: 'my-bucket',
+        },
+      })
+      expect(result.success).to.be.true
+    })
+
+    it('should accept S3 config with both credential fields omitted (IAM role mode)', () => {
+      const data = {
+        storageType: 's3',
+        s3Region: 'us-east-1',
+        s3BucketName: 'my-bucket',
+      }
+      const result = s3ConfigSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject missing region even in IAM role mode', () => {
+      const data = {
+        storageType: 's3',
+        s3BucketName: 'my-bucket',
+      }
+      const result = s3ConfigSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should reject missing bucket name', () => {
+      const data = {
+        storageType: 's3',
+        s3AccessKeyId: 'key',
+        s3SecretAccessKey: 'secret',
+        s3Region: 'us-east-1',
+      }
+      const result = s3ConfigSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('azureBlobConfigSchema', () => {
+    it('should accept valid Azure config with individual params', () => {
+      const data = {
+        storageType: 'azureBlob',
+        accountName: 'myaccount',
+        accountKey: 'mykey',
+        containerName: 'mycontainer',
+      }
+      const result = azureBlobConfigSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should accept Azure config with connection string', () => {
+      const data = {
+        storageType: 'azureBlob',
+        azureBlobConnectionString: 'DefaultEndpointsProtocol=https;AccountName=test;...',
+        containerName: 'mycontainer',
+      }
+      const result = azureBlobConfigSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject missing container name', () => {
+      const data = {
+        storageType: 'azureBlob',
+        accountName: 'myaccount',
+        accountKey: 'mykey',
+      }
+      const result = azureBlobConfigSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('providerType (dynamic string validation)', () => {
+    it('should accept known providers like openAI', () => {
+      const result = providerType.safeParse('openAI')
+      expect(result.success).to.be.true
+    })
+
+    it('should accept known providers like minimax', () => {
+      const result = providerType.safeParse('minimax')
+      expect(result.success).to.be.true
+    })
+
+    it('should accept any non-empty provider string (dynamic registry)', () => {
+      const result = providerType.safeParse('brandNewProvider')
+      expect(result.success).to.be.true
+    })
+
+    it('should reject empty string', () => {
+      const result = providerType.safeParse('')
+      expect(result.success).to.be.false
+    })
+  })
+
+  describe('addProviderRequestSchema - minimax', () => {
+    it('should accept valid MiniMax LLM provider config', () => {
+      const data = {
+        body: {
+          modelType: 'llm',
+          provider: 'minimax',
+          configuration: {
+            model: 'MiniMax-M3',
+            apiKey: 'test-minimax-key',
+          },
+          isMultimodal: true,
+          isReasoning: false,
+          isDefault: false,
+        },
+      }
+      const result = addProviderRequestSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should accept MiniMax with multiple models', () => {
+      const data = {
+        body: {
+          modelType: 'llm',
+          provider: 'minimax',
+          configuration: {
+            model: 'MiniMax-M3, MiniMax-M2.7, MiniMax-M2.7-highspeed',
+            apiKey: 'test-minimax-key',
+          },
+          isMultimodal: true,
+          isReasoning: false,
+          isDefault: false,
+        },
+      }
+      const result = addProviderRequestSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should reject MiniMax with invalid modelType', () => {
+      const data = {
+        body: {
+          modelType: 'invalid',
+          provider: 'minimax',
+          configuration: {
+            model: 'MiniMax-M3',
+            apiKey: 'test-key',
+          },
+          isMultimodal: false,
+          isReasoning: false,
+          isDefault: false,
+        },
+      }
+      const result = addProviderRequestSchema.safeParse(data)
+      expect(result.success).to.be.false
+    })
+
+    it('should accept modelType "tts"', () => {
+      const data = {
+        body: {
+          modelType: 'tts',
+          provider: 'openAI',
+          configuration: {
+            model: 'tts-1',
+            apiKey: 'test-key',
+            voice: 'nova',
+          },
+          isMultimodal: false,
+          isReasoning: false,
+          isDefault: true,
+        },
+      }
+      const result = addProviderRequestSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should accept modelType "stt" with openAI', () => {
+      const data = {
+        body: {
+          modelType: 'stt',
+          provider: 'openAI',
+          configuration: {
+            model: 'whisper-1',
+            apiKey: 'test-key',
+          },
+          isMultimodal: false,
+          isReasoning: false,
+          isDefault: true,
+        },
+      }
+      const result = addProviderRequestSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+
+    it('should accept modelType "stt" with self-hosted whisper (no apiKey)', () => {
+      const data = {
+        body: {
+          modelType: 'stt',
+          provider: 'whisper',
+          configuration: {
+            model: 'base',
+          },
+          isMultimodal: false,
+          isReasoning: false,
+          isDefault: true,
+        },
+      }
+      const result = addProviderRequestSchema.safeParse(data)
+      expect(result.success).to.be.true
+    })
+  })
+
+  describe('configurationSchema passthrough', () => {
+    it('should preserve provider-specific keys not declared on the base object shape', () => {
+      const result = configurationSchema.safeParse({
+        model: 'gemini-pro',
+        apiKey: 'optional',
+        project: 'gcp-project-123',
+        location: 'us-central1',
+        serviceAccountJson: '{"type":"service_account"}',
+      })
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.data.project).to.equal('gcp-project-123')
+        expect(result.data.location).to.equal('us-central1')
+        expect(result.data.serviceAccountJson).to.equal('{"type":"service_account"}')
+      }
+    })
+  })
+
+  describe('batch and rotate configuration', () => {
+    it('accepts a shared friendly name and drops it before the single-model rule', () => {
+      const result = batchAddModelsRequestSchema.safeParse({
+        body: {
+          modelType: 'llm',
+          provider: 'openAI',
+          configuration: { apiKey: 'sk', modelFriendlyName: 'Shared' },
+          models: [{ model: 'gpt-4o', modelFriendlyName: 'Bee' }],
+        },
+      })
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.data.body.configuration.modelFriendlyName).to.equal(undefined)
+        expect(result.data.body.configuration.apiKey).to.equal('sk')
+        expect(result.data.body.models[0].modelFriendlyName).to.equal('Bee')
+      }
+    })
+
+    it('rejects an endpoint on credential rotation', () => {
+      const result = rotateConnectionCredentialsSchema.safeParse({
+        params: { connectionId: 'conn-1' },
+        body: { configuration: { apiKey: 'sk-new', endpoint: 'https://attacker.example/v1' } },
+      })
+      expect(result.success).to.be.false
+    })
+
+    it('accepts a credential-only rotation', () => {
+      const result = rotateConnectionCredentialsSchema.safeParse({
+        params: { connectionId: 'conn-1' },
+        body: { configuration: { apiKey: 'sk-new' } },
+      })
+      expect(result.success).to.be.true
+    })
+  })
+
+  describe('configurationSchema defaultReasoningEffort', () => {
+    it('should keep a valid default so it is saved with the model', () => {
+      const result = configurationSchema.safeParse({ model: 'qwen', defaultReasoningEffort: 'low' })
+      expect(result.success).to.be.true
+      if (result.success) {
+        expect(result.data.defaultReasoningEffort).to.equal('low')
+      }
+    })
+
+    it('should accept an empty or null default, which means none is set', () => {
+      expect(configurationSchema.safeParse({ model: 'qwen', defaultReasoningEffort: '' }).success).to.be.true
+      expect(configurationSchema.safeParse({ model: 'qwen', defaultReasoningEffort: null }).success).to.be.true
+    })
+
+    it('should reject an unknown effort with a message naming the valid choices', () => {
+      const result = configurationSchema.safeParse({ model: 'qwen', defaultReasoningEffort: 'extreme' })
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.error.issues[0].path).to.deep.equal(['defaultReasoningEffort'])
+        expect(result.error.issues[0].message).to.equal(
+          'Default reasoning effort must be low, medium, high or max. Leave it empty to use the platform default.',
+        )
+      }
+    })
+  })
+
+  describe('githubAuthConfigSchema', () => {
+    it('should accept valid GitHub auth config', () => {
+      const result = githubAuthConfigSchema.safeParse({
+        body: {
+          clientId: 'github-client-id',
+          clientSecret: 'github-client-secret',
+        },
+      })
+      expect(result.success).to.be.true
+    })
+
+    it('should reject missing clientId', () => {
+      const result = githubAuthConfigSchema.safeParse({
+        body: {
+          clientSecret: 'github-client-secret',
+        },
+      })
+      expect(result.success).to.be.false
+    })
+
+    it('should reject missing clientSecret', () => {
+      const result = githubAuthConfigSchema.safeParse({
+        body: {
+          clientId: 'github-client-id',
+        },
+      })
+      expect(result.success).to.be.false
+    })
+
+    it('should reject empty clientId', () => {
+      const result = githubAuthConfigSchema.safeParse({
+        body: {
+          clientId: '',
+          clientSecret: 'github-client-secret',
+        },
+      })
+      expect(result.success).to.be.false
+    })
+  })
+})

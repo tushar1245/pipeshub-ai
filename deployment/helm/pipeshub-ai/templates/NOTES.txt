@@ -1,0 +1,154 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm get all {{ .Release.Name }}
+
+== IMPORTANT SECURITY NOTE ==
+
+{{- if not .Values.secretManagement.existingSecrets.enabled }}
+{{- if not .Values.secretManagement.externalSecrets.enabled }}
+
+⚠️  Default passwords are in use! Please set secure passwords:
+
+  MongoDB: --set mongodb.auth.rootPassword=<secure-password>
+  Redis: --set redis.auth.password=<secure-password>
+  {{- if .Values.neo4j.enabled }}
+  Neo4j: --set neo4j.auth.password=<secure-password>
+  {{- end }}
+  {{- if .Values.arango.enabled }}
+  ArangoDB: --set arango.auth.rootPassword=<secure-password>
+  {{- end }}
+  App Secret: --set secretKey=$(openssl rand -hex 32)
+
+{{- end }}
+{{- end }}
+
+== DEFAULT CREDENTIALS ==
+
+MongoDB:
+  Username: {{ .Values.mongodb.auth.rootUser | default "root" }}
+  Password: *** (set via --set mongodb.auth.rootPassword)
+
+Redis:
+  Password: *** (set via --set redis.auth.password)
+
+{{- if .Values.neo4j.enabled }}
+
+Neo4j:
+  Username: {{ .Values.neo4j.auth.username }}
+  Password: *** (set via --set neo4j.auth.password)
+
+{{- end }}
+
+== NEXT STEPS ==
+
+1. Install metrics-server for HPA (if autoscaling is enabled):
+   ./deployment/helm/local-install-metrics-server.sh
+
+2. Configure ingress (if needed):
+   --set ingress.enabled=true --set ingress.className=nginx
+
+3. Verify deployment:
+   kubectl get pods -l "app.kubernetes.io/name=pipeshub-ai,app.kubernetes.io/instance={{ .Release.Name }}"
+
+4. Get application URL:
+   kubectl get svc {{ include "pipeshub-ai.fullname" . }}
+
+5. Forward ports for local access (from your laptop):
+
+   # UI + API — sufficient for everyday use:
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "pipeshub-ai.fullname" . }} 3001:3001
+
+   # Add 8088 only when setting up connectors / OAuth (browser redirects):
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "pipeshub-ai.fullname" . }} 3001:3001 8088:8088
+
+   Open http://localhost:3001
+
+== SERVICE ENDPOINTS ==
+
+  Browser (port-forward):  http://localhost:3001  (UI + Node API)
+  Connector OAuth:         http://localhost:8088  (only if config.connectorPublicBackend uses localhost)
+
+  In-cluster only (Node calls these; no laptop port-forward needed):
+  Query:     http://{{ include "pipeshub-ai.fullname" . }}:8000
+  Indexing:  http://{{ include "pipeshub-ai.fullname" . }}:8091
+  Docling:   http://{{ include "pipeshub-ai.fullname" . }}:8081
+
+{{- if .Values.ingress.enabled }}
+
+== INGRESS CONFIGURATION ==
+
+Your application is accessible via the configured ingress:
+{{- range .Values.ingress.hosts }}
+  {{ .host }}
+{{- end }}
+
+{{- end }}
+
+{{- $path := include "pipeshub-ai.sandboxPath" . }}
+
+== CODING SANDBOX ==
+
+{{- if eq $path "local" }}
+
+NO ISOLATION. Code the model generates runs as a subprocess of the application
+pod, sharing its network and filesystem, bounded only by rlimits. Fine for a
+single-tenant development cluster; NOT fine for a shared or internet-reachable
+one.
+
+  For container isolation:
+    --set config.sandboxMode=docker --set sandbox.dind.enabled=true
+
+{{- else if eq $path "e2b" }}
+
+run_code executes OFF-CLUSTER on E2B. Nothing runs on this pod. Set E2B_API_KEY
+in the application's configuration, or run_code will fail at provision.
+
+{{- else if eq $path "dind" }}
+
+run_code executes in throwaway containers on the `dind` sidecar. The
+application reaches it only through the `docker-proxy` sidecar
+({{ include "pipeshub-ai.dockerHost" . }}), which refuses privileged
+containers, host mounts, devices, host namespaces and images other than
+{{ .Values.sandbox.proxy.allowedImages | default .Values.config.sandboxDockerImage }}.
+
+{{- else if eq $path "external" }}
+
+run_code executes on the Docker daemon at {{ .Values.config.dockerHost }}.
+That daemon runs untrusted, model-generated code: it should be dedicated to
+this purpose, reachable only by this deployment, and fronted by the policy
+proxy (python -m app.docker_proxy_main) rather than exposed raw.
+
+{{- end }}
+
+{{- if .Values.sandbox.dind.enabled }}
+
+-- The `dind` sidecar is PRIVILEGED --
+
+  * It can escape to the node. Pod Security Admission `restricted` and
+    OpenShift's default SCC will reject this pod; label the namespace
+    `privileged`/`baseline` or grant a matching SCC.
+  * dockerd has no TCP listener. Its unix socket lives in the `dind-sock`
+    emptyDir, mounted only into `dind` and `docker-proxy`; never mount that
+    volume into another container.
+  * `docker-proxy` runs app.docker_proxy_main from {{ .Values.sandbox.proxy.image | default (include "pipeshub-ai.image" (dict "image" .Values.image "global" .Values.global)) }}.
+    An image built before the Docker API proxy was added lacks it, and the
+    sidecar crash-loops; set sandbox.proxy.image to a newer one.
+{{- if not .Values.sandbox.dind.storage.existingClaim }}
+  * /var/lib/docker is an emptyDir, so {{ .Values.config.sandboxDockerImage }}
+    is re-pulled after every pod restart. Set
+    sandbox.dind.storage.existingClaim to keep the cache.
+{{- end }}
+{{- if ne $path "dind" }}
+
+  NOTE: run_code is NOT using this sidecar (it uses the "{{ $path }}" path
+  above), so you are running a privileged container for nothing. Either
+  --set sandbox.dind.enabled=false, or point run_code at it by clearing
+  config.dockerHost and setting config.sandboxMode=docker.
+{{- end }}
+{{- end }}
+
+For more information, visit: https://pipeshub.com

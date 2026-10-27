@@ -1,0 +1,1301 @@
+"""Agent conversation listing integration tests.
+
+``GET /api/v1/agents/{agentKey}/conversations``
+``GET /api/v1/agents/conversations/show/archives``
+``GET /api/v1/agents/{agentKey}/conversations/show/archives``
+``GET /api/v1/agents/{agentKey}/conversations/{conversationId}``
+
+Exercises the Node gateway + Zod validation layer for agent conversation
+listing, archive listing, and get-by-id using the shared ``agent_session``
+fixture.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+import requests
+
+_ROOT = Path(__file__).resolve().parents[3]
+_RV_HELPER = _ROOT / "response-validation" / "helper"
+for _p in (_ROOT, _RV_HELPER):
+    s = str(_p)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+from helper.agui_sse import (
+    is_root_error,
+    is_root_finished,
+    iter_sse_envelopes,
+    run_finished_result,
+)
+from helper.clients.conversations_client import AgentConversationsClient
+from openapi_schema_validator import (
+    assert_response_matches_openapi_operation,
+    assert_response_matches_openapi_ref,
+)
+
+logger = logging.getLogger(__name__)
+
+
+
+def _response_json(resp: requests.Response) -> dict[str, Any]:
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise AssertionError(
+            f"Expected JSON response, got status={resp.status_code}: {resp.text[:500]}"
+        ) from exc
+    assert isinstance(data, dict), f"Expected dict JSON body, got: {data!r}"
+    return data
+
+
+@pytest.mark.integration
+class TestAgentConversationListing:
+    @pytest.fixture(autouse=True)
+    def _setup(
+        self,
+        agent_conversations_client: AgentConversationsClient,
+        agent_session: dict[str, Any],
+    ) -> None:
+        self.conversations = agent_conversations_client
+        self.timeout = int(os.getenv("PIPESHUB_TEST_TIMEOUT", "60"))
+        stream_override = os.getenv("PIPESHUB_TEST_STREAM_TIMEOUT", "").strip()
+        self.stream_timeout = (
+            int(stream_override)
+            if stream_override
+            else max(self.timeout, 120)
+        )
+        # Nothing here asserts on KB content, and a knowledge-free agent cannot register
+        # the retrieval toolset — so every conversation this file seeds costs one LLM
+        # turn instead of two.
+        self.agent_key = agent_session["workhorse_agent"]
+        self.secondary_agents = list(agent_session["secondary_agents"])
+
+    @pytest.fixture
+    def created_conversations(self) -> Iterator[list[tuple[str, str]]]:
+        created: list[tuple[str, str]] = []
+        yield created
+        for agent_key, conversation_id in reversed(created):
+            try:
+                resp = self.conversations.delete_conversation(
+                    agent_key,
+                    conversation_id,
+                    timeout=self.timeout,
+                )
+                if resp.status_code >= 300:
+                    logger.warning(
+                        "Conversation delete failed for %s: HTTP %s %s",
+                        conversation_id, resp.status_code, resp.text[:300]
+                    )
+            except Exception:
+                pass
+
+    def _archive_agent_conversation(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        options: dict[str, Any] = {"timeout": self.timeout}
+        if headers is not None:
+            options["headers"] = headers
+        return self.conversations.archive_conversation(
+            agent_key,
+            conversation_id,
+            **options,
+        )
+
+    def _create_agent_conversation_id(
+        self,
+        agent_key: str,
+        *,
+        query: str,
+        created_conversations: list[tuple[str, str]],
+    ) -> str:
+        with self.conversations.stream_conversation(
+            agent_key,
+            query=query,
+            timeout=self.stream_timeout,
+        ) as resp:
+            assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+            for envelope in iter_sse_envelopes(resp):
+                payload = json.loads(envelope["data"])
+                if is_root_error(envelope["event"], payload):
+                    raise AssertionError(f"stream emitted RUN_ERROR: {payload!r}")
+                if not is_root_finished(envelope["event"], payload):
+                    continue
+
+                result = run_finished_result(payload)
+                conv = result.get("conversation") or {}
+                conversation_id = conv.get("_id")
+                assert isinstance(conversation_id, str) and conversation_id, (
+                    f"RUN_FINISHED result missing conversation._id: {result!r}"
+                )
+                created_conversations.append((agent_key, conversation_id))
+                return conversation_id
+
+        raise AssertionError("agent conversation stream ended without a RUN_FINISHED event")
+
+    def _stream_add_message(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        *,
+        query: str,
+    ) -> None:
+        with self.conversations.stream_message(
+            agent_key,
+            conversation_id,
+            query=query,
+            timeout=self.stream_timeout,
+        ) as resp:
+            assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+            for envelope in iter_sse_envelopes(resp):
+                payload = json.loads(envelope["data"])
+                if is_root_error(envelope["event"], payload):
+                    raise AssertionError(
+                        f"message stream emitted RUN_ERROR: {payload!r}"
+                    )
+                if is_root_finished(envelope["event"], payload):
+                    return
+
+        raise AssertionError("agent add-message stream ended without a RUN_FINISHED event")
+
+    def _list_agent_conversations(
+        self,
+        agent_key: str,
+        *,
+        params: Any | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        options: dict[str, Any] = {"timeout": self.timeout}
+        if params is not None:
+            options["params"] = params
+        if headers is not None:
+            options["headers"] = headers
+        return self.conversations.list_conversations(agent_key, **options)
+
+    def _get_agent_conversation(
+        self,
+        agent_key: str,
+        conversation_id: str,
+        *,
+        params: Any | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        options: dict[str, Any] = {"timeout": self.timeout}
+        if params is not None:
+            options["params"] = params
+        if headers is not None:
+            options["headers"] = headers
+        return self.conversations.get_conversation(
+            agent_key,
+            conversation_id,
+            **options,
+        )
+
+    def _list_grouped_archived_agent_conversations(
+        self,
+        *,
+        params: Any | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        options: dict[str, Any] = {"timeout": self.timeout}
+        if params is not None:
+            options["params"] = params
+        if headers is not None:
+            options["headers"] = headers
+        return self.conversations.list_grouped_archives(**options)
+
+    def _list_archived_agent_conversations(
+        self,
+        agent_key: str,
+        *,
+        params: Any | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        options: dict[str, Any] = {"timeout": self.timeout}
+        if params is not None:
+            options["params"] = params
+        if headers is not None:
+            options["headers"] = headers
+        return self.conversations.list_archived_conversations(agent_key, **options)
+
+    @staticmethod
+    def _all_returned_conversation_ids(body: dict[str, Any]) -> set[str]:
+        ids: set[str] = set()
+        for key in ("conversations", "sharedWithMeConversations"):
+            rows = body.get(key)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                conv_id = row.get("_id")
+                if isinstance(conv_id, str) and conv_id:
+                    ids.add(conv_id)
+        return ids
+
+    @staticmethod
+    def _all_returned_conversations(body: dict[str, Any]) -> list[dict[str, Any]]:
+        rows_out: list[dict[str, Any]] = []
+        for key in ("conversations", "sharedWithMeConversations"):
+            rows = body.get(key)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict):
+                    rows_out.append(row)
+        return rows_out
+
+    @staticmethod
+    def _grouped_archive_conversations(
+        body: dict[str, Any],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        groups = body.get("groups")
+        assert isinstance(groups, list), f"Expected groups list, got: {body!r}"
+        rows_out: list[tuple[str, dict[str, Any]]] = []
+        for group in groups:
+            assert isinstance(group, dict), f"Expected group object, got: {group!r}"
+            agent_key = group.get("agentKey")
+            assert isinstance(agent_key, str) and agent_key, (
+                f"Expected non-empty group.agentKey, got: {group!r}"
+            )
+            conversations = group.get("conversations")
+            assert isinstance(conversations, list), (
+                f"Expected group.conversations list, got: {group!r}"
+            )
+            for row in conversations:
+                assert isinstance(row, dict), (
+                    f"Expected archived conversation object, got: {row!r}"
+                )
+                rows_out.append((agent_key, row))
+        return rows_out
+
+    @staticmethod
+    def _conversation_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
+        conversation = body.get("conversation")
+        assert isinstance(conversation, dict), f"Expected conversation object, got: {body!r}"
+        messages = conversation.get("messages")
+        assert isinstance(messages, list), f"Expected conversation.messages list, got: {body!r}"
+        out: list[dict[str, Any]] = []
+        for row in messages:
+            assert isinstance(row, dict), f"Expected message object, got: {row!r}"
+            out.append(row)
+        return out
+
+    @staticmethod
+    def _assert_validation_error(resp: requests.Response) -> dict[str, Any]:
+        assert resp.status_code == 400, f"{resp.status_code}: {resp.text}"
+        body = _response_json(resp)
+        assert_response_matches_openapi_ref(body, "#/components/schemas/ErrorResponse")
+        error = body.get("error")
+        assert isinstance(error, dict), f"Expected error object, got: {body!r}"
+        assert error.get("code") == "VALIDATION_ERROR", (
+            f"Expected VALIDATION_ERROR, got {error.get('code')!r}"
+        )
+        metadata = error.get("metadata")
+        assert isinstance(metadata, dict), f"Expected error.metadata object, got: {body!r}"
+        details = metadata.get("errors")
+        assert isinstance(details, list) and details, (
+            f"Expected non-empty error.metadata.errors list, got: {body!r}"
+        )
+        return body
+
+    def test_list_agent_conversations_default_returns_owned_results(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        query = f"listing-default-{uuid4().hex}"
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=query,
+            created_conversations=created_conversations,
+        )
+
+        resp = self._list_agent_conversations(self.agent_key)
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        assert isinstance(body.get("conversations"), list), f"Unexpected body: {body!r}"
+        assert isinstance(body.get("sharedWithMeConversations"), list), (
+            f"Unexpected body: {body!r}"
+        )
+        returned_ids = self._all_returned_conversation_ids(body)
+        assert conversation_id in returned_ids, (
+            f"Expected conversation {conversation_id} in response, got: {body!r}"
+        )
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination: {body!r}"
+        assert pagination.get("page") == 1
+        assert pagination.get("limit") == 20
+
+    def test_list_agent_conversations_supports_search_and_sort_queries(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        search_token = f"listing-search-{uuid4().hex}"
+        created_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"{search_token} tell me about the attached kb",
+            created_conversations=created_conversations,
+        )
+
+        resp = self._list_agent_conversations(
+            self.agent_key,
+            params={
+                "search": search_token,
+                "page": "1",
+                "limit": "20",
+                "sortBy": "lastActivityAt",
+                "sortOrder": "desc",
+                "status": "Complete",
+                "isArchived": "false",
+            },
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        returned_ids = self._all_returned_conversation_ids(body)
+        assert created_id in returned_ids, (
+            f"Expected search-filtered response to include {created_id}, got: {body!r}"
+        )
+
+        filters = body.get("filters")
+        assert isinstance(filters, dict), f"Missing filters metadata: {body!r}"
+        applied = (filters.get("applied") or {}).get("filters")
+        assert isinstance(applied, list), f"Missing applied filters list: {filters!r}"
+        assert "search" in applied
+
+    def test_list_agent_conversations_supports_date_range_and_pagination(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        created_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"listing-date-range-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        now = datetime.now(timezone.utc)
+        start_date = (now - timedelta(days=1)).isoformat()
+        end_date = (now + timedelta(days=1)).isoformat()
+
+        resp = self._list_agent_conversations(
+            self.agent_key,
+            params={
+                "page": "1",
+                "limit": "1",
+                "sortBy": "createdAt",
+                "sortOrder": "desc",
+                "startDate": start_date,
+                "endDate": end_date,
+            },
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination object: {body!r}"
+        assert pagination.get("page") == 1
+        assert pagination.get("limit") == 1
+        assert pagination.get("totalCount", 0) >= 1
+
+        returned_ids = self._all_returned_conversation_ids(body)
+        assert created_id in returned_ids or pagination.get("totalCount", 0) >= 1, (
+            f"Expected created conversation or non-zero total count, got: {body!r}"
+        )
+
+    def test_list_agent_conversations_for_other_agent_key_is_scoped_to_that_agent(
+        self,
+    ) -> None:
+        other_agent_key = self.secondary_agents[0]
+
+        resp = self._list_agent_conversations(other_agent_key)
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        rows = self._all_returned_conversations(body)
+        for row in rows:
+            assert row.get("agentKey") == other_agent_key, (
+                "Agent-scoped listing returned a conversation from a different agent: "
+                f"{row!r}"
+            )
+            assert row.get("agentKey") != self.agent_key, (
+                "Agent-scoped listing leaked the primary agent key into another "
+                f"agent's results: {row!r}"
+            )
+
+    def test_list_agent_conversations_without_auth_returns_401(self) -> None:
+        resp = self.conversations.list_conversations(
+            self.agent_key,
+            auth=False,
+            timeout=self.timeout,
+        )
+        assert resp.status_code == 401, f"{resp.status_code}: {resp.text}"
+
+    @pytest.mark.parametrize(
+        ("label", "params"),
+        [
+            ("page zero", {"page": "0"}),
+            ("page non-numeric", {"page": "abc"}),
+            ("limit zero", {"limit": "0"}),
+            ("limit too large", {"limit": "101"}),
+            ("invalid startDate", {"startDate": "not-a-date"}),
+            ("invalid endDate", {"endDate": "still-not-a-date"}),
+            ("invalid isArchived", {"isArchived": "1"}),
+        ],
+    )
+    def test_list_agent_conversations_rejects_invalid_query_shapes(
+        self,
+        label: str,
+        params: dict[str, str],
+    ) -> None:
+        resp = self._list_agent_conversations(self.agent_key, params=params)
+        body = self._assert_validation_error(resp)
+        assert body["error"]["metadata"]["errors"], (
+            f"[{label}] Expected validation details"
+        )
+
+    def test_list_agent_conversations_rejects_duplicate_search_query_param(self) -> None:
+        resp = self._list_agent_conversations(
+            self.agent_key,
+            params=[("search", "first"), ("search", "second")],
+        )
+        self._assert_validation_error(resp)
+
+    @pytest.mark.parametrize(
+        ("label", "search_value"),
+        [
+            ("format specifier payload", "%s%s%s"),
+            ("too long", "x" * 1001),
+        ],
+    )
+    def test_list_agent_conversations_rejects_invalid_search_values(
+        self,
+        label: str,
+        search_value: str,
+    ) -> None:
+        resp = self._list_agent_conversations(
+            self.agent_key,
+            params={"search": search_value},
+        )
+        body = self._assert_validation_error(resp)
+        assert body["error"]["metadata"]["errors"], (
+            f"[{label}] Expected validation details"
+        )
+
+    def test_list_agent_conversations_rejects_xss_search_via_middleware(self) -> None:
+        resp = self._list_agent_conversations(
+            self.agent_key,
+            params={"search": "<script>alert('x')</script>"},
+        )
+        assert resp.status_code == 400, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        error = body.get("error")
+        assert isinstance(error, dict), f"Expected error object, got: {body!r}"
+        message = error.get("message")
+        assert isinstance(message, str) and "HTML tags, scripts, and XSS content" in message, (
+            f"Expected XSS middleware rejection message, got: {body!r}"
+        )
+
+    def test_list_grouped_archived_agent_conversations_default_returns_groups(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        primary_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"grouped-archives-primary-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        secondary_agent_key = self.secondary_agents[0]
+        secondary_conversation_id = self._create_agent_conversation_id(
+            secondary_agent_key,
+            query=f"grouped-archives-secondary-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        active_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"grouped-archives-active-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+
+        for agent_key, conversation_id in (
+            (self.agent_key, primary_conversation_id),
+            (secondary_agent_key, secondary_conversation_id),
+        ):
+            archive_resp = self._archive_agent_conversation(agent_key, conversation_id)
+            assert archive_resp.status_code == 200, (
+                f"{archive_resp.status_code}: {archive_resp.text}"
+            )
+            archive_body = _response_json(archive_resp)
+            assert archive_body.get("id") == conversation_id, (
+                f"archive id mismatch: {archive_body!r}"
+            )
+            assert archive_body.get("status") == "archived", (
+                f"expected archived status: {archive_body!r}"
+            )
+
+        resp = self._list_grouped_archived_agent_conversations()
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        rows = self._grouped_archive_conversations(body)
+        archived_ids = {
+            row.get("_id") for _, row in rows if isinstance(row.get("_id"), str)
+        }
+        assert primary_conversation_id in archived_ids, (
+            f"Expected archived primary conversation in grouped response: {body!r}"
+        )
+        assert secondary_conversation_id in archived_ids, (
+            f"Expected archived secondary conversation in grouped response: {body!r}"
+        )
+        assert active_conversation_id not in archived_ids, (
+            "Active conversation leaked into grouped archived response: "
+            f"{body!r}"
+        )
+
+        seen_agent_keys = {agent_key for agent_key, _ in rows}
+        assert self.agent_key in seen_agent_keys, (
+            f"Primary agent group missing from grouped archives: {body!r}"
+        )
+        assert secondary_agent_key in seen_agent_keys, (
+            f"Secondary agent group missing from grouped archives: {body!r}"
+        )
+
+        groups = body.get("groups")
+        assert isinstance(groups, list), f"Expected groups list, got: {body!r}"
+        for group in groups:
+            assert isinstance(group, dict), f"Expected group object, got: {group!r}"
+            pagination = group.get("pagination")
+            assert isinstance(pagination, dict), (
+                f"Expected group pagination object, got: {group!r}"
+            )
+            conversations = group.get("conversations")
+            assert isinstance(conversations, list), (
+                f"Expected group conversations list, got: {group!r}"
+            )
+            assert len(conversations) <= 5, (
+                f"Expected grouped archives to slice to 5 chats per agent: {group!r}"
+            )
+            for row in conversations:
+                assert row.get("archivedAt"), (
+                    f"Expected archivedAt on grouped archived conversation: {row!r}"
+                )
+                assert row.get("archivedBy"), (
+                    f"Expected archivedBy on grouped archived conversation: {row!r}"
+                )
+
+        agent_pagination = body.get("agentPagination")
+        assert isinstance(agent_pagination, dict), (
+            f"Expected agentPagination object, got: {body!r}"
+        )
+        assert agent_pagination.get("page") == 1
+        assert agent_pagination.get("limit") == 5
+        assert agent_pagination.get("totalCount", 0) >= 2
+
+        assert_response_matches_openapi_operation(
+            body, "listAgentArchivedConversationsGrouped", status_code="200"
+        )
+
+    def test_list_grouped_archived_agent_conversations_supports_agent_pagination(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        seeded_agents = [self.agent_key, self.secondary_agents[0], self.secondary_agents[1]]
+        archived_by_agent: dict[str, str] = {}
+
+        for agent_key in seeded_agents:
+            conversation_id = self._create_agent_conversation_id(
+                agent_key,
+                query=f"grouped-archives-page-{agent_key}-{uuid4().hex}",
+                created_conversations=created_conversations,
+            )
+            archive_resp = self._archive_agent_conversation(agent_key, conversation_id)
+            assert archive_resp.status_code == 200, (
+                f"{archive_resp.status_code}: {archive_resp.text}"
+            )
+            archived_by_agent[agent_key] = conversation_id
+
+        # Other xdist workers archive and delete under their own agents for the same user, so
+        # any page may hold one of theirs and a walk can shift by one mid-way: walk every page,
+        # and walk again if one of ours slipped past.
+        seen: set[str] = set()
+        for _walk in range(3):
+            page = 1
+            while True:
+                resp = self._list_grouped_archived_agent_conversations(
+                    params={"agentPage": str(page), "agentLimit": "1"},
+                )
+                assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+                body = _response_json(resp)
+
+                pagination = body.get("agentPagination")
+                assert isinstance(pagination, dict), (
+                    f"Missing agentPagination on page {page}: {body!r}"
+                )
+                assert pagination.get("page") == page
+                assert pagination.get("limit") == 1
+                assert pagination.get("hasPrevPage") is (page > 1)
+
+                groups = body.get("groups")
+                assert isinstance(groups, list) and len(groups) <= 1, (
+                    f"Expected at most one group on page {page}: {body!r}"
+                )
+                if not groups:
+                    # Only a page past a group deleted mid-walk may come back empty.
+                    assert page > 1, f"Expected a group on page one: {body!r}"
+                    break
+                seen.add(groups[0].get("agentKey"))
+                assert pagination.get("totalCount", 0) >= len(seeded_agents)
+                if not pagination.get("hasNextPage") or page >= 200:
+                    break
+                page += 1
+            if set(archived_by_agent) <= seen:
+                break
+
+        assert set(archived_by_agent) <= seen, (
+            f"Not every seeded agent was paged through: seeded={list(archived_by_agent)!r} seen={sorted(seen)!r}"
+        )
+
+    def test_list_grouped_archived_agent_conversations_normalizes_query_values(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"grouped-archives-normalize-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        resp = self._list_grouped_archived_agent_conversations(
+            params={
+                "agentPage": "0",
+                "agentLimit": "999",
+            },
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        agent_pagination = body.get("agentPagination")
+        assert isinstance(agent_pagination, dict), (
+            f"Expected agentPagination object, got: {body!r}"
+        )
+        assert agent_pagination.get("page") == 1, (
+            f"Expected agentPage=0 to normalize to 1: {body!r}"
+        )
+        assert agent_pagination.get("limit") == 100, (
+            f"Expected agentLimit=999 to clamp to 100: {body!r}"
+        )
+
+        rows = self._grouped_archive_conversations(body)
+        archived_ids = {
+            row.get("_id") for _, row in rows if isinstance(row.get("_id"), str)
+        }
+        assert conversation_id in archived_ids, (
+            f"Expected archived conversation in normalized grouped response: {body!r}"
+        )
+
+    def test_list_grouped_archived_agent_conversations_non_numeric_query_values_use_defaults(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"grouped-archives-nonnumeric-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        resp = self._list_grouped_archived_agent_conversations(
+            params={"agentPage": "abc", "agentLimit": "xyz"},
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        agent_pagination = body.get("agentPagination")
+        assert isinstance(agent_pagination, dict), (
+            f"Expected agentPagination object, got: {body!r}"
+        )
+        assert agent_pagination.get("page") == 1, (
+            f"Expected non-numeric agentPage to default to 1: {body!r}"
+        )
+        assert agent_pagination.get("limit") == 5, (
+            f"Expected non-numeric agentLimit to default to 5: {body!r}"
+        )
+
+    def test_list_grouped_archived_agent_conversations_without_auth_returns_401(
+        self,
+    ) -> None:
+        resp = self.conversations.list_grouped_archives(
+            auth=False,
+            timeout=self.timeout,
+        )
+        assert resp.status_code == 401, f"{resp.status_code}: {resp.text}"
+
+    def test_list_archived_agent_conversations_default_returns_archived_results(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        archived_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-archives-default-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        active_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-archives-active-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            archived_conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        resp = self._list_archived_agent_conversations(self.agent_key)
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        conversations = body.get("conversations")
+        assert isinstance(conversations, list), f"Unexpected body: {body!r}"
+
+        returned_ids = {
+            row.get("_id")
+            for row in conversations
+            if isinstance(row, dict) and isinstance(row.get("_id"), str)
+        }
+        assert archived_conversation_id in returned_ids, (
+            f"Expected archived conversation in archive listing: {body!r}"
+        )
+        assert active_conversation_id not in returned_ids, (
+            f"Active conversation leaked into archive listing: {body!r}"
+        )
+
+        for row in conversations:
+            assert isinstance(row, dict), f"Expected conversation object, got: {row!r}"
+            assert row.get("agentKey") == self.agent_key, (
+                f"Archive listing returned conversation for wrong agent: {row!r}"
+            )
+            assert row.get("archivedAt"), (
+                f"Expected archivedAt on archived conversation row: {row!r}"
+            )
+            assert row.get("archivedBy"), (
+                f"Expected archivedBy on archived conversation row: {row!r}"
+            )
+
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination object: {body!r}"
+        assert pagination.get("page") == 1
+        assert pagination.get("limit") == 20
+        assert pagination.get("totalCount", 0) >= 1
+
+        summary = body.get("summary")
+        assert isinstance(summary, dict), f"Missing summary object: {body!r}"
+        assert summary.get("totalArchived", 0) >= 1
+
+        filters = body.get("filters")
+        assert isinstance(filters, dict), f"Missing filters object: {body!r}"
+
+        assert_response_matches_openapi_operation(
+            body, "listAgentConversationArchives", status_code="200"
+        )
+
+    def test_list_archived_agent_conversations_supports_query_params(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        search_token = f"agent-archives-search-{uuid4().hex}"
+        archived_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"{search_token} explain the attached kb",
+            created_conversations=created_conversations,
+        )
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            archived_conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        now = datetime.now(timezone.utc)
+        start_date = (now - timedelta(days=1)).isoformat()
+        end_date = (now + timedelta(days=1)).isoformat()
+        resp = self._list_archived_agent_conversations(
+            self.agent_key,
+            params={
+                "search": search_token,
+                "page": "1",
+                "limit": "1",
+                "sortBy": "createdAt",
+                "sortOrder": "desc",
+                "startDate": start_date,
+                "endDate": end_date,
+            },
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        conversations = body.get("conversations")
+        assert isinstance(conversations, list), f"Unexpected body: {body!r}"
+        returned_ids = {
+            row.get("_id")
+            for row in conversations
+            if isinstance(row, dict) and isinstance(row.get("_id"), str)
+        }
+        assert archived_conversation_id in returned_ids or (
+            body.get("pagination", {}).get("totalCount", 0) >= 1
+        ), f"Expected archived search result or matching total count: {body!r}"
+
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination object: {body!r}"
+        assert pagination.get("page") == 1
+        assert pagination.get("limit") == 1
+        assert pagination.get("totalCount", 0) >= 1
+
+        filters = body.get("filters")
+        assert isinstance(filters, dict), f"Missing filters metadata: {body!r}"
+        applied = (filters.get("applied") or {}).get("filters")
+        assert isinstance(applied, list), f"Missing applied filters list: {filters!r}"
+        assert "search" in applied
+        assert "page" in applied
+        assert "limit" in applied
+
+    def test_list_archived_agent_conversations_for_other_agent_key_is_scoped(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        archived_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-archives-scoped-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            archived_conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        other_agent_key = self.secondary_agents[0]
+        resp = self._list_archived_agent_conversations(other_agent_key)
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        conversations = body.get("conversations")
+        assert isinstance(conversations, list), f"Unexpected body: {body!r}"
+        returned_ids = {
+            row.get("_id")
+            for row in conversations
+            if isinstance(row, dict) and isinstance(row.get("_id"), str)
+        }
+        assert archived_conversation_id not in returned_ids, (
+            "Archived conversation leaked into another agent's archive listing: "
+            f"{body!r}"
+        )
+        for row in conversations:
+            assert row.get("agentKey") == other_agent_key, (
+                f"Archive listing returned conversation from another agent: {row!r}"
+            )
+
+    def test_list_archived_agent_conversations_nonexistent_agent_key_returns_empty(
+        self,
+    ) -> None:
+        resp = self._list_archived_agent_conversations(f"missing-agent-{uuid4().hex}")
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        assert body.get("conversations") == [], f"Expected empty list: {body!r}"
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination object: {body!r}"
+        assert pagination.get("totalCount") == 0
+
+        summary = body.get("summary")
+        assert isinstance(summary, dict), f"Missing summary object: {body!r}"
+        assert summary.get("totalArchived") == 0
+
+    def test_list_archived_agent_conversations_normalizes_pagination_values(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        archived_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-archives-normalize-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            archived_conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        resp = self._list_archived_agent_conversations(
+            self.agent_key,
+            params={"page": "0", "limit": "101"},
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination object: {body!r}"
+        assert pagination.get("page") == 1, (
+            f"Expected page=0 to normalize to 1: {body!r}"
+        )
+        assert pagination.get("limit") == 20, (
+            f"Expected limit=101 to normalize to 20: {body!r}"
+        )
+
+    def test_list_archived_agent_conversations_non_numeric_pagination_uses_defaults(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        archived_conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-archives-defaults-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        archive_resp = self._archive_agent_conversation(
+            self.agent_key,
+            archived_conversation_id,
+        )
+        assert archive_resp.status_code == 200, (
+            f"{archive_resp.status_code}: {archive_resp.text}"
+        )
+
+        resp = self._list_archived_agent_conversations(
+            self.agent_key,
+            params={"page": "abc", "limit": "xyz"},
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        pagination = body.get("pagination")
+        assert isinstance(pagination, dict), f"Missing pagination object: {body!r}"
+        assert pagination.get("page") == 1, (
+            f"Expected non-numeric page to default to 1: {body!r}"
+        )
+        assert pagination.get("limit") == 20, (
+            f"Expected non-numeric limit to default to 20: {body!r}"
+        )
+
+    def test_list_archived_agent_conversations_without_auth_returns_401(self) -> None:
+        resp = self.conversations.list_archived_conversations(
+            self.agent_key,
+            auth=False,
+            timeout=self.timeout,
+        )
+        assert resp.status_code == 401, f"{resp.status_code}: {resp.text}"
+
+    @pytest.mark.parametrize(
+        ("label", "params"),
+        [
+            # Unknown query keys are rejected by strict Zod (shared is not in the contract).
+            ("invalid shared", {"shared": "maybe"}),
+            ("invalid startDate", {"startDate": "not-a-date"}),
+            ("invalid endDate", {"endDate": "still-not-a-date"}),
+        ],
+    )
+    def test_list_archived_agent_conversations_rejects_invalid_query_shapes(
+        self,
+        label: str,
+        params: dict[str, str],
+    ) -> None:
+        resp = self._list_archived_agent_conversations(self.agent_key, params=params)
+        body = self._assert_validation_error(resp)
+        assert body["error"]["metadata"]["errors"], (
+            f"[{label}] Expected validation details"
+        )
+
+    def test_list_archived_agent_conversations_rejects_duplicate_search_query_param(
+        self,
+    ) -> None:
+        resp = self._list_archived_agent_conversations(
+            self.agent_key,
+            params=[("search", "first"), ("search", "second")],
+        )
+        self._assert_validation_error(resp)
+
+    @pytest.mark.parametrize(
+        ("label", "search_value"),
+        [
+            ("format specifier payload", "%s%s%s"),
+            ("too long", "x" * 1001),
+        ],
+    )
+    def test_list_archived_agent_conversations_rejects_invalid_search_values(
+        self,
+        label: str,
+        search_value: str,
+    ) -> None:
+        resp = self._list_archived_agent_conversations(
+            self.agent_key,
+            params={"search": search_value},
+        )
+        body = self._assert_validation_error(resp)
+        assert body["error"]["metadata"]["errors"], (
+            f"[{label}] Expected validation details"
+        )
+
+    def test_list_archived_agent_conversations_rejects_xss_search_via_middleware(
+        self,
+    ) -> None:
+        resp = self._list_archived_agent_conversations(
+            self.agent_key,
+            params={"search": "<script>alert('x')</script>"},
+        )
+        assert resp.status_code == 400, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        error = body.get("error")
+        assert isinstance(error, dict), f"Expected error object, got: {body!r}"
+        message = error.get("message")
+        assert isinstance(message, str) and "HTML tags, scripts, and XSS content" in message, (
+            f"Expected XSS middleware rejection message, got: {body!r}"
+        )
+    def test_get_agent_conversation_by_id_default_returns_conversation(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-get-default-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+
+        resp = self._get_agent_conversation(self.agent_key, conversation_id)
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        conversation = body.get("conversation")
+        assert isinstance(conversation, dict), f"Expected conversation object, got: {body!r}"
+        assert conversation.get("id") == conversation_id, (
+            f"conversation.id mismatch: {conversation!r}"
+        )
+        assert body.get("meta", {}).get("conversationId") == conversation_id, (
+            f"meta.conversationId mismatch: {body.get('meta', {})!r}"
+        )
+
+        messages = self._conversation_messages(body)
+        assert messages, f"Expected at least one message, got: {body!r}"
+
+        pagination = conversation.get("pagination")
+        assert isinstance(pagination, dict), f"Missing conversation.pagination: {conversation!r}"
+        assert pagination.get("page") == 1
+        assert pagination.get("limit") == 20
+        assert pagination.get("totalCount", 0) >= len(messages)
+
+        assert_response_matches_openapi_operation(
+            body, "getAgentConversationById", status_code="200"
+        )
+
+    def test_get_agent_conversation_by_id_supports_query_params_and_pagination(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-get-query-1-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        self._stream_add_message(
+            self.agent_key,
+            conversation_id,
+            query=f"agent-get-query-2-{uuid4().hex}",
+        )
+
+        now = datetime.now(timezone.utc)
+        start_date = (now - timedelta(days=1)).isoformat()
+        end_date = (now + timedelta(days=1)).isoformat()
+        resp = self._get_agent_conversation(
+            self.agent_key,
+            conversation_id,
+            params={
+                "page": "1",
+                "limit": "2",
+                "sortBy": "createdAt",
+                "sortOrder": "asc",
+                "startDate": start_date,
+                "endDate": end_date,
+                "messageType": "bot_response",
+            },
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        conversation = body.get("conversation")
+        assert isinstance(conversation, dict), f"Expected conversation object, got: {body!r}"
+        assert conversation.get("id") == conversation_id, (
+            f"conversation.id mismatch: {conversation!r}"
+        )
+
+        messages = self._conversation_messages(body)
+        assert 1 <= len(messages) <= 2, f"Expected paginated messages, got: {messages!r}"
+
+        created_at_values = [msg.get("createdAt") for msg in messages]
+        assert created_at_values == sorted(created_at_values), (
+            f"Expected createdAt ascending order, got: {created_at_values!r}"
+        )
+
+        pagination = conversation.get("pagination")
+        assert isinstance(pagination, dict), f"Missing conversation.pagination: {conversation!r}"
+        assert pagination.get("page") == 1
+        assert pagination.get("limit") == 2
+        assert pagination.get("totalCount", 0) >= 4, (
+            f"Expected at least two user/bot exchanges, got: {pagination!r}"
+        )
+
+    def test_get_agent_conversation_by_id_accepts_non_asc_sort_order_as_desc(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-get-sort-order-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+
+        resp = self._get_agent_conversation(
+            self.agent_key,
+            conversation_id,
+            params={"sortOrder": "sideways"},
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        conversation = body.get("conversation")
+        assert isinstance(conversation, dict), f"Expected conversation object, got: {body!r}"
+        assert conversation.get("id") == conversation_id, (
+            f"conversation.id mismatch: {conversation!r}"
+        )
+        assert self._conversation_messages(body), f"Expected messages in response, got: {body!r}"
+
+    def test_get_agent_conversation_by_id_for_other_agent_key_returns_404(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        conversation_id = self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"agent-get-wrong-agent-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+        other_agent_key = self.secondary_agents[0]
+
+        resp = self._get_agent_conversation(other_agent_key, conversation_id)
+        assert resp.status_code == 404, f"{resp.status_code}: {resp.text}"
+
+    def test_get_agent_conversation_by_id_without_auth_returns_401(self) -> None:
+        resp = self.conversations.get_conversation(
+            self.agent_key,
+            "0" * 24,
+            auth=False,
+            timeout=self.timeout,
+        )
+        assert resp.status_code == 401, f"{resp.status_code}: {resp.text}"
+
+    @pytest.mark.parametrize(
+        ("label", "conversation_id", "params"),
+        [
+            ("invalid conversation id", "not-an-objectid", None),
+            ("page zero", "0" * 24, {"page": "0"}),
+            ("page non-numeric", "0" * 24, {"page": "abc"}),
+            ("limit zero", "0" * 24, {"limit": "0"}),
+            ("limit too large", "0" * 24, {"limit": "101"}),
+            ("invalid sortBy", "0" * 24, {"sortBy": "lastActivityAt"}),
+            ("invalid startDate", "0" * 24, {"startDate": "not-a-date"}),
+            ("invalid endDate", "0" * 24, {"endDate": "still-not-a-date"}),
+            ("invalid messageType", "0" * 24, {"messageType": "assistant"}),
+        ],
+    )
+    def test_get_agent_conversation_by_id_rejects_invalid_params(
+        self,
+        label: str,
+        conversation_id: str,
+        params: dict[str, str] | None,
+    ) -> None:
+        resp = self._get_agent_conversation(
+            self.agent_key,
+            conversation_id,
+            params=params,
+        )
+        body = self._assert_validation_error(resp)
+        assert body["error"]["metadata"]["errors"], (
+            f"[{label}] Expected validation details"
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "params"),
+        [
+            ("duplicate sortBy", [("sortBy", "createdAt"), ("sortBy", "content")]),
+            (
+                "duplicate messageType",
+                [("messageType", "bot_response"), ("messageType", "user_query")],
+            ),
+        ],
+    )
+    def test_get_agent_conversation_by_id_rejects_duplicate_query_params(
+        self,
+        label: str,
+        params: list[tuple[str, str]],
+    ) -> None:
+        resp = self._get_agent_conversation(
+            self.agent_key,
+            "0" * 24,
+            params=params,
+        )
+        body = self._assert_validation_error(resp)
+        assert body["error"]["metadata"]["errors"], (
+            f"[{label}] Expected validation details"
+        )
+    def test_list_agent_conversations_response_matches_openapi_spec(
+        self,
+        created_conversations: list[tuple[str, str]],
+    ) -> None:
+        self._create_agent_conversation_id(
+            self.agent_key,
+            query=f"listing-openapi-{uuid4().hex}",
+            created_conversations=created_conversations,
+        )
+
+        resp = self._list_agent_conversations(
+            self.agent_key,
+            params={"page": "1", "limit": "20"},
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+
+        body = _response_json(resp)
+        assert_response_matches_openapi_operation(
+            body, "listAgentConversations", status_code="200"
+        )

@@ -1,0 +1,195 @@
+"""
+Module-level constants for the GitHub Teams connector.
+
+Numeric tuning knobs carry explanatory comments because they encode
+operational knowledge about real-world GitHub REST/Search API limits. Do not
+change them without reading those comments first.
+"""
+
+from app.config.constants.arangodb import ExtensionTypes
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+#
+# GitHub.com cloud only. Enterprise Server is not supported: GitHubClient
+# never passes a base_url, and the connector's auth config has no
+# instance-URL field to source one from.
+
+# REST "core" budget (authenticated) is 5,000 req/hr, shared with every other
+# tool on the token owner's account. Sync, listing and streaming to indexing
+# stop sending once a reserve of it is left (github_async._check_reserve); a
+# person opening a file does not, and stops only when the pool is spent. A
+# rate limit that resets within _GITHUB_RATE_LIMIT_MAX_WAIT_SECONDS is waited
+# out in ds_call; a longer one fails fast: the sync aborts with its checkpoint
+# withheld and the scheduler retries later, and a stream answers 429 with
+# Retry-After, on which indexing puts the record back in line until then.
+# (The timestamp backfill runs on GraphQL's separate point budget.)
+
+# Search API budget is a *separate*, much smaller pool: 30 req/min. Used by
+# the repo-picker search (filters.py). Paced with a sliding one-minute window
+# rather than a fixed inter-call gap: the budget is per minute, so bursts
+# (the picker's scoped+public pair) are fine as long as the window total
+# holds — a fixed gap added ~2.1s of dead latency to every picker keystroke.
+GITHUB_SEARCH_RATE_LIMIT_PER_MINUTE = 30
+GITHUB_SEARCH_CONCURRENCY = 2
+GITHUB_SEARCH_WINDOW_SECONDS = 60.0
+# 2-call safety margin absorbs clock skew and any Search call issued outside
+# this pacer (e.g. a second service instance sharing the token).
+GITHUB_SEARCH_WINDOW_BUDGET = GITHUB_SEARCH_RATE_LIMIT_PER_MINUTE - 2
+
+# ---------------------------------------------------------------------------
+# Per-operation wall-clock budget
+# ---------------------------------------------------------------------------
+
+# Per-logical-call wall-clock budget (seconds). On expiry the op's coroutine
+# is cancelled, success=False is returned, and the caller's skip-and-continue
+# fallback takes over. Sized for the slowest legitimate ops (recursive tree
+# of a huge repo, PR-diff regeneration), not typical calls.
+_GITHUB_OP_DEFAULT_TIMEOUT_SECONDS = 300.0
+
+# Concurrency cap for the per-member GET /users/:login enrichment fan-out
+# (visible-email phase).
+_GITHUB_USER_ENRICHMENT_CONCURRENCY = 4
+
+# ---------------------------------------------------------------------------
+# Code indexing
+# ---------------------------------------------------------------------------
+
+# GitHub's recursive Git Trees API truncates beyond 100,000 entries or 7MB of
+# response body (whichever is hit first). Above this, `GitTree.truncated` is
+# True and callers must fall back to a per-subtree (non-recursive) walk.
+GIT_TREE_TRUNCATION_ENTRY_HINT = 100_000
+
+# Compare Commits API caps `files[]` at 300 entries for the entire
+# comparison (files beyond that are silently missing, not paginated).
+COMPARE_COMMITS_FILES_LIMIT = 300
+
+# Compare Commits API only returns up to 250 commits without pagination;
+# `total_commits` beyond this is unreliable evidence of the true delta size.
+COMPARE_COMMITS_TOTAL_LIMIT = 250
+
+# Content-indexing ceiling for code blobs (bytes). Files above it still get a
+# record (visible, name-searchable) but their content is not indexed — the
+# record is stamped AUTO_INDEX_OFF at full sync, or refused with 413 at stream
+# time on the incremental path where blob size is unknown until first fetch.
+CODE_FILE_MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# GitHub's maximum page size. Listings carry everything we store, so a full
+# page is one API call per 100 items and the page doubles as the batch —
+# records start landing after the first page instead of after the last.
+PR_PAGE_SIZE = 100
+ISSUE_PAGE_SIZE = 100
+
+# A changed file GitHub returns without a diff (too large to show) has its
+# contents inlined into the PR's blocks payload instead, held in memory while
+# the container is serialised, so cap what gets inlined.
+PR_FILE_INLINE_CONTENT_MAX_BYTES = 256 * 1024
+
+# Each inlined file costs one Contents API call, every time the PR is indexed. A PR
+# of 300 binary or too-large files would cost ~300 calls per update, so ~16 updates
+# of one such PR spend a whole hourly budget. Past this many, nothing more is inlined.
+PR_FILE_INLINE_MAX_FILES = 30
+
+# Diff and inlined file text kept per pull request. Parsing turns diff text into
+# blocks whose stored JSON is about ten times its size, and storage refuses a
+# record over 100 MB, so a PR whose diff deletes or re-adds the whole repository
+# (GitHub lists up to 3,000 files) failed outright. Past this, a file's change is
+# named but its text left out. 4 MiB is ~40 MB stored, and well above ordinary
+# PRs: the largest of 400 recent apache/airflow merges was 2.7 MB.
+PR_DIFF_TEXT_MAX_BYTES = 4 * 1024 * 1024
+
+# GitHub permits attachment uploads up to 25 MB; refuse anything larger so a
+# single record cannot stall the stream indefinitely.
+ATTACHMENT_MAX_SIZE_BYTES = 25 * 1024 * 1024
+
+PREVIEW_RENDERABLE_EXTENSIONS: frozenset[str] = frozenset(
+    ext.value for ext in ExtensionTypes
+)
+
+# ---------------------------------------------------------------------------
+# Email resolution
+# ---------------------------------------------------------------------------
+
+# GitHub's private-email placeholder format: "{id}+{login}@users.noreply.github.com"
+# (or the legacy "{login}@users.noreply.github.com"). These confirm identity
+# but are not usable as a real email for permission matching.
+NOREPLY_EMAIL_SUFFIX = "@users.noreply.github.com"
+
+# Phase B batches GraphQL ``organizationVerifiedDomainEmails`` lookups with
+# one aliased ``user(login:)`` field per member — ~1 point per query on
+# GraphQL's separate budget regardless of member count. 100 mirrors the REST
+# page size and stays far below GitHub's query-size limits.
+VERIFIED_DOMAIN_EMAIL_BATCH = 100
+
+# ---------------------------------------------------------------------------
+# Filter-options picker limits
+# ---------------------------------------------------------------------------
+
+_FILTER_OPTIONS_MAX_PER_PAGE = 100
+_FILTER_OPTIONS_MAX_SCAN_PAGES = 20
+
+# GitHub's Search API refuses to page past the first 1,000 results (422),
+# regardless of per_page — stop offering more before hitting it.
+SEARCH_RESULTS_HARD_CAP = 1_000
+
+# Public-search pages fetched per picker request while filling one result
+# page (dedup against scoped rows can consume several). Bounds worst-case
+# Search-budget spend per keystroke; an under-filled page just returns short
+# with a cursor and the UI loads more.
+_SEARCH_PUBLIC_PAGES_PER_REQUEST = 3
+
+# The repo picker resolves the token's org list per request (it has no other
+# sync-state to lean on). One keystroke = one request, so cache briefly.
+_ORG_SCOPE_CACHE_TTL_SECONDS = 60.0
+
+# Streamed records name their repository only by numeric id, so each one needs
+# owner/name before its real request. Remembered per repository for this long:
+# a sync streams hundreds of records per repo, and the bound means a renamed or
+# transferred repository is picked up again within minutes.
+_REPO_LOOKUP_TTL_SECONDS = 15 * 60.0
+
+# ---------------------------------------------------------------------------
+# Auth error markers — substring fallback for stringified errors on
+# GitHubResponse objects that carry no HTTP status
+# ---------------------------------------------------------------------------
+
+# Fallback only — used when GitHubResponse.status_code is None. A bare "401"
+# is deliberately absent: it matches repo names, diffs and commit messages.
+_AUTH_ERROR_MARKERS: tuple[str, ...] = (
+    "bad credentials",
+    "unauthorized",
+    "invalid_token",
+    "invalid_grant",
+    "requires authentication",
+)
+
+HTTP_UNAUTHORIZED = 401
+HTTP_NOT_FOUND = 404
+
+# Transient statuses worth retrying. 403 is excluded: it is a genuine
+# permission denial by the time it gets here, because the data source reports
+# GitHub's rate-limited 403s as 429, and ds_call waits those out separately.
+_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+# httpx transport failures: the connection broke before GitHub sent a status. Not
+# retried, one dropped connection made a sync a silent no-op (B3: a force-push sat
+# unsynced until the next sync).
+_RETRYABLE_TRANSPORT_ERRORS: frozenset[str] = frozenset({
+    "RemoteProtocolError", "ConnectError", "ReadError", "WriteError", "CloseError",
+    "ConnectTimeout", "PoolTimeout", "ReadTimeout", "WriteTimeout",
+})
+_GITHUB_MAX_RETRIES = 3
+_GITHUB_RETRY_BASE_DELAY_SECONDS = 1.0
+_GITHUB_RETRY_MAX_DELAY_SECONDS = 30.0
+
+# Longest rate-limit wait taken inside one call. A stream request runs under
+# the indexing service's HTTP timeout (aiohttp's 300s default), so a primary
+# reset up to an hour away is left to the caller's retry instead.
+_GITHUB_RATE_LIMIT_MAX_WAIT_SECONDS = 90
+# GitHub's documented wait for a secondary limit that sends no Retry-After.
+_GITHUB_SECONDARY_RATE_LIMIT_WAIT_SECONDS = 60
+
+# GitHub collaborator "affiliation" values, used to enumerate collaborators
+# without paying for a per-user permission lookup (NamedUser.permissions
+# already carries the role for the queried repo).
+AFFILIATION_ALL = "all"

@@ -1,0 +1,35 @@
+export interface SmtpConfig {
+  username?: string;
+  password?: string;
+  host: string;
+  fromEmail: string;
+  port: number;
+}
+
+export interface MailBody {
+  orgId?: string;
+  productName?: string;
+  emailTemplateType: string;
+  isAutoEmail?: boolean;
+  fromEmailDomain?: string;
+  sendEmailTo?: string[];
+  subject?: string;
+  templateData?: Record<string, any>;
+  sendCcTo?: string[];
+  replyTo?: string;
+  attachments?: any[];
+}
+
+export enum EmailTemplateType {
+  LoginWithOtp = 'loginWithOTP',
+  ResetPassword = 'resetPassword',
+  ResetEmail = 'resetEmail',
+  EmailChangeNotice = 'emailChangeNotice',
+  AccountCreation = 'accountCreation',
+  OrgEmailVerification = 'orgEmailVerification',
+  AppuserInvite = 'appuserInvite',
+  SuspiciousLoginAttempt = 'suspiciousLoginAttempt',
+  DomainLimitReached = 'domainLimitReached',
+  JoinRequestNotify = 'joinRequestNotify',
+  JoinRequestDecision = 'joinRequestDecision',
+}

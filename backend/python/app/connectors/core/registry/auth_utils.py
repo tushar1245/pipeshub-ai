@@ -1,0 +1,91 @@
+from typing import Any
+
+from app.connectors.core.registry.auth_builder import OAuthConfig
+from app.connectors.core.registry.types import AuthField
+
+
+def include_jira_scope_enabled(value: Any) -> bool:
+    """Return True when Confluence OAuth config opts into the optional Jira user scope."""
+    if isinstance(value, str):
+        return value.strip().lower() == "yes"
+    return value is True
+
+
+def auth_field_to_dict(field: AuthField) -> dict[str, Any]:
+    """
+    Convert AuthField to field config dictionary.
+
+    This is a shared utility function used by both ConnectorConfigBuilder
+    and ToolsetConfigBuilder to avoid code duplication.
+
+    Args:
+        field: AuthField instance to convert
+
+    Returns:
+        Dictionary representation of the auth field. The ``validation`` object
+        includes ``acceptedFileTypes`` and ``validationRules`` only when
+        ``fieldType`` is ``FILE`` (omitted for all other field types).
+    """
+    min_length = 0 if field.field_type == "CHECKBOX" else field.min_length
+    validation: dict[str, Any] = {
+        "minLength": min_length,
+        "maxLength": field.max_length,
+    }
+    if field.field_type == "FILE":
+        validation["acceptedFileTypes"] = field.accepted_file_types
+        validation["validationRules"] = [
+            r.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for r in field.validation_rules
+        ]
+    result: dict[str, Any] = {
+        "name": field.name,
+        "displayName": field.display_name,
+        "placeholder": field.placeholder,
+        "description": field.description,
+        "fieldType": field.field_type,
+        "required": field.required,
+        "usage": field.usage,
+        "defaultValue": field.default_value,
+        "validation": validation,
+        "isSecret": field.is_secret
+    }
+    if field.options:
+        result["options"] = field.options
+    if field.saved_only:
+        result["savedOnly"] = True
+    if field.required_unless_saved:
+        result["requiredUnlessSaved"] = field.required_unless_saved
+    return result
+
+
+def auto_add_oauth_fields(
+    config: dict[str, Any],
+    oauth_config: OAuthConfig,
+    auth_type: str
+) -> None:
+    """
+    Automatically add all OAuth fields from OAuth config to the config dictionary.
+
+    This is a shared utility function used by both ConnectorConfigBuilder
+    and ToolsetConfigBuilder to avoid code duplication.
+
+    Args:
+        config: The configuration dictionary to modify
+        oauth_config: OAuthConfig instance with fields to add
+        auth_type: The authentication type to add fields to
+    """
+    # Initialize schema structure if needed
+    if "schemas" not in config["auth"]:
+        config["auth"]["schemas"] = {}
+    if auth_type not in config["auth"]["schemas"]:
+        config["auth"]["schemas"][auth_type] = {"fields": []}
+
+    target_schema = config["auth"]["schemas"][auth_type]
+    existing_fields = {f.get("name") for f in target_schema.get("fields", []) if isinstance(f, dict)}
+
+    # Add all fields from OAuth config (reuse conversion logic)
+    for auth_field in oauth_config.auth_fields:
+        if auth_field.name not in existing_fields:
+            field_config = auth_field_to_dict(auth_field)
+            target_schema["fields"].append(field_config)
+

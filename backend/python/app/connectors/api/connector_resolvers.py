@@ -1,0 +1,239 @@
+"""OSS connector edition resolvers — pass-through / single-tenant behavior.
+
+EE counterparts live in ``app.ee.connectors.api.connector_resolvers``.
+Shared router imports these via ``edition_config`` (comment-flip).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+from fastapi import HTTPException, Request
+
+from app.config.constants.arangodb import CollectionNames, Connectors
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
+from app.config.redaction import (
+    OAUTH_CLIENT_SECRET_FIELDS,
+    REDACTED_PLACEHOLDER,
+    hide_secrets_by_default,
+)
+from app.api.middlewares.auth import is_request_admin
+from app.utils.user_lookup import get_user_or_503
+from app.utils.user_messages import not_found
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_config_service(container: Any, org_id: Optional[str]) -> Any:
+    """Return the container config service (no org wrapping on OSS)."""
+    del org_id
+    return container.config_service()
+
+
+def build_graph_data_store(logger_: logging.Logger, graph_provider: Any, org_id: Optional[str]) -> GraphDataStore:
+    """OSS GraphDataStore has no org_id constructor arg."""
+    del org_id
+    return GraphDataStore(logger_, graph_provider)
+
+
+async def authorize_connector_stats(
+    request: Request,
+    graph_provider: Any,
+    connector_registry: Any,
+    connector_id: str,
+    org_id: str,
+) -> None:
+    """OSS: the caller's org, then KB role or the connector read gate.
+
+    A connector the caller may not open answers 404 like every other read, so
+    stats never confirm that someone else's personal connector exists.
+    """
+    user_id = request.state.user.get("userId")
+    is_admin = is_request_admin(request)
+
+    app_doc = await graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+    # Another org's connector answers like a missing one, so its id is not confirmed.
+    if not app_doc or not org_id or not await connector_registry.belongs_to_org(app_doc, org_id):
+        raise HTTPException(
+            status_code=HttpStatusCode.NOT_FOUND.value,
+            detail=not_found("This connector"),
+        )
+
+    if app_doc.get("type") == Connectors.KNOWLEDGE_BASE.value:
+        user = await get_user_or_503(graph_provider, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User not found for user_id: {user_id}",
+            )
+        user_role = await graph_provider.get_user_kb_permission(connector_id, user.get("_key"))
+        # No role at all means the caller cannot see the collection; the KB reads answer 404 there too.
+        if not user_role:
+            raise HTTPException(
+                status_code=HttpStatusCode.NOT_FOUND.value,
+                detail=not_found("This connector"),
+            )
+        if user_role not in ("OWNER", "WRITER", "READER"):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Insufficient KB permissions for connector {connector_id}. "
+                    "Required: OWNER, WRITER, or READER"
+                ),
+            )
+        return
+
+    connector = await connector_registry.get_connector_instance(
+        connector_id, user_id, org_id, is_admin=is_admin
+    )
+    if not connector:
+        raise HTTPException(
+            status_code=HttpStatusCode.NOT_FOUND.value,
+            detail=not_found("This connector"),
+        )
+
+
+def strip_redacted_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop secrets sent back as the mask, so merging the save keeps what is stored."""
+    return {k: v for k, v in data.items() if v != REDACTED_PLACEHOLDER}
+
+
+def mask_oauth_config_for_response(
+    oauth_config: dict[str, Any],
+    caller_org_id: str,
+    *,
+    is_admin: bool,
+    reveal: bool = False,
+) -> dict[str, Any]:
+    """OSS: admins get the config, its secrets masked under HIDE_SECRET_CONFIG unless revealed."""
+    del caller_org_id
+    if not is_admin:
+        return {"config": {}, "inherited": False}
+    raw_cfg = dict(oauth_config.get("config") or {})
+    if hide_secrets_by_default() and not reveal:
+        raw_cfg = {
+            k: (REDACTED_PLACEHOLDER if k in OAUTH_CLIENT_SECRET_FIELDS and v else v)
+            for k, v in raw_cfg.items()
+        }
+    return {"config": raw_cfg, "inherited": False}
+
+
+async def resolve_oauth_configs(
+    container: Any,
+    config_path: str,
+    org_id: str,
+    config_service: Any,
+    *,
+    scope: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """OSS: read configs from etcd via config_service (own org filtered by callers)."""
+    del container, org_id, scope
+    configs = await config_service.get_config(config_path, default=[])
+    if not isinstance(configs, list):
+        return []
+    return configs
+
+
+async def resolve_oauth_config(
+    container: Any,
+    config_path: str,
+    org_id: str,
+    config_id: str,
+    config_service: Any,
+) -> Optional[dict[str, Any]]:
+    """OSS: find config by id + org in local etcd list."""
+    configs = await resolve_oauth_configs(container, config_path, org_id, config_service)
+    return next(
+        (c for c in configs if c.get("_id") == config_id and c.get("orgId") == org_id),
+        None,
+    )
+
+
+async def forbid_inherited_oauth_mutation(
+    container: Any,
+    config_path: str,
+    org_id: str,
+    config_id: str,
+) -> None:
+    """OSS: no inheritance — no-op (caller already 404'd local miss)."""
+    del container, config_path, org_id, config_id
+
+
+def default_connector_scope(
+    connector_type: str,
+    connector_registry: Any,
+    body_scope: Optional[str],
+) -> Optional[str]:
+    """OSS: do not require connectorScope on OAuth create."""
+    del connector_type, connector_registry
+    scope = (body_scope or "").strip().lower()
+    return scope or None
+
+
+async def resolve_shared_oauth_config_for_flow(
+    auth_config: dict[str, Any],
+    oauth_config_id: str,
+    org_id: str,
+    oauth_config_path: str,
+    config_service: Any,
+    *,
+    container: Any = None,
+    logger_: Optional[logging.Logger] = None,
+) -> Optional[dict[str, Any]]:
+    """OSS: local etcd lookup only (own org)."""
+    del container, logger_
+    oauth_configs = await config_service.get_config(oauth_config_path, default=[])
+    if not isinstance(oauth_configs, list):
+        oauth_configs = []
+    for oauth_cfg in oauth_configs:
+        if oauth_cfg.get("_id") == oauth_config_id and oauth_cfg.get("orgId") == org_id:
+            return oauth_cfg
+    return None
+
+
+def schedule_token_refresh_kwargs(org_id: Optional[str]) -> dict[str, Any]:
+    """OSS schedule_token_refresh has no org_id kwarg."""
+    del org_id
+    return {}
+
+
+def oauth_create_extra_fields(
+    *,
+    connector_scope: Optional[str],
+    oauth_instance_name: str,
+) -> dict[str, Any]:
+    del connector_scope, oauth_instance_name
+    return {}
+
+
+def ensure_oauth_default(
+    existing_configs: list[dict[str, Any]],
+    new_config: dict[str, Any],
+    org_id: str,
+) -> None:
+    """OSS: no isDefault management needed."""
+    del existing_configs, new_config, org_id
+
+
+def annotate_oauth_inheritance(
+    auth_dict: dict[str, Any],
+    shared_oauth_config: dict[str, Any],
+    org_id: str,
+) -> None:
+    """OSS: no inheritance, so an owning org already stored on the connector is never valid."""
+    del shared_oauth_config, org_id
+    auth_dict.pop("inheritedFromOrgId", None)
+    auth_dict.pop("orgId", None)
+
+
+def filter_oauth_configs_for_list(
+    oauth_configs: list[dict[str, Any]],
+    org_id: str,
+    *,
+    scope: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """OSS listing filters by org in the registry helper; return list as-is here."""
+    del org_id, scope
+    return oauth_configs

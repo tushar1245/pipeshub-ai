@@ -1,0 +1,3022 @@
+'use client';
+
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { useComposerResizeAnimation } from '../hooks/use-composer-resize-animation';
+import { FileIcon } from '@/app/components/ui/file-icon';
+import { Spinner } from '@/app/components/ui/spinner';
+import { Flex, Box, Text, IconButton, Tooltip, Popover } from '@radix-ui/themes';
+import { getMimeTypeExtension } from '@/lib/utils/file-icon-utils';
+import { ICON_SIZES } from '@/lib/constants/icon-sizes';
+import { ChatInputExpansionPanel } from '@/chat/components/chat-panel/expansion-panels/chat-input-expansion-panel';
+import { ChatInputOverlayPanel } from '@/chat/components/chat-panel/expansion-panels/chat-input-overlay-panel';
+import { ConnectorsCollectionsPanel } from '@/chat/components/chat-panel/expansion-panels/connectors-collections/connectors-collections-panel';
+import { AgentScopedResourcesPanel } from '@/chat/components/chat-panel/expansion-panels/agent-scoped-resources-panel';
+import { bareToolFullName } from '@/chat/tool-groups';
+import { UniversalAgentResourcesPanel } from '@/chat/components/chat-panel/expansion-panels/universal-agent-resources-panel';
+import { MessageActionIndicator } from '@/chat/components/chat-panel/expansion-panels/message-actions';
+import {
+  ModelSelectorPanel,
+  getAppliedReasoningEffortLabel,
+} from '@/chat/components/chat-panel/expansion-panels/model-selector/model-selector-panel';
+import { SelectedCollections } from '@/chat/components/selected-collections';
+import { resolveConnectorType } from '@/app/components/ui/ConnectorIcon';
+import {
+  AgentStrategyModeSwitcher,
+  AgentStrategyModePanel,
+  PlusMenuButton,
+  PlusMenuSheet,
+  PlusMenuTriggerIcon,
+  hasNonDefaultSearchCapabilities,
+} from '@/chat/components/chat-panel';
+import { MobileQueryOptionsSheet } from '@/chat/components/chat-panel/expansion-panels/mobile-query-options-sheet';
+import { getQueryModeConfig } from '@/chat/constants';
+import {
+  useChatStore,
+  ctxKeyFromAgent,
+  isModelReasoningCapable,
+  getModelDefaultReasoningEffort,
+} from '@/chat/store';
+import { useIsMobile } from '@/lib/hooks/use-is-mobile';
+import { useCommandStore } from '@/lib/store/command-store';
+import { toast } from '@/lib/store/toast-store';
+import { attachmentErrorMessage } from '@/chat/utils/attachment-error';
+import { showRemoteRunInProgressToast } from '@/chat/utils/remote-run-toast';
+import { streamRegenerateForSlot, cancelStreamForSlot } from '@/chat/streaming';
+import { useTranslation } from 'react-i18next';
+import { useAuthStore } from '@/lib/store/auth-store';
+import { getUserIdFromToken } from '@/lib/utils/jwt';
+import { useComposerDraft } from '@/chat/hooks/use-composer-draft';
+import { buildDraftKey } from '@/chat/utils/composer-draft';
+import { useChatSpeechRecognition } from '@/lib/hooks/use-chat-speech-recognition';
+import { PastedTextChip } from '@/chat/components/pasted-text-chip';
+import { TextPreviewDialog } from '@/chat/components/text-preview-dialog';
+import {
+  isLargePaste,
+  createPastedTextFile,
+  generatePastePreview,
+  DEFAULT_PASTE_ATTACHMENT_CONFIG,
+} from '@/chat/utils/paste-attachment';
+import type {
+  UploadedFile,
+  UploadedFileSource,
+  ActiveMessageAction,
+  ModelOverride,
+  AppliedFilters,
+  AttachmentRef,
+} from '@/chat/types';
+import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MAX_FILES, buildAssistantApiFilters } from '@/chat/types';
+import type { ChatKnowledgeFilters } from '@/chat/types';
+import { MentionComposerField, type MentionParent } from '@/chat/components/mention-composer-field';
+import { useSelectionPlaces } from '@/chat/components/chat-panel/expansion-panels/connectors-collections/knowledge-tree';
+import {
+  mentionMeta,
+  mergeMentionFilters,
+  retainedMentions,
+  stripMentionPads,
+  unembedMention,
+  type MentionNode,
+} from '@/chat/utils/node-mentions';
+import {
+  BELOW_APP_KEYS,
+  bucketFor,
+  hasAnyFilter,
+  removeSelected,
+  sameSelection,
+  selectedIds,
+  selectedNodeKind,
+} from '@/chat/utils/tree-selection';
+import {
+  SUPPORTED_FILE_TYPES,
+  ACCEPTED_MIME_TYPES,
+  ACCEPTED_EXTENSIONS,
+  isFileTypeSupported,
+  pasteFallbackExtension,
+} from '../utils/attachment-file-types';
+
+type ChatInputVariant = 'full' | 'widget';
+
+/** A chip for a file already stored with the question being edited. */
+function chipForStoredFile(ref: AttachmentRef): UploadedFile {
+  return {
+    id: `stored-${ref.recordId}`,
+    file: new File([], ref.recordName, { type: ref.mimeType }),
+    name: ref.recordName,
+    size: 0,
+    type: ref.mimeType,
+    status: 'uploaded',
+    ref,
+    existing: true,
+  };
+}
+
+const sameFiles = (a: AttachmentRef[], b: AttachmentRef[]): boolean =>
+  a.length === b.length && a.every((file) => b.some((other) => other.recordId === file.recordId));
+
+interface ChatInputProps {
+  /**
+   * Called when the user submits. `attachments` only contains the
+   * server-assigned refs of files whose upload finished successfully.
+   * Chips still uploading or in error are blocked from submit by `canSubmit`.
+   */
+  /** Return `false` (or a promise of it) when the message was not sent: the draft is then kept. */
+  onSend?: (
+    message: string,
+    attachments?: AttachmentRef[],
+    mentions?: MentionNode[],
+  ) => void | boolean | Promise<void | boolean>;
+  /** `@` searches node names under this parent. Omitted, search is global. */
+  mentionParent?: MentionParent | null;
+  /**
+   * Per-file upload. Fired the moment a file is added to the composer
+   * (not at send time). Receives an abort signal so the composer can cancel
+   * the in-flight request when the user removes the chip mid-upload.
+   * Throws on failure — the chip is marked `'error'` and surfaces a retry.
+   */
+  onUploadFile?: (file: File, signal: AbortSignal) => Promise<AttachmentRef>;
+  /**
+   * Called fire-and-forget when the user removes a chip whose upload already
+   * completed. The chip is removed from state synchronously; this callback
+   * should trigger a best-effort server-side delete in the background.
+   * Errors MUST be swallowed by the caller — never block the UI on a failed
+   * delete.
+   */
+  onDeleteFile?: (recordId: string) => void;
+  placeholder?: string;
+  /** Placeholder shown in the collapsed widget pill (parent controls the text) */
+  widgetPlaceholder?: string;
+  variant?: ChatInputVariant;
+  expandable?: boolean;
+  /** `?agentId=` agent conversation — query-mode + web search controls are hidden */
+  isAgentChat?: boolean;
+  /** Agent ID for filtering models to only those configured for the agent */
+  agentId?: string | null;
+  /**
+   * Seeds the composer's text once per unique `key` (e.g. a quick-start
+   * suggestion chip rendered outside this component). Bump `key` to re-seed
+   * with the same `text` twice in a row; typing in the composer afterwards
+   * is never overwritten since the effect only fires on `key` changes.
+   */
+  prefill?: { text: string; key: number } | null;
+  /** Keep unsent text per conversation across reloads and navigation (main chat only). */
+  persistDraft?: boolean;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+interface SpeechInputButtonProps {
+  tooltip: string;
+  ariaLabel: string;
+  isListening: boolean;
+  isSupported: boolean;
+  isDisabled: boolean;
+  isRegenerateMode: boolean;
+  activeIconColor: string;
+  onToggle: () => void;
+  style?: React.CSSProperties;
+}
+
+function StopMark() {
+  return (
+    <span
+      aria-hidden
+      style={{
+        width: 8,
+        height: 8,
+        boxSizing: 'border-box',
+        border: '1.5px solid currentColor',
+        borderRadius: 1,
+        display: 'block',
+      }}
+    />
+  );
+}
+
+const composerIconButtonStyle: React.CSSProperties = {
+  margin: 0,
+  width: 32,
+  height: 32,
+  minWidth: 32,
+  padding: 0,
+  borderRadius: 'var(--radius-2)',
+  flexShrink: 0,
+};
+
+function SpeechInputButton({
+  tooltip,
+  ariaLabel,
+  isListening,
+  isSupported,
+  isDisabled,
+  isRegenerateMode,
+  activeIconColor,
+  onToggle,
+  style,
+}: SpeechInputButtonProps) {
+  return (
+    <Tooltip content={tooltip} side="top">
+      <IconButton
+        variant={isListening ? 'soft' : 'ghost'}
+        color={isListening ? 'red' : 'gray'}
+        size="2"
+        disabled={isDisabled}
+        onClick={onToggle}
+        aria-label={ariaLabel}
+        style={{
+          ...composerIconButtonStyle,
+          cursor: !isSupported ? 'not-allowed' : isRegenerateMode ? 'default' : 'pointer',
+          ...(isListening && { animation: 'pulse 1.5s ease-in-out infinite' }),
+          ...style,
+        }}
+      >
+        <MaterialIcon
+          name="mic"
+          size={16}
+          color={
+            isDisabled ? 'var(--slate-9)' : isListening ? 'var(--red-11)' : activeIconColor
+          }
+        />
+      </IconButton>
+    </Tooltip>
+  );
+}
+
+export function ChatInput({
+  onSend,
+  onUploadFile,
+  onDeleteFile,
+  placeholder,
+  widgetPlaceholder,
+  variant = 'full',
+  expandable = false,
+  isAgentChat = false,
+  agentId,
+  prefill,
+  persistDraft = false,
+  mentionParent,
+}: ChatInputProps) {
+  const router = useRouter();
+  const agentDeprecatedToolNames = useChatStore((s) => s.agentDeprecatedToolNames);
+  const [message, setMessage] = useState('');
+  const [mentions, setMentions] = useState<MentionNode[]>([]);
+  const [showUploadArea, setShowUploadArea] = useState(false);
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isPanelDragging, setIsPanelDragging] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(variant === 'full');
+  const [widgetFilters, setWidgetFilters] = useState<ChatKnowledgeFilters>({ apps: [], kb: [] });
+  const [isAgentStrategyPanelOpen, setIsAgentStrategyPanelOpen] = useState(false);
+  const [isCollectionsPanelOpen, setIsCollectionsPanelOpen] = useState(false);
+  /** Agent chat: Connectors / Collections / Actions (Figma agent input). */
+  const [isAgentResourcesPanelOpen, setIsAgentResourcesPanelOpen] = useState(false);
+  const [isModelPanelOpen, setIsModelPanelOpen] = useState(false);
+  const [isModelButtonHovered, setIsModelButtonHovered] = useState(false);
+  const [isAddFileButtonHovered, setIsAddFileButtonHovered] = useState(false);
+  const [isMobileOptionsOpen, setIsMobileOptionsOpen] = useState(false);
+  /** "+" menu — Attach files & Internal Search / Web Search capability toggles. */
+  const [isPlusMenuOpen, setIsPlusMenuOpen] = useState(false);
+  const [isMobilePlusMenuOpen, setIsMobilePlusMenuOpen] = useState(false);
+  const [isCompactToolbar, setIsCompactToolbar] = useState(false);
+  const [isCompactMenuOpen, setIsCompactMenuOpen] = useState(false);
+  const [isInputFocused, setIsInputFocused] = useState(false);
+  const isMobile = useIsMobile();
+  // ── Message action state (local — NOT in Zustand store) ──
+  const [activeMessageAction, setActiveMessageAction] = useState<ActiveMessageAction>(null);
+  const [regenModelOverride, setRegenModelOverride] = useState<ModelOverride | null>(null);
+  const isRegenerateMode = activeMessageAction?.type === 'regenerate';
+  const isEditMode = activeMessageAction?.type === 'editQuery';
+  const isActionMode = isRegenerateMode || isEditMode;
+
+  // Unsent text survives leaving the page, per conversation. Opt-in: the
+  // collection widget and agent builder reuse this composer and have no thread to key on.
+  // A reload restores only the tokens, not `user`, so the id comes from the token first.
+  const draftAccessToken = useAuthStore((s) => s.accessToken);
+  const draftStoreUserId = useAuthStore((s) => s.user?.id);
+  const draftUserId = useMemo(
+    () => getUserIdFromToken() ?? draftStoreUserId,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- getUserIdFromToken reads the token this re-runs on
+    [draftAccessToken, draftStoreUserId],
+  );
+  const draftSlotId = useChatStore((s) => s.activeSlotId);
+  const draftConvId = useChatStore((s) =>
+    s.activeSlotId ? (s.slots[s.activeSlotId]?.convId ?? null) : null,
+  );
+  const draft = useComposerDraft({
+    draftKey: persistDraft
+      ? buildDraftKey({ userId: draftUserId, convId: draftConvId, agentId })
+      : null,
+    userId: draftUserId,
+    slotId: draftSlotId,
+    message,
+    setMessage,
+    paused: isActionMode,
+  });
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const chipsScrollRef = useRef<HTMLDivElement>(null);
+
+  // `prefill` seeds the composer from an external suggestion chip. Keyed by
+  // `prefill.key` (not `prefill.text`) so clicking the same suggestion twice
+  // re-seeds even if the user hadn't changed the text.
+  const lastPrefillKeyRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!prefill || prefill.key === lastPrefillKeyRef.current) return;
+    lastPrefillKeyRef.current = prefill.key;
+    setMessage(prefill.text);
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  }, [prefill]);
+
+  useEffect(() => {
+    setMentions((prev) => {
+      const next = retainedMentions(message, prev);
+      if (next.length === prev.length && next.every((node, index) => node.id === prev[index]?.id)) {
+        return prev;
+      }
+      return next;
+    });
+  }, [message]);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+  /**
+   * Per-file AbortController keyed by `UploadedFile.id`. Held in a ref (not
+   * state) because controllers are imperative — they belong outside the
+   * render cycle. Used by `removeFile`/retry/unmount to cancel in-flight
+   * uploads cleanly. Entries are deleted in the upload finalizer so the map
+   * doesn't leak across long-lived sessions.
+   */
+  const uploadControllersRef = useRef<Map<string, AbortController>>(new Map());
+  /**
+   * Tracks whether Shift is currently held, so `handlePaste` can honor the
+   * Cmd/Ctrl+Shift+V "paste as plain text" convention (bypasses the
+   * large-paste → attachment conversion). `ClipboardEvent` does not expose
+   * modifier-key state directly, hence the separate keydown/keyup listeners.
+   */
+  const shiftKeyHeldRef = useRef(false);
+  /** id of the `UploadedFile` currently shown in the text preview dialog (composer, pre-send). */
+  const [textPreviewFileId, setTextPreviewFileId] = useState<string | null>(null);
+  const { t, i18n } = useTranslation();
+  const resolvedPlaceholder = placeholder ?? t('chat.askAnything');
+
+  const {
+    isListening,
+    isSupported: isSpeechSupported,
+    transcript: speechTranscript,
+    interimTranscript,
+    toggle: toggleSpeech,
+    stop: stopSpeech,
+    resetTranscript,
+    unavailableReason: speechUnavailableReason,
+  } = useChatSpeechRecognition({
+    lang: i18n.language,
+    onError: (error) => {
+      if (error === 'not-allowed') {
+        toast.error(t('chat.voiceError'));
+      }
+    },
+  });
+
+  // Sync finalized speech transcript into the message textarea
+  useEffect(() => {
+    if (speechTranscript) {
+      setMessage((prev) => {
+        const separator = prev.length > 0 ? ' ' : '';
+        return prev + separator + speechTranscript;
+      });
+      resetTranscript();
+    }
+  }, [speechTranscript, resetTranscript]);
+
+  // Read all chat settings directly from the shared store
+  const settings = useChatStore((s) => s.settings);
+  const setMode = useChatStore((s) => s.setMode);
+  const setAgentStrategy = useChatStore((s) => s.setAgentStrategy);
+  const setFilters = useChatStore((s) => s.setFilters);
+  const setSelectedModelForCtx = useChatStore((s) => s.setSelectedModelForCtx);
+  const collectionNamesCache = useChatStore((s) => s.collectionNamesCache);
+  const collectionMetaCache = useChatStore((s) => s.collectionMetaCache);
+  const agentKnowledgeScope = useChatStore((s) => s.agentKnowledgeScope);
+  const agentKnowledgeDefaults = useChatStore((s) => s.agentKnowledgeDefaults);
+  const setAgentKnowledgeScope = useChatStore((s) => s.setAgentKnowledgeScope);
+  const agentStreamToolsSel = useChatStore((s) => s.agentStreamTools);
+  const agentToolCatalogLen = useChatStore((s) => s.agentToolCatalogFullNames.length);
+  const agentChatToolGroups = useChatStore((s) => s.agentChatToolGroups);
+  const universalAgentStreamTools = useChatStore((s) => s.universalAgentStreamTools);
+  const universalAgentToolsLoading = useChatStore((s) => s.universalAgentToolsLoading);
+  // "+" menu capability toggles — universal agent uses settings.agentCapabilities;
+  // scoped custom agents use their own per-agent capabilities map.
+  const setAgentCapabilities = useChatStore((s) => s.setAgentCapabilities);
+  const agentHasWebSearch = useChatStore((s) => s.agentHasWebSearch);
+  const scopedAgentCapabilities = useChatStore((s) =>
+    agentId ? s.scopedAgentCapabilities[agentId] : undefined
+  );
+  const setScopedAgentCapabilities = useChatStore((s) => s.setScopedAgentCapabilities);
+  // Whole sources and the nodes a source is limited to both count as knowledge.
+  const agentHasInternalSearch = hasAnyFilter(agentKnowledgeDefaults);
+  const scopedInternalSearch = scopedAgentCapabilities?.internalSearch ?? true;
+  const scopedWebSearch = scopedAgentCapabilities?.webSearch ?? true;
+  const universalAgentToolGroups = useChatStore((s) => s.universalAgentToolGroups);
+  // Project-scoped chat (`/chat?projectId=` or the /projects workspace). Hydrated by
+  // `useProjectScopeHydration`; null everywhere else.
+  const projectScope = useChatStore((s) => s.projectScope);
+  const projectKnowledgeScope = useChatStore((s) => s.projectKnowledgeScope);
+  const setProjectKnowledgeScope = useChatStore((s) => s.setProjectKnowledgeScope);
+  const projectStreamToolsSel = useChatStore((s) => s.projectStreamTools);
+  const isProjectChat = !isAgentChat && projectScope !== null;
+  // An agent's or project's sources can't be searched in one request, so @ offers nothing there.
+  // Editing or regenerating re-asks with the filters the question was first sent with.
+  const mentionsOff = isAgentChat || isProjectChat || isActionMode;
+  /**
+   * The composer shows the scoped Connectors·Collections·Actions·MCP panel (agent or project
+   * allow-list) instead of the org-wide pickers. Web search has no knowledge scope.
+   */
+  const usesScopedPanel = isAgentChat || (isProjectChat && settings.queryMode !== 'web-search');
+
+  // Shared capability wiring for the desktop "+" popover (PlusMenuButton) and
+  // the mobile "+" sheet (PlusMenuSheet) — kept in one place so the two
+  // surfaces can't drift. `isAgentChat` and `agentId` come from the same
+  // `effectiveAgentId` at the only real call site today, but `ChatInput`
+  // still declares them as independent props, so a scoped chat without a
+  // resolved `agentId` disables the toggles instead of silently no-op'ing.
+  const plusMenuCapabilities = useMemo(() => {
+    const canPersistScoped = isAgentChat && Boolean(agentId);
+    return {
+      internalSearch: isAgentChat ? scopedInternalSearch : settings.agentCapabilities.internalSearch,
+      webSearch: isAgentChat ? scopedWebSearch : settings.agentCapabilities.webSearch,
+      onToggleInternalSearch: (enabled: boolean) => {
+        if (canPersistScoped) setScopedAgentCapabilities(agentId as string, { internalSearch: enabled });
+        else if (!isAgentChat) setAgentCapabilities({ internalSearch: enabled });
+      },
+      onToggleWebSearch: (enabled: boolean) => {
+        if (canPersistScoped) setScopedAgentCapabilities(agentId as string, { webSearch: enabled });
+        else if (!isAgentChat) setAgentCapabilities({ webSearch: enabled });
+      },
+      agentHasInternalSearch: isAgentChat
+        ? (agentHasInternalSearch && canPersistScoped ? undefined : false)
+        : undefined,
+      agentHasWebSearch: isAgentChat
+        ? (agentHasWebSearch && canPersistScoped ? undefined : false)
+        : undefined,
+    };
+  }, [
+    isAgentChat,
+    agentId,
+    scopedInternalSearch,
+    scopedWebSearch,
+    settings.agentCapabilities,
+    setScopedAgentCapabilities,
+    setAgentCapabilities,
+    agentHasInternalSearch,
+    agentHasWebSearch,
+  ]);
+  const showPlusMenuFilterBadge = hasNonDefaultSearchCapabilities(
+    plusMenuCapabilities.internalSearch,
+    plusMenuCapabilities.webSearch,
+  );
+
+  // Context key for the active (agent-scoped or assistant) chat. All
+  // model-related reads/writes below are keyed by this so assistant selections
+  // don't leak into agents and vice-versa.
+  const modelCtxKey = ctxKeyFromAgent(agentId);
+  const contextSelectedModel = settings.selectedModels[modelCtxKey] ?? null;
+  const contextDefaultModel = settings.defaultModels[modelCtxKey] ?? null;
+  const displayModel = contextSelectedModel ?? contextDefaultModel;
+  const displayModelLabel = displayModel
+    ? (displayModel.modelFriendlyName || displayModel.modelName)
+    : t('chat.aiModelsTooltip');
+  const handleModelSelect = useCallback(
+    (model: ModelOverride | null) => {
+      setSelectedModelForCtx(modelCtxKey, model);
+    },
+    [setSelectedModelForCtx, modelCtxKey],
+  );
+
+  // Reasoning effort indicator — mirrors ModelSelectorPanel's selector so the
+  // toolbar shows what's actually applied without opening the panel, the same
+  // way Claude's model picker shows "Sonnet 5 · High" inline.
+  const activeModelSupportsReasoning = isModelReasoningCapable(modelCtxKey, displayModel);
+  const reasoningEffortOverride = settings.reasoningEffort[modelCtxKey] ?? null;
+  const agentDefault = useChatStore((s) => s.settings.agentDefaultReasoningEffort[modelCtxKey] ?? null);
+  const reasoningEffortLabel = activeModelSupportsReasoning
+    ? getAppliedReasoningEffortLabel(t, {
+        picked: reasoningEffortOverride,
+        agentDefault,
+        modelDefault: getModelDefaultReasoningEffort(modelCtxKey, displayModel),
+      })
+    : null;
+
+  // Expansion panel view mode (inline vs overlay) from store
+  const expansionViewMode = useChatStore((s) => s.expansionViewMode);
+  const setExpansionViewMode = useChatStore((s) => s.setExpansionViewMode);
+
+  // Active slot ID for regenerate/edit flows
+  const activeSlotId = useChatStore((s) => s.activeSlotId);
+
+  // Is the active slot currently streaming? The widget composer starts a new
+  // chat, so a run left going on the chat page is not its run.
+  const isStreaming = useChatStore((s) =>
+    variant !== 'widget' && s.activeSlotId ? (s.slots[s.activeSlotId]?.isStreaming ?? false) : false
+  );
+  // True from the moment Stop is clicked until the run actually ends —
+  // disables the stop button so a second click can't fire another cancel
+  // POST / restart the grace timer (see `cancelStreamForSlot`).
+  const isStopping = useChatStore((s) =>
+    variant !== 'widget' && s.activeSlotId ? (s.slots[s.activeSlotId]?.stopping ?? false) : false
+  );
+
+  const handleStopStream = useCallback(() => {
+    const sid = useChatStore.getState().activeSlotId;
+    if (!sid || useChatStore.getState().slots[sid]?.stopping) return;
+    cancelStreamForSlot(sid);
+    toast.info(t('chat.toasts.stopStreamTitle'), {
+      description: t('chat.toasts.stopStreamDescription'),
+    });
+  }, [t]);
+
+  const handleToggleView = useCallback(() => {
+    setExpansionViewMode(expansionViewMode === 'inline' ? 'overlay' : 'inline');
+  }, [expansionViewMode, setExpansionViewMode]);
+
+  const showFullUI = variant === 'full' || isExpanded;
+  const dockGlass = variant === 'widget';
+  // The dock is already scoped to the folder it sits in; narrowing happens with @.
+  const showResourcesControl = variant !== 'widget';
+  const resolvedWidgetPlaceholder = widgetPlaceholder || resolvedPlaceholder;
+
+  const isSearchMode = settings.mode === 'search' && !isAgentChat;
+  const canAcceptDrop = !isRegenerateMode && !isSearchMode && settings.queryMode !== 'web-search';
+  const composerFilters = variant === 'widget' ? widgetFilters : settings.filters;
+  const selectedKbCount = selectedIds(composerFilters).length;
+  // Agent and project chats narrow their own sources; there the menu only inserts mentions.
+  const mentionSelection = isAgentChat || isProjectChat ? undefined : composerFilters;
+  const onMentionSelectionChange = isAgentChat || isProjectChat ? undefined : variant === 'widget' ? setWidgetFilters : setFilters;
+  const agentResourcesCustomized =
+    isAgentChat &&
+    (agentKnowledgeScope !== null ||
+      (agentStreamToolsSel !== null &&
+        agentToolCatalogLen > 0 &&
+        (agentStreamToolsSel.length === 0 || agentStreamToolsSel.length < agentToolCatalogLen)));
+
+  const projectToolCatalogLen = projectScope?.toolCatalogFullNames.length ?? 0;
+  const projectResourcesCustomized =
+    isProjectChat &&
+    (projectKnowledgeScope !== null ||
+      (projectStreamToolsSel !== null &&
+        projectToolCatalogLen > 0 &&
+        (projectStreamToolsSel.length === 0 || projectStreamToolsSel.length < projectToolCatalogLen)));
+  /** Scoped panel narrowed below its defaults (agent or project). */
+  const scopedResourcesCustomized = isAgentChat ? agentResourcesCustomized : projectResourcesCustomized;
+
+  /** Universal agent mode: tools explicitly customized OR connectors/collections selected. */
+  const universalAgentResourcesCustomized =
+    !usesScopedPanel && settings.queryMode === 'agent' && (universalAgentStreamTools !== null || selectedKbCount > 0);
+
+  const showResourcesFilterBadge = usesScopedPanel
+    ? scopedResourcesCustomized
+    : settings.queryMode === 'agent'
+      ? universalAgentResourcesCustomized
+      : selectedKbCount > 0;
+
+  /** True when universal agent tool data is loading (disable send while loading). */
+  const isUniversalAgentLoading =
+    !isAgentChat && settings.queryMode === 'agent' && universalAgentToolsLoading;
+  const activeQueryConfig = getQueryModeConfig(settings.queryMode) ?? getQueryModeConfig('chat')!;
+  /** Internal-search / chat modes: `settings.filters` drives the connectors & collections picker. */
+  const hubFilterQueryMode =
+    !usesScopedPanel && settings.queryMode !== 'agent' && settings.queryMode !== 'web-search';
+  /** Assistant collections overlay is active (web search never uses this chrome). */
+  const assistantCollectionsOverlayActive =
+    !usesScopedPanel && isCollectionsPanelOpen && settings.queryMode !== 'web-search';
+  const modeColors = activeQueryConfig.colors;
+  const agentQueryToolbarConfig = getQueryModeConfig('agent')!;
+  const agentStrategyToolbarColors = agentQueryToolbarConfig.colors;
+  /** Agent-strategy or agent resources panel — chrome + outside click (agent chat only; no mode picker anymore). */
+  const modeChromeOpen = isAgentChat
+    ? isAgentStrategyPanelOpen || isAgentResourcesPanelOpen
+    : usesScopedPanel
+      ? isAgentResourcesPanelOpen
+      : false;
+
+  const dismissExpansionPanels = useCallback(() => {
+    setIsPlusMenuOpen(false);
+    setIsAgentStrategyPanelOpen(false);
+    setIsCollectionsPanelOpen(false);
+    setIsAgentResourcesPanelOpen(false);
+    setIsModelPanelOpen(false);
+    setShowUploadArea(false);
+  }, []);
+
+  const dismissExpansionPanelsRef = useRef(dismissExpansionPanels);
+  useEffect(() => {
+    dismissExpansionPanelsRef.current = dismissExpansionPanels;
+  }, [dismissExpansionPanels]);
+
+  // Build selected collections from store (roots → apps API; record groups → kb API).
+  // Includes connector metadata so pills show the right icon per source type.
+  // In agent mode, read from the effective agent knowledge scope instead of settings.filters.
+  // In regenerate mode, read from the original message's appliedFilters (locked, non-removable).
+  const regenAppliedFilters = isRegenerateMode && activeMessageAction?.type === 'regenerate'
+    ? activeMessageAction.appliedFilters
+    : undefined;
+
+  const pillSource: ChatKnowledgeFilters | null | undefined = isAgentChat
+    ? (agentKnowledgeScope ?? agentKnowledgeDefaults)
+    : isProjectChat
+      ? (projectKnowledgeScope ?? projectScope.knowledgeDefaults)
+      : composerFilters;
+  // The pills name folders and records; nothing else may have looked them up yet.
+  useSelectionPlaces(pillSource ?? { apps: [], kb: [] });
+
+  const selectedCollections = useMemo(() => {
+    // Regenerate mode: derive pills directly from the original message's appliedFilters nodes
+    // (they carry name + connector already, so no cache lookup needed).
+    if (regenAppliedFilters) {
+      return [
+        ...regenAppliedFilters.apps.map((node) => ({
+          id: node.id,
+          name: node.name,
+          kind: (node.nodeType === 'app' ? 'connector' : 'collection') as 'connector' | 'collection',
+          connectorType: node.connector ? resolveConnectorType(node.connector) : undefined,
+        })),
+        ...regenAppliedFilters.kb.map((node) => ({
+          id: node.id,
+          name: node.name,
+          kind: 'collection' as const,
+          connectorType: node.connector ? resolveConnectorType(node.connector) : undefined,
+        })),
+        ...BELOW_APP_KEYS.flatMap((bucket) =>
+          (regenAppliedFilters[bucket] ?? []).map((node) => ({
+            id: node.id,
+            name: bucket === 'recordsExact' ? t('chat.selectedAlone', { name: node.name }) : node.name,
+            kind: selectedNodeKind(bucket, node.nodeType),
+            nodeType: node.nodeType,
+            connector: node.connector,
+            extension: node.extension,
+            mimeType: node.mimeType,
+          }))
+        ),
+      ];
+    }
+
+    if (!isAgentChat && settings.queryMode === 'web-search') {
+      return [];
+    }
+
+    const source: ChatKnowledgeFilters | null | undefined = isAgentChat
+      ? (agentKnowledgeScope ?? agentKnowledgeDefaults)
+      : isProjectChat
+        ? (projectKnowledgeScope ?? projectScope.knowledgeDefaults)
+        : composerFilters;
+    const hubApps = source?.apps ?? [];
+    const groups = source?.kb ?? [];
+    // Nodes embedded with @ join the scope when the message is sent; until then they show here too.
+    const scoped = new Set(selectedIds(source ?? { apps: [], kb: [] }));
+    const embedded = mentions
+      .filter((node) => !scoped.has(node.id))
+      .map((node) => {
+        const bucket = bucketFor(node.nodeType);
+        return {
+          id: node.id,
+          name: node.name,
+          kind: selectedNodeKind(bucket, node.nodeType),
+          nodeType: node.nodeType,
+          connector: node.connector || undefined,
+          connectorType: bucket === 'apps' && node.connector ? resolveConnectorType(node.connector) : undefined,
+          extension: node.extension ?? undefined,
+          mimeType: node.mimeType ?? undefined,
+        };
+      });
+    const belowAppLevel = BELOW_APP_KEYS.flatMap((bucket) =>
+      (source?.[bucket] ?? []).map((id) => {
+        const meta = collectionMetaCache[id];
+        const name =
+          collectionNamesCache[id] ||
+          meta?.name ||
+          (meta?.unavailable
+            ? t('chat.sourceUnavailable', { defaultValue: "A source you can't open" })
+            : t('chat.sourceLoading', { defaultValue: 'Loading…' }));
+        return {
+          id,
+          name: bucket === 'recordsExact' ? t('chat.selectedAlone', { name }) : name,
+          kind: selectedNodeKind(bucket, meta?.nodeType),
+          nodeType: meta?.nodeType,
+          connector: meta?.connector,
+          extension: meta?.extension ?? undefined,
+          mimeType: meta?.mimeType ?? undefined,
+        };
+      })
+    );
+    return [
+      ...hubApps.map((id) => {
+        const meta = collectionMetaCache[id];
+        const isConnector = meta?.nodeType === 'app';
+        return {
+          id,
+          name: collectionNamesCache[id] || meta?.name || 'Collection',
+          kind: (isConnector ? 'connector' : 'collection') as 'connector' | 'collection',
+          nodeType: meta?.nodeType || (isConnector ? 'app' : 'kb'),
+          connector: meta?.connector,
+          connectorType: meta?.connector ? resolveConnectorType(meta.connector) : undefined,
+        };
+      }),
+      ...groups.map((id) => {
+        const meta = collectionMetaCache[id];
+        return {
+          id,
+          name: collectionNamesCache[id] || meta?.name || 'Collection',
+          kind: 'collection' as const,
+          nodeType: meta?.nodeType || 'kb',
+          connector: meta?.connector,
+          connectorType: meta?.connector ? resolveConnectorType(meta.connector) : undefined,
+        };
+      }),
+      ...belowAppLevel,
+      ...embedded,
+    ];
+  }, [
+    mentions,
+    regenAppliedFilters,
+    isAgentChat,
+    isProjectChat,
+    projectKnowledgeScope,
+    projectScope,
+    agentKnowledgeScope,
+    agentKnowledgeDefaults,
+    composerFilters,
+    settings.queryMode,
+    collectionNamesCache,
+    collectionMetaCache,
+    t,
+  ]);
+
+  const showSelectedCollectionsRow =
+    selectedCollections.length > 0 && !isCollectionsPanelOpen && !modeChromeOpen;
+
+  const handleRemoveCollection = useCallback(
+    (id: string) => {
+      // Removing an embedded node's chip leaves its name in the text as plain words.
+      if (mentions.some((node) => node.id === id)) {
+        setMentions((prev) => prev.filter((node) => node.id !== id));
+        setMessage((prev) => unembedMention(prev, mentions, id));
+        const scope = isAgentChat
+          ? (agentKnowledgeScope ?? agentKnowledgeDefaults)
+          : isProjectChat
+            ? (projectKnowledgeScope ?? projectScope.knowledgeDefaults)
+            : composerFilters;
+        // Only embedded, not yet in the scope: there is nothing there to take it out of.
+        if (!selectedIds(scope ?? { apps: [], kb: [] }).includes(id)) return;
+      }
+      if (isAgentChat) {
+        const next = removeSelected(agentKnowledgeScope ?? agentKnowledgeDefaults, id);
+        // Back at the agent's own sources: nothing is narrowed any more.
+        setAgentKnowledgeScope(sameSelection(next, agentKnowledgeDefaults) ? null : next);
+      } else if (isProjectChat) {
+        setProjectKnowledgeScope(removeSelected(projectKnowledgeScope ?? projectScope.knowledgeDefaults, id));
+      } else if (variant === 'widget') {
+        setWidgetFilters(removeSelected(widgetFilters, id));
+      } else {
+        setFilters(removeSelected(settings.filters, id));
+      }
+    },
+    [
+      isAgentChat,
+      isProjectChat,
+      agentKnowledgeScope,
+      agentKnowledgeDefaults,
+      setAgentKnowledgeScope,
+      projectKnowledgeScope,
+      projectScope,
+      setProjectKnowledgeScope,
+      variant,
+      widgetFilters,
+      settings.filters,
+      setFilters,
+      mentions,
+      composerFilters,
+    ]
+  );
+
+  // Toolbar icon color follows the active query mode / search-view state.
+  const activeIconColor = isSearchMode
+    ? 'var(--mode-search-icon)'
+    : modeColors.icon;
+  const toolbarIconColor = isSearchMode ? 'var(--mode-search-icon)' : 'var(--emerald-a11)';
+
+  const activeToggleColor = isSearchMode
+    ? 'var(--mode-search-toggle)'
+    : modeColors.toggle;
+
+  // ── Files of the question being edited ───────────────────────────
+  // Editing swaps the composer's files for the question's own; what the reader had attached
+  // is set aside and put back when the edit ends.
+  const stashedFilesRef = useRef<UploadedFile[] | null>(null);
+  const uploadedFilesRef = useRef(uploadedFiles);
+  useEffect(() => {
+    uploadedFilesRef.current = uploadedFiles;
+  });
+
+  /** Files picked while editing that the edit did not send are of no use: drop them. */
+  const discardNewEditFiles = useCallback(() => {
+    for (const file of uploadedFilesRef.current) {
+      if (file.existing) continue;
+      uploadControllersRef.current.get(file.id)?.abort();
+      uploadControllersRef.current.delete(file.id);
+      if (file.status === 'uploaded' && file.ref?.recordId) onDeleteFile?.(file.ref.recordId);
+    }
+  }, [onDeleteFile]);
+
+  const enterEditFiles = useCallback((stored: AttachmentRef[]) => {
+    if (stashedFilesRef.current === null) {
+      const current = uploadedFilesRef.current;
+      for (const file of current) {
+        if (file.status === 'uploading') uploadControllersRef.current.get(file.id)?.abort();
+      }
+      stashedFilesRef.current = current.filter((file) => file.status !== 'uploading');
+    } else {
+      discardNewEditFiles();
+    }
+    setUploadedFiles(stored.map(chipForStoredFile));
+    setShowUploadArea(false);
+  }, [discardNewEditFiles]);
+
+  const leaveEditFiles = useCallback((keepNew: boolean) => {
+    const stashed = stashedFilesRef.current;
+    if (stashed === null) return;
+    stashedFilesRef.current = null;
+    if (!keepNew) discardNewEditFiles();
+    setUploadedFiles(stashed);
+  }, [discardNewEditFiles]);
+  const leaveEditFilesRef = useRef(leaveEditFiles);
+  useEffect(() => {
+    leaveEditFilesRef.current = leaveEditFiles;
+  });
+
+  // ── Message action command handlers ──────────────────────────────
+  // Both handlers are registered on the global command bus (useCommandStore) so
+  // ChatResponse / MessageActions can trigger them without prop drilling.
+
+  // Regenerate: closes all panels, sets activeMessageAction, and pre-fills the
+  // textarea with the original question text (dispatched from message-actions.tsx
+  // as { messageId, text: question }).
+  const handleShowRegenBar = useCallback((payload?: unknown) => {
+    if (typeof payload !== 'object' || payload === null) return;
+    const { messageId, text, appliedFilters } = payload as { messageId: string; text?: string; appliedFilters?: AppliedFilters };
+    if (!messageId) return;
+    dismissExpansionPanels();
+    setRegenModelOverride(null);
+    leaveEditFiles(false);
+    useChatStore.getState().setRegenAnswers(null);
+    setActiveMessageAction({ type: 'regenerate', messageId, appliedFilters });
+    // Pre-fill textarea so user can see what will be regenerated (shown dimmed/disabled)
+    setMessage(text ?? '');
+  }, [dismissExpansionPanels, leaveEditFiles]);
+
+  // Edit query: same as regenerate but the textarea is editable so the user can
+  // amend the question before resending. Also focuses the textarea immediately.
+  const handleShowEditQuery = useCallback((payload?: unknown) => {
+    if (
+      typeof payload !== 'object' ||
+      payload === null ||
+      typeof (payload as Record<string, unknown>).messageId !== 'string'
+    ) return;
+    const { messageId, text, appliedFilters, attachments } = payload as {
+      messageId: string;
+      text: string;
+      appliedFilters?: AppliedFilters;
+      attachments?: AttachmentRef[];
+    };
+    dismissExpansionPanels();
+    setRegenModelOverride(null);
+    useChatStore.getState().setRegenAnswers(null);
+    enterEditFiles(attachments ?? []);
+    setActiveMessageAction({ type: 'editQuery', messageId, text, appliedFilters, attachments });
+    // Populate the textarea with the original question so the user can edit it
+    setMessage(text ?? '');
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  }, [dismissExpansionPanels, enterEditFiles]);
+
+  // Dismissing either action clears the pill bar and resets the textarea to empty.
+  const handleDismissAction = useCallback(() => {
+    leaveEditFiles(false);
+    setActiveMessageAction(null);
+    setRegenModelOverride(null);
+    useChatStore.getState().setRegenAnswers(null);
+    setMessage('');
+  }, [leaveEditFiles]);
+
+  // While the bar is open, the reply's question card can be answered again (ChatResponse reads this).
+  const regenTargetMessageId = activeMessageAction?.type === 'regenerate' ? activeMessageAction.messageId : null;
+  useEffect(() => {
+    useChatStore.getState().setRegenTargetMessageId(regenTargetMessageId);
+    return () => useChatStore.getState().setRegenTargetMessageId(null);
+  }, [regenTargetMessageId]);
+
+  // Register showRegenBar / showEditQuery commands
+  useEffect(() => {
+    const { register, unregister } = useCommandStore.getState();
+    register('showRegenBar', handleShowRegenBar);
+    register('showEditQuery', handleShowEditQuery);
+    return () => {
+      unregister('showRegenBar');
+      unregister('showEditQuery');
+    };
+  }, [handleShowRegenBar, handleShowEditQuery]);
+
+  // Dismiss message action on slot switch
+  useEffect(() => {
+    leaveEditFilesRef.current(false);
+    setActiveMessageAction(null);
+    setRegenModelOverride(null);
+  }, [activeSlotId]);
+
+  // ── Execute message action (regenerate or edit query) ──
+  const executeMessageAction = useCallback((_editedText?: string) => {
+    if (!activeMessageAction) return;
+
+    const isEdit = activeMessageAction.type === 'editQuery';
+    const af = activeMessageAction.appliedFilters;
+    const editedText = isEdit ? stripMentionPads(message, retainedMentions(message, mentions)).trim() : '';
+    // An empty edit has no question to answer; stay in edit mode so the text can be fixed.
+    if (isEdit && !editedText) return;
+    const modelOverride = regenModelOverride ?? undefined;
+    const originalFilters = af
+      ? buildAssistantApiFilters({
+          apps: af.apps.map((a) => a.id),
+          kb: af.kb.map((k) => k.id),
+          recordGroups: (af.recordGroups ?? []).map((g) => g.id),
+          records: (af.records ?? []).map((r) => r.id),
+          recordsExact: (af.recordsExact ?? []).map((r) => r.id),
+        })
+      : undefined;
+    // Only what changed is sent; an unchanged edit is a plain regenerate.
+    const storedFiles = isEdit ? (activeMessageAction.attachments ?? []) : [];
+    const editedFiles = uploadedFiles
+      .filter((file) => file.status === 'uploaded' && file.ref)
+      .map((file) => file.ref as AttachmentRef);
+    const filesChanged = isEdit && !sameFiles(editedFiles, storedFiles);
+    const textChanged = isEdit && editedText !== activeMessageAction.text.trim();
+    const edit = textChanged || filesChanged
+      ? { query: editedText, ...(filesChanged ? { attachments: editedFiles } : {}) }
+      : undefined;
+    // The files picked for the edit now belong to the question; what the reader had attached returns.
+    leaveEditFiles(true);
+    setActiveMessageAction(null);
+    setRegenModelOverride(null);
+    setMessage('');
+    if (activeSlotId) {
+      const target = [activeSlotId, activeMessageAction.messageId, modelOverride, originalFilters] as const;
+      // Kept until the re-run ends, so the card shows the answers it is running with.
+      const regenAnswers = useChatStore.getState().regenAnswers;
+      const answers =
+        !isEdit && regenAnswers?.messageId === activeMessageAction.messageId ? regenAnswers.message : undefined;
+      if (edit) streamRegenerateForSlot(...target, edit);
+      else if (answers) streamRegenerateForSlot(...target, undefined, answers);
+      else streamRegenerateForSlot(...target);
+    }
+  }, [activeMessageAction, regenModelOverride, activeSlotId, message, mentions, uploadedFiles, leaveEditFiles]);
+
+  // Submitting the reopened question card regenerates as the bar's button does, with the bar's model.
+  useEffect(() => {
+    const { register, unregister } = useCommandStore.getState();
+    register('runRegenerate', () => executeMessageAction());
+    return () => unregister('runRegenerate');
+  }, [executeMessageAction]);
+
+  const handleSubmit = (e: React.SyntheticEvent) => {
+    e.preventDefault();
+
+    if (isListening) stopSpeech();
+
+    const sid = variant === 'widget' ? null : useChatStore.getState().activeSlotId;
+    const liveSlot = sid ? useChatStore.getState().slots[sid] : undefined;
+    if ((liveSlot?.isStreaming && !liveSlot.stopping) || isUniversalAgentLoading) return;
+    if (liveSlot?.remoteRunInProgress) {
+      showRemoteRunInProgressToast();
+      return;
+    }
+    // Block submit while any chip is still uploading — every chip must be
+    // either `uploaded` (forwarded as a ref) or removed by the user before
+    // we hand off to the runtime.
+    if (uploadedFiles.some((f) => f.status === 'uploading')) return;
+
+    // ── Message action intercept ──────────────────────────────
+    if (activeMessageAction) {
+      executeMessageAction();
+      return;
+    }
+
+    // ── Agent tool validation ─────────────────────────────────
+    const isUrlAgent = Boolean(agentId);
+    const isUniversalAgentMode = !agentId && settings.queryMode === 'agent';
+    if (isUrlAgent && agentDeprecatedToolNames.length > 0) {
+      toast.error(t('chat.toasts.deprecatedTools'), {
+        action: {
+          label: t('chat.toasts.openAgentBuilder'),
+          onClick: () =>
+            router.push(`/agents/edit?agentKey=${encodeURIComponent(agentId!)}`),
+        },
+      });
+      return;
+    }
+    if (isUrlAgent || isUniversalAgentMode) {
+      const isProjectAgentMode = isUniversalAgentMode && isProjectChat;
+      const groups = isProjectAgentMode
+        ? [...projectScope.toolGroups, ...projectScope.mcpGroups]
+        : isUniversalAgentMode
+          ? universalAgentToolGroups
+          : agentChatToolGroups;
+      const toolsSel = isProjectAgentMode
+        ? projectStreamToolsSel
+        : isUniversalAgentMode
+          ? universalAgentStreamTools
+          : agentStreamToolsSel;
+
+      // `toolsSel === null` means "everything selected" (no explicit
+      // filter) — the wire format (runtime.ts) omits `tools` entirely in
+      // that case, so the backend treats it as "use every configured
+      // toolset" rather than an exploded per-action list. Lazy tool
+      // disclosure (backend default ON) means the number of schemas bound
+      // to the model no longer scales with toolset count either, so there
+      // is nothing to guard here — only an actual explicit selection
+      // (`toolsSel !== null`) needs a sanity cap, and even that is now
+      // generous (matches the backend's own bound — see agent.py) rather
+      // than a tight per-action count that a handful of multi-action
+      // toolsets already exceeded with nothing deselected.
+      if (toolsSel !== null) {
+        // Count resolved (stripped + deduped) tools — mirrors the wire
+        // format in runtime.ts where prefixed keys are stripped then deduped
+        // via Set.
+        const resolvedCount = new Set(toolsSel.map(bareToolFullName)).size;
+
+        if (resolvedCount > 1024) {
+          toast.error(
+            t('chat.toolValidation.tooManyTools', {
+              defaultValue:
+                'Too many tools selected. Maximum 1024 tools are allowed per request due to performance limits.',
+            })
+          );
+          return;
+        }
+      }
+
+      // Detect multiple selected instances of the same toolset type.
+      // Key format differs by mode:
+      //   universal agent  → `${instanceId}:${fullName}` (prefixed)
+      //   URL-scoped agent → bare `fullName`
+      //
+      // When toolsSel === null (default "all tools") and the groups list is empty
+      // (panel hasn't loaded yet), skip the check — the user hasn't had a chance
+      // to curate, and blocking without an actionable path is confusing.
+      const instanceCountBySlug = new Map<string, number>();
+      if (toolsSel === null) {
+        if (groups.length === 0) {
+          // Groups not loaded yet — let the request through; the backend will
+          // use its own full set and handle any conflicts server-side.
+        } else {
+          for (const group of groups) {
+            instanceCountBySlug.set(
+              group.toolsetSlug,
+              (instanceCountBySlug.get(group.toolsetSlug) ?? 0) + 1
+            );
+          }
+        }
+      } else {
+        const selectedKeys = new Set(toolsSel);
+        for (const group of groups) {
+          const hasSelected = isUniversalAgentMode && !isProjectAgentMode
+            // Universal: keys are `${instanceId}:${fullName}`
+            ? group.fullNames.some((fn) => selectedKeys.has(`${group.instanceId ?? ''}:${fn}`))
+            // URL-scoped agent and project: group keys already match the selection keys
+            : group.fullNames.some((fn) => selectedKeys.has(fn));
+          if (hasSelected) {
+            instanceCountBySlug.set(
+              group.toolsetSlug,
+              (instanceCountBySlug.get(group.toolsetSlug) ?? 0) + 1
+            );
+          }
+        }
+      }
+      const multiTypes = [...instanceCountBySlug.entries()]
+        .filter(([, n]) => n > 1)
+        .map(([slug]) => slug);
+      if (multiTypes.length > 0) {
+        const typeNames = multiTypes.join(', ');
+        toast.error(
+          t('chat.toolValidation.multipleInstances', {
+            types: typeNames,
+            defaultValue:
+              `Multiple instances of the same action type (${typeNames}) cannot be used together. Open the Actions panel and select only one instance per type.`,
+          })
+        );
+        return;
+      }
+    }
+
+    // ── Normal send flow ──────────────────────────────────────
+    // Only forward chips whose upload completed. A failed chip stays, with
+    // its retry, and does not by itself enable send.
+    const hasUploaded = uploadedFiles.some((f) => f.status === 'uploaded');
+    if ((message.trim() || hasUploaded) && onSend) {
+      const refs = uploadedFiles
+        .filter((f) => f.status === 'uploaded' && f.ref)
+        .map((f) => f.ref!);
+      const kept = retainedMentions(message, mentions);
+      const sent = variant === 'widget'
+        ? [
+            ...kept,
+            ...selectedIds(widgetFilters)
+              .filter((id) => !kept.some((node) => node.id === id))
+              .map((id) => {
+                const meta = collectionMetaCache[id];
+                return {
+                  id,
+                  name: collectionNamesCache[id] || meta?.name || id,
+                  nodeType: meta?.nodeType || 'record',
+                  connector: meta?.connector || '',
+                  extension: meta?.extension,
+                  mimeType: meta?.mimeType,
+                };
+              }),
+          ]
+        : kept;
+      if (variant !== 'widget' && kept.length > 0) {
+        const store = useChatStore.getState();
+        const { names, meta } = mentionMeta(kept);
+        store.setCollectionNamesCache({ ...store.collectionNamesCache, ...names });
+        store.setCollectionMetaCache({ ...store.collectionMetaCache, ...meta });
+        if (isAgentChat) {
+          store.setAgentKnowledgeScope(
+            mergeMentionFilters(
+              store.agentKnowledgeScope ?? { apps: [], kb: [] },
+              kept,
+            ),
+          );
+        } else if (isProjectChat) {
+          // A project chat is scoped by its own selection, not the assistant's filters.
+          store.setProjectKnowledgeScope(mergeMentionFilters(store.projectKnowledgeScope ?? { apps: [], kb: [] }, kept));
+        } else {
+          store.setFilters(mergeMentionFilters(store.settings.filters, kept));
+        }
+      }
+      const clearDraft = () => {
+        setMessage('');
+        setMentions([]);
+        setUploadedFiles([]);
+        setShowUploadArea(false);
+        if (textareaRef.current) {
+          textareaRef.current.style.height = 'auto';
+        }
+      };
+      const sentText = message;
+      draft.markSent();
+      const sending = onSend(
+        stripMentionPads(message, kept),
+        refs.length > 0 ? refs : undefined,
+        sent.length > 0 ? sent : undefined,
+      );
+      if (sending instanceof Promise) {
+        // The host said why it refused (or failed); the draft stays for another try.
+        void sending.then(
+          (ok) => {
+            if (ok !== false) clearDraft();
+            else draft.unmarkSent(sentText);
+          },
+          () => draft.unmarkSent(sentText),
+        );
+      } else if (sending !== false) {
+        clearDraft();
+      } else {
+        draft.unmarkSent(sentText);
+      }
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Escape cancels whichever action mode is active (edit or regenerate)
+    if (e.key === 'Escape' && isActionMode) {
+      handleDismissAction();
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      handleSubmit(e);
+    }
+  };
+
+  /**
+   * Fire the upload for a single chip. Called both on initial add and on
+   * retry. The chip MUST already exist in `uploadedFiles` — we only flip
+   * status and store the ref / error.
+   *
+   * On abort (user removed the chip mid-flight) we silently swallow the
+   * error — the chip is already gone from state, no UX needed.
+   */
+  const startUpload = useCallback((file: UploadedFile) => {
+    if (!onUploadFile) return;
+
+    // Replace any prior controller for this id (e.g. retry after error).
+    const prevCtrl = uploadControllersRef.current.get(file.id);
+    if (prevCtrl) prevCtrl.abort();
+    const controller = new AbortController();
+    uploadControllersRef.current.set(file.id, controller);
+
+    setUploadedFiles((prev) =>
+      prev.map((f) =>
+        f.id === file.id ? { ...f, status: 'uploading', errorMessage: undefined } : f,
+      ),
+    );
+
+    onUploadFile(file.file, controller.signal)
+      .then((ref) => {
+        if (controller.signal.aborted) return;
+        setUploadedFiles((prev) =>
+          prev.map((f) => (f.id === file.id ? { ...f, status: 'uploaded', ref } : f)),
+        );
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        const errorMessage = attachmentErrorMessage(file.name, err, t);
+        setUploadedFiles((prev) =>
+          prev.map((f) =>
+            f.id === file.id ? { ...f, status: 'error', errorMessage, ref: undefined } : f,
+          ),
+        );
+        toast.error(errorMessage);
+      })
+      .finally(() => {
+        if (uploadControllersRef.current.get(file.id) === controller) {
+          uploadControllersRef.current.delete(file.id);
+        }
+      });
+  }, [onUploadFile, t]);
+
+  const processFiles = useCallback((
+    files: FileList | File[],
+    options?: {
+      source?: UploadedFileSource;
+      pastePreview?: string;
+      pasteCharCount?: number;
+      pasteLineCount?: number;
+    },
+  ) => {
+    const fileArray = Array.from(files);
+
+    const typeValid: File[] = [];
+    const typeRejected: File[] = [];
+    for (const f of fileArray) {
+      if (isFileTypeSupported(f)) {
+        typeValid.push(f);
+      } else {
+        typeRejected.push(f);
+      }
+    }
+    if (typeRejected.length > 0) {
+      toast.error(
+        t('chat.attachments.unsupportedType', {
+          names: typeRejected.map((f) => f.name).join(', '),
+          types: SUPPORTED_FILE_TYPES.join(', '),
+        })
+      );
+    }
+
+    const sizeValid: File[] = [];
+    const sizeRejected: File[] = [];
+    for (const f of typeValid) {
+      if (f.size > CHAT_ATTACHMENT_MAX_BYTES) {
+        sizeRejected.push(f);
+      } else {
+        sizeValid.push(f);
+      }
+    }
+    if (sizeRejected.length > 0) {
+      toast.error(
+        t('chat.attachments.fileTooLarge', {
+          names: sizeRejected.map((f) => f.name).join(', '),
+          maxMb: Math.round(CHAT_ATTACHMENT_MAX_BYTES / (1024 * 1024)),
+        })
+      );
+    }
+
+    if (sizeValid.length === 0) return;
+
+    // Compute the new chips entirely outside of any setState call so the
+    // arrays are stable — React Strict Mode calls updater functions twice
+    // to detect impure updaters, which would push into `newFiles` twice and
+    // produce duplicate chips and duplicate upload calls.
+    const currentCount = uploadedFiles.length;
+    const remaining = CHAT_ATTACHMENT_MAX_FILES - currentCount;
+    if (remaining <= 0) return;
+
+    const toAdd = sizeValid.slice(0, remaining);
+    if (toAdd.length < sizeValid.length) {
+      toast.error(
+        t('chat.attachments.tooManyFiles', {
+          max: CHAT_ATTACHMENT_MAX_FILES,
+        })
+      );
+    }
+
+    const newFiles: UploadedFile[] = toAdd.map((file) => ({
+      id: `${file.name}-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+      file,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      status: 'uploading' as const,
+      source: options?.source ?? 'upload',
+      pastePreview: options?.pastePreview,
+      pasteCharCount: options?.pasteCharCount,
+      pasteLineCount: options?.pasteLineCount,
+    }));
+
+    // Pure state update — no side effects inside the updater.
+    setUploadedFiles((prev) => [...prev, ...newFiles]);
+
+    // Kick off uploads after the state update — never inside React's reducer.
+    for (const file of newFiles) {
+      startUpload(file);
+    }
+
+    setShowUploadArea(false);
+  }, [t, startUpload, uploadedFiles]);
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      processFiles(e.target.files);
+    }
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    setIsPanelDragging(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      processFiles(e.dataTransfer.files, { source: 'drag' });
+    }
+  };
+
+  // Panel-level drag handlers — activate the drop overlay when any file is
+  // dragged over the whole chat input area (not just the upload-area box).
+  const handlePanelDragEnter = (e: React.DragEvent) => {
+    if (!canAcceptDrop) return;
+    if (!e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault();
+    setIsPanelDragging(true);
+  };
+
+  const handlePanelDragOver = (e: React.DragEvent) => {
+    if (!canAcceptDrop) return;
+    if (!e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault();
+  };
+
+  // Use relatedTarget to distinguish cursor-left-container from cursor-moved-to-child.
+  // Handles drag-leaves-window (relatedTarget === null) correctly.
+  const handlePanelDragLeave = (e: React.DragEvent) => {
+    if (e.relatedTarget && containerRef.current?.contains(e.relatedTarget as Node)) return;
+    setIsPanelDragging(false);
+  };
+
+  const handlePanelDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsPanelDragging(false);
+    if (!canAcceptDrop) return;
+    if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+      processFiles(e.dataTransfer.files, { source: 'drag' });
+    }
+  };
+
+  const removeFile = useCallback((fileId: string) => {
+    // Abort any in-flight upload for this chip so the network call and its
+    // `.then`/`.catch` handlers don't write back into state after the chip is gone.
+    const ctrl = uploadControllersRef.current.get(fileId);
+    if (ctrl) {
+      ctrl.abort();
+      uploadControllersRef.current.delete(fileId);
+    }
+
+    // Capture the record ref before setState — Strict Mode runs updaters twice,
+    // so any side effect inside an updater fires twice.
+    const fileToDelete = uploadedFiles.find((f) => f.id === fileId);
+
+    // Pure state update — remove the chip.
+    setUploadedFiles((prev) => prev.filter((f) => f.id !== fileId));
+
+    // Fire-and-forget server delete outside the updater. A file stored with the question being
+    // edited stays: the edit may not be sent, and a fork of the chat may use it.
+    if (
+      fileToDelete?.status === 'uploaded' &&
+      !fileToDelete.existing &&
+      fileToDelete.ref?.recordId &&
+      onDeleteFile
+    ) {
+      onDeleteFile(fileToDelete.ref.recordId);
+    }
+  }, [uploadedFiles, onDeleteFile]);
+
+  const retryFile = useCallback((fileId: string) => {
+    // Find the target outside the updater — Strict Mode runs updaters twice
+    // which would trigger two upload calls for the same retry.
+    const target = uploadedFiles.find((f) => f.id === fileId);
+    if (target) startUpload(target);
+  }, [uploadedFiles, startUpload]);
+
+  /**
+   * Handle Ctrl+V / paste events.
+   *
+   * Two things can be intercepted here:
+   *  1. Clipboard items of kind `'file'` with a supported MIME type
+   *     (screenshots, copied images/PDFs) — unchanged from before.
+   *  2. A large plain-text paste (no file items) — auto-converted to a
+   *     synthetic `.txt` attachment, mirroring ChatGPT/Claude. Held Shift
+   *     (Cmd/Ctrl+Shift+V) bypasses this and pastes as plain text, same as
+   *     ChatGPT's convention.
+   *
+   * In both cases we only call `e.preventDefault()` once we've actually
+   * decided to consume the paste, so normal short-text pasting is never
+   * disrupted.
+   *
+   * Both paths use the same gating as the attach control: enterprise search
+   * (`mode === 'search'`) and web search do not accept attachments.
+   */
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    if (isRegenerateMode || isSearchMode || settings.queryMode === 'web-search') {
+      return;
+    }
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    const fileItems: File[] = [];
+    let hasFileItem = false;
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file') {
+        hasFileItem = true;
+        const file = item.getAsFile();
+        if (file && isFileTypeSupported(file)) {
+          // Keep the original filename when the browser provides one.
+          // Screenshot/copy-image pastes typically arrive with an empty name
+          // or a bare extension-less name — only generate a fallback in those
+          // cases so user-copied files preserve their real names.
+          const hasRealName = file.name && file.name.trim() !== '' && file.name !== 'image';
+          if (hasRealName) {
+            fileItems.push(file);
+          } else {
+            const ext = pasteFallbackExtension(file);
+            const named = new File([file], `pasted-${Date.now()}.${ext}`, {
+              type: file.type,
+            });
+            fileItems.push(named);
+          }
+        }
+      }
+    }
+
+    if (fileItems.length > 0) {
+      // Stop the event here — without this, bubbling causes the handler to fire
+      // once for each ancestor that also has onPaste registered, producing
+      // duplicate chips for the same paste action.
+      e.stopPropagation();
+      // Prevent the browser from trying to render the raw image data as text.
+      e.preventDefault();
+      processFiles(fileItems, { source: 'paste' });
+      return;
+    }
+
+    // No file items — check whether the plain text itself is large enough
+    // to collapse into an attachment. Held Shift bypasses this entirely.
+    if (hasFileItem || shiftKeyHeldRef.current) return;
+    const text = e.clipboardData?.getData('text/plain') ?? '';
+    if (!text || !isLargePaste(text)) return;
+
+    e.stopPropagation();
+    e.preventDefault();
+    const file = createPastedTextFile(text, {
+      ...DEFAULT_PASTE_ATTACHMENT_CONFIG,
+      truncationNotice: t('chat.attachments.pasteTruncated', {
+        defaultValue:
+          '\n\n[Content truncated — pasted text exceeded the maximum attachment size.]',
+      }),
+    });
+    processFiles([file], {
+      source: 'paste-text',
+      pastePreview: generatePastePreview(text),
+      pasteCharCount: text.length,
+      pasteLineCount: text.split('\n').length,
+    });
+  }, [processFiles, isRegenerateMode, isSearchMode, settings.queryMode]);
+
+  /**
+   * "Show in text field" — moves a pasted-text chip's content back into the
+   * textarea and removes the chip (aborting/deleting its upload via the
+   * existing `removeFile` path, so there is exactly one place that does
+   * that bookkeeping).
+   */
+  const handleShowInTextField = useCallback((file: UploadedFile) => {
+    void file.file.text().then((text) => {
+      setMessage((prev) => (prev.trim() ? `${prev}\n\n${text}` : text));
+      removeFile(file.id);
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    });
+  }, [removeFile]);
+
+  // Track Shift key state for the paste-as-plain-text bypass (see handlePaste).
+  // ClipboardEvent carries no modifier state, so it has to be tracked globally.
+  useEffect(() => {
+    // Read `shiftKey` off every key event, not just the Shift key itself, so any
+    // keystroke re-syncs a ref left stale by a missed keyup.
+    const sync = (e: KeyboardEvent) => {
+      shiftKeyHeldRef.current = e.shiftKey;
+    };
+    // A keyup during Cmd+Tab or a native dialog is delivered to the other window
+    // and never reaches us, which would strand the ref at true.
+    const clear = () => {
+      shiftKeyHeldRef.current = false;
+    };
+    window.addEventListener('keydown', sync);
+    window.addEventListener('keyup', sync);
+    window.addEventListener('blur', clear);
+    return () => {
+      window.removeEventListener('keydown', sync);
+      window.removeEventListener('keyup', sync);
+      window.removeEventListener('blur', clear);
+    };
+  }, []);
+
+  // Abort any still-pending uploads on unmount so we don't write back into
+  // a destroyed component's state when the network finally responds.
+  useEffect(() => {
+    const controllers = uploadControllersRef.current;
+    return () => {
+      for (const ctrl of controllers.values()) ctrl.abort();
+      controllers.clear();
+    };
+  }, []);
+
+  // Keep scroll-arrow visibility in sync with the chips container scroll state.
+  const updateChipsScrollState = useCallback(() => {
+    const el = chipsScrollRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 0);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+  }, []);
+
+  // Re-check whenever the file list changes (chips added / removed).
+  useEffect(() => {
+    updateChipsScrollState();
+  }, [uploadedFiles, updateChipsScrollState]);
+
+  const scrollChips = useCallback((direction: 'left' | 'right') => {
+    const el = chipsScrollRef.current;
+    if (!el) return;
+    el.scrollBy({ left: direction === 'left' ? -220 : 220, behavior: 'smooth' });
+  }, []);
+
+  const toggleUploadArea = () => {
+    const next = !showUploadArea;
+    if (next) {
+      // Close all other panels before opening the upload area
+      setIsPlusMenuOpen(false);
+      setIsAgentStrategyPanelOpen(false);
+      setIsCollectionsPanelOpen(false);
+      setIsAgentResourcesPanelOpen(false);
+      setIsModelPanelOpen(false);
+      setExpansionViewMode('inline');
+      // Clear any stale drag overlay state so the panel overlay doesn't bleed
+      // into the upload area UI when files were dragged prior to opening it.
+      setIsPanelDragging(false);
+    }
+    setShowUploadArea(next);
+  };
+
+  const hasSendableAttachment = uploadedFiles.some((f) => f.status === 'uploaded');
+  const hasContent = Boolean(message.trim()) || hasSendableAttachment || isListening;
+  const hasUploadingAttachments = uploadedFiles.some((f) => f.status === 'uploading');
+  const canSubmit =
+    (hasContent || activeMessageAction !== null) &&
+    !isUniversalAgentLoading &&
+    !hasUploadingAttachments;
+
+  // Display value combines committed text with interim speech so users see real-time feedback
+  const displayValue = interimTranscript
+    ? message + (message.length > 0 ? ' ' : '') + interimTranscript
+    : message;
+
+  const speechTooltip =
+    speechUnavailableReason === 'stt-not-configured'
+      ? t('chat.voiceSttNotConfigured', {
+          defaultValue:
+            'Configure a Speech-to-Text (STT) model in AI Models settings to enable voice input.',
+        })
+      : speechUnavailableReason === 'stt-loading'
+        ? t('chat.voiceSttLoading', {
+            defaultValue: 'Checking speech capabilities…',
+          })
+        : !isSpeechSupported
+          ? t('chat.voiceInputNotSupported')
+          : isListening
+            ? t('chat.listening')
+            : t('chat.micTooltip');
+  const isSpeechButtonDisabled = isRegenerateMode || !isSpeechSupported;
+
+  // Compact toolbar: collapse secondary controls when the input box is narrow
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setIsCompactToolbar(entry.contentRect.width < 500);
+    });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  // Close panels on outside click
+  useEffect(() => {
+    if (!modeChromeOpen && !isCollectionsPanelOpen && !isModelPanelOpen && !showUploadArea) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (expansionViewMode === 'overlay') return;
+      // A dialog opened from a panel (an MCP server's key) is portaled outside the input; closing
+      // the panel on a click inside it would unmount the dialog under the person typing.
+      if ((e.target as Element | null)?.closest?.('[role="dialog"], [role="alertdialog"]')) return;
+
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        dismissExpansionPanelsRef.current();
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [modeChromeOpen, isCollectionsPanelOpen, isModelPanelOpen, showUploadArea, expansionViewMode]);
+
+  // All Records dock: shrink when the click lands outside it. Draft text and
+  // applied filters stay; only the open panels close.
+  useEffect(() => {
+    if (variant !== 'widget' || !expandable) return;
+    const shrink = () => {
+      setIsExpanded(false);
+      setIsCollectionsPanelOpen(false);
+      setIsPlusMenuOpen(false);
+      setIsMobilePlusMenuOpen(false);
+      setIsModelPanelOpen(false);
+      setIsAgentResourcesPanelOpen(false);
+      setIsAgentStrategyPanelOpen(false);
+      setIsCompactMenuOpen(false);
+      setShowUploadArea(false);
+    };
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (!t || containerRef.current?.contains(t)) return;
+      if (t instanceof Element && t.closest('[data-composer-popover]')) return;
+      shrink();
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [variant, expandable]);
+
+  const handleExpand = () => {
+    if (expandable && !isExpanded) {
+      setIsExpanded(true);
+    }
+  };
+
+  useComposerResizeAnimation(
+    containerRef,
+    [
+      showFullUI,
+      isAgentStrategyPanelOpen,
+      isModelPanelOpen,
+      isAgentResourcesPanelOpen,
+      isCollectionsPanelOpen,
+      expansionViewMode,
+      showUploadArea,
+      uploadedFiles.length > 0,
+      showSelectedCollectionsRow,
+    ].join('|'),
+  );
+
+  // Auto-focus the textarea when expanding from widget to full
+  useEffect(() => {
+    if (isExpanded && variant === 'widget' && textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  }, [isExpanded, variant]);
+
+  useEffect(() => {
+    if (!isAgentChat) {
+      setIsAgentStrategyPanelOpen(false);
+      setIsAgentResourcesPanelOpen(false);
+    }
+  }, [isAgentChat]);
+
+  // Dismiss collections chrome when it no longer applies (stale panel / overlay).
+  const prevQueryModeRef = useRef(settings.queryMode);
+  useEffect(() => {
+    const prev = prevQueryModeRef.current;
+    prevQueryModeRef.current = settings.queryMode;
+    if (!isCollectionsPanelOpen) return;
+    if ((prev === 'agent' && settings.queryMode !== 'agent') || settings.queryMode === 'web-search') {
+      setIsCollectionsPanelOpen(false);
+      setExpansionViewMode('inline');
+    }
+  }, [settings.queryMode, isCollectionsPanelOpen, setExpansionViewMode]);
+
+  if (!showFullUI) {
+    return (
+      <Flex
+        ref={containerRef}
+        direction="column"
+        gap="0"
+        data-composer-shell=""
+        style={{
+          width: 420,
+          maxWidth: '100%',
+          margin: '0 auto',
+          pointerEvents: 'auto',
+          background: 'color-mix(in srgb, var(--olive-1) 42%, transparent)',
+          border: '1px solid var(--olive-3)',
+          backdropFilter: 'blur(25px)',
+          WebkitBackdropFilter: 'blur(25px)',
+          borderRadius: 'var(--radius-1)',
+          padding: '7px 8px',
+          boxSizing: 'border-box',
+          overflow: 'hidden',
+        }}
+      >
+        {/* Single row: plus button + input + send */}
+        <Flex align="center" justify="between" gap="1" style={{ height: 26 }}>
+          {!isAgentChat && (
+            <IconButton
+              variant="ghost"
+              color="gray"
+              size="2"
+              onClick={handleExpand}
+              aria-label={t('chat.expandComposer', { defaultValue: 'Expand composer' })}
+              style={{ margin: 0, cursor: 'pointer', flexShrink: 0, width: 26, height: 26, minWidth: 26, minHeight: 26, padding: 0 }}
+            >
+              <MaterialIcon name="add" size={16} color="var(--neutral-11)" />
+            </IconButton>
+          )}
+
+          {/* Input field */}
+          <MentionComposerField
+            value={displayValue}
+            mentions={mentions}
+            onChange={setMessage}
+            onMentionsChange={setMentions}
+            onKeyDown={handleKeyDown}
+            onFocus={handleExpand}
+            placeholder={resolvedWidgetPlaceholder}
+            parent={mentionParent}
+            selection={mentionSelection}
+            mentionsOff={mentionsOff}
+            onSelectionChange={onMentionSelectionChange}
+            aria-label={resolvedWidgetPlaceholder}
+            style={{
+              flex: 1,
+              fontSize: 'var(--font-size-2)',
+              fontFamily: 'Manrope, sans-serif',
+              lineHeight: '20px',
+              minWidth: 0,
+              height: 20,
+              overflow: 'hidden',
+            }}
+          />
+
+          {/* Send / Stop — same contract as full composer */}
+          {isStreaming ? (
+            <IconButton
+              variant="solid"
+              size="2"
+              onClick={handleStopStream}
+              disabled={isStopping}
+              aria-label={t('chat.stopGenerating', { defaultValue: 'Stop generating' })}
+              data-testid="chat-stop-button"
+              style={{
+                margin: 0,
+                width: 26,
+                height: 26,
+                minWidth: 26,
+                padding: 0,
+                borderRadius: 'var(--radius-2)',
+                backgroundColor: 'var(--emerald-9)',
+                color: 'white',
+                opacity: isStopping ? 0.6 : 1,
+                cursor: isStopping ? 'default' : 'pointer',
+              }}
+            >
+              <StopMark />
+            </IconButton>
+          ) : (
+            <IconButton
+              variant="solid"
+              size="2"
+              onClick={(event) => {
+                if (!canSubmit) {
+                  event.preventDefault();
+                  return;
+                }
+                handleSubmit(event);
+              }}
+              aria-disabled={!canSubmit}
+              aria-label={t('chat.sendMessage')}
+              style={{
+                margin: 0,
+                width: 26,
+                height: 26,
+                minWidth: 26,
+                padding: 0,
+                borderRadius: 'var(--radius-2)',
+                backgroundColor: canSubmit ? 'var(--emerald-9)' : 'transparent',
+                color: canSubmit ? 'white' : 'var(--neutral-11)',
+                opacity: 1,
+                cursor: canSubmit ? 'pointer' : 'default',
+              }}
+            >
+              <MaterialIcon
+                name="arrow_upward"
+                size={16}
+                color={canSubmit ? 'white' : 'var(--neutral-11)'}
+              />
+            </IconButton>
+          )}
+        </Flex>
+      </Flex>
+    );
+  }
+
+  const composerActive =
+    !isStreaming && (isInputFocused || message.trim() || isEditMode || isListening);
+
+  const textareaLayoutStyle: React.CSSProperties = {
+    width: '100%',
+    backgroundColor: 'transparent',
+    outline: 'none',
+    border: 'none',
+    fontSize: 'var(--font-size-2)',
+    lineHeight: '20px',
+    letterSpacing: 0,
+    resize: 'none',
+    maxHeight: '160px',
+    fontFamily: 'Manrope, sans-serif',
+    height: 'auto',
+    overflow: 'auto',
+    padding: 0,
+    margin: 0,
+  };
+
+  const syncTextareaHeight = (e: React.FormEvent<HTMLTextAreaElement>) => {
+    const target = e.currentTarget;
+    target.style.height = 'auto';
+    target.style.height = `${Math.min(target.scrollHeight, 160)}px`;
+  };
+
+  return (
+    <>
+    <Flex
+      ref={containerRef}
+      data-composer-shell=""
+      direction="column"
+      align="stretch"
+      onPaste={handlePaste}
+      onDragEnter={handlePanelDragEnter}
+      onDragOver={handlePanelDragOver}
+      onDragLeave={handlePanelDragLeave}
+      onDrop={handlePanelDrop}
+      style={{
+        width: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
+        overflow: 'hidden',
+        pointerEvents: 'auto',
+        fontFamily: 'Manrope, sans-serif',
+        backdropFilter:
+          dockGlass || !(composerActive || message.trim() || isListening) ? 'blur(25px)' : 'none',
+        WebkitBackdropFilter:
+          dockGlass || !(composerActive || message.trim() || isListening) ? 'blur(25px)' : 'none',
+        background: dockGlass
+          ? 'color-mix(in srgb, var(--olive-1) 42%, transparent)'
+          : composerActive || message.trim() || isListening
+            ? 'var(--olive-2)'
+            : 'var(--effects-translucent)',
+        boxShadow:
+          composerActive || message.trim() || isListening
+            ? '0 12px 32px -16px rgba(0, 9, 50, 0.12), 0 12px 60px 0 rgba(0, 0, 0, 0.15)'
+            : 'none',
+        transition: 'background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease',
+        // The dock sits over a table; a full-strength accent line reads heavier there than in chat.
+        border: composerActive
+          ? `1px solid ${dockGlass ? 'var(--accent-a7)' : 'var(--accent-11)'}`
+          : '1px solid var(--olive-3)',
+        borderRadius: 'var(--radius-1)',
+      }}
+    >
+      {/* Selected filters — same horizontal padding as the textarea/toolbar */}
+      {showSelectedCollectionsRow && (
+        <Flex
+          align="center"
+          style={{
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
+            backgroundColor: dockGlass ? 'transparent' : 'var(--slate-1)',
+            borderBottom: '1px solid var(--olive-3)',
+            padding: 8,
+          }}
+        >
+          <SelectedCollections
+            collections={selectedCollections}
+            removable={!isRegenerateMode}
+            onRemove={isRegenerateMode ? undefined : handleRemoveCollection}
+          />
+        </Flex>
+      )}
+
+      {/* Uploaded Files Preview — inside the same bordered composer */}
+      {uploadedFiles.length > 0 && (
+        <Flex
+          align="center"
+          style={{
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
+            backgroundColor: dockGlass ? 'transparent' : 'var(--slate-1)',
+            borderBottom: '1px solid var(--olive-3)',
+            padding: 'var(--space-3) var(--space-4)',
+            gap: 'var(--space-1)',
+          }}
+        >
+          {/* Left scroll arrow */}
+          {canScrollLeft && (
+            <Box
+              onClick={() => scrollChips('left')}
+              style={{
+                flexShrink: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 24,
+                height: 24,
+                borderRadius: 'var(--radius-round)',
+                backgroundColor: 'var(--slate-4)',
+                cursor: 'pointer',
+              }}
+              aria-label={t('chat.scrollAttachmentsLeft')}
+            >
+              <MaterialIcon name="chevron_left" size={16} color="var(--slate-11)" />
+            </Box>
+          )}
+
+          {/* Scrollable chips row */}
+          <Box
+            ref={chipsScrollRef}
+            onScroll={updateChipsScrollState}
+            style={{
+              flex: 1,
+              overflowX: 'auto',
+              overflowY: 'hidden',
+              scrollbarWidth: 'none',
+            }}
+            className="no-scrollbar"
+          >
+          <Flex gap="2" style={{ minWidth: 'max-content' }}>
+            {uploadedFiles.map((file) => (
+              file.source === 'paste-text' ? (
+                <PastedTextChip
+                  key={file.id}
+                  file={file}
+                  onPreview={() => setTextPreviewFileId(file.id)}
+                  onShowInTextField={() => handleShowInTextField(file)}
+                  onRemove={() => removeFile(file.id)}
+                  onRetry={() => retryFile(file.id)}
+                />
+              ) : (
+              <Box
+                key={file.id}
+                style={{
+                  flexShrink: 0,
+                  width: '196px',
+                  padding: 'var(--space-2)',
+                  backgroundColor: 'var(--olive-a2)',
+                  border:
+                    file.status === 'error'
+                      ? '1px solid var(--red-7)'
+                      : '1px solid var(--olive-3)',
+                  borderRadius: 'var(--radius-1)',
+                }}
+              >
+                <Flex direction="column" gap="2">
+                  {/* Header: file icon + per-status action affordance.
+                      - uploading: spinner replaces the close button.
+                      - uploaded:  close button removes the chip (and signals
+                        the server orphan via the future cleanup endpoint).
+                      - error:     retry + close so the user can recover
+                        without losing the other chips' completed uploads. */}
+                  <Flex align="center" justify="between">
+                    <FileIcon
+                      extension={getMimeTypeExtension(file.type) || undefined}
+                      filename={file.name}
+                      size={16}
+                      fallbackIcon="insert_drive_file"
+                    />
+                    {file.status === 'uploading' ? (
+                      <Tooltip
+                        content={t('chat.attachments.uploading', { defaultValue: 'Uploading…' })}
+                        side="top"
+                      >
+                        <Box
+                          aria-label={`Uploading ${file.name}`}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            width: 20,
+                            height: 20,
+                            flexShrink: 0,
+                          }}
+                        >
+                          <Spinner
+                            size={14}
+                            thickness={1.5}
+                            color="var(--slate-11)"
+                            ariaLabel={`Uploading ${file.name}`}
+                          />
+                        </Box>
+                      </Tooltip>
+                    ) : (
+                      <Flex align="center" gap="1" style={{ flexShrink: 0 }}>
+                        {file.status === 'error' && (
+                          <Tooltip
+                            content={t('chat.attachments.retry', { defaultValue: 'Retry upload' })}
+                            side="top"
+                          >
+                            <IconButton
+                              variant="ghost"
+                              size="1"
+                              onClick={() => retryFile(file.id)}
+                              style={{ margin: 0, flexShrink: 0 }}
+                              aria-label={`Retry uploading ${file.name}`}
+                            >
+                              <MaterialIcon
+                                name="refresh"
+                                size={ICON_SIZES.SECONDARY}
+                                color="var(--red-11)"
+                              />
+                            </IconButton>
+                          </Tooltip>
+                        )}
+                        <IconButton
+                          variant="ghost"
+                          size="1"
+                          onClick={() => removeFile(file.id)}
+                          style={{ margin: 0, flexShrink: 0 }}
+                          aria-label={`Remove ${file.name}`}
+                        >
+                          <MaterialIcon
+                            name="close"
+                            size={ICON_SIZES.SECONDARY}
+                            color="var(--slate-11)"
+                          />
+                        </IconButton>
+                      </Flex>
+                    )}
+                  </Flex>
+
+                  {/* Content: filename + size (or error message in red). */}
+                  <Flex direction="column" gap="1" style={{ minWidth: 0 }}>
+                    <Text
+                      size="1"
+                      weight="medium"
+                      style={{
+                        color: 'var(--slate-12)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap'
+                      }}
+                    >
+                      {file.name}
+                    </Text>
+                    <Text
+                      size="1"
+                      style={{
+                        color: file.status === 'error' ? 'var(--red-11)' : 'var(--slate-11)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {file.status === 'error'
+                        ? file.errorMessage ||
+                          t('chat.attachments.uploadFailed', { defaultValue: 'Upload failed' })
+                        : file.existing
+                          ? (file.ref?.extension ?? '').toUpperCase()
+                          : formatFileSize(file.size)}
+                    </Text>
+                  </Flex>
+                </Flex>
+              </Box>
+              )
+            ))}
+
+            {/* Add Button */}
+            <Box
+              onClick={() => fileInputRef.current?.click()}
+              style={{
+                flexShrink: 0,
+                width: '76px',
+                border: '1px dashed var(--accent-9)',
+                borderRadius: 'var(--radius-1)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                transition: 'background-color 0.15s',
+                backgroundColor: isAddFileButtonHovered ? 'var(--accent-a2)' : 'transparent',
+              }}
+              onMouseEnter={() => setIsAddFileButtonHovered(true)}
+              onMouseLeave={() => setIsAddFileButtonHovered(false)}
+            >
+              <MaterialIcon name="add" size={24} color="var(--accent-9)" />
+            </Box>
+          </Flex>
+          </Box>
+
+          {/* Right scroll arrow */}
+          {canScrollRight && (
+            <Box
+              onClick={() => scrollChips('right')}
+              style={{
+                flexShrink: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 24,
+                height: 24,
+                borderRadius: 'var(--radius-round)',
+                backgroundColor: 'var(--slate-4)',
+                cursor: 'pointer',
+              }}
+              aria-label={t('chat.scrollAttachmentsRight')}
+            >
+              <MaterialIcon name="chevron_right" size={16} color="var(--slate-11)" />
+            </Box>
+          )}
+        </Flex>
+      )}
+
+      {/* Action pill bar — edit / regenerate chrome inside the composer */}
+      {isActionMode && activeMessageAction && (
+        <Flex
+          style={{
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
+            background: 'var(--olive-1)',
+            borderBottom: '1px solid var(--olive-5)',
+            padding: 'var(--space-3) var(--space-4)',
+          }}
+        >
+          <MessageActionIndicator
+            action={activeMessageAction}
+            onDismiss={handleDismissAction}
+            onSubmit={() => {}}
+          />
+        </Flex>
+      )}
+
+      {/* Textarea + toolbar */}
+      <Flex
+      direction="column"
+      gap="3"
+      style={{
+        width: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
+        position: 'relative',
+        // Bottom matches the sides so the toolbar buttons sit the same distance from both edges.
+        padding: '12px 16px 16px',
+      }}
+    >
+      {/* Hidden file input - always rendered so add button can access it */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept={[
+          ...Object.keys(ACCEPTED_MIME_TYPES),
+          ...ACCEPTED_EXTENSIONS.map((e) => `.${e}`),
+        ].join(',')}
+        onChange={handleFileSelect}
+        style={{ display: 'none' }}
+      />
+
+      {/* Upload Area */}
+      {showUploadArea && (
+        <Flex direction="column" gap="2">
+          <Text size="2" style={{ color: 'var(--slate-12)' }}>{t('chat.uploadYourFile')}</Text>
+          <Box
+            style={{
+              position: 'relative',
+              border: `2px dashed ${isDragging ? 'var(--accent-8)' : 'var(--slate-6)'}`,
+              borderRadius: 'var(--radius-4)',
+              padding: 'var(--space-7)',
+              transition: 'all 0.15s',
+              backgroundColor: isDragging ? 'var(--accent-2)' : 'transparent',
+              cursor: 'pointer',
+            }}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Flex direction="column" align="center" gap="2">
+              <MaterialIcon
+                name={isDragging ? 'file_upload' : 'add'}
+                size={isDragging ? 32 : 24}
+                color={isDragging ? 'var(--accent-9)' : 'var(--slate-9)'}
+              />
+              <Text
+                size="2"
+                weight={isDragging ? 'medium' : 'regular'}
+                style={{ color: isDragging ? 'var(--accent-11)' : 'var(--slate-12)' }}
+              >
+                {isDragging ? t('chat.dropFilesHere') : t('action.upload')}
+              </Text>
+              <Text size="1" style={{ color: 'var(--slate-11)' }}>
+                {t('chat.supportsFileTypes', { types: SUPPORTED_FILE_TYPES.join(', ') })}
+              </Text>
+              <Text size="1" style={{ color: 'var(--slate-10)' }}>
+                {uploadedFiles.length > 0
+                  ? t('chat.uploadFilesRemaining', {
+                      remaining: CHAT_ATTACHMENT_MAX_FILES - uploadedFiles.length,
+                      total: CHAT_ATTACHMENT_MAX_FILES,
+                    })
+                  : t('chat.uploadFilesLimit', { count: CHAT_ATTACHMENT_MAX_FILES })}
+              </Text>
+            </Flex>
+          </Box>
+        </Flex>
+      )}
+
+      {/* Input or expansion panel (mutually exclusive) */}
+      {isAgentChat && isAgentStrategyPanelOpen ? (
+        <ChatInputExpansionPanel
+          open={isAgentStrategyPanelOpen}
+          onClose={() => setIsAgentStrategyPanelOpen(false)}
+          minHeight="0px"
+          height="fit-content"
+        >
+          <AgentStrategyModePanel
+            activeStrategy={settings.agentStrategy}
+            onSelect={(strategy) => {
+              setAgentStrategy(strategy);
+              setIsAgentStrategyPanelOpen(false);
+            }}
+          />
+        </ChatInputExpansionPanel>
+      ) : isModelPanelOpen ? (
+        <ChatInputExpansionPanel
+          open={isModelPanelOpen}
+          onClose={() => setIsModelPanelOpen(false)}
+          height="auto"
+          maxHeight="380px"
+        >
+          <ModelSelectorPanel
+            selectedModel={contextSelectedModel ?? contextDefaultModel}
+            onModelSelect={handleModelSelect}
+            agentId={agentId}
+          />
+        </ChatInputExpansionPanel>
+      ) : usesScopedPanel && isAgentResourcesPanelOpen && expansionViewMode === 'inline' ? (
+        <ChatInputExpansionPanel
+          open={isAgentResourcesPanelOpen}
+          onClose={() => {
+            setIsAgentResourcesPanelOpen(false);
+            setExpansionViewMode('inline');
+          }}
+        >
+          <AgentScopedResourcesPanel
+            viewMode="inline"
+            onToggleView={handleToggleView}
+            scope={isAgentChat ? 'agent' : 'project'}
+          />
+        </ChatInputExpansionPanel>
+      ) : !usesScopedPanel && settings.queryMode === 'agent' && isCollectionsPanelOpen && expansionViewMode === 'inline' ? (
+        <ChatInputExpansionPanel
+          open={isCollectionsPanelOpen}
+          onClose={() => {
+            setIsCollectionsPanelOpen(false);
+            setExpansionViewMode('inline');
+          }}
+        >
+          <UniversalAgentResourcesPanel viewMode="inline" onToggleView={handleToggleView} />
+        </ChatInputExpansionPanel>
+      ) : hubFilterQueryMode && isCollectionsPanelOpen && expansionViewMode === 'inline' ? (
+        <ChatInputExpansionPanel
+          open={isCollectionsPanelOpen}
+          onClose={() => {
+            setIsCollectionsPanelOpen(false);
+            setExpansionViewMode('inline');
+          }}
+        >
+          <ConnectorsCollectionsPanel
+            selection={composerFilters}
+            onSelectionChange={variant === 'widget' ? setWidgetFilters : setFilters}
+            viewMode="inline"
+            onToggleView={handleToggleView}
+          />
+        </ChatInputExpansionPanel>
+      ) : ((usesScopedPanel && isAgentResourcesPanelOpen) || assistantCollectionsOverlayActive) &&
+        expansionViewMode === 'overlay' ? (
+        /* Render textarea underneath while overlay is open */
+        <MentionComposerField
+          value={message}
+          mentions={mentions}
+          onChange={setMessage}
+          onMentionsChange={setMentions}
+          onKeyDown={handleKeyDown}
+          onFocus={() => setIsInputFocused(true)}
+          onBlur={() => setIsInputFocused(false)}
+          placeholder={resolvedPlaceholder}
+          parent={mentionParent}
+          selection={mentionSelection}
+          mentionsOff={mentionsOff}
+          onSelectionChange={onMentionSelectionChange}
+          multiline
+          style={{ ...textareaLayoutStyle, color: 'var(--slate-11)' }}
+          onInput={syncTextareaHeight}
+        />
+      ) : !showUploadArea || isActionMode ? (
+        // isActionMode keeps the textarea visible even when showUploadArea is true,
+        // so the user can see / edit their query during edit or regenerate flows.
+        // In regenerate mode the textarea is disabled and text is rendered dimmed;
+        // in edit mode it is fully editable (focused immediately on activation).
+        <MentionComposerField
+          ref={textareaRef}
+          value={displayValue}
+          mentions={mentions}
+          onChange={setMessage}
+          onMentionsChange={setMentions}
+          onKeyDown={handleKeyDown}
+          onFocus={() => setIsInputFocused(true)}
+          onBlur={() => setIsInputFocused(false)}
+          placeholder={isListening ? t('chat.listening') : resolvedPlaceholder}
+          readOnly={isRegenerateMode}
+          parent={mentionParent}
+          selection={mentionSelection}
+          mentionsOff={mentionsOff}
+          onSelectionChange={onMentionSelectionChange}
+          multiline
+          style={{
+            ...textareaLayoutStyle,
+            color: isRegenerateMode ? 'var(--slate-a8)' : 'var(--neutral-12)',
+          }}
+          onInput={syncTextareaHeight}
+        />
+      ) : null}
+
+      {/* Bottom controls — fixed 32px row so left/right share one baseline */}
+      <Flex align="center" justify="between" style={{ width: '100%', minWidth: 0, minHeight: 32 }}>
+        {/* Left side — search-view toggle (hidden for agent-scoped chats, which don't
+            support the keyword-search-results view), plus the "+" attach & capabilities button. */}
+        <Flex align="center" gap="1" style={{ minWidth: 0 }}>
+          {!isAgentChat && (
+            <Tooltip
+              content={isSearchMode ? t('chat.backToChat', { defaultValue: 'Back to chat' }) : t('form.search')}
+              side="top"
+            >
+              <IconButton
+                variant={isSearchMode ? 'soft' : 'ghost'}
+                color="gray"
+                size="2"
+                disabled={isRegenerateMode}
+                aria-label={
+                  isSearchMode
+                    ? t('chat.backToChat', { defaultValue: 'Back to chat' })
+                    : t('chat.searchToggle.ariaLabel', { defaultValue: 'Switch to search view' })
+                }
+                onClick={
+                  isSearchMode
+                    ? () => {
+                        setMode('chat');
+                        useChatStore.getState().clearSearchResults();
+                      }
+                    : () => {
+                        useCommandStore.getState().dispatch('newChat');
+                        setMode('search');
+                      }
+                }
+                style={{ ...composerIconButtonStyle, cursor: isRegenerateMode ? 'default' : 'pointer' }}
+              >
+                <MaterialIcon
+                  name={isSearchMode ? 'chat' : 'search'}
+                  size={16}
+                  color={isRegenerateMode ? 'var(--slate-5)' : toolbarIconColor}
+                />
+              </IconButton>
+            </Tooltip>
+          )}
+
+          {/* "+" menu — attach files & Internal Search / Web Search capability toggles.
+              Hidden in the keyword-search-results view (settings.mode === 'search'), which has
+              no attach/capabilities concept, same as the old mode picker never showed there. */}
+          {!isSearchMode && (
+            isMobile ? (
+              <IconButton
+                variant="ghost"
+                color="gray"
+                size="2"
+                disabled={isRegenerateMode}
+                onClick={() => setIsMobilePlusMenuOpen(true)}
+                aria-label={
+                  showPlusMenuFilterBadge
+                    ? t('chat.plusMenu.ariaLabelFiltersApplied', {
+                        defaultValue: 'Attach files and capabilities. Search filters applied',
+                      })
+                    : t('chat.plusMenu.ariaLabel', { defaultValue: 'Attach files and capabilities' })
+                }
+                style={{ margin: 0, cursor: isRegenerateMode ? 'default' : 'pointer' }}
+              >
+                <PlusMenuTriggerIcon
+                  color={isRegenerateMode ? 'var(--slate-5)' : activeIconColor}
+                  showFilterBadge={showPlusMenuFilterBadge}
+                />
+              </IconButton>
+            ) : (
+              <PlusMenuButton
+                open={isPlusMenuOpen}
+                onOpenChange={(open) => {
+                  if (open) {
+                    setIsAgentStrategyPanelOpen(false);
+                    setIsCollectionsPanelOpen(false);
+                    setIsAgentResourcesPanelOpen(false);
+                    setIsModelPanelOpen(false);
+                    setShowUploadArea(false);
+                  }
+                  setIsPlusMenuOpen(open);
+                }}
+                disabled={isRegenerateMode}
+                activeIconColor={toolbarIconColor}
+                onAttachFiles={toggleUploadArea}
+                {...plusMenuCapabilities}
+              />
+            )
+          )}
+        </Flex>
+
+        {/* Right side - Controls */}
+        <Flex align="center" gap="1" style={{ minWidth: 0, flexShrink: 0 }}>
+          {isMobile ? (
+            /* Mobile: meatball opens bottom sheet; mic stays inline (attach files lives in the + menu). */
+            <Flex align="center" gap="1">
+              <IconButton
+                variant="ghost"
+                color="gray"
+                size="2"
+                aria-label={t('common.moreOptions')}
+                onClick={() => setIsMobileOptionsOpen(true)}
+                style={{ margin: 0, cursor: 'pointer' }}
+              >
+                <MaterialIcon name="more_horiz" size={ICON_SIZES.PRIMARY} color={activeIconColor} />
+              </IconButton>
+              <SpeechInputButton
+                tooltip={speechTooltip}
+                ariaLabel={speechTooltip}
+                isListening={isListening}
+                isSupported={isSpeechSupported}
+                isDisabled={isSpeechButtonDisabled}
+                isRegenerateMode={isRegenerateMode}
+                activeIconColor={activeIconColor}
+                onToggle={toggleSpeech}
+              />
+            </Flex>
+          ) : isCompactToolbar ? (
+            /* Compact desktop: overflow popover with all secondary controls */
+            <Popover.Root open={isCompactMenuOpen} onOpenChange={setIsCompactMenuOpen}>
+              <Popover.Trigger>
+                <IconButton
+                  variant={isCompactMenuOpen ? 'soft' : 'ghost'}
+                  color="gray"
+                  size="2"
+                  style={{ margin: 0, cursor: 'pointer' }}
+                  aria-label={t('common.moreOptions')}
+                >
+                  <MaterialIcon name="tune" size={ICON_SIZES.PRIMARY} color={activeIconColor} />
+                </IconButton>
+              </Popover.Trigger>
+              <Popover.Content
+                data-composer-popover=""
+                side="top"
+                align="end"
+                style={{
+                  padding: 'var(--space-2)',
+                  minWidth: '220px',
+                  backgroundColor: 'var(--color-panel-solid)',
+                  borderRadius: 'var(--radius-3)',
+                  boxShadow: 'var(--shadow-4)',
+                }}
+              >
+                <Flex direction="column" gap="1">
+
+                  {/* Collections / Connectors */}
+                  {showResourcesControl && settings.queryMode !== 'web-search' && (
+                    <Flex
+                      align="center"
+                      gap="2"
+                      onClick={() => {
+                        if (isRegenerateMode) return;
+                        setIsCompactMenuOpen(false);
+                        if (usesScopedPanel) {
+                          const next = !isAgentResourcesPanelOpen;
+                          if (isAgentResourcesPanelOpen) setExpansionViewMode('inline');
+                          dismissExpansionPanels();
+                          setIsAgentResourcesPanelOpen(next);
+                        } else {
+                          const next = !isCollectionsPanelOpen;
+                          if (isCollectionsPanelOpen) setExpansionViewMode('inline');
+                          dismissExpansionPanels();
+                          setIsCollectionsPanelOpen(next);
+                        }
+                      }}
+                      style={{
+                        padding: 'var(--space-2) var(--space-2)',
+                        borderRadius: 'var(--radius-2)',
+                        cursor: isRegenerateMode ? 'default' : 'pointer',
+                        opacity: isRegenerateMode ? 0.5 : 1,
+                        backgroundColor:
+                          (usesScopedPanel ? isAgentResourcesPanelOpen || scopedResourcesCustomized : isCollectionsPanelOpen || (settings.queryMode === 'agent' ? universalAgentResourcesCustomized : selectedKbCount > 0))
+                            ? 'var(--olive-3)'
+                            : 'transparent',
+                      }}
+                    >
+                      <Box style={{ position: 'relative', display: 'inline-flex' }}>
+                        <MaterialIcon name="apps" size={ICON_SIZES.PRIMARY} color={isRegenerateMode ? 'var(--slate-5)' : activeIconColor} />
+                        {showResourcesFilterBadge && !(usesScopedPanel ? isAgentResourcesPanelOpen : isCollectionsPanelOpen) && (
+                          <Box
+                            aria-hidden
+                            style={{
+                              position: 'absolute',
+                              top: -1,
+                              right: -1,
+                              width: 7,
+                              height: 7,
+                              borderRadius: '50%',
+                              backgroundColor: 'var(--red-9)',
+                              boxShadow: '0 0 0 1.5px var(--color-panel-solid)',
+                              pointerEvents: 'none',
+                            }}
+                          />
+                        )}
+                      </Box>
+                      <Text size="2" style={{ color: isRegenerateMode ? 'var(--slate-5)' : 'var(--slate-12)' }}>
+                        {isAgentChat
+                          ? t('chat.agentResourcesTooltip', { defaultValue: 'Connectors & actions' })
+                          : settings.queryMode === 'agent'
+                            ? t('chat.agentResourcesTooltip', { defaultValue: 'Connectors, collections & actions' })
+                            : t('chat.connectorsTooltip', { defaultValue: 'Connectors & collections' })}
+                      </Text>
+                    </Flex>
+                  )}
+
+                  {/* Model selector */}
+                  <Flex
+                    align="center"
+                    gap="2"
+                    data-testid="chat-model-selector"
+                    onClick={() => {
+                      setIsCompactMenuOpen(false);
+                      const next = !isModelPanelOpen;
+                      dismissExpansionPanels();
+                      setIsModelPanelOpen(next);
+                    }}
+                    style={{
+                      padding: 'var(--space-2) var(--space-2)',
+                      borderRadius: 'var(--radius-2)',
+                      cursor: 'pointer',
+                      backgroundColor: isModelPanelOpen ? 'var(--olive-3)' : 'transparent',
+                    }}
+                  >
+                    <MaterialIcon name="memory" size={ICON_SIZES.PRIMARY} color={activeIconColor} />
+                    <Text
+                      size="2"
+                      style={{
+                        color: 'var(--slate-12)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        maxWidth: reasoningEffortLabel ? '110px' : '160px',
+                        opacity: displayModel ? 1 : 0.7,
+                      }}
+                    >
+                      {displayModelLabel || t('chat.aiModelsTooltip', { defaultValue: 'AI model' })}
+                    </Text>
+                    {reasoningEffortLabel && (
+                      <Text
+                        size="2"
+                        style={{ color: 'var(--slate-10)', whiteSpace: 'nowrap', flexShrink: 0 }}
+                      >
+                        · {reasoningEffortLabel}
+                      </Text>
+                    )}
+                  </Flex>
+
+                  {/* Speech */}
+                  {isSpeechSupported && (
+                    <Flex
+                      align="center"
+                      gap="2"
+                      onClick={() => {
+                        if (isSpeechButtonDisabled) return;
+                        setIsCompactMenuOpen(false);
+                        toggleSpeech();
+                      }}
+                      style={{
+                        padding: 'var(--space-2) var(--space-2)',
+                        borderRadius: 'var(--radius-2)',
+                        cursor: isSpeechButtonDisabled ? 'default' : 'pointer',
+                        opacity: isSpeechButtonDisabled ? 0.5 : 1,
+                        backgroundColor: isListening ? 'var(--olive-3)' : 'transparent',
+                      }}
+                    >
+                      <MaterialIcon
+                        name={isListening ? 'mic' : 'mic_none'}
+                        size={ICON_SIZES.PRIMARY}
+                        color={isListening ? activeToggleColor : activeIconColor}
+                      />
+                      <Text size="2" style={{ color: 'var(--slate-12)' }}>
+                        {isListening ? t('chat.stopListening', { defaultValue: 'Stop listening' }) : t('chat.voiceInput', { defaultValue: 'Voice input' })}
+                      </Text>
+                    </Flex>
+                  )}
+                </Flex>
+              </Popover.Content>
+            </Popover.Root>
+          ) : (
+            /* Desktop: full controls */
+            <>
+
+              {/* Action buttons group */}
+              <Flex align="center" gap="1">
+                  
+                {!showResourcesControl ? null : !usesScopedPanel && settings.queryMode !== 'web-search' ? (
+                  <Tooltip
+                  content={
+                    settings.queryMode === 'agent'
+                      ? t('chat.agentResourcesTooltip', { defaultValue: 'Connectors, collections & actions' })
+                      : t('chat.connectorsTooltip')
+                  }
+                  side="top"
+                >
+                    <IconButton
+                      variant="ghost"
+                      color="gray"
+                      size="2"
+                      disabled={isRegenerateMode}
+                      onClick={() => {
+                        setIsCollectionsPanelOpen((prev) => {
+                          if (prev) setExpansionViewMode('inline');
+                          return !prev;
+                        });
+                        setIsPlusMenuOpen(false);
+                        setIsAgentStrategyPanelOpen(false);
+                        setIsModelPanelOpen(false);
+                        setShowUploadArea(false);
+                      }}
+                      style={{
+                        ...composerIconButtonStyle,
+                        cursor: isRegenerateMode ? 'default' : 'pointer',
+                        backgroundColor: isCollectionsPanelOpen ? 'var(--olive-3)' : undefined,
+                      }}
+                    >
+                      <Box style={{ position: 'relative', display: 'inline-flex' }}>
+                        <MaterialIcon name="apps" size={16} color={isRegenerateMode ? 'var(--slate-5)' : toolbarIconColor} />
+                        {showResourcesFilterBadge && !isCollectionsPanelOpen && (
+                          <Box
+                            aria-hidden
+                            style={{
+                              position: 'absolute',
+                              top: -1,
+                              right: -1,
+                              width: 7,
+                              height: 7,
+                              borderRadius: '50%',
+                              backgroundColor: 'var(--red-9)',
+                              boxShadow: '0 0 0 1.5px var(--color-panel-solid)',
+                              pointerEvents: 'none',
+                            }}
+                          />
+                        )}
+                      </Box>
+                    </IconButton>
+                  </Tooltip>
+                ) : usesScopedPanel ? (
+                  <Tooltip
+                    content={
+                      isAgentChat || settings.queryMode === 'agent'
+                        ? t('chat.agentResourcesTooltip')
+                        : t('chat.connectorsTooltip')
+                    }
+                    side="top"
+                  >
+                    <IconButton
+                      variant="ghost"
+                      color="gray"
+                      size="2"
+                      disabled={isRegenerateMode}
+                      onClick={() => {
+                        setIsAgentResourcesPanelOpen((prev) => {
+                          if (prev) setExpansionViewMode('inline');
+                          return !prev;
+                        });
+                        setIsPlusMenuOpen(false);
+                        setIsAgentStrategyPanelOpen(false);
+                        setIsCollectionsPanelOpen(false);
+                        setIsModelPanelOpen(false);
+                        setShowUploadArea(false);
+                      }}
+                      style={{
+                        ...composerIconButtonStyle,
+                        cursor: isRegenerateMode ? 'default' : 'pointer',
+                        backgroundColor: isAgentResourcesPanelOpen ? 'var(--olive-3)' : undefined,
+                      }}
+                    >
+                      <Box style={{ position: 'relative', display: 'inline-flex' }}>
+                        <MaterialIcon name="apps" size={16} color={isRegenerateMode ? 'var(--slate-5)' : toolbarIconColor} />
+                        {showResourcesFilterBadge && !isAgentResourcesPanelOpen && (
+                          <Box
+                            aria-hidden
+                            style={{
+                              position: 'absolute',
+                              top: -1,
+                              right: -1,
+                              width: 7,
+                              height: 7,
+                              borderRadius: '50%',
+                              backgroundColor: 'var(--red-9)',
+                              boxShadow: '0 0 0 1.5px var(--color-panel-solid)',
+                              pointerEvents: 'none',
+                            }}
+                          />
+                        )}
+                      </Box>
+                    </IconButton>
+                  </Tooltip>
+                ) : null}
+                {/* Model selector button — icon + current model name so the active model is always visible */}
+                <Tooltip content={t('chat.aiModelsTooltip')} side="top">
+                  <Flex
+                    asChild
+                    align="center"
+                    gap="1"
+                  >
+                  <button
+                    type="button"
+                    className="touch-hit"
+                    aria-label={t('chat.aiModelsTooltip')}
+                    data-testid="chat-model-selector"
+                    onClick={() => {
+                      const next = !isModelPanelOpen;
+                      dismissExpansionPanels();
+                      setIsModelPanelOpen(next);
+                    }}
+                    style={{
+                      height: 28,
+                      padding: '0 8px',
+                      borderRadius: 'var(--radius-2)',
+                      cursor: 'pointer',
+                      backgroundColor: isModelPanelOpen
+                        ? 'var(--accent-a3)'
+                        : isModelButtonHovered
+                          ? 'var(--olive-3)'
+                          : 'transparent',
+                      transition: 'background-color 0.12s ease',
+                      border: 'none',
+                      font: 'inherit',
+                      maxWidth: isMobile ? '32px' : (reasoningEffortLabel ? '220px' : '180px'),
+                      flexShrink: 0,
+                    }}
+                    onMouseEnter={() => setIsModelButtonHovered(true)}
+                    onMouseLeave={() => setIsModelButtonHovered(false)}
+                  >
+                    <MaterialIcon name="memory" size={14} color={toolbarIconColor} />
+                    {!isMobile && (
+                      <Flex align="center" gap="1" style={{ overflow: 'hidden' }}>
+                        <Text
+                          size="1"
+                          weight="regular"
+                          style={{
+                            color: toolbarIconColor,
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            maxWidth: reasoningEffortLabel ? '120px' : '140px',
+                            opacity: displayModel ? 1 : 0.7,
+                          }}
+                        >
+                          {displayModelLabel}
+                        </Text>
+                        {reasoningEffortLabel && (
+                          <Text
+                            size="1"
+                            weight="regular"
+                            style={{
+                              color: 'var(--neutral-a10)',
+                              whiteSpace: 'nowrap',
+                              flexShrink: 0,
+                            }}
+                          >
+                            · {reasoningEffortLabel}
+                          </Text>
+                        )}
+                      </Flex>
+                    )}
+                  </button>
+                  </Flex>
+                </Tooltip>
+                <SpeechInputButton
+                  tooltip={speechTooltip}
+                  ariaLabel={speechTooltip}
+                  isListening={isListening}
+                  isSupported={isSpeechSupported}
+                  isDisabled={isSpeechButtonDisabled}
+                  isRegenerateMode={isRegenerateMode}
+                  activeIconColor={toolbarIconColor}
+                  onToggle={toggleSpeech}
+                  style={{ '--accent-a3': modeColors.bg } as React.CSSProperties}
+                />
+              </Flex>
+            </>
+          )}
+
+          {/* Send / Stop button */}
+          {isStreaming ? (
+            <IconButton
+              variant="solid"
+              size="2"
+              onClick={handleStopStream}
+              disabled={isStopping}
+              aria-label={t('chat.stopGenerating', { defaultValue: 'Stop generating' })}
+              data-testid="chat-stop-button"
+              style={{
+                ...composerIconButtonStyle,
+                backgroundColor: 'var(--emerald-9)',
+                color: 'white',
+                opacity: isStopping ? 0.6 : 1,
+                cursor: isStopping ? 'default' : 'pointer',
+              }}
+            >
+              <StopMark />
+            </IconButton>
+          ) : (
+            <IconButton
+              variant="solid"
+              size="2"
+              onClick={(event) => {
+                if (!canSubmit) {
+                  event.preventDefault();
+                  return;
+                }
+                handleSubmit(event);
+              }}
+              aria-disabled={!canSubmit}
+              aria-label={t('chat.sendMessage')}
+              style={{
+                ...composerIconButtonStyle,
+                backgroundColor: canSubmit ? 'var(--emerald-9)' : 'var(--neutral-a3)',
+                color: canSubmit ? 'white' : 'var(--neutral-11)',
+                opacity: 1,
+                cursor: canSubmit ? 'pointer' : 'default',
+                transition: 'background-color 120ms ease',
+              }}
+            >
+              <MaterialIcon
+                name="arrow_upward"
+                size={16}
+                color={canSubmit ? 'white' : 'var(--neutral-11)'}
+              />
+            </IconButton>
+          )}
+        </Flex>
+      </Flex>
+
+      {/* Drop overlay — shown only when the dedicated upload area is NOT open.
+          When showUploadArea=true the inner drop box handles drag/drop directly. */}
+      {isPanelDragging && !showUploadArea && (
+        <Box
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 10,
+            borderRadius: 'inherit',
+            border: '2px dashed var(--accent-8)',
+            backgroundColor: 'var(--accent-2)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexDirection: 'column',
+            gap: 'var(--space-2)',
+            pointerEvents: 'none',
+          }}
+        >
+          <MaterialIcon name="file_upload" size={36} color="var(--accent-9)" />
+          <Text size="3" weight="medium" style={{ color: 'var(--accent-11)' }}>
+            {t('chat.dropFilesHere')}
+          </Text>
+          <Text size="1" style={{ color: 'var(--slate-11)' }}>
+            {t('chat.supportsFileTypes', { types: SUPPORTED_FILE_TYPES.join(', ') })}
+          </Text>
+          <Text size="1" style={{ color: 'var(--slate-10)' }}>
+            {uploadedFiles.length > 0
+              ? t('chat.uploadFilesRemaining', {
+                  remaining: CHAT_ATTACHMENT_MAX_FILES - uploadedFiles.length,
+                  total: CHAT_ATTACHMENT_MAX_FILES,
+                })
+              : t('chat.uploadFilesLimit', { count: CHAT_ATTACHMENT_MAX_FILES })}
+          </Text>
+        </Box>
+      )}
+    </Flex>
+    </Flex>
+
+    {/* Pasted-text attachment preview — composer chip click (pre-send) */}
+    {textPreviewFileId && (() => {
+      const previewFile = uploadedFiles.find((f) => f.id === textPreviewFileId);
+      if (!previewFile) return null;
+      return (
+        <TextPreviewDialog
+          key={previewFile.id}
+          open
+          onOpenChange={(open) => {
+            if (!open) setTextPreviewFileId(null);
+          }}
+          title={previewFile.pastePreview || previewFile.name}
+          loadText={() => previewFile.file.text()}
+          onShowInTextField={() => handleShowInTextField(previewFile)}
+        />
+      );
+    })()}
+
+    {/* Mobile query options sheet — meatball → sheet flow */}
+    <MobileQueryOptionsSheet
+      open={isMobileOptionsOpen}
+      onOpenChange={setIsMobileOptionsOpen}
+      isAgentChat={isAgentChat}
+      agentId={agentId}
+    />
+
+    {/* Mobile "+" menu sheet — attach files & Internal Search / Web Search toggles */}
+    <PlusMenuSheet
+      open={isMobilePlusMenuOpen}
+      onOpenChange={setIsMobilePlusMenuOpen}
+      onAttachFiles={toggleUploadArea}
+      {...plusMenuCapabilities}
+    />
+
+    {/* Overlay panel — collections (assistant) or agent resources (overlay mode) */}
+    <ChatInputOverlayPanel
+      open={
+        expansionViewMode === 'overlay' &&
+        (assistantCollectionsOverlayActive || (usesScopedPanel && isAgentResourcesPanelOpen))
+      }
+      onCollapse={() => setExpansionViewMode('inline')}
+    >
+      {usesScopedPanel ? (
+        <AgentScopedResourcesPanel
+          viewMode="overlay"
+          onToggleView={handleToggleView}
+          scope={isAgentChat ? 'agent' : 'project'}
+        />
+      ) : settings.queryMode === 'agent' ? (
+        <UniversalAgentResourcesPanel viewMode="overlay" onToggleView={handleToggleView} />
+      ) : hubFilterQueryMode ? (
+        <ConnectorsCollectionsPanel
+          selection={composerFilters}
+          onSelectionChange={variant === 'widget' ? setWidgetFilters : setFilters}
+          viewMode="overlay"
+          onToggleView={handleToggleView}
+        />
+      ) : null}
+    </ChatInputOverlayPanel>
+
+    </>
+  );
+}

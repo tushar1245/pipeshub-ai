@@ -1,0 +1,1149 @@
+"""
+Token Refresh Service
+Handles automatic token refresh for OAuth connectors
+"""
+
+import asyncio
+import logging
+import weakref
+from datetime import datetime, timedelta
+from typing import Optional
+
+from app.core.org_context import spawn_detached
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.arangodb import CollectionNames
+from app.connectors.core.constants import (
+    AuthFieldKeys,
+    ConnectorRequestKeys,
+    ConnectorStateKeys,
+    OAuthConfigKeys,
+)
+from app.connectors.core.base.token_service.oauth_service import (
+    OAuthToken,
+    RefreshTokenInvalidError,
+)
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.messaging.interface.producer import IMessagingProducer
+from app.utils.oauth_config import (
+    carry_oauth_url_settings,
+    get_oauth_config,
+    pin_oauth_urls,
+)
+from app.utils.request_context import (
+    new_system_root,
+    reset_context,
+    set_context,
+)
+from app.utils.time_conversion import get_epoch_timestamp_in_ms
+
+# Consecutive rejections before deactivating; guards against provider blips
+MAX_REFRESH_TOKEN_INVALID_FAILURES = 3
+
+CREDENTIAL_SAVE_ATTEMPTS = 3
+CREDENTIAL_SAVE_RETRY_DELAY_SECONDS = 0.5
+
+
+class CredentialSaveError(Exception):
+    """A refreshed token could not be stored. With rotating refresh tokens the old
+    one is already spent, so the refresh must not be reported as a success."""
+
+# Refreshes for one connector must not run concurrently. Providers that rotate
+# refresh tokens (GitLab among them) invalidate the old token as soon as the
+# first refresh lands, so parallel callers holding the same token are guaranteed
+# to be rejected — and those rejections used to be counted as consecutive
+# failures and deactivate a perfectly healthy connector.
+#
+# Keyed by event loop as well as connector: an asyncio.Lock binds to the loop it
+# is first awaited on, so a module-level lock reused across loops raises.
+_refresh_locks: "weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def connector_refresh_lock(connector_id: str) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), connector_id)
+    lock = _refresh_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _refresh_locks[key] = lock
+    return lock
+
+
+class TokenRefreshService:
+    """Service for managing token refresh across all connectors"""
+
+    def __init__(
+        self,
+        configuration_service: ConfigurationService,
+        graph_provider: IGraphDBProvider,
+        messaging_producer: Optional[IMessagingProducer] = None,
+    ) -> None:
+        self.configuration_service = configuration_service
+        self.graph_provider = graph_provider
+        self._messaging_producer = messaging_producer
+        self.logger = logging.getLogger("connector_service")
+        self._refresh_tasks: dict[str, asyncio.Task] = {}
+        self._running = False
+        self._refresh_lock = asyncio.Lock()  # Prevent concurrent refresh operations
+        self._processing_connectors: set = set()  # Track connectors currently being processed to prevent recursion
+        self._invalid_refresh_failures: dict[str, int] = {}  # Consecutive refresh-token rejections per connector
+        # Per-connector lock: Atlassian-style rotating RTs are single-use.
+        # refresh_now / delayed / immediate must not POST the same RT twice.
+        self._connector_refresh_locks: dict[str, asyncio.Lock] = {}
+
+    def set_messaging_producer(self, producer: IMessagingProducer) -> None:
+        """Attach the messaging producer; it starts after this service at app startup."""
+        self._messaging_producer = producer
+
+    async def start(self, wait_for_initial_refresh: bool = True) -> None:
+        """Start the token refresh service.
+
+        Args:
+            wait_for_initial_refresh: When True (default), await the initial
+                scan of all authenticated connectors before returning. When
+                False, the initial scan is scheduled as a background task so
+                the caller (typically app startup) is not blocked on per-
+                connector OAuth provider round-trips.
+        """
+        if self._running:
+            return
+
+        self._running = True
+        self.logger.info("Starting token refresh service")
+
+        # Start refresh tasks for all active connectors
+        if wait_for_initial_refresh:
+            await self._refresh_all_tokens()
+        else:
+            spawn_detached(self._refresh_all_tokens())
+
+        # Start periodic refresh check
+        spawn_detached(self._periodic_refresh_check())
+
+    async def stop(self) -> None:
+        """Stop the token refresh service"""
+        self._running = False
+
+        # Cancel all refresh tasks
+        for task in self._refresh_tasks.values():
+            task.cancel()
+
+        self._refresh_tasks.clear()
+        self.logger.info("Token refresh service stopped")
+
+    async def _refresh_all_tokens(self) -> None:
+        """Refresh tokens for all authenticated connectors (regardless of active status)"""
+        # Seed a trace root so every refresh-cycle log line is attributable.
+        token = set_context(new_system_root())
+        try:
+            # Prevent concurrent execution
+            async with self._refresh_lock:
+                await self._refresh_all_tokens_internal()
+        finally:
+            reset_context(token)
+
+    async def _is_connector_authenticated(self, connector_id: str) -> bool:
+        """
+        Check if connector has valid OAuth credentials stored.
+
+        Returns:
+            True if connector has refresh_token, False otherwise
+        """
+        try:
+            config_key = f"/services/connectors/{connector_id}/config"
+            config = await self.configuration_service.get_config(config_key)
+
+            if not config:
+                return False
+
+            credentials = config.get('credentials')
+            if not credentials:
+                return False
+
+            return bool(credentials.get('refresh_token'))
+
+        except Exception as e:
+            self.logger.debug(f"Could not check credentials for connector {connector_id}: {e}")
+            return False
+
+    _OAUTH_AUTH_TYPES = ('OAUTH', 'OAUTH_ADMIN_CONSENT')
+
+    def _is_oauth_connector(self, connector: dict[str, any]) -> bool:
+        """Check if connector uses OAuth authentication."""
+        auth_type = connector.get('authType', '')
+        return auth_type in self._OAUTH_AUTH_TYPES
+
+    async def _filter_authenticated_oauth_connectors(
+        self,
+        connectors: list
+    ) -> list:
+        """
+        Filter connectors to only include authenticated OAuth connectors.
+
+        Args:
+            connectors: List of all connectors from database
+
+        Returns:
+            List of authenticated OAuth connectors
+        """
+        authenticated_connectors = []
+
+        for conn in connectors:
+            # Only process OAuth connectors
+            if not self._is_oauth_connector(conn):
+                continue
+
+            # Explicit False only — legacy docs may lack the flag
+            if conn.get(ConnectorStateKeys.IS_AUTHENTICATED) is False:
+                continue
+
+            connector_id = conn.get('_key')
+            if not connector_id:
+                continue
+
+            # Check if connector has credentials
+            if await self._is_connector_authenticated(connector_id):
+                authenticated_connectors.append(conn)
+                self.logger.debug(f"Found authenticated OAuth connector: {connector_id}")
+
+        return authenticated_connectors
+
+    async def _process_connectors_for_refresh(
+        self,
+        authenticated_connectors: list
+    ) -> None:
+        """
+        Process each authenticated connector for token refresh.
+        Deduplicates by connector_id and handles errors gracefully.
+
+        Args:
+            authenticated_connectors: List of authenticated OAuth connectors
+        """
+        processed_connectors = set()
+
+        for connector in authenticated_connectors:
+            connector_id = connector.get('_key')
+
+            if not connector_id:
+                self.logger.debug("Skipping connector with no ID")
+                continue
+
+            if connector_id in processed_connectors:
+                self.logger.debug(f"Skipping duplicate connector: {connector_id}")
+                continue
+
+            processed_connectors.add(connector_id)
+            connector_type = connector.get('type', '')
+
+            # Process this connector (will schedule if not expired, or refresh if expired)
+            try:
+                await self._refresh_connector_token(connector_id, connector_type)
+            except Exception as e:
+                self.logger.error(f"Failed to process connector {connector_id}: {e}", exc_info=False)
+
+    async def _refresh_all_tokens_internal(self) -> None:
+        """Internal method to refresh tokens (called with lock held)"""
+        try:
+            # 1. Get the OAuth connectors from database. Only they hold a token; a
+            # tenant can have thousands of collection Apps, and loading every App
+            # here would stall this service's event loop on each pass.
+            connectors = []
+            for auth_type in self._OAUTH_AUTH_TYPES:
+                connectors.extend(await self.graph_provider.get_nodes_by_filters(
+                    CollectionNames.APPS.value, {"authType": auth_type},
+                ))
+
+            # 2. Filter for authenticated OAuth connectors
+            authenticated_connectors = await self._filter_authenticated_oauth_connectors(connectors)
+
+            self.logger.debug(f"Found {len(authenticated_connectors)} authenticated OAuth connectors to refresh")
+
+            # 3. Process each connector for refresh
+            await self._process_connectors_for_refresh(authenticated_connectors)
+
+        except Exception as e:
+            self.logger.error(f"❌ Error refreshing tokens: {e}", exc_info=True)
+
+    # ============================================================================
+    # Helper Methods for OAuth Config Building
+    # ============================================================================
+
+    async def _fetch_shared_oauth_config(
+        self,
+        oauth_config_id: str,
+        connector_type: str
+    ) -> dict[str, any]:
+        """
+        Fetch shared OAuth config from ETCD.
+
+        Returns:
+            OAuth config dict if found, empty dict otherwise
+        """
+        try:
+            oauth_config_path = f"/services/oauth/{connector_type.lower().replace(' ', '')}"
+            oauth_configs = await self.configuration_service.get_config(oauth_config_path)
+
+            if not oauth_configs or not isinstance(oauth_configs, list):
+                self.logger.warning(f"No OAuth configs found for connector type {connector_type}")
+                return {}
+
+            # Find the OAuth config by ID
+            for oauth_cfg in oauth_configs:
+                if oauth_cfg.get("_id") == oauth_config_id:
+                    return oauth_cfg
+
+            self.logger.warning("Referenced OAuth config not found in the list for connector type %s", connector_type)
+            return {}
+
+        except Exception as e:
+            self.logger.warning(
+                "Error fetching shared OAuth config for connector type %s: %s",
+                connector_type,
+                type(e).__name__,
+            )
+            return {}
+
+    def _enrich_from_registry(
+        self,
+        oauth_flow_config: dict[str, any],
+        connector_type: str
+    ) -> None:
+        """
+        Enrich OAuth config with missing infrastructure fields from registry.
+        Modifies oauth_flow_config in-place.
+        """
+        needs_enrichment = (
+            not oauth_flow_config.get(AuthFieldKeys.TOKEN_URL)
+            or not oauth_flow_config.get(AuthFieldKeys.AUTHORIZE_URL)
+            or OAuthConfigKeys.TOKEN_ACCESS_TYPE not in oauth_flow_config
+            or OAuthConfigKeys.ADDITIONAL_PARAMS not in oauth_flow_config
+            or OAuthConfigKeys.SCOPE_PARAMETER_NAME not in oauth_flow_config
+            or OAuthConfigKeys.TOKEN_RESPONSE_PATH not in oauth_flow_config
+        )
+        if not needs_enrichment:
+            return
+
+        try:
+            from app.connectors.core.registry.oauth_config_registry import (
+                get_oauth_config_registry,
+            )
+            oauth_registry = get_oauth_config_registry()
+            registry_oauth_config = oauth_registry.get_config(connector_type)
+
+            if not registry_oauth_config:
+                return
+
+            if not oauth_flow_config.get(AuthFieldKeys.TOKEN_URL) and registry_oauth_config.token_url:
+                oauth_flow_config[AuthFieldKeys.TOKEN_URL] = registry_oauth_config.token_url
+            if not oauth_flow_config.get(AuthFieldKeys.AUTHORIZE_URL) and registry_oauth_config.authorize_url:
+                oauth_flow_config[AuthFieldKeys.AUTHORIZE_URL] = registry_oauth_config.authorize_url
+            if not oauth_flow_config.get(AuthFieldKeys.REDIRECT_URI) and registry_oauth_config.redirect_uri:
+                oauth_flow_config[AuthFieldKeys.REDIRECT_URI] = registry_oauth_config.redirect_uri
+            if (
+                OAuthConfigKeys.TOKEN_ACCESS_TYPE not in oauth_flow_config
+                and registry_oauth_config.token_access_type
+            ):
+                oauth_flow_config[OAuthConfigKeys.TOKEN_ACCESS_TYPE] = (registry_oauth_config.token_access_type)
+
+            if (
+                OAuthConfigKeys.ADDITIONAL_PARAMS not in oauth_flow_config
+                and registry_oauth_config.additional_params
+            ):
+                oauth_flow_config[OAuthConfigKeys.ADDITIONAL_PARAMS] = (registry_oauth_config.additional_params)
+
+            if OAuthConfigKeys.SCOPE_PARAMETER_NAME not in oauth_flow_config and registry_oauth_config.scope_parameter_name and registry_oauth_config.scope_parameter_name != "scope":
+                oauth_flow_config[OAuthConfigKeys.SCOPE_PARAMETER_NAME] = registry_oauth_config.scope_parameter_name
+
+            if OAuthConfigKeys.TOKEN_RESPONSE_PATH not in oauth_flow_config and registry_oauth_config.token_response_path:
+                oauth_flow_config[OAuthConfigKeys.TOKEN_RESPONSE_PATH] = registry_oauth_config.token_response_path
+
+            self.logger.debug(f"Enriched OAuth config from registry for {connector_type}")
+
+        except Exception as e:
+            self.logger.debug(f"Could not enrich OAuth config from registry: {e}")
+
+    def _extract_scopes(
+        self,
+        shared_oauth_config: dict[str, any],
+        connector_scope: str
+    ) -> list:
+        """
+        Extract appropriate scopes based on connector scope.
+
+        Args:
+            shared_oauth_config: OAuth config with scopes
+            connector_scope: Connector scope (personal/team/agent)
+
+        Returns:
+            List of scope strings
+        """
+        scopes_data = shared_oauth_config.get(OAuthConfigKeys.SCOPES, {})
+
+        if not isinstance(scopes_data, dict):
+            return scopes_data if isinstance(scopes_data, list) else []
+
+        # Map connector scope to scope key
+        scope_key_map = {
+            "personal": "personal_sync",
+            "team": "team_sync",
+            "agent": "agent"
+        }
+        scope_key = scope_key_map.get(connector_scope.lower(), "team_sync")
+
+        # Get scopes for the specific connector scope
+        scope_list = scopes_data.get(scope_key, [])
+        return scope_list if isinstance(scope_list, list) else []
+
+    def _extract_credentials_from_oauth_config(
+        self,
+        shared_oauth_config: dict[str, any]
+    ) -> tuple[str, str]:
+        """
+        Extract clientId and clientSecret from OAuth config.
+
+        Returns:
+            Tuple of (client_id, client_secret), both may be None
+        """
+        oauth_config_data = shared_oauth_config.get(OAuthConfigKeys.CONFIG, {})
+        if not oauth_config_data:
+            return None, None
+
+        client_id = oauth_config_data.get(AuthFieldKeys.CLIENT_ID) or oauth_config_data.get(AuthFieldKeys.CLIENT_ID_ALT)
+        client_secret = oauth_config_data.get(AuthFieldKeys.CLIENT_SECRET) or oauth_config_data.get(AuthFieldKeys.CLIENT_SECRET_ALT)
+
+        return client_id, client_secret
+
+    def _build_oauth_flow_from_shared_config(
+        self,
+        shared_oauth_config: dict[str, any],
+        connector_scope: str,
+        connector_type: str
+    ) -> dict[str, any]:
+        """
+        Build OAuth flow config from shared OAuth config.
+
+        Returns:
+            OAuth flow config dict with all necessary fields
+        """
+        # Prefer user-provided URLs from config (e.g. ServiceNow instance URLs); fall back to top-level
+        config_data = shared_oauth_config.get(OAuthConfigKeys.CONFIG) or {}
+        oauth_flow_config = {
+            AuthFieldKeys.AUTHORIZE_URL: config_data.get(AuthFieldKeys.AUTHORIZE_URL)
+            or shared_oauth_config.get(AuthFieldKeys.AUTHORIZE_URL, ""),
+            AuthFieldKeys.TOKEN_URL: config_data.get(AuthFieldKeys.TOKEN_URL)
+            or shared_oauth_config.get(AuthFieldKeys.TOKEN_URL, ""),
+            AuthFieldKeys.REDIRECT_URI: shared_oauth_config.get(AuthFieldKeys.REDIRECT_URI, ""),
+        }
+
+        # Self-managed connectors (GitLab EE, ServiceNow, etc.) keep the host in
+        # config.instanceUrl. Propagate it here so get_oauth_config() can
+        # redirect SaaS-default OAuth URLs to the user's instance even for
+        # legacy connector instances that don't carry instanceUrl in their
+        # auth_config.
+        if config_data.get(AuthFieldKeys.INSTANCE_URL):
+            oauth_flow_config[AuthFieldKeys.INSTANCE_URL] = config_data[AuthFieldKeys.INSTANCE_URL]
+        # A Salesforce refresh must go to the login host that issued the token.
+        if config_data.get(AuthFieldKeys.LOGIN_URL):
+            oauth_flow_config[AuthFieldKeys.LOGIN_URL] = config_data[AuthFieldKeys.LOGIN_URL]
+        carry_oauth_url_settings(connector_type, config_data, oauth_flow_config)
+
+        # Add optional infrastructure fields if present
+        if OAuthConfigKeys.TOKEN_ACCESS_TYPE in shared_oauth_config:
+            oauth_flow_config[OAuthConfigKeys.TOKEN_ACCESS_TYPE] = shared_oauth_config[OAuthConfigKeys.TOKEN_ACCESS_TYPE]
+        if OAuthConfigKeys.ADDITIONAL_PARAMS in shared_oauth_config:
+            oauth_flow_config[OAuthConfigKeys.ADDITIONAL_PARAMS] = shared_oauth_config[OAuthConfigKeys.ADDITIONAL_PARAMS]
+
+        # Enrich from registry if fields are missing
+        self._enrich_from_registry(oauth_flow_config, connector_type)
+
+        # Extract and add scopes
+        oauth_flow_config[OAuthConfigKeys.SCOPES] = self._extract_scopes(shared_oauth_config, connector_scope)
+
+        return oauth_flow_config
+
+    def _build_oauth_flow_from_auth_config(
+        self,
+        auth_config: dict[str, any],
+        base_config: dict[str, any]
+    ) -> dict[str, any]:
+        """
+        Build/enrich OAuth flow config from auth config (fallback).
+
+        Args:
+            auth_config: Auth configuration
+            base_config: Base OAuth flow config (may be empty or partially filled)
+
+        Returns:
+            Enriched OAuth flow config
+        """
+        # Derive authorize/token URLs from instanceUrl when explicit URLs are absent.
+        # This supports self-managed connectors (e.g. GitLab EE) where OAuth endpoints
+        # live on the instance host rather than a fixed SaaS domain.
+        instance_url = auth_config.get("instanceUrl", "").rstrip("/")
+
+        # Fill in missing fields from auth config
+        if not base_config.get(AuthFieldKeys.AUTHORIZE_URL):
+            base_config[AuthFieldKeys.AUTHORIZE_URL] = (
+                auth_config.get(AuthFieldKeys.AUTHORIZE_URL)
+                or (f"{instance_url}/oauth/authorize" if instance_url else "")
+            )
+        if not base_config.get(AuthFieldKeys.TOKEN_URL):
+            base_config[AuthFieldKeys.TOKEN_URL] = (
+                auth_config.get(AuthFieldKeys.TOKEN_URL)
+                or (f"{instance_url}/oauth/token" if instance_url else "")
+            )
+        if not base_config.get(AuthFieldKeys.REDIRECT_URI):
+            base_config[AuthFieldKeys.REDIRECT_URI] = auth_config.get(AuthFieldKeys.REDIRECT_URI, "")
+        if not base_config.get(OAuthConfigKeys.SCOPES):
+            base_config[OAuthConfigKeys.SCOPES] = auth_config.get(OAuthConfigKeys.SCOPES, [])
+        if not base_config.get(AuthFieldKeys.LOGIN_URL) and auth_config.get(AuthFieldKeys.LOGIN_URL):
+            base_config[AuthFieldKeys.LOGIN_URL] = auth_config[AuthFieldKeys.LOGIN_URL]
+
+        return base_config
+
+    async def _build_complete_oauth_config(
+        self,
+        connector_id: str,
+        connector_type: str,
+        auth_config: dict[str, any]
+    ) -> dict[str, any]:
+        """
+        Build complete OAuth flow configuration from all available sources.
+        Tries shared OAuth config first, falls back to auth config.
+
+        Args:
+            connector_id: Connector ID (for logging)
+            connector_type: Connector type
+            auth_config: Auth configuration from connector
+
+        Returns:
+            Complete OAuth flow config with clientId, clientSecret, and all infrastructure fields
+
+        Raises:
+            ValueError: If credentials cannot be found in any source
+        """
+        oauth_config_id = auth_config.get(OAuthConfigKeys.OAUTH_CONFIG_ID)
+        connector_scope = auth_config.get(ConnectorRequestKeys.CONNECTOR_SCOPE, "team")
+
+        # Try to use shared OAuth config first
+        if oauth_config_id:
+            shared_oauth_config = await self._fetch_shared_oauth_config(oauth_config_id, connector_type)
+
+            if shared_oauth_config:
+                # Build config from shared OAuth config
+                oauth_flow_config = self._build_oauth_flow_from_shared_config(
+                    shared_oauth_config,
+                    connector_scope,
+                    connector_type
+                )
+
+                # Extract credentials
+                client_id, client_secret = self._extract_credentials_from_oauth_config(shared_oauth_config)
+
+                if client_id and client_secret:
+                    oauth_flow_config[AuthFieldKeys.CLIENT_ID] = client_id
+                    oauth_flow_config[AuthFieldKeys.CLIENT_SECRET] = client_secret
+                    self.logger.info(f"Using shared OAuth config for connector {connector_id}")
+                    return oauth_flow_config
+
+                self.logger.warning("OAuth config found but missing credentials, falling back to auth config")
+
+        # Fallback to auth config
+        client_id = auth_config.get(AuthFieldKeys.CLIENT_ID)
+        client_secret = auth_config.get(AuthFieldKeys.CLIENT_SECRET)
+
+        if not client_id or not client_secret:
+            raise ValueError(
+                f"No OAuth credentials found for connector {connector_id} "
+                f"in OAuth config or auth config"
+            )
+
+        self.logger.info(f"Using credentials from auth config for connector {connector_id}")
+
+        # Build config from auth config
+        oauth_flow_config = self._build_oauth_flow_from_auth_config(
+            auth_config,
+            {}  # Start with empty config
+        )
+        oauth_flow_config[AuthFieldKeys.CLIENT_ID] = client_id
+        oauth_flow_config[AuthFieldKeys.CLIENT_SECRET] = client_secret
+
+        return oauth_flow_config
+
+    def _lock_for_connector(self, connector_id: str) -> asyncio.Lock:
+        lock = self._connector_refresh_locks.get(connector_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._connector_refresh_locks[connector_id] = lock
+        return lock
+
+    def _adopt_already_rotated_token(
+        self, config: dict, requested_refresh_token: str
+    ) -> tuple[Optional[OAuthToken], str]:
+        """If store already rotated the RT, reuse the live token instead of POSTing the consumed one."""
+        credentials = config.get("credentials") or {}
+        stored_rt = credentials.get("refresh_token") or requested_refresh_token
+        if stored_rt != requested_refresh_token and credentials.get("access_token"):
+            live = OAuthToken.from_dict(credentials)
+            if not live.is_expired:
+                return live, stored_rt
+        return None, stored_rt
+
+    # ============================================================================
+    # Core Token Refresh Logic
+    # ============================================================================
+
+    async def refresh_now(
+        self,
+        connector_id: str,
+        connector_type: str,
+        refresh_token: str,
+        org_id: str | None = None,
+    ) -> OAuthToken:
+        """Public entry point for an on-demand OAuth token refresh.
+
+        ``org_id`` Optional
+        """
+        try:
+            return await self._perform_token_refresh(
+                connector_id, connector_type, refresh_token
+            )
+        except RefreshTokenInvalidError as e:
+            await self._handle_refresh_token_invalid(connector_id, e, refresh_token)
+            raise
+
+    async def _stored_refresh_token(self, connector_id: str) -> Optional[str]:
+        """The refresh token currently persisted for this connector, if any."""
+        try:
+            config = await self.configuration_service.get_config(
+                f"/services/connectors/{connector_id}/config"
+            )
+            return ((config or {}).get('credentials') or {}).get('refresh_token')
+        except Exception:
+            # Unknown beats wrong here: returning None makes the caller count the
+            # rejection, which is the existing behaviour.
+            return None
+
+    async def _handle_refresh_token_invalid(
+        self,
+        connector_id: str,
+        error: Exception,
+        refresh_token: Optional[str] = None,
+    ) -> None:
+        """Deactivate the connector after MAX_REFRESH_TOKEN_INVALID_FAILURES consecutive rejections."""
+        if refresh_token is not None:
+            stored = await self._stored_refresh_token(connector_id)
+            if stored and stored != refresh_token:
+                # The token we were rejected for has already been rotated by a
+                # concurrent refresh, so this is a lost race rather than a dead
+                # credential. Counting it would deactivate a working connector.
+                self.logger.debug(
+                    f"Ignoring superseded refresh-token rejection for connector "
+                    f"{connector_id}"
+                )
+                return
+
+        failures = self._invalid_refresh_failures.get(connector_id, 0) + 1
+        self._invalid_refresh_failures[connector_id] = failures
+
+        if failures < MAX_REFRESH_TOKEN_INVALID_FAILURES:
+            self.logger.error(
+                f"Refresh token rejected for connector {connector_id} "
+                f"(failure {failures}/{MAX_REFRESH_TOKEN_INVALID_FAILURES}): {error}",
+                exc_info=False,
+            )
+            return
+
+        self.logger.error(
+            f"Refresh token rejected for connector {connector_id} "
+            f"{failures} consecutive times, deactivating: {error}",
+            exc_info=False,
+        )
+        self._invalid_refresh_failures.pop(connector_id, None)
+        await self._mark_connector_unauthenticated(connector_id)
+
+    async def _mark_connector_unauthenticated(self, connector_id: str) -> None:
+        """Flip the connector to unauthenticated so refresh scans stop until re-auth."""
+        # Cancelling our own task here would abort the state update below.
+        existing_task = self._refresh_tasks.get(connector_id)
+        if existing_task is not None and existing_task is not asyncio.current_task():
+            self._cancel_existing_refresh_task(connector_id)
+
+        updates = {
+            ConnectorStateKeys.IS_AUTHENTICATED: False,
+            ConnectorStateKeys.UPDATED_AT_TIMESTAMP: get_epoch_timestamp_in_ms(),
+        }
+
+        # The appDisabled consumer owns isActive and sync-stop; write directly if it can't be reached
+        if not await self._send_app_disabled_event(connector_id):
+            updates[ConnectorStateKeys.IS_ACTIVE] = False
+
+        try:
+            updated = await self.graph_provider.update_node(
+                connector_id,
+                CollectionNames.APPS.value,
+                updates,
+            )
+            if updated:
+                self.logger.warning(
+                    f"Marked connector {connector_id} as unauthenticated — "
+                    f"refresh token is invalid, re-authentication required"
+                )
+            else:
+                self.logger.error(f"Failed to mark connector {connector_id} as unauthenticated")
+        except Exception as e:
+            self.logger.error(
+                f"Error marking connector {connector_id} as unauthenticated: {e}", exc_info=False
+            )
+
+    async def _send_app_disabled_event(self, connector_id: str) -> bool:
+        """Publish the platform appDisabled event for this connector instance."""
+        producer = self._messaging_producer
+        if producer is None:
+            return False
+
+        try:
+            app_doc = await self.graph_provider.get_document(connector_id, CollectionNames.APPS.value)
+            if not app_doc:
+                return False
+
+            org_id = app_doc.get("orgId")
+            if not org_id:
+                edges = await self.graph_provider.get_edges_to_node(
+                    f"{CollectionNames.APPS.value}/{connector_id}",
+                    CollectionNames.ORG_APP_RELATION.value,
+                )
+                if edges:
+                    from_val = edges[0].get("_from")
+                    if from_val: 
+                        org_id = from_val.split("/")[-1]
+
+
+            message = {
+                "eventType": "appDisabled",
+                "payload": {
+                    "orgId": org_id,
+                    "appGroup": app_doc.get("appGroup"),
+                    "apps": [str(app_doc.get("type", "")).replace(" ", "").lower()],
+                    "connectorId": connector_id,
+                    "scope": app_doc.get("scope"),
+                },
+                "timestamp": get_epoch_timestamp_in_ms(),
+            }
+            await producer.send_message(topic="entity-events", message=message)
+            self.logger.info(
+                f"Sent appDisabled event for connector {connector_id} (refresh token invalid)"
+            )
+            return True
+        except Exception as e:
+            self.logger.error(
+                f"Failed to send appDisabled event for connector {connector_id}: {e}", exc_info=False
+            )
+            return False
+
+    async def _perform_token_refresh(
+        self,
+        connector_id: str,
+        connector_type: str,
+        refresh_token: str
+    ) -> OAuthToken:
+        """
+        Core token refresh logic - performs the actual OAuth token refresh.
+        This is the single source of truth for token refresh operations.
+
+        Args:
+            connector_id: The connector ID
+            connector_type: The connector type
+            refresh_token: The refresh token to use
+
+        Returns:
+            The new OAuthToken after refresh
+        Raises:
+            ValueError: If config or credentials are missing
+            Exception: If refresh fails
+        """
+        async with connector_refresh_lock(connector_id):
+            return await self._perform_token_refresh_locked(
+                connector_id, connector_type, refresh_token
+            )
+
+    async def _perform_token_refresh_locked(
+        self,
+        connector_id: str,
+        connector_type: str,
+        refresh_token: str
+    ) -> OAuthToken:
+        """Refresh body, serialised per connector by ``_perform_token_refresh``."""
+        config_key = f"/services/connectors/{connector_id}/config"
+        config = await self.configuration_service.get_config(config_key)
+        if not config:
+            raise ValueError(f"No config found for connector {connector_id}")
+
+        adopted, refresh_token = self._adopt_already_rotated_token(config, refresh_token)
+        if adopted is not None:
+            self.logger.info(
+                f"Using already-rotated token for connector {connector_id}, skipping refresh"
+            )
+            self._invalid_refresh_failures.pop(connector_id, None)
+            return adopted
+
+        auth_config = config.get('auth', {})
+        oauth_flow_config = await self._build_complete_oauth_config(
+            connector_id,
+            connector_type,
+            auth_config
+        )
+        carry_oauth_url_settings(connector_type, auth_config, oauth_flow_config)
+        pin_oauth_urls(connector_type, oauth_flow_config)
+        oauth_config = get_oauth_config(oauth_flow_config)
+
+        from app.connectors.core.base.token_service.oauth_service import OAuthProvider
+        oauth_provider = OAuthProvider(
+            config=oauth_config,
+            configuration_service=self.configuration_service,
+            credentials_path=config_key
+        )
+
+        try:
+            self.logger.info(f"🔄 Refreshing token for connector {connector_id}")
+            new_token = await oauth_provider.refresh_access_token(refresh_token)
+            self.logger.info(f"✅ Successfully refreshed token for connector {connector_id}")
+
+            await self._persist_refreshed_credentials(connector_id, config_key, config, new_token)
+
+            self._invalid_refresh_failures.pop(connector_id, None)
+            return new_token
+        finally:
+            await oauth_provider.close()
+
+    async def _persist_refreshed_credentials(
+        self,
+        connector_id: str,
+        config_key: str,
+        fallback_config: dict,
+        new_token: OAuthToken,
+    ) -> None:
+        """Save the new access and refresh token together, retrying a failed write.
+
+        Raises ``CredentialSaveError`` when nothing was stored.
+        """
+        for attempt in range(1, CREDENTIAL_SAVE_ATTEMPTS + 1):
+            latest = await self.configuration_service.get_config(config_key) or fallback_config
+            if self._credentials_match(latest.get('credentials'), new_token):
+                self.logger.info(f"💾 Refreshed credentials already stored for connector {connector_id}")
+                return
+            # A copy: get_config hands back the cached dict, and a failed write must not change it.
+            updated = {**latest, 'credentials': new_token.to_dict()}
+            if await self.configuration_service.set_config(config_key, updated) is not False:
+                self.logger.info(f"💾 Updated stored credentials for connector {connector_id}")
+                return
+            self.logger.warning(
+                f"Saving refreshed credentials for connector {connector_id} failed "
+                f"(attempt {attempt}/{CREDENTIAL_SAVE_ATTEMPTS})"
+            )
+            if attempt < CREDENTIAL_SAVE_ATTEMPTS:
+                await asyncio.sleep(CREDENTIAL_SAVE_RETRY_DELAY_SECONDS * attempt)
+        raise CredentialSaveError(
+            f"Could not save refreshed credentials for connector {connector_id} after "
+            f"{CREDENTIAL_SAVE_ATTEMPTS} attempts. The old refresh token may already be spent, "
+            f"so the connector may need to be reconnected."
+        )
+
+    @staticmethod
+    def _credentials_match(stored: dict | None, new_token: OAuthToken) -> bool:
+        return (
+            isinstance(stored, dict)
+            and stored.get('access_token') == new_token.access_token
+            and stored.get('refresh_token') == new_token.refresh_token
+        )
+
+    def _is_connector_being_processed(self, connector_id: str) -> bool:
+        """Check if connector is currently being processed."""
+        return connector_id in self._processing_connectors
+
+    def _mark_connector_processing(self, connector_id: str) -> None:
+        """Mark connector as being processed."""
+        self._processing_connectors.add(connector_id)
+
+    def _unmark_connector_processing(self, connector_id: str) -> None:
+        """Remove connector from processing set."""
+        self._processing_connectors.discard(connector_id)
+
+    async def _load_token_from_config(self, connector_id: str) -> tuple[OAuthToken, bool]:
+        """
+        Load OAuth token from connector config.
+
+        Returns:
+            Tuple of (token, has_credentials)
+            - token: OAuthToken if found, None otherwise
+            - has_credentials: True if connector has valid credentials
+        """
+        config_key = f"/services/connectors/{connector_id}/config"
+        config = await self.configuration_service.get_config(config_key)
+
+        if not config:
+            return None, False
+
+        credentials = config.get('credentials')
+        if not credentials or not credentials.get('refresh_token'):
+            return None, False
+
+        token = OAuthToken.from_dict(credentials)
+        return token, True
+
+    async def _handle_token_refresh_workflow(
+        self,
+        connector_id: str,
+        connector_type: str,
+        token: OAuthToken
+    ) -> None:
+        """
+        Handle the token refresh workflow based on token expiry status.
+
+        Args:
+            connector_id: Connector ID
+            connector_type: Connector type
+            token: Current OAuth token
+        """
+        # Log token status
+        expiry_time = None
+        if token.expires_in:
+            expiry_time = token.created_at + timedelta(seconds=token.expires_in)
+
+        self.logger.debug(
+            f"Token for connector {connector_id}: "
+            f"expires_in={token.expires_in}s, "
+            f"expiry_time={expiry_time}, "
+            f"is_expired={token.is_expired}"
+        )
+
+        # If token not expired, just schedule refresh
+        if not token.is_expired:
+            self.logger.debug(f"✅ Token not expired for connector {connector_id}, scheduling refresh")
+            await self.schedule_token_refresh(connector_id, connector_type, token)
+            return
+
+        # Token is expired - refresh it now
+        self.logger.debug(f"🔄 Token expired for connector {connector_id}, refreshing now")
+        new_token = await self._perform_token_refresh(connector_id, connector_type, token.refresh_token)
+
+        # Schedule next refresh for the new token
+        await self.schedule_token_refresh(connector_id, connector_type, new_token)
+
+    async def _refresh_connector_token(self, connector_id: str, connector_type: str) -> None:
+        """
+        Check token status and refresh if needed, then schedule next refresh.
+        This method orchestrates the token refresh workflow.
+
+        Args:
+            connector_id: Connector ID
+            connector_type: Connector type
+        """
+        # Prevent recursion
+        if self._is_connector_being_processed(connector_id):
+            self.logger.warning(f"⚠️ Already processing connector {connector_id}, skipping to prevent recursion")
+            return
+
+        self._mark_connector_processing(connector_id)
+
+        # Bound before the try so the RefreshTokenInvalidError handler below can
+        # tell which token was rejected even when the load itself raised.
+        token = None
+
+        try:
+            # Load token from config
+            token, has_credentials = await self._load_token_from_config(connector_id)
+
+            if not has_credentials:
+                self.logger.debug(f"Connector {connector_id} has no credentials to refresh")
+                return
+
+            # Handle refresh workflow
+            await self._handle_token_refresh_workflow(connector_id, connector_type, token)
+
+        except RecursionError as e:
+            # Special handling for recursion errors
+            self.logger.error(f"❌ Recursion error refreshing token for connector {connector_id}: {e}", exc_info=False)
+        except RefreshTokenInvalidError as e:
+            await self._handle_refresh_token_invalid(
+                connector_id, e, getattr(token, "refresh_token", None)
+            )
+        except Exception as e:
+            # Use exc_info=False to avoid potential recursion in traceback formatting
+            self.logger.error(f"❌ Error refreshing token for connector {connector_id}: {e}", exc_info=False)
+        finally:
+            # Always remove from processing set
+            self._unmark_connector_processing(connector_id)
+
+    async def _periodic_refresh_check(self) -> None:
+        """Periodically check and refresh tokens"""
+        self.logger.info("🔄 Starting periodic token refresh check (every 5 minutes)")
+        while self._running:
+            try:
+                await asyncio.sleep(300)  # Check every 5 minutes
+                if self._running:
+                    self.logger.debug("🔄 Running periodic token refresh check...")
+                    await self._refresh_all_tokens()
+            except asyncio.CancelledError:
+                self.logger.info("🛑 Periodic refresh check cancelled")
+                break
+            except Exception as e:
+                self.logger.error(f"❌ Error in periodic refresh check: {e}", exc_info=True)
+
+    async def refresh_connector_token(self, connector_id: str, connector_type: str) -> None:
+        """Manually refresh token for a specific connector"""
+        await self._refresh_connector_token(connector_id, connector_type)
+
+    def _calculate_refresh_delay(self, token: OAuthToken) -> tuple[float, datetime]:
+        """
+        Calculate delay until token refresh (10 minutes before expiry).
+
+        Returns:
+            Tuple of (delay_seconds, refresh_time)
+        """
+        refresh_time = token.created_at + timedelta(seconds=max(0, token.expires_in - 600))
+        delay = (refresh_time - datetime.now()).total_seconds()
+        return delay, refresh_time
+
+    async def _refresh_token_immediately(
+        self,
+        connector_id: str,
+        connector_type: str,
+        token: OAuthToken
+    ) -> tuple[OAuthToken, bool]:
+        """
+        Perform immediate token refresh.
+
+        Returns:
+            Tuple of (new_token, success)
+        """
+        try:
+            new_token = await self._perform_token_refresh(connector_id, connector_type, token.refresh_token)
+            self.logger.info(f"🔄 Immediate refresh completed for connector {connector_id}")
+            return new_token, True
+        except RefreshTokenInvalidError as e:
+            await self._handle_refresh_token_invalid(connector_id, e, token.refresh_token)
+            return None, False
+        except Exception as e:
+            self.logger.error(f"❌ Failed to perform immediate refresh for connector {connector_id}: {e}", exc_info=False)
+            return None, False
+
+    def _cancel_existing_refresh_task(self, connector_id: str) -> None:
+        """Cancel existing refresh task for connector if one exists."""
+        if connector_id not in self._refresh_tasks:
+            return
+
+        old_task = self._refresh_tasks[connector_id]
+
+        if old_task.done():
+            del self._refresh_tasks[connector_id]
+            self.logger.debug(f"Removed completed/cancelled task for connector {connector_id}")
+        else:
+            try:
+                old_task.cancel()
+                self.logger.debug(f"Cancelled existing refresh task for connector {connector_id} to reschedule")
+            except Exception as e:
+                self.logger.warning(f"Error cancelling existing task for connector {connector_id}: {e}")
+
+    def _create_refresh_task(
+        self,
+        connector_id: str,
+        connector_type: str,
+        delay: float,
+        refresh_time: datetime
+    ) -> bool:
+        """
+        Create and store a new refresh task.
+
+        Returns:
+            True if task created successfully, False otherwise
+        """
+        try:
+            task = asyncio.create_task(
+                self._delayed_refresh(connector_id, connector_type, delay)
+            )
+            self._refresh_tasks[connector_id] = task
+            self.logger.info(
+                f"✅ Scheduled token refresh for connector {connector_id} in {delay:.0f} seconds "
+                f"({delay/60:.1f} minutes) - will refresh at {refresh_time}"
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"❌ Failed to schedule token refresh for connector {connector_id}: {e}", exc_info=True)
+            return False
+
+    async def schedule_token_refresh(
+        self,
+        connector_id: str,
+        connector_type: str,
+        token: OAuthToken
+    ) -> None:
+        """
+        Schedule token refresh for a specific connector.
+        If the token needs immediate refresh (delay <= 0), refreshes it immediately then schedules.
+
+        Args:
+            connector_id: Connector ID
+            connector_type: Connector type
+            token: Current OAuth token
+        """
+        if not self._running:
+            self.logger.warning(f"⚠️ Token refresh service not running, scheduling anyway for {connector_id}")
+
+        if not token.expires_in:
+            self.logger.warning(f"⚠️ Token for connector {connector_id} has no expiry time, cannot schedule refresh")
+            return
+
+        self.logger.debug(f"🔄 Scheduling token refresh for connector {connector_id} (type: {connector_type})")
+
+        # Calculate refresh delay
+        delay, refresh_time = self._calculate_refresh_delay(token)
+
+        # Handle immediate refresh if needed
+        if delay <= 0:
+            self.logger.warning(
+                f"⚠️ Token for connector {connector_id} needs immediate refresh "
+                f"(expires_in={token.expires_in}s, delay={delay:.1f}s). Refreshing now..."
+            )
+
+            new_token, success = await self._refresh_token_immediately(connector_id, connector_type, token)
+
+            if not success:
+                return
+
+            # Recalculate delay with new token
+            delay, refresh_time = self._calculate_refresh_delay(new_token)
+
+            if delay <= 0:
+                self.logger.error(
+                    f"❌ New token for connector {connector_id} is also expired/expiring soon! "
+                    f"(expires_in={new_token.expires_in}s, delay={delay:.1f}s). "
+                    f"Cannot schedule refresh - will be picked up by periodic check."
+                )
+                return
+
+            token = new_token
+            self.logger.info(f"🔄 Scheduling next refresh for connector {connector_id} with new token")
+
+        # Cancel any existing task
+        self._cancel_existing_refresh_task(connector_id)
+
+        # Create new refresh task
+        self._create_refresh_task(connector_id, connector_type, delay, refresh_time)
+
+    async def _delayed_refresh(self, connector_id: str, connector_type: str, delay: float) -> None:
+        """Delayed token refresh"""
+        try:
+            await asyncio.sleep(delay)
+            self.logger.info(f"⏰ Scheduled refresh time reached for connector {connector_id}, refreshing token...")
+            await self._refresh_connector_token(connector_id, connector_type)
+        except asyncio.CancelledError:
+            # This is expected when rescheduling - don't log as error
+            self.logger.debug(f"🔄 Token refresh task cancelled for connector {connector_id} (likely rescheduled)")
+            raise
+        except Exception as e:
+            self.logger.error(f"❌ Error in delayed token refresh for connector {connector_id}: {e}", exc_info=True)
+        finally:
+            # Remove task from tracking only if it's this task
+            if connector_id in self._refresh_tasks and self._refresh_tasks[connector_id].done():
+                del self._refresh_tasks[connector_id]

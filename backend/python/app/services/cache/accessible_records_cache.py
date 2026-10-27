@@ -1,0 +1,902 @@
+"""Redis cache for the `virtualRecordId -> recordId` maps that gate every search.
+
+`get_accessible_virtual_record_ids` recomputes a user's entire accessible
+corpus on every search call — an 8-path permission traversal per connector plus
+a KB traversal, each returning every accessible record. That was ~8% of the
+query service's CPU, repeated once per search per turn even though the answer
+almost never changes between turns.
+
+The maps are cached at the granularity they are computed, not as one merged
+blob, so a single connector's sync only drops that connector's entry:
+
+* KB and app-level connectors produce **user-independent** maps (access to the
+  KB/app implies access to its records), so those entries are shared by every
+  user in the org. Which KBs and apps a given user may reach is still resolved
+  live on every request — only the contents are cached.
+* Record-level connectors sync real per-record ACLs, so their entries are keyed
+  per user. They live in one hash per connector (field = user id) so a single
+  DEL invalidates every user at once, with no SCAN and no set-index.
+
+Every entry carries a TTL. Invalidation never fails a sync, a delete or the
+indexing pipeline: a delete that fails is retried in the background until it
+lands or the entries expire on their own, so the TTL is the most an entry can
+outlive the change that should have dropped it.
+
+Redis is never allowed to break or stall a search: any error falls through to
+the live query and trips a short circuit-breaker so the next requests skip
+Redis entirely instead of paying a timeout each.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import threading
+import time
+import zlib
+from typing import TYPE_CHECKING
+
+from app.services.cache.interface import (
+    IAccessibleRecordsCache,
+    Loader,
+    NoopAccessibleRecordsCache,
+)
+from app.services.cache.pg_invalidation import PgCacheBus
+from app.services.redis.config import ClientOptions, RedisConnectionConfig
+from app.services.redis.connection_provider_factory import (
+    get_redis_provider,
+    uses_pg_state,
+)
+from app.services.redis.loop_clients import LoopBoundClients
+from app.utils.loop_local import LoopLocal
+
+if TYPE_CHECKING:
+    from logging import Logger
+
+    from app.config.configuration_service import ConfigurationService
+    from app.config.constants.arangodb import Connectors
+    from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+    from app.services.redis.connection_provider import RedisClient
+
+__all__ = ["AccessibleRecordsCache", "AccessibleRecordsInvalidator"]
+
+_DISABLED_VALUES = {"0", "off", "false", "no"}
+
+
+def _cache_enabled_from_env() -> bool:
+    raw = os.getenv(AccessibleRecordsCache.ENV_ENABLED)
+    return raw is None or raw.strip().lower() not in _DISABLED_VALUES
+
+
+def _ttl_from_env(default: int) -> int:
+    raw = os.getenv(AccessibleRecordsCache.ENV_TTL)
+    if raw is None:
+        return default
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return default
+
+
+class AccessibleRecordsCache(IAccessibleRecordsCache):
+    """Read-through cache of accessible-record maps, shared across workers."""
+
+    KEY_PREFIX = "pipeshub:accessible_records:v1"
+    _EPOCH_SEGMENT = "cgen"
+    ENV_ENABLED = "PIPESHUB_ACCESSIBLE_RECORDS_CACHE"
+    ENV_TTL = "PIPESHUB_ACCESSIBLE_RECORDS_CACHE_TTL"
+    DEFAULT_TTL_SECONDS = 300
+    PG_STATE_TTL_SECONDS = 60   # REDIS_MODE=postgres: the longest an entry can outlive a lost notification
+    OP_TIMEOUT_SECONDS = 2.0
+    DOWN_BACKOFF_SECONDS = 30.0
+    # Striped locks, not one per key. A per-key table could only be trimmed of
+    # *unlocked* entries, so under enough concurrent misses on distinct keys it
+    # grew without limit. A fixed stripe array is bounded by construction; two
+    # unrelated keys sharing a stripe just serialise their (already expensive)
+    # miss, which is the point of the lock anyway.
+    LOCK_STRIPES = 1024
+    # Waits between background attempts at a delete that failed; the last
+    # repeats until the delete lands or the entries' TTL has passed.
+    INVALIDATION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0, 5.0, 10.0)
+    # A connector's epoch must outlive any fill that read it, or an expired
+    # epoch reads as unchanged; a day is far beyond any search.
+    EPOCH_TTL_SECONDS = 86400
+
+    def __init__(
+        self,
+        logger: "Logger",
+        redis_client: "RedisClient | LoopBoundClients[RedisClient] | None",
+        ttl_seconds: int,
+        enabled: bool,  # noqa: FBT001 - positional keeps the test fakes terse
+        key_namespace: str = "",
+        bus: "PgCacheBus | None" = None,
+    ) -> None:
+        """``redis_client`` is either one client, used from a single loop, or
+        the per-loop holder `create()` builds: the indexing service invalidates
+        from its consumer's worker loop as well as the main one."""
+        self.logger = logger
+        if isinstance(redis_client, LoopBoundClients):
+            self._loop_clients: LoopBoundClients[RedisClient] | None = redis_client
+            self._redis: RedisClient | None = None
+        else:
+            self._loop_clients = None
+            self._redis = redis_client
+        self._ttl = ttl_seconds
+        self._bus = bus      # REDIS_MODE=postgres: invalidations reach the other processes through it
+        self._enabled = enabled and redis_client is not None
+        self._down_until = 0.0
+        # Keys whose delete failed, with the monotonic time they expire anyway.
+        # Shared by both loops of the indexing service, hence the thread lock.
+        self._pending_deletes: dict[str, float] = {}
+        self._pending_lock = threading.Lock()
+        # At most one retry task per loop; each clears its own slot when it ends.
+        self._retry_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task[None]] = {}
+        # REDIS_KEY_NAMESPACE (R9): set by `create()` from the provider;
+        # stays empty when a raw `redis_client` is injected directly without
+        # a namespace (mostly tests), same as an unset namespace.
+        self._key_namespace = key_namespace
+        # Per loop, as a Lock binds to its first waiter's loop: a stripe excludes misses within one loop only.
+        self._lock_stripes: LoopLocal[tuple[asyncio.Lock, ...]] = LoopLocal(
+            lambda: tuple(asyncio.Lock() for _ in range(self.LOCK_STRIPES))
+        )
+
+    @classmethod
+    async def create(
+        cls, logger: "Logger", config_service: "ConfigurationService"
+    ) -> IAccessibleRecordsCache:
+        """Build a cache. Never raises — a failure yields a disabled cache.
+
+        Returns ``NoopAccessibleRecordsCache`` rather than a
+        ``redis_client=None`` instance of this class when the cache is off:
+        the disabled behaviour (every read falls through to ``loader()``) has
+        nothing to do with Redis, and callers depend on
+        ``IAccessibleRecordsCache``, not this implementation.
+        """
+        ttl = _ttl_from_env(cls.DEFAULT_TTL_SECONDS)
+        if not _cache_enabled_from_env():
+            logger.info("Accessible-records cache disabled via %s", cls.ENV_ENABLED)
+            return NoopAccessibleRecordsCache()
+
+        clients: LoopBoundClients[RedisClient] | None = None
+        try:
+            redis_config = await config_service.get_redis_config()
+            provider = get_redis_provider(
+                RedisConnectionConfig.from_host_port(
+                    host=redis_config.host,
+                    port=redis_config.port,
+                    password=redis_config.password,
+                    db=redis_config.db,
+                    tls=redis_config.tls,
+                )
+            )
+            options = ClientOptions(
+                decode_responses=True,
+                socket_timeout_seconds=cls.OP_TIMEOUT_SECONDS,
+                socket_connect_timeout_seconds=cls.OP_TIMEOUT_SECONDS,
+            )
+            clients = LoopBoundClients(lambda: provider.create_client(options))
+            await clients.get().ping()
+        except Exception as e:
+            logger.warning(
+                "Accessible-records cache unavailable (%s); falling back to live queries", str(e)
+            )
+            # `create_client()` hands out caller-owned clients (not the
+            # provider's shared one) -- release them ourselves on failure, or
+            # the ping-that-never-succeeded connection leaks for good.
+            if clients is not None:
+                await clients.aclose()
+            return NoopAccessibleRecordsCache()
+
+        bus = None
+        if uses_pg_state():
+            # Each process has its own cache here, so an invalidation must reach the others or a revoked record is served until the TTL
+            # ends. No way to deliver one (no direct address to LISTEN on) means no cache; a short TTL bounds what a lost one can cost.
+            ttl = min(ttl, cls.PG_STATE_TTL_SECONDS)
+            cache = cls(logger, clients, ttl, enabled=True, key_namespace=provider.key_namespace)
+            try:
+                bus = PgCacheBus(cache._apply_remote, cache._flush_local)
+                if not bus.available:
+                    logger.warning(
+                        "Accessible-records cache off: REDIS_MODE=postgres needs a direct PostgreSQL address "
+                        "(PG_LISTEN_URL, or PG_POOLER=none) to invalidate it across processes"
+                    )
+                    await clients.aclose()
+                    return NoopAccessibleRecordsCache()
+                cache._bus = bus
+                bus.start()
+            except Exception as e:  # create() never raises: no cache is the safe answer
+                logger.warning("Accessible-records cache off: the invalidation channel could not be set up (%s)", e)
+                await clients.aclose()
+                return NoopAccessibleRecordsCache()
+            logger.info("Accessible-records cache ready (ttl=%ss, invalidated across processes by NOTIFY)", ttl)
+            return cache
+
+        logger.info("Accessible-records cache ready (ttl=%ss)", ttl)
+        return cls(logger, clients, ttl, enabled=True, key_namespace=provider.key_namespace)
+
+    @property
+    def enabled(self) -> bool:
+        """False while disabled, unconfigured, or inside the post-failure backoff."""
+        if not self._enabled:
+            return False
+        if self._bus is not None and not self._bus.healthy():
+            return False       # fail closed: a notification may not arrive, so every read goes to the graph
+        return time.monotonic() >= self._down_until
+
+    @property
+    def ttl_seconds(self) -> int:
+        return self._ttl
+
+    async def close(self) -> None:
+        bus, self._bus = self._bus, None
+        if bus is not None:
+            await bus.stop()
+        client, self._redis = self._redis, None
+        loop_clients, self._loop_clients = self._loop_clients, None
+        self._enabled = False
+        with self._pending_lock:
+            retries = list(self._retry_tasks.items())
+            self._retry_tasks.clear()
+        for loop, task in retries:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(task.cancel)
+        if loop_clients is not None:
+            await loop_clients.aclose()
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as e:
+                self.logger.debug("Error closing accessible-records cache: %s", str(e))
+
+    def _client(self) -> "RedisClient":
+        if self._loop_clients is not None:
+            return self._loop_clients.get()
+        return self._redis  # type: ignore[return-value]
+
+    # ---- keys ---------------------------------------------------------
+
+    def _namespaced_prefix(self) -> str:
+        return f"{self._key_namespace}:{self.KEY_PREFIX}" if self._key_namespace else self.KEY_PREFIX
+
+    def _kb_key(self, org_id: str, kb_id: str) -> str:
+        return f"{self._namespaced_prefix()}:kb:{org_id}:{kb_id}"
+
+    def _app_connector_key(self, org_id: str, connector_id: str) -> str:
+        return f"{self._namespaced_prefix()}:capp:{org_id}:{connector_id}"
+
+    def _user_connector_key(self, org_id: str, connector_id: str) -> str:
+        return f"{self._namespaced_prefix()}:cusr:{org_id}:{connector_id}"
+
+    def _connector_epoch_key(self, org_id: str, connector_id: str) -> str:
+        return f"{self._namespaced_prefix()}:{self._EPOCH_SEGMENT}:{org_id}:{connector_id}"
+
+    # ---- read-through -------------------------------------------------
+
+    async def get_or_compute_kb(
+        self, org_id: str, kb_id: str, loader: Loader
+    ) -> dict[str, str]:
+        return await self._get_or_compute(self._kb_key(org_id, kb_id), None, loader)
+
+    async def get_or_compute_app_connector(
+        self, org_id: str, connector_id: str, loader: Loader
+    ) -> dict[str, str]:
+        return await self._get_or_compute(
+            self._app_connector_key(org_id, connector_id), None, loader,
+            self._connector_epoch_key(org_id, connector_id),
+        )
+
+    async def get_or_compute_user_connector(
+        self, org_id: str, connector_id: str, user_id: str, loader: Loader
+    ) -> dict[str, str]:
+        return await self._get_or_compute(
+            self._user_connector_key(org_id, connector_id), user_id, loader,
+            self._connector_epoch_key(org_id, connector_id),
+        )
+
+    async def _get_or_compute(
+        self, key: str, field: str | None, loader: Loader, epoch_key: str | None = None
+    ) -> dict[str, str]:
+        """``epoch_key``: the map is written only if that epoch did not move while
+        ``loader()`` ran, so a fill that read the graph before a permission
+        change cannot put the old map back after the change dropped it."""
+        if not self.enabled:
+            return await loader()
+
+        cached = await self._read(key, field)
+        if cached is not None:
+            return cached
+        # A failed read has already tripped the breaker. Every further Redis
+        # call in this same request would wait out its own timeout, so one
+        # outage cost three of them (read, re-read, write) on a single search.
+        if not self.enabled:
+            return await loader()
+
+        lock_key = key if field is None else f"{key}#{field}"
+        lock = self._lock_for(lock_key)
+
+        async with lock:
+            if not self.enabled:
+                return await loader()
+            # Another coroutine may have populated the entry while we queued.
+            cached = await self._read(key, field)
+            if cached is not None:
+                return cached
+
+            epoch = await self._read_epoch(epoch_key) if epoch_key else None
+            # An unreadable epoch fails closed for the write, open for the search.
+            if not self.enabled:
+                return await loader()
+            value = await loader()
+            if self.enabled:
+                await self._write(key, field, value, epoch_key, epoch)
+            return value
+
+    def _lock_for(self, lock_key: str) -> asyncio.Lock:
+        """Stripe for this key. crc32 rather than hash() so the mapping is
+        stable across processes and test runs."""
+        stripes = self._lock_stripes.get()
+        return stripes[zlib.crc32(lock_key.encode()) % len(stripes)]
+
+    async def _read(self, key: str, field: str | None) -> dict[str, str] | None:
+        try:
+            client = self._client()
+            raw = await (client.get(key) if field is None else client.hget(key, field))
+        except Exception as e:
+            self._mark_down("read", e)
+            return None
+
+        if raw is None:
+            return None
+
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+        if field is None:
+            return payload if isinstance(payload, dict) else None
+
+        # Hash fields carry their own timestamp: Redis expires whole keys only,
+        # and the key's TTL is refreshed by every other user's write, so a field
+        # would otherwise live forever under steady traffic.
+        if not isinstance(payload, dict):
+            return None
+        written_at = payload.get("t")
+        stored = payload.get("m")
+        if not isinstance(written_at, (int, float)) or not isinstance(stored, dict):
+            return None
+        if time.time() - written_at > self._ttl:
+            return None
+        return stored
+
+    async def _read_epoch(self, epoch_key: str) -> str | None:
+        """The epoch, ``""`` when never bumped; None (and the breaker tripped)
+        when Redis could not answer."""
+        try:
+            return await self._client().get(epoch_key) or ""
+        except Exception as e:
+            self._mark_down("read", e)
+            return None
+
+    async def _write(
+        self,
+        key: str,
+        field: str | None,
+        value: dict[str, str],
+        epoch_key: str | None = None,
+        epoch: str | None = None,
+    ) -> None:
+        """Checked against the epoch before and after, not atomically: on a
+        Redis Cluster the epoch and the map sit in different hash slots, so a
+        script or MULTI over both is refused. Two reads are enough because every
+        bump is followed by a delete: a bump before the second read makes this
+        write remove itself, and one after it is followed by a delete that does."""
+        written = False
+        try:
+            client = self._client()
+            if epoch_key is not None and (await client.get(epoch_key) or "") != epoch:
+                return
+            if field is None:
+                await client.set(key, json.dumps(value, separators=(",", ":")), ex=self._ttl)
+            else:
+                envelope = json.dumps({"t": int(time.time()), "m": value}, separators=(",", ":"))
+                await client.hset(key, field, envelope)
+                await client.expire(key, self._ttl)
+            written = True
+            if epoch_key is not None and (await client.get(epoch_key) or "") != epoch:
+                await (client.delete(key) if field is None else client.hdel(key, field))
+        except Exception as e:
+            self._mark_down("write", e)
+            if written and epoch_key is not None:
+                # Could not confirm the epoch held, so this map may predate a change.
+                self._retry_later((key,))
+
+    # ---- invalidation -------------------------------------------------
+
+    async def invalidate_connector(self, org_id: str, connector_id: str) -> None:
+        """Drop a connector's entry regardless of its permission model."""
+        await self._delete(
+            self._connector_epoch_key(org_id, connector_id),
+            self._app_connector_key(org_id, connector_id),
+            self._user_connector_key(org_id, connector_id),
+        )
+        await self._publish("c", org_id, connector_id)
+
+    async def mark_connector_changed(self, org_id: str, connector_id: str) -> None:
+        """Reject every fill of this connector already in flight, without deleting
+        what is cached. The caller owes a delete after it."""
+        await self._delete(self._connector_epoch_key(org_id, connector_id))
+        await self._publish("m", org_id, connector_id)
+
+    async def invalidate_kb(self, org_id: str, kb_id: str) -> None:
+        await self._delete(self._kb_key(org_id, kb_id))
+        await self._publish("k", org_id, kb_id)
+
+    # ---- across processes (REDIS_MODE=postgres) -----------------------
+
+    async def _publish(self, kind: str, org_id: str, scope_id: str) -> None:
+        """Tell the other processes. Never fails the caller (a sync, a delete, the indexing pipeline); if the notice cannot be sent the
+        error is logged, and the other processes' entries age out within the short TTL."""
+        bus = self._bus
+        if bus is None:
+            return
+        try:
+            await bus.publish(kind, org_id, scope_id)
+        except Exception as e:
+            self.logger.error(
+                "Could not tell the other processes to drop accessible-records cache entries (%s %s): %s; "
+                "they expire within %ss",
+                kind, scope_id, e, self._ttl,
+            )
+
+    async def _apply_remote(self, kind: str, org_id: str, scope_id: str) -> None:
+        """A change made by another process: drop the same entries here, without publishing it again."""
+        try:
+            if kind == "k":
+                await self._delete(self._kb_key(org_id, scope_id))
+            elif kind == "m":
+                await self._delete(self._connector_epoch_key(org_id, scope_id))
+            else:
+                await self._delete(
+                    self._connector_epoch_key(org_id, scope_id),
+                    self._app_connector_key(org_id, scope_id),
+                    self._user_connector_key(org_id, scope_id),
+                )
+        except Exception as e:
+            self.logger.error("Could not apply a cache invalidation from another process: %s", e)
+            await self._flush_local()
+
+    async def _flush_local(self) -> None:
+        """Drop everything this cache holds (after a notification that could not be read, or a LISTEN reconnect, when some may have been
+        missed). Epoch keys are bumped, not deleted, like any other invalidation."""
+        try:
+            client = self._client()
+            keys = [k async for k in client.scan_iter(match=f"{self._namespaced_prefix()}:*", count=500)]
+            keys = [k.decode() if isinstance(k, bytes) else k for k in keys]
+            if keys:
+                await self._delete_now(keys)
+        except Exception as e:
+            self._mark_down("flush", e)
+
+    async def _delete(self, *keys: str) -> None:
+        """Delete every key. Pipelined, one command per key (R5): a single
+        multi-key ``DEL`` raises CROSSSLOT on a Redis Cluster/MemoryDB
+        whenever the keys land in different hash slots, which
+        ``invalidate_connector``'s two keys (``capp:`` and ``cusr:``) do.
+        redis-py's ``ClusterPipeline`` routes each command to the right
+        node; on standalone this is one round trip either way.
+
+        Never skipped while the read breaker is open -- that is what left an
+        entry serving the old list until its TTL ran out -- but not attempted
+        inline either: the caller is an indexing handler, and a dead Redis
+        must cost it one timeout, not one per record. The keys go to the
+        background retry instead."""
+        if not self._enabled:
+            return
+        if time.monotonic() < self._down_until:
+            self._retry_later(keys)
+            return
+        try:
+            await self._delete_now(keys)
+        except Exception as e:
+            self._mark_down("delete", e)
+            self._retry_later(keys)
+            self.logger.warning(
+                "Could not drop accessible-records cache entries %s (%s); retrying in the "
+                "background until it works or they expire in %ss",
+                list(keys), str(e), self._ttl,
+            )
+            return
+        # Keys can be left pending by a retry task that was cancelled with its
+        # loop (a consumer restarting its worker thread); pick them up here.
+        self._ensure_retry_task()
+
+    def _is_epoch_key(self, key: str) -> bool:
+        return key.startswith(f"{self._namespaced_prefix()}:{self._EPOCH_SEGMENT}:")
+
+    async def _delete_now(self, keys: "list[str] | tuple[str, ...]") -> None:
+        """Epoch keys are bumped, never deleted -- a deleted epoch reads the same
+        as one never bumped, so a fill that began before both would pass. They
+        go first, in their own round trip: on a cluster one pipeline's commands
+        run on several nodes in no set order, and a delete that landed before
+        the bump would leave a gap for a stale fill to write into."""
+        epochs = [key for key in keys if self._is_epoch_key(key)]
+        others = [key for key in keys if not self._is_epoch_key(key)]
+        client = self._client()
+        if epochs:
+            async with client.pipeline(transaction=False) as pipe:
+                for key in epochs:
+                    pipe.incr(key)
+                    pipe.expire(key, self.EPOCH_TTL_SECONDS)
+                await pipe.execute()
+        if others:
+            async with client.pipeline(transaction=False) as pipe:
+                for key in others:
+                    pipe.delete(key)
+                await pipe.execute()
+
+    def _retry_later(self, keys: tuple[str, ...]) -> None:
+        """Queue keys for the one retry task on this loop, starting it if none runs.
+
+        Pending keys are coalesced in one map, so any number of callers share
+        a single retry loop per event loop."""
+        # Re-queueing a pending key moves its deadline later on purpose: this
+        # call is for a newer change, and an entry written after the earlier
+        # one can live a full TTL from now.
+        expires_at = time.monotonic() + self._ttl
+        with self._pending_lock:
+            for key in keys:
+                self._pending_deletes[key] = expires_at
+        self._ensure_retry_task()
+
+    def _ensure_retry_task(self) -> None:
+        """Start this loop's retry task if keys are pending and none is running.
+
+        The task drains the whole shared map, including keys another loop's
+        task left behind, and keeps their deadlines as they are."""
+        loop = asyncio.get_running_loop()
+        with self._pending_lock:
+            if not self._pending_deletes:
+                return
+            task = self._retry_tasks.get(loop)
+            if task is not None and not task.done():
+                return
+            task = loop.create_task(self._retry_pending_deletes())
+            self._retry_tasks[loop] = task
+        task.add_done_callback(lambda done: self._forget_retry_task(loop, done))
+
+    def _forget_retry_task(
+        self, loop: asyncio.AbstractEventLoop, task: "asyncio.Task[None]"
+    ) -> None:
+        with self._pending_lock:
+            if self._retry_tasks.get(loop) is task:
+                del self._retry_tasks[loop]
+
+    async def _retry_pending_deletes(self) -> None:
+        delays = self.INVALIDATION_RETRY_DELAYS_SECONDS
+        attempt = 0
+        while True:
+            await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
+            attempt += 1
+            if not self._enabled:
+                return
+            now = time.monotonic()
+            with self._pending_lock:
+                expired = [k for k, at in self._pending_deletes.items() if at <= now]
+                for key in expired:
+                    del self._pending_deletes[key]
+                pending = dict(self._pending_deletes)
+            if expired:
+                self.logger.error(
+                    "Gave up dropping accessible-records cache entries %s: Redis stayed "
+                    "unreachable until they expired, so searches may have used the old "
+                    "list for up to %ss",
+                    expired, self._ttl,
+                )
+            if not pending:
+                return
+            try:
+                await self._delete_now(list(pending))
+            except Exception as e:
+                self.logger.debug("Accessible-records cache delete retry failed: %s", str(e))
+                continue
+            with self._pending_lock:
+                for key, expires_at in pending.items():
+                    # A newer failure for the same key re-arms it; leave that one queued.
+                    if self._pending_deletes.get(key) == expires_at:
+                        del self._pending_deletes[key]
+            self.logger.info(
+                "Dropped accessible-records cache entries %s on retry", list(pending)
+            )
+
+    # ---- failure handling ---------------------------------------------
+
+    def _mark_down(self, op: str, error: Exception) -> None:
+        """Skip Redis for a while so a dead server costs one timeout, not one per call."""
+        first = time.monotonic() >= self._down_until
+        self._down_until = time.monotonic() + self.DOWN_BACKOFF_SECONDS
+        if first:
+            self.logger.warning(
+                "Accessible-records cache %s failed (%s); bypassing cache for %ss",
+                op, str(error), self.DOWN_BACKOFF_SECONDS,
+            )
+
+
+class _SettleRun:
+    """One connector's coalesced permission-change deletes."""
+
+    __slots__ = ("changed", "org_id", "task")
+
+    def __init__(self, org_id: str) -> None:
+        self.org_id = org_id
+        self.changed = False
+        self.task: asyncio.Task[None]
+
+
+class AccessibleRecordsInvalidator:
+    """Invalidation façade for the services that write records.
+
+    Resolves the owning org when the caller does not have it, and swallows every
+    error: dropping a cache entry must never fail a sync, a delete, or the
+    indexing pipeline. A failed Redis delete is retried by the cache itself.
+    """
+
+    # The coalescing window for permission-change deletes. While changes keep
+    # arriving, the connector's entries are deleted once per window; the window
+    # after the last change ends the run.
+    PERMISSION_CHANGE_SETTLE_SECONDS = 5.0
+    # The same coalescing for connector records that finish indexing, which
+    # arrive in bursts of thousands during a sync. Per process: N indexing
+    # processes cost at most N deletes per window, fewer than one permission
+    # window's worth.
+    RECORD_INDEXED_SETTLE_SECONDS = 30.0
+
+    def __init__(
+        self,
+        logger: "Logger",
+        cache: AccessibleRecordsCache,
+        graph_provider: "IGraphDBProvider",
+    ) -> None:
+        self.logger = logger
+        self.cache = cache
+        self.graph_provider = graph_provider
+        # connector id -> its settle run, one map per kind of change. Thread
+        # lock: the indexing service calls in from its consumer's worker loop too.
+        self._settling: dict[str, _SettleRun] = {}
+        self._indexed_settling: dict[str, _SettleRun] = {}
+        self._settle_lock = threading.Lock()
+
+    async def on_connector_permissions_changed(
+        self, connector_id: str, org_id: str | None = None
+    ) -> None:
+        """Drop a connector's entries now, and keep dropping them while changes arrive.
+
+        Waiting for the sync to finish left a user who lost access searching the
+        old map until the sync ended or the entry expired. Every change bumps
+        the connector's epoch, so no fill that read the graph before it can be
+        written. Deletes are coalesced: the first change deletes at once, and a
+        change inside the window is deleted when the window ends, then the
+        window starts again -- a sync narrowing access record after record
+        costs one delete per window, not one per record.
+        """
+        try:
+            if not connector_id:
+                return
+            run = self._join_settle_run(self._settling, connector_id, org_id)
+            if run is not None:
+                await self.cache.mark_connector_changed(run.org_id, connector_id)
+                return
+            org_id = org_id or await self._org_for_app(connector_id)
+            if not org_id:
+                self.logger.warning(
+                    "Skipping accessible-records cache invalidation for connector %s after a "
+                    "permission change: could not resolve its org, so searches keep the old "
+                    "list until the sync finishes or the entry expires",
+                    connector_id,
+                )
+                return
+            run = self._join_settle_run(
+                self._settling, connector_id, org_id,
+                start_window=self.PERMISSION_CHANGE_SETTLE_SECONDS,
+            )
+            if run is not None:
+                await self.cache.mark_connector_changed(run.org_id, connector_id)
+                return
+            await self.cache.invalidate_connector(org_id, connector_id)
+        except Exception as e:
+            self.logger.warning(
+                "Could not invalidate accessible-records cache for connector %s after a "
+                "permission change: %s",
+                connector_id, str(e),
+            )
+
+    def _join_settle_run(
+        self,
+        runs: dict[str, _SettleRun],
+        connector_id: str,
+        org_id: str | None,
+        *,
+        start_window: float | None = None,
+    ) -> "_SettleRun | None":
+        """The running settle run in ``runs``, marked as owing a delete; None when
+        there was none, after starting one with ``start_window`` (the caller then
+        deletes at once)."""
+        with self._settle_lock:
+            run = runs.get(connector_id)
+            if run is not None and not run.task.done():
+                run.changed = True
+                if org_id:
+                    run.org_id = org_id
+                return run
+            if start_window is not None and org_id:
+                run = _SettleRun(org_id)
+                run.task = asyncio.get_running_loop().create_task(
+                    self._settle(runs, connector_id, run, start_window)
+                )
+                runs[connector_id] = run
+            return None
+
+    async def _settle(
+        self,
+        runs: dict[str, _SettleRun],
+        connector_id: str,
+        run: "_SettleRun",
+        window: float,
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(window)
+                with self._settle_lock:
+                    changed, run.changed = run.changed, False
+                    if not changed:
+                        del runs[connector_id]
+                        return
+                try:
+                    await self.cache.invalidate_connector(run.org_id, connector_id)
+                except Exception as e:
+                    self.logger.warning(
+                        "Could not invalidate accessible-records cache for connector %s: %s",
+                        connector_id, str(e),
+                    )
+        finally:
+            with self._settle_lock:
+                if runs.get(connector_id) is run:
+                    del runs[connector_id]
+
+    async def on_connector_sync_completed(
+        self, connector_id: str, org_id: str | None = None
+    ) -> None:
+        try:
+            if not connector_id:
+                return
+            org_id = org_id or await self._org_for_app(connector_id)
+            if not org_id:
+                # Returning silently here hid a total failure: the cache keeps
+                # serving the pre-sync permission map until the TTL expires.
+                self.logger.warning(
+                    "Skipping accessible-records cache invalidation for connector %s: "
+                    "could not resolve its org",
+                    connector_id,
+                )
+                return
+            await self.cache.invalidate_connector(org_id, connector_id)
+        except Exception as e:
+            self.logger.warning(
+                "Could not invalidate accessible-records cache for connector %s: %s",
+                connector_id, str(e),
+            )
+
+    async def on_kb_records_changed(self, kb_id: str, org_id: str | None = None) -> None:
+        """No-op unless `kb_id` really is a KB — the generic delete paths this
+        hangs off also fire for ordinary connectors, which invalidate on sync
+        completion instead."""
+        try:
+            if not kb_id:
+                return
+            app = await self._app_doc(kb_id)
+            if app is None:
+                return
+            from app.config.constants.arangodb import Connectors
+
+            if app.get("type") != Connectors.KNOWLEDGE_BASE.value:
+                return
+            org_id = org_id or app.get("orgId")
+            if not org_id:
+                return
+            await self.cache.invalidate_kb(org_id, kb_id)
+        except Exception as e:
+            self.logger.warning(
+                "Could not invalidate accessible-records cache for KB %s: %s", kb_id, str(e)
+            )
+
+    async def on_record_indexed(
+        self,
+        connector_name: "Connectors | str | None" = None,
+        connector_id: str | None = None,
+        external_record_group_id: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
+        """Invalidate when a record becomes searchable.
+
+        A KB record drops its KB's entry at once. A connector record finishes
+        indexing after its sync completed, so the delete at sync completion
+        does not cover it; but a full sync flips thousands of records here in a
+        burst, and a delete per record would leave the cache empty exactly when
+        the graph is busiest. Those deletes are coalesced instead: the first
+        deletes at once, the rest once per window while records keep arriving.
+        """
+        try:
+            from app.config.constants.arangodb import Connectors
+
+            name = getattr(connector_name, "value", connector_name)
+            if name != Connectors.KNOWLEDGE_BASE.value:
+                if name:
+                    await self._on_connector_record_indexed(connector_id, org_id)
+                return
+            kb_id = connector_id or external_record_group_id
+            if not kb_id:
+                return
+            if not org_id:
+                app = await self._app_doc(kb_id)
+                org_id = (app or {}).get("orgId")
+            if not org_id:
+                return
+            await self.cache.invalidate_kb(org_id, kb_id)
+        except Exception as e:
+            self.logger.warning(
+                "Could not invalidate accessible-records cache after indexing: %s", str(e)
+            )
+
+    async def _on_connector_record_indexed(
+        self, connector_id: str | None, org_id: str | None
+    ) -> None:
+        if not connector_id:
+            return
+        if self._join_settle_run(self._indexed_settling, connector_id, org_id) is not None:
+            return
+        org_id = org_id or await self._org_for_app(connector_id)
+        if not org_id:
+            return
+        run = self._join_settle_run(
+            self._indexed_settling, connector_id, org_id,
+            start_window=self.RECORD_INDEXED_SETTLE_SECONDS,
+        )
+        if run is None:
+            await self.cache.invalidate_connector(org_id, connector_id)
+
+    async def _app_doc(self, app_id: str) -> dict | None:
+        from app.config.constants.arangodb import CollectionNames
+
+        return await self.graph_provider.get_document(app_id, CollectionNames.APPS.value)
+
+    async def _org_for_app(self, app_id: str) -> str | None:
+        """The org that owns this app.
+
+        Connector apps do not carry `orgId` as a property -- only KB apps do --
+        so the ORG_APP_RELATION edge is the answer for every connector, not a
+        rare fallback. Reading only the property meant every connector-scoped
+        invalidation resolved to None and silently did nothing.
+        """
+        from app.config.constants.arangodb import CollectionNames
+
+        app = await self._app_doc(app_id)
+        org_id = (app or {}).get("orgId")
+        if org_id:
+            return org_id
+
+        edges = await self.graph_provider.get_edges_to_node(
+            f"{CollectionNames.APPS.value}/{app_id}",
+            CollectionNames.ORG_APP_RELATION.value,
+        )
+        for edge in edges or []:
+            # A malformed entry must cost only itself: letting .get() raise here
+            # would abort the loop and skip invalidation altogether.
+            if not isinstance(edge, dict):
+                continue
+            # neo4j returns a bare id in `from_id`; arango returns a document
+            # handle in `_from` ("organizations/<key>").
+            raw = str(edge.get("from_id") or edge.get("_from") or "")
+            if raw:
+                return raw.rsplit("/", 1)[-1]
+        return None

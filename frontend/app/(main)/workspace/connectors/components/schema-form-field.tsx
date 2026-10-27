@@ -1,0 +1,1475 @@
+'use client';
+
+import React, { useState, useRef, useContext, useMemo, useEffect, useId } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Flex, Text, Box, Checkbox, Switch, Select, IconButton, Tooltip, Button } from '@radix-ui/themes';
+import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
+import { FormField, labelEndsWithOptional, useFormFieldControl } from '@/app/(main)/workspace/components/form-field';
+import {
+  WORKSPACE_DRAWER_POPPER_Z_INDEX,
+  WorkspaceRightPanelBodyPortalContext,
+} from '@/app/(main)/workspace/components/workspace-right-panel';
+import { useToastStore } from '@/lib/store/toast-store';
+import { isElectron } from '@/lib/electron';
+import { ValidationRuleType } from '../types';
+import { normalizeUrlInputOnBlur } from '../utils/url-field';
+import type { SchemaField, ValidationRule } from '../types';
+
+/** Extra left padding when `startAdornment` is set (icon column) */
+const ADORNMENT_LEFT_GUTTER = 30;
+
+// ========================================
+// Types
+// ========================================
+
+interface SchemaFormFieldProps {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled?: boolean;
+  /** For SELECT/MULTISELECT with dynamic options */
+  options?: { label: string; value: string }[];
+  /** For conditional display — if false, component returns null */
+  visible?: boolean;
+  /** Error message */
+  error?: string;
+  /**
+   * When this field renders inside a portaled overlay (e.g. workspace drawer), set so
+   * `Select.Content` stacks above the backdrop. Omit in normal inline forms.
+   */
+  selectPortalZIndex?: number;
+  /** Optional icon or node inside the left side of text-like inputs */
+  startAdornment?: React.ReactNode;
+  /** Shown on hover/focus when `disabled` is true (e.g. non-editable sync fields). */
+  disabledTooltip?: string;
+  /** Set once the form has fetched the stored secret, so a password field shows it instead of dots. */
+  revealed?: boolean;
+}
+
+// ========================================
+// Shared input style
+// ========================================
+
+const inputStyle: React.CSSProperties = {
+  height: 32,
+  paddingTop: 6,
+  paddingBottom: 6,
+  paddingLeft: 8,
+  paddingRight: 8,
+  backgroundColor: 'var(--color-surface)',
+  border: '1px solid var(--gray-a5)',
+  borderRadius: 'var(--radius-2)',
+  fontSize: 14,
+  fontFamily: 'var(--default-font-family)',
+  color: 'var(--gray-12)',
+  boxSizing: 'border-box',
+  width: '100%',
+  outline: 'none',
+};
+
+const textareaStyle: React.CSSProperties = {
+  ...inputStyle,
+  height: 80,
+  resize: 'vertical',
+};
+
+const focusStyle: React.CSSProperties = {
+  border: '2px solid var(--accent-8)',
+  paddingTop: 5,
+  paddingBottom: 5,
+  paddingLeft: 7,
+  paddingRight: 7,
+};
+
+const errorFieldChrome: React.CSSProperties = {
+  border: '1px solid var(--red-9)',
+  backgroundColor: 'var(--red-a2)',
+};
+
+// ========================================
+// Component
+// ========================================
+
+export function SchemaFormField({
+  field,
+  value,
+  onChange,
+  disabled = false,
+  options,
+  visible = true,
+  error,
+  selectPortalZIndex,
+  startAdornment,
+  disabledTooltip,
+  revealed = false,
+}: SchemaFormFieldProps) {
+  const panelBodyPortal = useContext(WorkspaceRightPanelBodyPortalContext);
+  const toggleIds = useId();
+
+  if (!visible) return null;
+
+  const fieldType = field.fieldType || 'TEXT';
+  const isOptional = 'required' in field && !field.required;
+  const isRequired = !isOptional;
+  const invalid = Boolean(error);
+  const labelId = `${toggleIds}-label`;
+  const helpId = field.description ? `${toggleIds}-help` : undefined;
+  const errorId = error ? `${toggleIds}-error` : undefined;
+  const toggleDescribedBy = [helpId, errorId].filter(Boolean).join(' ') || undefined;
+  const toggleError = error ? (
+    <Text id={errorId} role="alert" size="1" style={{ color: 'var(--red-a11)' }}>
+      {error}
+    </Text>
+  ) : null;
+
+  // Render the appropriate input based on field type
+  const renderField = () => {
+    switch (fieldType) {
+      case 'CHECKBOX':
+        return (
+          <Flex direction="column" gap="1">
+            <CheckboxField
+              field={field}
+              value={value}
+              onChange={onChange}
+              disabled={disabled}
+              labelId={labelId}
+              describedBy={toggleDescribedBy}
+            />
+            {toggleError}
+          </Flex>
+        );
+
+      case 'BOOLEAN':
+        return (
+          <Flex direction="column" gap="1">
+            <BooleanField
+              field={field}
+              value={value}
+              onChange={onChange}
+              disabled={disabled}
+              hasError={invalid}
+              labelId={labelId}
+              describedBy={toggleDescribedBy}
+            />
+            {toggleError}
+          </Flex>
+        );
+
+      case 'FILE':
+        // FILE is handled outside the FormField wrapper so it can manage its own
+        // label, error display, and description internally.
+        return (
+          <FileInput
+            field={field}
+            value={value}
+            onChange={onChange}
+            disabled={disabled}
+            error={error}
+            isOptional={isOptional}
+          />
+        );
+
+      case 'TAGS':
+        return (
+          <Flex direction="column" gap="1">
+            <FormField
+              label={field.displayName}
+              required={isRequired}
+              optional={isOptional}
+              description={field.description}
+              error={error}
+            >
+              <TagsInput field={field} value={value} onChange={onChange} disabled={disabled} hasError={invalid} />
+            </FormField>
+          </Flex>
+        );
+
+      default: {
+        // All other field types use the FormField label wrapper
+        const renderInput = () => {
+          switch (fieldType) {
+            case 'PASSWORD':
+              return (
+                <PasswordInput
+                  field={field}
+                  value={value}
+                  onChange={onChange}
+                  disabled={disabled}
+                  hasError={invalid}
+                  startAdornment={startAdornment}
+                  revealed={revealed}
+                />
+              );
+            case 'TEXTAREA':
+              return (
+                <TextareaInput
+                  field={field}
+                  value={value}
+                  onChange={onChange}
+                  disabled={disabled}
+                  hasError={invalid}
+                />
+              );
+            case 'JSON':
+              return <JsonInput field={field} value={value} onChange={onChange} disabled={disabled} hasError={invalid} />;
+            case 'SELECT':
+              return (
+                <SelectInput
+                  field={field}
+                  value={value}
+                  onChange={onChange}
+                  disabled={disabled}
+                  options={options}
+                  portalZIndex={selectPortalZIndex}
+                  startAdornment={startAdornment}
+                  hasError={invalid}
+                />
+              );
+            case 'NUMBER':
+              return (
+                <NumberInput
+                  field={field}
+                  value={value}
+                  onChange={onChange}
+                  disabled={disabled}
+                  startAdornment={startAdornment}
+                  hasError={invalid}
+                />
+              );
+            case 'FOLDER':
+              return <FolderPickerInput field={field} value={value} onChange={onChange} disabled={disabled} />;
+            default:
+              // TEXT, EMAIL, URL, and fallback
+              return (
+                <TextInput
+                  field={field}
+                  value={value}
+                  onChange={onChange}
+                  disabled={disabled}
+                  fieldType={fieldType}
+                  startAdornment={startAdornment}
+                  hasError={invalid}
+                />
+              );
+          }
+        };
+
+        return (
+          <FormField
+            label={field.displayName}
+            required={isRequired}
+            optional={isOptional}
+            description={field.description}
+            error={error}
+          >
+            {renderInput()}
+          </FormField>
+        );
+      }
+    }
+  };
+
+  const inner = (
+    <Flex direction="column" gap="1" data-ph-field={field.name}>
+      {renderField()}
+
+      {/* Description below the field (when not using FormField wrapper for checkbox/boolean) */}
+      {field.description && (fieldType === 'CHECKBOX' || fieldType === 'BOOLEAN') && (
+        <Text id={helpId} size="1" style={{ color: 'var(--gray-10)' }}>
+          {field.description}
+        </Text>
+      )}
+    </Flex>
+  );
+
+  if (disabled && disabledTooltip) {
+    return (
+      <Tooltip
+        content={disabledTooltip}
+        delayDuration={200}
+        container={panelBodyPortal ?? undefined}
+        sideOffset={0}
+        style={{ zIndex: WORKSPACE_DRAWER_POPPER_Z_INDEX }}
+      >
+        <span
+          className="ph-disabled-field-tooltip-wrap"
+          style={{ display: 'block', width: '100%', cursor: 'not-allowed' }}
+        >
+          {inner}
+        </span>
+      </Tooltip>
+    );
+  }
+
+  return inner;
+}
+
+// ========================================
+// Sub-components for each field type
+// ========================================
+
+/**
+ * Compact, copyable list of labeled example values rendered below an input.
+ *
+ * Used when a single `placeholder` can't convey all the variants a user may
+ * need (e.g. Azure AI endpoint URLs differ per model family). Each row has a
+ * label, the example value in a monospace pill, and a copy button so the user
+ * doesn't have to hand-type or squint at a truncated placeholder.
+ */
+function FieldExamples({
+  examples,
+}: {
+  examples: { label: string; value: string }[];
+}) {
+  const addToast = useToastStore((s) => s.addToast);
+  const [copiedValue, setCopiedValue] = useState<string | null>(null);
+
+  const handleCopy = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedValue(value);
+      window.setTimeout(() => {
+        setCopiedValue((v) => (v === value ? null : v));
+      }, 1800);
+    } catch {
+      addToast({
+        variant: 'error',
+        title: 'Failed to copy',
+        duration: 3000,
+      });
+    }
+  };
+
+  return (
+    <Box
+      style={{
+        marginTop: 6,
+        padding: '8px 10px',
+        borderRadius: 'var(--radius-2)',
+        border: '1px solid var(--gray-a4)',
+        backgroundColor: 'var(--gray-a2)',
+      }}
+    >
+      <Flex align="center" gap="1" style={{ marginBottom: 6 }}>
+        <MaterialIcon name="info" size={14} color="var(--gray-10)" />
+        <Text size="1" weight="medium" style={{ color: 'var(--gray-11)' }}>
+          {examples.length > 1 ? 'Examples' : 'Example'}
+        </Text>
+      </Flex>
+      <Flex direction="column" gap="2">
+        {examples.map((ex) => {
+          const justCopied = copiedValue === ex.value;
+          return (
+            <Flex key={`${ex.label}:${ex.value}`} direction="column" gap="1">
+              <Text size="1" style={{ color: 'var(--gray-11)' }}>
+                {ex.label}
+              </Text>
+              <Flex align="center" gap="2" style={{ minWidth: 0 }}>
+                <Box
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: '4px 8px',
+                    borderRadius: 'var(--radius-1)',
+                    border: '1px solid var(--gray-a5)',
+                    backgroundColor: 'var(--color-surface)',
+                    fontFamily: 'var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, monospace)',
+                    fontSize: 12,
+                    color: 'var(--gray-12)',
+                    overflowX: 'auto',
+                    whiteSpace: 'nowrap',
+                    userSelect: 'all',
+                  }}
+                >
+                  {ex.value}
+                </Box>
+                <Tooltip content={justCopied ? 'Copied' : 'Copy to clipboard'}>
+                  <IconButton className="touch-hit"
+                    type="button"
+                    variant="soft"
+                    color="gray"
+                    size="1"
+                    aria-label={`Copy example ${ex.label}`}
+                    onClick={() => {
+                      void handleCopy(ex.value);
+                    }}
+                    style={{ cursor: 'pointer', flexShrink: 0 }}
+                  >
+                    <MaterialIcon
+                      name={justCopied ? 'check' : 'content_copy'}
+                      size={14}
+                      color={justCopied ? 'var(--green-11)' : 'var(--gray-11)'}
+                    />
+                  </IconButton>
+                </Tooltip>
+              </Flex>
+            </Flex>
+          );
+        })}
+      </Flex>
+    </Box>
+  );
+}
+
+function StartAdornmentOverlay({
+  startAdornment,
+  children,
+}: {
+  startAdornment?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <Box style={{ position: 'relative', width: '100%' }}>
+      {startAdornment ? (
+        <Flex
+          align="center"
+          justify="center"
+          style={{
+            position: 'absolute',
+            left: 8,
+            top: 0,
+            bottom: 0,
+            width: 22,
+            pointerEvents: 'none',
+            zIndex: 1,
+          }}
+        >
+          {startAdornment}
+        </Flex>
+      ) : null}
+      {children}
+    </Box>
+  );
+}
+
+function TextInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  fieldType,
+  startAdornment,
+  hasError,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  fieldType: string;
+  startAdornment?: React.ReactNode;
+  hasError?: boolean;
+}) {
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+
+  const htmlType =
+    fieldType === 'EMAIL' ? 'email' :
+    fieldType === 'URL' ? 'url' :
+    'text';
+
+  const leftGutter = startAdornment ? ADORNMENT_LEFT_GUTTER : 0;
+
+  const examples =
+    'examples' in field && Array.isArray(field.examples) ? field.examples : undefined;
+
+  return (
+    <>
+      <StartAdornmentOverlay startAdornment={startAdornment}>
+        <input
+          {...control}
+          type={htmlType}
+          value={String(value ?? '')}
+          placeholder={'placeholder' in field ? (field.placeholder ?? '') : ''}
+          disabled={disabled}
+          onChange={(e) => onChange(field.name, e.target.value)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => {
+            setIsFocused(false);
+            if (!disabled && fieldType === 'URL') {
+              const current = String(value ?? '');
+              const next = normalizeUrlInputOnBlur(current);
+              if (next !== current) {
+                onChange(field.name, next);
+              }
+            }
+          }}
+          aria-invalid={hasError || undefined}
+          style={{
+            ...inputStyle,
+            ...(hasError && !isFocused ? errorFieldChrome : {}),
+            ...(isFocused ? (hasError
+              ? { ...focusStyle, border: '2px solid var(--red-9)' }
+              : focusStyle) : {}),
+            paddingLeft: (isFocused ? 7 : 8) + leftGutter,
+            opacity: disabled ? 0.6 : 1,
+          }}
+        />
+      </StartAdornmentOverlay>
+      {examples && examples.length > 0 ? <FieldExamples examples={examples} /> : null}
+    </>
+  );
+}
+
+/** First occurrence wins casing; later entries that only differ by case are dropped. */
+function dedupeTagsCaseInsensitive(trimmed: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of trimmed) {
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
+
+/** Tag list: type in the box and press Enter to add (same UX as legacy MUI TagsFieldRenderer). */
+function TagsInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  hasError,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  hasError?: boolean;
+}) {
+  const { t } = useTranslation();
+  const [draft, setDraft] = useState('');
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+
+  const { rawTags, tags } = useMemo(() => {
+    const raw: string[] = Array.isArray(value)
+      ? (value as unknown[]).map((v) => String(v).trim()).filter((s) => s.length > 0)
+      : [];
+    return { rawTags: raw, tags: dedupeTagsCaseInsensitive(raw) };
+  }, [value]);
+
+  const addTag = () => {
+    const next = draft.trim();
+    if (!next || tags.some((x) => x.toLowerCase() === next.toLowerCase())) return;
+    onChange(field.name, [...tags, next]);
+    setDraft('');
+  };
+
+  const removeTag = (tag: string) => {
+    const k = tag.toLowerCase();
+    onChange(field.name, rawTags.filter((x) => x.toLowerCase() !== k));
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addTag();
+    }
+  };
+
+  const placeholder =
+    'placeholder' in field && field.placeholder
+      ? field.placeholder
+      : t('workspace.connectors.schemaForm.tagsPlaceholder');
+
+  return (
+    <>
+      <input
+        {...control}
+        type="text"
+        value={draft}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={onKeyDown}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => setIsFocused(false)}
+        aria-invalid={hasError || undefined}
+        style={{
+          ...inputStyle,
+          ...(hasError && !isFocused ? errorFieldChrome : {}),
+          ...(isFocused
+            ? hasError
+              ? { ...focusStyle, border: '2px solid var(--red-9)' }
+              : focusStyle
+            : {}),
+          marginBottom: tags.length > 0 ? 8 : 0,
+          opacity: disabled ? 0.6 : 1,
+        }}
+      />
+      {tags.length > 0 ? (
+        <Flex wrap="wrap" gap="2" style={{ marginBottom: 4 }}>
+          {tags.map((tag) => (
+            <Flex
+              key={tag}
+              align="center"
+              gap="1"
+              style={{
+                paddingLeft: 8,
+                paddingRight: 2,
+                paddingTop: 2,
+                paddingBottom: 2,
+                borderRadius: 'var(--radius-2)',
+                border: '1px solid var(--accent-a6)',
+                backgroundColor: 'var(--accent-a2)',
+                maxWidth: '100%',
+              }}
+            >
+              <Text size="1" style={{ color: 'var(--gray-12)', wordBreak: 'break-word' }}>
+                {tag}
+              </Text>
+              <IconButton className="touch-hit"
+                type="button"
+                size="1"
+                variant="ghost"
+                color="gray"
+                disabled={disabled}
+                aria-label={t('workspace.connectors.schemaForm.removeTagAriaLabel', { tag })}
+                onClick={() => removeTag(tag)}
+                style={{ flexShrink: 0 }}
+              >
+                <MaterialIcon name="close" size={14} color="var(--gray-11)" />
+              </IconButton>
+            </Flex>
+          ))}
+        </Flex>
+      ) : null}
+    </>
+  );
+}
+
+function PasswordInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  startAdornment,
+  hasError,
+  revealed,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  startAdornment?: React.ReactNode;
+  hasError?: boolean;
+  revealed?: boolean;
+}) {
+  const { t } = useTranslation();
+  const [showPassword, setShowPassword] = useState(false);
+  // Follow the reveal: shown when the form fetched the stored value, hidden again when it
+  // moves to another config. The eye still toggles freely in between.
+  useEffect(() => {
+    setShowPassword(Boolean(revealed));
+  }, [revealed]);
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+
+  const leftGutter = startAdornment ? ADORNMENT_LEFT_GUTTER : 0;
+
+  return (
+    <>
+      <StartAdornmentOverlay startAdornment={startAdornment}>
+        <input
+          {...control}
+          type={showPassword ? 'text' : 'password'}
+          value={String(value ?? '')}
+          placeholder={'placeholder' in field ? (field.placeholder ?? '') : ''}
+          disabled={disabled}
+          onChange={(e) => onChange(field.name, e.target.value)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          aria-invalid={hasError || undefined}
+          style={{
+            ...inputStyle,
+            ...(hasError && !isFocused ? errorFieldChrome : {}),
+            ...(isFocused
+              ? hasError
+                ? { ...focusStyle, border: '2px solid var(--red-9)' }
+                : focusStyle
+              : {}),
+            paddingLeft: (isFocused ? 7 : 8) + leftGutter,
+            paddingRight: 36,
+            opacity: disabled ? 0.6 : 1,
+          }}
+        />
+        <IconButton
+          type="button"
+          variant="ghost"
+          color="gray"
+          size="1"
+          aria-label={t(showPassword ? 'auth.common.hidePassword' : 'auth.common.showPassword')}
+          onClick={() => setShowPassword(!showPassword)}
+          // touch-hit widens the tap area without growing the icon out of the field.
+          className="touch-hit"
+          style={{
+            position: 'absolute',
+            right: 6,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            cursor: 'pointer',
+          }}
+        >
+          <MaterialIcon
+            name={showPassword ? 'visibility_off' : 'visibility'}
+            size={16}
+            color="var(--gray-11)"
+          />
+        </IconButton>
+      </StartAdornmentOverlay>
+    </>
+  );
+}
+
+function TextareaInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  hasError,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  hasError?: boolean;
+}) {
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+
+  return (
+    <>
+      <textarea
+        {...control}
+        value={String(value ?? '')}
+        placeholder={'placeholder' in field ? (field.placeholder ?? '') : ''}
+        disabled={disabled}
+        onChange={(e) => onChange(field.name, e.target.value)}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => setIsFocused(false)}
+        aria-invalid={hasError || undefined}
+        style={{
+          ...textareaStyle,
+          ...(hasError && !isFocused ? errorFieldChrome : {}),
+          ...(isFocused
+            ? (hasError
+                ? { ...focusStyle, border: '2px solid var(--red-9)' }
+                : { ...focusStyle })
+            : {}),
+          opacity: disabled ? 0.6 : 1,
+        }}
+      />
+    </>
+  );
+}
+
+function JsonInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  hasError,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  hasError?: boolean;
+}) {
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+
+  const stringVal =
+    typeof value === 'string' ? value : JSON.stringify(value ?? '', null, 2);
+
+  return (
+    <>
+      <textarea
+        {...control}
+        value={stringVal}
+        placeholder={'placeholder' in field ? (field.placeholder ?? '{}') : '{}'}
+        disabled={disabled}
+        onChange={(e) => onChange(field.name, e.target.value)}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => setIsFocused(false)}
+        aria-invalid={hasError || undefined}
+        style={{
+          ...textareaStyle,
+          height: 120,
+          ...(hasError && !isFocused ? errorFieldChrome : {}),
+          ...(isFocused
+            ? (hasError
+                ? { ...focusStyle, border: '2px solid var(--red-9)' }
+                : { ...focusStyle })
+            : {}),
+          fontFamily: 'monospace',
+          fontSize: 13,
+          opacity: disabled ? 0.6 : 1,
+        }}
+      />
+    </>
+  );
+}
+
+function NumberInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  startAdornment,
+  hasError,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  startAdornment?: React.ReactNode;
+  hasError?: boolean;
+}) {
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+  const unitId = useId();
+
+  const min = 'validation' in field ? field.validation?.min : undefined;
+  const max = 'validation' in field ? field.validation?.max : undefined;
+  const unit = 'unit' in field ? field.unit : undefined;
+  const describedBy = [control['aria-describedby'], unit ? unitId : null].filter(Boolean).join(' ') || undefined;
+
+  const leftGutter = startAdornment ? ADORNMENT_LEFT_GUTTER : 0;
+
+  return (
+    <Flex align="center" gap="2">
+      <StartAdornmentOverlay startAdornment={startAdornment}>
+        <input
+          {...control}
+          aria-describedby={describedBy}
+          type="number"
+          value={value !== undefined && value !== null ? String(value) : ''}
+          placeholder={'placeholder' in field ? (field.placeholder ?? '') : ''}
+          disabled={disabled}
+          min={min}
+          max={max}
+          // Bounded numbers are whole numbers: the connector service refuses a fraction for them.
+          step={min != null || max != null ? 1 : undefined}
+          onChange={(e) => {
+            const num = e.target.value === '' ? '' : Number(e.target.value);
+            onChange(field.name, num);
+          }}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          aria-invalid={hasError || undefined}
+          style={{
+            ...inputStyle,
+            ...(hasError && !isFocused ? errorFieldChrome : {}),
+            ...(isFocused ? (hasError
+              ? { ...focusStyle, border: '2px solid var(--red-9)' }
+              : focusStyle) : {}),
+            paddingLeft: (isFocused ? 7 : 8) + leftGutter,
+            opacity: disabled ? 0.6 : 1,
+          }}
+        />
+      </StartAdornmentOverlay>
+      {unit ? (
+        <Text id={unitId} size="2" style={{ color: 'var(--gray-11)', flexShrink: 0 }}>
+          {unit}
+        </Text>
+      ) : null}
+    </Flex>
+  );
+}
+
+/** Map legacy checkbox booleans to yes/no select values (Radix items use "yes"/"no"). */
+function toYesNoSelectValue(value: unknown): string {
+  if (value === true) return 'yes';
+  if (value === false) return 'no';
+  return String(value ?? '');
+}
+
+function SelectInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  options,
+  portalZIndex,
+  startAdornment,
+  hasError,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  options?: { label: string; value: string }[];
+  portalZIndex?: number;
+  startAdornment?: React.ReactNode;
+  hasError?: boolean;
+}) {
+  const { t } = useTranslation();
+  const panelBodyPortal = useContext(WorkspaceRightPanelBodyPortalContext);
+  const control = useFormFieldControl();
+  const optionLabels = 'optionLabels' in field ? field.optionLabels : undefined;
+
+  const optionItems = useMemo(() => {
+    // Schemas send yes/no as bare values; show them as words, not "yes".
+    const fallbackLabel = (opt: string) =>
+      opt === 'yes' ? t('common.yes') : opt === 'no' ? t('common.no') : opt;
+    return (options ||
+      ('options' in field && Array.isArray(field.options)
+        ? field.options.map((opt: string | { id: string; label: string }) =>
+            typeof opt === 'string'
+              ? { label: optionLabels?.[opt] ?? fallbackLabel(opt), value: opt }
+              : { label: opt.label, value: opt.id }
+          )
+        : [])
+    ).filter((opt) => opt.value !== '');
+  }, [options, field, optionLabels, t]);
+
+  const hasYesNoOptions = useMemo(() => {
+    const optionValues = new Set(optionItems.map((opt) => opt.value));
+    return optionValues.has('yes') && optionValues.has('no');
+  }, [optionItems]);
+
+  const selectValue = useMemo(
+    () => (hasYesNoOptions ? toYesNoSelectValue(value) : String(value ?? '')),
+    [hasYesNoOptions, value]
+  );
+
+  const leftGutter = startAdornment ? ADORNMENT_LEFT_GUTTER : 0;
+
+  return (
+    <>
+      <StartAdornmentOverlay startAdornment={startAdornment}>
+        <Select.Root
+          value={selectValue}
+          onValueChange={(v) => onChange(field.name, v)}
+          disabled={disabled}
+        >
+          <Select.Trigger
+            {...control}
+            data-invalid={hasError || undefined}
+            color={hasError ? 'red' : undefined}
+            style={{
+              width: '100%',
+              height: 32,
+              paddingLeft: 8 + leftGutter,
+            }}
+            placeholder={'placeholder' in field ? (field.placeholder ?? 'Select...') : 'Select...'}
+          />
+          <Select.Content
+            position="popper"
+            container={panelBodyPortal ?? undefined}
+            style={portalZIndex != null ? { zIndex: portalZIndex } : undefined}
+          >
+            {optionItems.map((opt) => (
+              <Select.Item key={opt.value} value={opt.value}>
+                {opt.label}
+              </Select.Item>
+            ))}
+          </Select.Content>
+        </Select.Root>
+      </StartAdornmentOverlay>
+    </>
+  );
+}
+
+function FolderPickerInput({
+  field,
+  value,
+  onChange,
+  disabled,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+}) {
+  const { t } = useTranslation();
+  const [isFocused, setIsFocused] = useState(false);
+  const control = useFormFieldControl();
+  const pathValue = String(value ?? '');
+  const addToast = useToastStore((s) => s.addToast);
+
+  const handleChooseFolder = async () => {
+    if (disabled) return;
+    if (!isElectron()) return;
+    const api = (window as Window & { electronAPI?: { selectFolder?: () => Promise<string | null> } }).electronAPI;
+    if (!api?.selectFolder) {
+      addToast({
+        title: t('workspace.connectors.schemaForm.folderPickerUnavailableTitle'),
+        description: t('workspace.connectors.schemaForm.folderPickerUnavailableDescription'),
+        variant: 'error',
+      });
+      return;
+    }
+    const selectedPath = await api.selectFolder();
+    if (selectedPath) {
+      onChange(field.name, selectedPath);
+    }
+  };
+
+  return (
+    <>
+      <Flex gap="2" align="center" wrap="wrap">
+        <input
+          {...control}
+          type="text"
+          value={pathValue}
+          placeholder={'placeholder' in field ? (field.placeholder ?? '/path/to/folder') : '/path/to/folder'}
+          disabled={disabled}
+          onChange={(e) => onChange(field.name, e.target.value)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={() => setIsFocused(false)}
+          style={{
+            ...inputStyle,
+            ...(isFocused ? focusStyle : {}),
+            flex: '1 1 160px',
+            minWidth: 120,
+            opacity: disabled ? 0.6 : 1,
+          }}
+        />
+        {isElectron() && (
+          <Button
+            type="button"
+            variant="soft"
+            size="2"
+            disabled={disabled}
+            onClick={handleChooseFolder}
+            style={{ cursor: disabled ? 'not-allowed' : 'pointer', flexShrink: 0 }}
+          >
+            <Flex align="center" gap="1">
+              <MaterialIcon name="folder_open" size={18} color="var(--accent-11)" />
+              <span style={{ fontSize: 14, fontFamily: 'var(--default-font-family)' }}>
+                {t('workspace.connectors.schemaForm.chooseFolder')}
+              </span>
+            </Flex>
+          </Button>
+        )}
+      </Flex>
+    </>
+  );
+}
+
+function CheckboxField({
+  field,
+  value,
+  onChange,
+  disabled,
+  labelId,
+  describedBy,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  labelId: string;
+  describedBy?: string;
+}) {
+  return (
+    <Flex align="center" gap="2" style={{ minHeight: 32 }}>
+      <Checkbox
+        checked={Boolean(value)}
+        onCheckedChange={(checked) => onChange(field.name, checked)}
+        disabled={disabled}
+        aria-labelledby={labelId}
+        aria-describedby={describedBy}
+      />
+      <Text id={labelId} size="2" weight="medium" style={{ color: 'var(--gray-12)' }}>
+        {field.displayName}
+        {'required' in field && field.required && ' *'}
+      </Text>
+    </Flex>
+  );
+}
+
+function BooleanField({
+  field,
+  value,
+  onChange,
+  disabled,
+  hasError = false,
+  labelId,
+  describedBy,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  hasError?: boolean;
+  labelId: string;
+  describedBy?: string;
+}) {
+  const { t } = useTranslation();
+  const isIncludeSubfolders = field.name.toLowerCase() === 'include_subfolders';
+  const isUnsetValue = value === undefined || value === null || value === '';
+
+  // Normalize string "true" / "false" to boolean
+  const boolVal =
+    isIncludeSubfolders && isUnsetValue
+      ? true
+      : typeof value === 'boolean'
+      ? value
+      : value === 'true'
+      ? true
+      : value === 'false'
+      ? false
+      : Boolean(value);
+
+  if (isIncludeSubfolders) {
+    return (
+      <Flex direction="column" gap="1">
+        <Text id={labelId} size="2" weight="medium" style={{ color: 'var(--gray-12)' }}>
+          {field.displayName}
+        </Text>
+        <Select.Root
+          value={boolVal ? 'yes' : 'no'}
+          onValueChange={(v) => onChange(field.name, v === 'yes')}
+          disabled={disabled}
+        >
+          <Select.Trigger
+            aria-labelledby={labelId}
+            aria-describedby={describedBy}
+            style={{ width: '100%', height: 32 }}
+          />
+          <Select.Content>
+            <Select.Item value="yes">{t('common.yes')}</Select.Item>
+            <Select.Item value="no">{t('common.no')}</Select.Item>
+          </Select.Content>
+        </Select.Root>
+      </Flex>
+    );
+  }
+
+  return (
+    <Flex align="center" justify="between" gap="3" style={{ minHeight: 32 }}>
+      <Flex direction="column" gap="1">
+        <Text id={labelId} size="2" weight="medium" style={{ color: 'var(--gray-12)' }}>
+          {field.displayName}
+          {'required' in field && field.required && ' *'}
+        </Text>
+      </Flex>
+      <Switch
+        checked={boolVal}
+        onCheckedChange={(checked) => onChange(field.name, checked)}
+        disabled={disabled}
+        color={hasError ? 'red' : undefined}
+        aria-labelledby={labelId}
+        aria-describedby={describedBy}
+        style={{ flexShrink: 0 }}
+      />
+    </Flex>
+  );
+}
+
+// ========================================
+// Generic file content validation (rule-driven from backend schema)
+// ========================================
+
+function executeValidationRules(
+  content: string,
+  rules: ValidationRule[]
+): { valid: boolean; error?: string } {
+  let parsedJson: Record<string, unknown> | null = null;
+
+  for (const rule of rules) {
+    switch (rule.type) {
+      case ValidationRuleType.JSON_VALID: {
+        try {
+          parsedJson = JSON.parse(content) as Record<string, unknown>;
+        } catch {
+          return { valid: false, error: rule.errorMessage ?? 'File must be valid JSON.' };
+        }
+        break;
+      }
+      case ValidationRuleType.JSON_HAS_FIELDS: {
+        if (!parsedJson) {
+          try {
+            parsedJson = JSON.parse(content) as Record<string, unknown>;
+          } catch {
+            return {
+              valid: false,
+              error: rule.errorMessage ?? 'File must be valid JSON.',
+            };
+          }
+        }
+        const missing = (rule.requiredFields ?? []).filter((f) => !(f in parsedJson!));
+        if (missing.length > 0) {
+          const msg = (rule.errorMessage ?? 'Missing required fields: {missing}').replace(
+            '{missing}',
+            missing.join(', ')
+          );
+          return { valid: false, error: msg };
+        }
+        break;
+      }
+      case ValidationRuleType.JSON_FIELD_EQUALS: {
+        if (!parsedJson) {
+          try {
+            parsedJson = JSON.parse(content) as Record<string, unknown>;
+          } catch {
+            return {
+              valid: false,
+              error: rule.errorMessage ?? 'File must be valid JSON.',
+            };
+          }
+        }
+        if (rule.field !== undefined && parsedJson[rule.field] !== rule.value) {
+          return {
+            valid: false,
+            error: rule.errorMessage ?? `Field "${rule.field}" must equal "${rule.value}".`,
+          };
+        }
+        break;
+      }
+      case ValidationRuleType.TEXT_CONTAINS: {
+        if (rule.pattern && !content.includes(rule.pattern)) {
+          return {
+            valid: false,
+            error: rule.errorMessage ?? `Content must contain: ${rule.pattern}`,
+          };
+        }
+        break;
+      }
+      case ValidationRuleType.TEXT_NOT_CONTAINS: {
+        if (rule.pattern && content.includes(rule.pattern)) {
+          return {
+            valid: false,
+            error: rule.errorMessage ?? `Content must not contain: ${rule.pattern}`,
+          };
+        }
+        break;
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
+// ========================================
+// FileInput sub-component
+// ========================================
+
+/** Max bytes for connector auth/config file uploads (JSON keys, PEM, etc.) — read before file.text(). */
+const MAX_CONNECTOR_FILE_BYTES = 256 * 1024;
+
+function FileInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  error,
+  isOptional,
+}: {
+  field: SchemaField;
+  value: unknown;
+  onChange: (name: string, value: unknown) => void;
+  disabled: boolean;
+  error?: string;
+  isOptional?: boolean;
+}) {
+  const { t } = useTranslation();
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const validation = 'validation' in field ? field.validation : undefined;
+  const acceptedTypes = validation?.acceptedFileTypes;
+  const validationRules = validation?.validationRules ?? [];
+
+  const acceptAttr = acceptedTypes && acceptedTypes.length > 0 ? acceptedTypes.join(',') : undefined;
+
+  const hasExistingValue = value != null && String(value).trim() !== '';
+
+  // Keep the local fileName display in sync with the parent value prop.
+  // If the parent resets the value to empty (e.g. a form reset triggered by a
+  // useEffect re-run), clear the local fileName so the green checkmark does not
+  // mislead the user into thinking the file content is still present.
+  React.useEffect(() => {
+    if (!hasExistingValue) {
+      setFileName(null);
+    }
+  }, [hasExistingValue]);
+
+  const isLoaded = fileName !== null || hasExistingValue;
+
+  const displayError = localError ?? error;
+
+  const handleClick = () => {
+    if (!disabled) fileInputRef.current?.click();
+  };
+
+  const ids = useId();
+  const labelId = `${ids}-label`;
+  const errorId = displayError ? `${ids}-error` : undefined;
+  const helpId = field.description ? `${ids}-help` : undefined;
+  // The hidden file input can't take focus, so the zone is the control keyboard and screen-reader users reach.
+  // Once a file is loaded, a key press replaces it, as the Replace link does: picking the same file again
+  // needs the input reset first.
+  const zoneProps = {
+    role: 'button',
+    tabIndex: disabled ? -1 : 0,
+    'aria-labelledby': labelId,
+    'aria-describedby': [helpId, errorId].filter(Boolean).join(' ') || undefined,
+    'aria-disabled': disabled || undefined,
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (disabled || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      if (isLoaded) handleReplace();
+      else handleClick();
+    },
+  } as const;
+
+  const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.size > MAX_CONNECTOR_FILE_BYTES) {
+      setLocalError(
+        `File is too large (${Math.ceil(file.size / 1024)} KB). Maximum size is ${MAX_CONNECTOR_FILE_BYTES / 1024} KB for key, certificate, or JSON uploads.`
+      );
+      e.target.value = '';
+      return;
+    }
+
+    try {
+      const content = await file.text();
+      const result = validationRules.length > 0
+        ? executeValidationRules(content, validationRules)
+        : { valid: true };
+      if (!result.valid) {
+        setLocalError(result.error ?? 'Invalid file.');
+        // Reset the input so the same file can be re-selected after correction
+        e.target.value = '';
+        return;
+      }
+      setLocalError(null);
+      setFileName(file.name);
+      onChange(field.name, content);
+    } catch {
+      setLocalError('Failed to read file.');
+      e.target.value = '';
+    }
+  };
+
+  const handleReplace = (e?: React.SyntheticEvent) => {
+    e?.stopPropagation();
+    setFileName(null);
+    setLocalError(null);
+    onChange(field.name, '');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    fileInputRef.current?.click();
+  };
+
+  return (
+    <Flex direction="column" gap="2">
+      {/* Label row */}
+      <Flex align="center" gap="1">
+        <Text id={labelId} size="2" weight="medium" style={{ color: 'var(--gray-12)' }}>
+          {field.displayName}
+        </Text>
+        {isOptional && !labelEndsWithOptional(field.displayName, t('form.optional')) && (
+          <Text size="1" style={{ color: 'var(--gray-10)' }}>
+            {t('form.optional')}
+          </Text>
+        )}
+      </Flex>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        tabIndex={-1}
+        aria-labelledby={labelId}
+        accept={acceptAttr}
+        onChange={handleChange}
+        disabled={disabled}
+        style={{ display: 'none' }}
+      />
+
+      {isLoaded ? (
+        /* Loaded state */
+        <Flex
+          align="center"
+          justify="between"
+          style={{
+            padding: '8px 12px',
+            backgroundColor: 'var(--green-a3)',
+            border: '1px solid var(--green-a6)',
+            borderRadius: 'var(--radius-2)',
+            cursor: disabled ? 'default' : 'pointer',
+            minHeight: 40,
+          }}
+          onClick={disabled ? undefined : handleClick}
+          {...zoneProps}
+        >
+          <Flex align="center" gap="2">
+            <MaterialIcon name="check_circle" size={16} color="var(--green-a11)" />
+            <Text size="2" style={{ color: 'var(--green-a11)', fontWeight: 500 }}>
+              {fileName ?? 'Already configured'}
+            </Text>
+          </Flex>
+          {!disabled && (
+            <Text
+              size="1"
+              style={{ color: 'var(--green-a11)', textDecoration: 'underline', cursor: 'pointer' }}
+              onClick={handleReplace}
+            >
+              Replace
+            </Text>
+          )}
+        </Flex>
+      ) : (
+        /* Upload zone */
+        <Flex
+          direction="column"
+          align="center"
+          justify="center"
+          gap="1"
+          style={{
+            padding: '16px 12px',
+            backgroundColor: displayError ? 'var(--red-a2)' : 'var(--color-surface)',
+            border: `1px dashed ${displayError ? 'var(--red-a7)' : 'var(--gray-a6)'}`,
+            borderRadius: 'var(--radius-2)',
+            cursor: disabled ? 'default' : 'pointer',
+            opacity: disabled ? 0.6 : 1,
+            minHeight: 72,
+            transition: 'border-color 0.15s, background-color 0.15s',
+          }}
+          onClick={handleClick}
+          {...zoneProps}
+        >
+          <MaterialIcon
+            name="upload_file"
+            size={20}
+            color={displayError ? 'var(--red-a10)' : 'var(--gray-10)'}
+          />
+          <Text size="2" style={{ color: displayError ? 'var(--red-a10)' : 'var(--gray-11)' }}>
+            {'placeholder' in field && field.placeholder ? field.placeholder : 'Click to upload file'}
+          </Text>
+          {acceptedTypes && acceptedTypes.length > 0 && (
+            <Text size="1" style={{ color: 'var(--gray-9)' }}>
+              {acceptedTypes.join(', ')}
+            </Text>
+          )}
+          <Text size="1" style={{ color: 'var(--gray-9)' }}>
+            Max {MAX_CONNECTOR_FILE_BYTES / 1024} KB
+          </Text>
+        </Flex>
+      )}
+
+      {displayError && (
+        <Text id={errorId} role="alert" size="1" style={{ color: 'var(--red-a10)' }}>
+          {displayError}
+        </Text>
+      )}
+
+      {field.description && (
+        <Text id={helpId} size="1" style={{ color: 'var(--gray-10)' }}>
+          {field.description}
+        </Text>
+      )}
+    </Flex>
+  );
+}
+
+export type { SchemaFormFieldProps };

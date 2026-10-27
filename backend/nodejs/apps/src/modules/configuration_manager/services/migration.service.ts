@@ -1,0 +1,357 @@
+import { inject, injectable } from 'inversify';
+import { Logger } from '../../../libs/services/logger.service';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import {
+  ConfigurationManagerConfig,
+  loadConfigurationManagerConfig,
+} from '../config/config';
+import { EncryptionService } from '../../../libs/encryptor/encryptor';
+import { configPaths } from '../paths/paths';
+import { randomUUID } from 'crypto';
+import { CrawlingSchedulerService } from '../../crawling_manager/services/crawling_service';
+import { AppConfig } from '../../tokens_manager/config/config';
+import { ScheduledJobsBackfillMigration } from './migrations/scheduled_jobs_backfill.migration';
+import { ChatKbFiltersMigration } from './migrations/chat_kb_filters.migration';
+import { AdminRoleMigration } from './migrations/admin_role.migration';
+import { DocumentOrgIdBackfillMigration } from './migrations/document_orgid_backfill.migration';
+import { ChatSessionsMigration } from './migrations/chat_sessions.migration';
+import { UserGroupNameIndexMigration } from './migrations/user_group_name_index.migration';
+import { SignInMethodsRemovalMigration } from './migrations/sign_in_methods_removal.migration';
+import { DelegationLogRetentionMigration } from './migrations/delegation_log_retention.migration';
+import { ServiceAccountKindBackfillMigration } from './migrations/service_account_kind_backfill.migration';
+import { Org } from '../../user_management/schema/org.schema';
+
+const DEFAULT_CHAT_SESSIONS_MIGRATION_BATCH_SIZE = 10;
+
+export interface MigrationDependencies {
+  scheduler: CrawlingSchedulerService;
+  appConfig: AppConfig;
+}
+
+@injectable()
+export class MigrationService {
+  private keyValueStoreService: KeyValueStoreService;
+  private logger: Logger;
+  private configManagerConfig: ConfigurationManagerConfig;
+
+  constructor(
+    @inject('Logger') logger: Logger,
+    @inject('KeyValueStoreService') keyValueStoreService: KeyValueStoreService,
+  ) {
+    this.logger = logger;
+    this.keyValueStoreService = keyValueStoreService;
+    this.configManagerConfig = loadConfigurationManagerConfig();
+  }
+
+  async runMigration(deps: MigrationDependencies): Promise<void> {
+    this.logger.info('Running migration...');
+    // await this.aiModelsMigration();  NO LONGER NEEDED
+    // Before the two below, which wait on the connector service. This one has
+    // nothing to wait for — it reads Mongo and writes one key — and the
+    // connector service reads that key during its own startup, so staging
+    // after a wait that the connector service itself has to finish would
+    // always miss the boot that introduced it.
+    await this.serviceAccountKindBackfillMigration();
+    // Until it runs, a policy may still name a removed sign-in method.
+    await this.signInMethodsRemovalMigration();
+    await this.connectorSyncScheduleMigration(deps.scheduler, deps.appConfig);
+    await this.chatKbFiltersMigration();
+    await this.chatSessionsMigration();
+    await this.adminRoleMigration();
+    await this.userGroupNameIndexMigration();
+    await this.delegationLogRetentionMigration();
+    await this.documentOrgIdMigration();
+    this.logger.info('✅ Migration completed');
+  }
+
+  async serviceAccountKindBackfillMigration(): Promise<void> {
+    try {
+      const result = await new ServiceAccountKindBackfillMigration(
+        this.logger,
+        this.keyValueStoreService,
+        this.configManagerConfig.algorithm,
+        this.configManagerConfig.secretKey,
+      ).run();
+
+      if (result.skipped) return;
+
+      this.logger.info(
+        '✅ Service accounts staged for the connector service to mark in the graph',
+        result,
+      );
+    } catch (error) {
+      this.logger.error('Service-account kind backfill failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async adminRoleMigration(): Promise<void> {
+    this.logger.info('Migrating admin group membership to user.role');
+    try {
+      const result = await new AdminRoleMigration(
+        this.logger,
+        this.keyValueStoreService,
+      ).run();
+
+      if (result.errored > 0) {
+        this.logger.warn(
+          '⚠️  Admin-role migration finished with errors — will retry on next boot',
+          result,
+        );
+      } else {
+        this.logger.info('✅ Admin role migrated', result);
+      }
+    } catch (error) {
+      this.logger.error('Admin-role migration failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async signInMethodsRemovalMigration(): Promise<void> {
+    this.logger.info('Removing SAML and OAuth from sign-in policies');
+    try {
+      const result = await new SignInMethodsRemovalMigration(
+        this.logger,
+        this.keyValueStoreService,
+      ).run();
+
+      if (result.errored > 0) {
+        this.logger.warn(
+          '⚠️  Sign-in methods removal finished with errors — will retry on next boot',
+          result,
+        );
+      } else {
+        this.logger.info('✅ Sign-in methods removed', result);
+      }
+    } catch (error) {
+      this.logger.error('Sign-in methods removal failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async userGroupNameIndexMigration(): Promise<void> {
+    // run() logs its own outcome and never throws.
+    await new UserGroupNameIndexMigration(this.logger).run();
+  }
+
+  async delegationLogRetentionMigration(): Promise<void> {
+    // Changing the retention constant does not move an index that already
+    // exists; this does. run() logs its own outcome and never throws.
+    await new DelegationLogRetentionMigration(this.logger).run();
+  }
+
+  async chatKbFiltersMigration(): Promise<void> {
+    this.logger.info('Migrating chat KB filters');
+    try {
+      const result = await new ChatKbFiltersMigration(
+        this.logger,
+        this.keyValueStoreService,
+        this.configManagerConfig.algorithm,
+        this.configManagerConfig.secretKey,
+      ).run();
+
+      if (result.errored > 0) {
+        this.logger.warn(
+          '⚠️  Chat KB-filters migration finished with errors — will retry on next boot',
+          result,
+        );
+      } else {
+        this.logger.info('✅ Chat KB filters migrated', result);
+      }
+    } catch (error) {
+      this.logger.error('Chat KB-filters migration failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async chatSessionsMigration(): Promise<void> {
+    this.logger.info('Migrating legacy conversations into chatSessions');
+    try {
+      const configuredBatchSize = Number.parseInt(
+        process.env.CHAT_SESSIONS_MIGRATION_BATCH_SIZE ?? '',
+        10,
+      );
+      const batchSize =
+        Number.isInteger(configuredBatchSize) && configuredBatchSize > 0
+          ? configuredBatchSize
+          : DEFAULT_CHAT_SESSIONS_MIGRATION_BATCH_SIZE;
+      const result = await new ChatSessionsMigration(
+        this.logger,
+        this.keyValueStoreService,
+        batchSize,
+      ).run();
+
+      if (result.errored > 0) {
+        this.logger.warn(
+          '⚠️  Chat sessions migration finished with errors — will retry unmigrated documents on next boot',
+          result,
+        );
+      } else {
+        this.logger.info('✅ Chat sessions migrated', result);
+      }
+    } catch (error) {
+      this.logger.error('Chat sessions migration failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async documentOrgIdMigration(): Promise<void> {
+    this.logger.info('Migrating document orgId backfill');
+    try {
+      const result = await new DocumentOrgIdBackfillMigration(
+        this.logger,
+        this.keyValueStoreService,
+      ).run();
+
+      if (result.errored > 0) {
+        this.logger.warn(
+          '⚠️  Document orgId migration finished with errors — will retry on next boot',
+          result,
+        );
+      } else {
+        this.logger.info('✅ Document orgId migrated', result);
+      }
+    } catch (error) {
+      this.logger.error('Document orgId migration failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async connectorSyncScheduleMigration(
+    scheduler: CrawlingSchedulerService,
+    appConfig: AppConfig,
+  ): Promise<void> {
+    this.logger.info('Migrating connector sync schedules');
+    try {
+      // On a completely fresh installation no organisation has been created yet,
+      // so there can be no connectors to schedule. Mark the migration done
+      // immediately rather than trying to reach the (possibly still booting)
+      // Python connector service — this makes cold-start faster and avoids
+      // unnecessary retry noise in the logs.
+      const orgCount = await Org.countDocuments();
+      if (orgCount === 0) {
+        this.logger.info(
+          'No organisation found — fresh setup detected. ' +
+            'Marking connector sync schedule migration as done without backfill.',
+        );
+        await this.keyValueStoreService.set(
+          configPaths.connectorSyncScheduledJobsMigrationV2,
+          'true',
+        );
+        return;
+      }
+
+      const result = await new ScheduledJobsBackfillMigration(
+        this.logger,
+        this.keyValueStoreService,
+        scheduler,
+        appConfig,
+      ).run();
+
+      if (result.errored > 0) {
+        this.logger.warn(
+          '⚠️  Connector sync schedule migration finished with errors — will retry on next boot',
+          result,
+        );
+      } else {
+        this.logger.info('✅ Connector sync schedules migrated', result);
+      }
+    } catch (error) {
+      this.logger.error('Connector sync schedule migration failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  /**
+   * Recreate the BullMQ job of any scheduled connector that lost it. Run on a timer: a schedule
+   * written in the background after a save can fail, and nothing else would ever notice.
+   */
+  async repairConnectorSchedules(
+    scheduler: CrawlingSchedulerService,
+    appConfig: AppConfig,
+  ): Promise<void> {
+    try {
+      const result = await new ScheduledJobsBackfillMigration(
+        this.logger,
+        this.keyValueStoreService,
+        scheduler,
+        appConfig,
+        { maxAttempts: 1 },
+      ).run({ ignoreDoneFlag: true });
+      if (result.scheduled > 0 || result.errored > 0) {
+        this.logger.warn(
+          'Repaired connector sync schedules that were missing',
+          result,
+        );
+      }
+    } catch (error) {
+      this.logger.error('Connector sync schedule repair failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  async aiModelsMigration(): Promise<void> {
+    this.logger.info('Migrating ai models configurations');
+    const encryptedAIConfig = await this.keyValueStoreService.get<string>(
+      configPaths.aiModels,
+    );
+    if (!encryptedAIConfig) {
+      this.logger.info('No ai models configurations found');
+      return;
+    }
+    const aiModels = JSON.parse(
+      EncryptionService.getInstance(
+        this.configManagerConfig.algorithm,
+        this.configManagerConfig.secretKey,
+      ).decrypt(encryptedAIConfig),
+    );
+    if (!aiModels) {
+      this.logger.info('No ai models configurations found');
+      return;
+    }
+
+    //  migrate llm configs
+    const llmConfigs = aiModels['llm'];
+    let isDefault = true;
+    for (const llmConfig of llmConfigs) {
+      if (!llmConfig.modelKey) {
+        const modelKey = randomUUID();
+        llmConfig.modelKey = modelKey;
+        llmConfig.isDefault = isDefault;
+        llmConfig.isMultiModel = false;
+        isDefault = false;
+      }
+    }
+
+    const embeddingConfigs = aiModels['embedding'];
+    isDefault = true;
+    for (const embeddingConfig of embeddingConfigs) {
+      if (!embeddingConfig.modelKey) {
+        const modelKey = randomUUID();
+        embeddingConfig.modelKey = modelKey;
+        embeddingConfig.isDefault = isDefault;
+        embeddingConfig.isMultiModel = false;
+        isDefault = false;
+      }
+    }
+
+    aiModels['llm'] = llmConfigs;
+    aiModels['embedding'] = embeddingConfigs;
+
+    const encryptedAiModels = EncryptionService.getInstance(
+      this.configManagerConfig.algorithm,
+      this.configManagerConfig.secretKey,
+    ).encrypt(JSON.stringify(aiModels));
+    await this.keyValueStoreService.set(configPaths.aiModels, encryptedAiModels);
+
+    this.logger.info('✅ Ai models configurations migrated');
+  }
+}

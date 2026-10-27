@@ -1,0 +1,290 @@
+import { Router, Response, NextFunction } from 'express';
+import { z } from 'zod';
+import { Container } from 'inversify';
+import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
+
+import {
+  authSessionMiddleware,
+  userValidator,
+} from '../middlewares/userAuthentication.middleware';
+import { attachContainerMiddleware } from '../middlewares/attachContainer.middleware';
+import { AuthSessionRequest } from '../middlewares/types';
+import { UserAccountController } from '../controller/userAccount.controller';
+import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
+import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
+import { AuthenticatedServiceRequest } from '../../../libs/middlewares/types';
+import { createAuthRateLimiter } from '../../../libs/middlewares/rate-limit.middleware';
+import { Logger } from '../../../libs/services/logger.service';
+import { AppConfig, loadAppConfig } from '../../tokens_manager/config/config';
+import {
+  AUTH_APP_CONFIG_RELOADER,
+  AuthAppConfigReloader,
+} from '../container/authService.container';
+import { emailCheck } from '../../../libs/utils/zod-formats';
+
+const otpGenerationBody = z.object({
+  email: z.string().check(emailCheck('Invalid email')),
+  'cf-turnstile-response': z.string().optional(), // Add Turnstile token for forgot password
+});
+
+const otpGenerationValidationSchema = z.object({
+  body: otpGenerationBody,
+  query: z.object({}),
+  params: z.object({}),
+  headers: z.object({}),
+});
+
+const initAuthBody = z.object({
+  email: z
+    .string()
+    // .min(1, 'Email is required')
+    .max(254, 'Email address is too long') // RFC 5321 limit
+    .check(emailCheck('Invalid email format'))
+    .optional(),
+});
+
+const initAuthValidationSchema = z.object({
+  body: initAuthBody,
+  query: z.object({}),
+  params: z.object({}),
+  headers: z.object({}),
+});
+
+export function createUserAccountRouter(container: Container) {
+  const router = Router();
+
+  router.use(attachContainerMiddleware(container));
+  const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
+  // One per-IP bucket shared by all credential/OTP/email routes below.
+  const authRateLimiter = createAuthRateLimiter(
+    container.get<Logger>('Logger'),
+    container.get<AppConfig>('AppConfig').maxAuthRequestsPerMinute,
+  );
+
+  router.post(
+    '/initAuth',
+    authRateLimiter,
+    ValidationMiddleware.validate(initAuthValidationSchema),
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.initAuth(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  const authenticateBody = z.object({
+    method: z.string().min(1, 'Authentication method is required'),
+    credentials: z.union([
+      z.string().min(1, 'Credentials cannot be empty'), // For Google OAuth, credentials can be a string (ID token)
+      z.object({
+        password: z.string().optional(),
+        otp: z.string().optional(),
+        token: z.string().optional(),
+        code: z.string().optional(),
+        accessToken: z.string().optional(),
+        idToken: z.string().optional(),
+      }).loose(), // Allow additional fields for OAuth providers
+    ]),
+    email: z
+      .string()
+      .max(254, 'Email address is too long') // RFC 5321 limit
+      .check(emailCheck('Invalid email format'))
+      .optional(),
+    'cf-turnstile-response': z.string().optional(), // Add Turnstile token
+  }).strict();
+
+  const authenticateValidationSchema = z.object({
+    body: authenticateBody,
+    query: z.object({}),
+    params: z.object({}),
+    headers: z.object({}),
+  });
+
+  router.post(
+    '/authenticate',
+    authRateLimiter,
+    authSessionMiddleware,
+    ValidationMiddleware.validate(authenticateValidationSchema),
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.authenticate(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/login/otp/generate',
+    authRateLimiter,
+    ValidationMiddleware.validate(otpGenerationValidationSchema),
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.getLoginOtp(req, res);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  const resetPasswordValidationSchema = z.object({
+    body: z.object({
+      currentPassword: z.string().optional(),
+      newPassword: z.string(),
+      'cf-turnstile-response': z.string().optional(),
+    }),
+  });
+
+  router.post(
+    '/password/reset',
+    authRateLimiter,
+    userValidator,
+    ValidationMiddleware.validate(resetPasswordValidationSchema),
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.resetPassword(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/refresh/token',
+    authMiddleware.scopedTokenValidator(TokenScopes.TOKEN_REFRESH),
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.getAccessTokenFromRefreshToken(
+          req,
+          res,
+          next,
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/logout/manual',
+    userValidator,
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.logoutSession(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  router.post(
+    '/password/reset/token',
+    authMiddleware.scopedTokenValidator(TokenScopes.PASSWORD_RESET),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.resetPasswordViaEmailLink(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/password/forgot',
+    authRateLimiter,
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.forgotPasswordEmail(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  //sending mail for setting password for the first time
+  router.get(
+    '/internal/password/check',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.hasPasswordMethod(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.put(
+    '/validateEmailChange',
+    authMiddleware.scopedTokenValidator(TokenScopes.VALIDATE_EMAIL),
+    async (req: AuthSessionRequest, res: Response, next: NextFunction) => {
+      try {
+        const userAccountController = container.get<UserAccountController>(
+          'UserAccountController',
+        );
+        await userAccountController.validateEmailChange(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Called by the configuration manager after settings such as the frontend URL change.
+  router.post(
+    '/updateAppConfig',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    async (
+      _req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      try {
+        container.get<AuthAppConfigReloader>(AUTH_APP_CONFIG_RELOADER)(
+          await loadAppConfig(),
+        );
+        res
+          .status(200)
+          .json({ message: 'Auth configuration updated successfully' });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  return router;
+}

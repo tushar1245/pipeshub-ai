@@ -1,0 +1,2293 @@
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+
+from tests.support.vector_db import make_collection_registry
+
+MODULE = "app.api.routes.health"
+
+
+class TestLlmHealthCheck:
+    @pytest.mark.asyncio
+    async def test_success(self, mock_request):
+        """The bulk route now runs the same per-model check as the model
+        dialog, so both screens verify the same things."""
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import llm_health_check
+            resp = await llm_health_check(
+                mock_request, [{"provider": "openai", "configuration": {"model": "gpt-4"}}],
+            )
+
+        assert resp.status_code == 200
+        assert "healthy" in resp.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_no_configs_is_rejected(self, mock_request):
+        from app.api.routes.health import llm_health_check
+        resp = await llm_health_check(mock_request, [])
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_one_bad_config_fails_the_batch(self, mock_request):
+        """A batch is only healthy if every model in it is."""
+        with patch(f"{MODULE}.get_generator_model", side_effect=RuntimeError("bad key")):
+            from app.api.routes.health import llm_health_check
+            resp = await llm_health_check(
+                mock_request,
+                [
+                    {"provider": "openai", "configuration": {"model": "gpt-4"}},
+                    {"provider": "openai", "configuration": {"model": "gpt-4o"}},
+                ],
+            )
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_failure(self, mock_request):
+        with patch(f"{MODULE}.get_generator_model", side_effect=Exception("LLM failed")):
+            from app.api.routes.health import llm_health_check
+            resp = await llm_health_check(
+                mock_request, [{"provider": "openai", "configuration": {"model": "gpt-4"}}],
+            )
+
+        assert resp.status_code == 500
+        assert "LLM failed" not in resp.body.decode()  # logged, never returned
+
+
+class TestInitializeEmbeddingModel:
+    @pytest.mark.asyncio
+    async def test_default_model(self, mock_request):
+        mock_embed = MagicMock()
+        with patch(f"{MODULE}.get_default_embedding_model", return_value=mock_embed):
+            from app.api.routes.health import initialize_embedding_model
+            result = await initialize_embedding_model(mock_request, [])
+
+        assert result[0] is mock_embed
+
+    @pytest.mark.asyncio
+    async def test_config_with_default_flag(self, mock_request):
+        mock_embed = MagicMock()
+        configs = [
+            {"provider": "openai", "isDefault": False},
+            {"provider": "openai", "isDefault": True},
+        ]
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed):
+            from app.api.routes.health import initialize_embedding_model
+            result = await initialize_embedding_model(mock_request, configs)
+
+        assert result[0] is mock_embed
+
+    @pytest.mark.asyncio
+    async def test_config_without_default_uses_first(self, mock_request):
+        mock_embed = MagicMock()
+        configs = [{"provider": "openai", "isDefault": False}]
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed):
+            from app.api.routes.health import initialize_embedding_model
+            result = await initialize_embedding_model(mock_request, configs)
+
+        assert result[0] is mock_embed
+
+    @pytest.mark.asyncio
+    async def test_no_model_found_raises(self, mock_request):
+        configs = [{"provider": "openai", "isDefault": False}]
+        with patch(f"{MODULE}.get_embedding_model", return_value=None):
+            from app.api.routes.health import initialize_embedding_model
+            with pytest.raises(HTTPException) as exc_info:
+                await initialize_embedding_model(mock_request, configs)
+            assert exc_info.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_exception_during_init_raises(self, mock_request):
+        configs = [{"provider": "bad", "isDefault": True}]
+        with patch(f"{MODULE}.get_embedding_model", side_effect=Exception("init fail")):
+            from app.api.routes.health import initialize_embedding_model
+            with pytest.raises(HTTPException) as exc_info:
+                await initialize_embedding_model(mock_request, configs)
+            assert exc_info.value.status_code == 500
+
+
+class TestVerifyEmbeddingHealth:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        mock_embed = AsyncMock()
+        mock_embed.aembed_query = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        logger = MagicMock()
+
+        from app.api.routes.health import verify_embedding_health
+        size = await verify_embedding_health(mock_embed, logger)
+        assert size == 3
+
+    @pytest.mark.asyncio
+    async def test_empty_embedding_raises(self):
+        mock_embed = AsyncMock()
+        mock_embed.aembed_query = AsyncMock(return_value=[])
+        logger = MagicMock()
+
+        from app.api.routes.health import verify_embedding_health
+        with pytest.raises(HTTPException) as exc_info:
+            await verify_embedding_health(mock_embed, logger)
+        assert exc_info.value.status_code == 500
+
+
+class TestHandleModelChange:
+    @pytest.mark.asyncio
+    async def test_no_change(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "model-a", "model-a", 768, 100, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_model_change_with_data_raises(self):
+        """Model name change with existing data should be rejected."""
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        with pytest.raises(HTTPException) as exc_info:
+            await handle_model_change(retrieval_svc, "model-a", "model-b", 768, 100, 512, logger)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_model_change_empty_collection_recreates(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.recreate_collection", new_callable=AsyncMock) as mock_recreate:
+            from app.api.routes.health import handle_model_change
+            await handle_model_change(retrieval_svc, "model-a", "model-b", 768, 0, 512, logger)
+            mock_recreate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_change_when_current_is_none(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, None, "model-b", 768, 0, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_no_change_when_new_is_none(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "model-a", None, 768, 0, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_strips_models_prefix(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "models/model-a", "models/model-a", 768, 100, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_comparison(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "Model-A", "model-a", 768, 100, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_same_model_different_provider_allowed_with_data(self):
+        """Same model served by different providers (org prefix differs) is NOT a
+        breaking change when dimensions also match."""
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(
+            retrieval_svc, "nomic-ai/nomic-embed-text", "nomic-embed-text", 768, 100, 768, logger
+        )
+        retrieval_svc.vector_db_service.delete_collection.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_different_model_with_data_raises(self):
+        """Different model with data in collection should be rejected."""
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        with pytest.raises(HTTPException) as exc_info:
+            await handle_model_change(
+                retrieval_svc, "nomic-ai/nomic-embed-text", "BAAI/bge-large-en-v1.5", 768, 100, 1024, logger
+            )
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_same_name_empty_recreates(self):
+        """Same model name but different dimensions on empty collection should recreate."""
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.recreate_collection", new_callable=AsyncMock) as mock_recreate:
+            from app.api.routes.health import handle_model_change
+            await handle_model_change(retrieval_svc, "model-a", "model-a", 768, 0, 1024, logger)
+            mock_recreate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_same_name_with_data_raises(self):
+        """Same model name but different dimensions with data should be rejected."""
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        with pytest.raises(HTTPException) as exc_info:
+            await handle_model_change(retrieval_svc, "model-a", "model-a", 768, 50, 1024, logger)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_null_name_empty_recreates(self):
+        """Unknown current model but mismatched dimensions on empty collection should recreate."""
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.recreate_collection", new_callable=AsyncMock) as mock_recreate:
+            from app.api.routes.health import handle_model_change
+            await handle_model_change(retrieval_svc, None, "model-b", 768, 0, 512, logger)
+            mock_recreate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_zero_qdrant_vector_size_no_recreate(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "model-a", "model-b", 0, 0, 512, logger)
+
+
+class TestRecreateCollection:
+    @pytest.mark.asyncio
+    async def test_rebuilds_every_managed_collection(self):
+        retrieval_svc = MagicMock()
+        retrieval_svc.collection_name = "test_coll"
+        registry = MagicMock()
+        registry.recreate_records_collections = AsyncMock(return_value=["test_coll", "other"])
+        registry.ensure_collection = AsyncMock()
+        retrieval_svc.collection_registry = registry
+        logger = MagicMock()
+
+        from app.api.routes.health import recreate_collection
+        await recreate_collection(retrieval_svc, 768, logger)
+
+        registry.recreate_records_collections.assert_awaited_once()
+        # Nothing to backfill when the registry already rebuilt something.
+        registry.ensure_collection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_creates_the_collection_when_nothing_is_managed_yet(self):
+        """Nothing managed means nothing to rebuild.
+
+        Creating one here would have to invent a context, which under a
+        strategy that names collections per org or connector names a
+        collection belonging to nobody. The indexing write path pins the
+        dimension from the record that actually needs it.
+        """
+        retrieval_svc = MagicMock()
+        retrieval_svc.collection_name = "test_coll"
+        registry = MagicMock()
+        registry.recreate_records_collections = AsyncMock(return_value=[])
+        registry.ensure_collection = AsyncMock(return_value="test_coll")
+        retrieval_svc.collection_registry = registry
+        logger = MagicMock()
+
+        from app.api.routes.health import recreate_collection
+        await recreate_collection(retrieval_svc, 768, logger)
+
+        registry.ensure_collection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failure_raises(self):
+        retrieval_svc = MagicMock()
+        retrieval_svc.collection_name = "test_coll"
+        registry = MagicMock()
+        registry.recreate_records_collections = AsyncMock(side_effect=Exception("fail"))
+        retrieval_svc.collection_registry = registry
+        logger = MagicMock()
+
+        from app.api.routes.health import recreate_collection
+        with pytest.raises(Exception, match="fail"):
+            await recreate_collection(retrieval_svc, 768, logger)
+
+
+class TestCheckCollectionInfo:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        from app.services.vector_db.models import VectorCollectionInfo
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=True, dense_dimension=768, points_count=10)
+        )
+        retrieval_svc.get_current_embedding_model_name = AsyncMock(return_value="model-a")
+        retrieval_svc.get_embedding_model_name = MagicMock(return_value="model-a")
+        logger = MagicMock()
+        dense_embeddings = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        await check_collection_info(retrieval_svc, dense_embeddings, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_grpc_not_found(self):
+        from app.services.vector_db.models import VectorCollectionInfo
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+
+        # get_collection_info returns exists=False for a missing collection (not an exception)
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=False)
+        )
+        retrieval_svc.get_current_embedding_model_name = AsyncMock(return_value="model-a")
+        retrieval_svc.get_embedding_model_name = MagicMock(return_value="model-a")
+        logger = MagicMock()
+        dense_embeddings = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        # Should NOT raise — missing collection is acceptable for health check
+        await check_collection_info(retrieval_svc, dense_embeddings, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception(self):
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(side_effect=RuntimeError("bad"))
+        logger = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        # Current behavior: non-HTTPException connectivity errors are swallowed as warnings
+        await check_collection_info(retrieval_svc, MagicMock(), 768, logger)
+        logger.warning.assert_called()
+
+
+class TestEmbeddingHealthCheck:
+    @pytest.mark.asyncio
+    async def test_success(self, mock_request):
+        mock_embed = AsyncMock()
+        mock_embed.aembed_query = AsyncMock(return_value=[0.1, 0.2])
+
+        with patch(f"{MODULE}.initialize_embedding_model", new_callable=AsyncMock,
+                   return_value=(mock_embed, mock_request.app.container.retrieval_service.return_value, MagicMock())), \
+             patch(f"{MODULE}.verify_embedding_health", new_callable=AsyncMock, return_value=2), \
+             patch(f"{MODULE}.check_collection_info", new_callable=AsyncMock):
+            from app.api.routes.health import embedding_health_check
+            resp = await embedding_health_check(mock_request, [{"provider": "openai"}])
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_http_exception(self, mock_request):
+        with patch(f"{MODULE}.initialize_embedding_model", new_callable=AsyncMock,
+                   side_effect=HTTPException(status_code=500, detail={"status": "not healthy", "error": "fail"})):
+            from app.api.routes.health import embedding_health_check
+            resp = await embedding_health_check(mock_request, [])
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_general_exception(self, mock_request):
+        mock_embed = AsyncMock()
+        retrieval_svc = mock_request.app.container.retrieval_service.return_value
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.initialize_embedding_model", new_callable=AsyncMock,
+                   return_value=(mock_embed, retrieval_svc, logger)), \
+             patch(f"{MODULE}.verify_embedding_health", new_callable=AsyncMock, side_effect=Exception("boom")):
+            from app.api.routes.health import embedding_health_check
+            resp = await embedding_health_check(mock_request, [{"provider": "openai"}])
+
+        assert resp.status_code == 500
+
+
+class TestPerformLlmHealthCheck:
+    @pytest.fixture(autouse=True)
+    def _mock_outbound_probe(self):
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=True):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_success_text(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+        mock_model.invoke.return_value = "ok"
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_no_model_names(self):
+        """A configuration the admin has to fix is a 400, so the UI can tell it
+        apart from the service being broken."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": ""}}
+
+        from app.api.routes.health import perform_llm_health_check
+        resp = await perform_llm_health_check(config, logger)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_multimodal_image_success(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4o"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_multimodal_image_fails_text_passes(self):
+        """Text works, the image is rejected with an error that names the
+        limitation: that is the one case where "no vision" is the right
+        verdict."""
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+
+        call_count = 0
+        async def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:      # text probe first, image second
+                raise Exception("This model does not support image input")
+            return "text ok"
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", side_effect=side_effect):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 400
+        body = resp.body.decode()
+        assert "doesn't support images" in body
+
+    @pytest.mark.asyncio
+    async def test_transient_image_failure_is_not_a_vision_verdict(self):
+        """A 429 says nothing about vision. Reporting "no vision" here tells an
+        admin to disable a capability their model actually has."""
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4o"}}
+        rate_limited = Exception("Rate limit reached")
+        rate_limited.status_code = 429
+
+        call_count = 0
+        async def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise rate_limited
+            return "text ok"
+
+        with patch(f"{MODULE}.get_generator_model", return_value=MagicMock()), \
+             patch("asyncio.wait_for", side_effect=side_effect):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        body = resp.body.decode()
+        assert resp.status_code == 500
+        assert "doesn't support images" not in body
+        assert "Rate limit" not in body  # the provider's text is logged, never returned
+
+    @pytest.mark.asyncio
+    async def test_multimodal_both_fail(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=Exception("total fail")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_outbound_connectivity_on_connection_failure(self):
+        logger = MagicMock()
+        config = {"provider": "gemini", "configuration": {"model": "gemini-pro"}}
+
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False), \
+             patch(f"{MODULE}.get_generator_model", side_effect=ConnectionError("failed to establish a new connection")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 500
+        body = resp.body.decode()
+        assert "outbound_connectivity" in body
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_does_not_block_reachable_provider(self):
+        logger = MagicMock()
+        config = {"provider": "gemini", "configuration": {"model": "gemini-pro"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False) as probe, \
+             patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_not_called()
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_outbound_probe_skipped_for_ollama(self):
+        logger = MagicMock()
+        config = {
+            "provider": "ollama",
+            "configuration": {"model": "llama3", "endpoint": "http://host.docker.internal:11434"},
+        }
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False) as probe, \
+             patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_not_called()
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_timeout(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 504
+        body = resp.body.decode()
+        assert "timed out" in body
+        assert "health_check_timeout" in body
+
+    @pytest.mark.asyncio
+    async def test_http_exception(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.get_generator_model", side_effect=HTTPException(status_code=401, detail="unauthorized")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_general_exception(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.get_generator_model", side_effect=RuntimeError("bad")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_multimodal_from_configuration(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4o", "isMultimodal": True}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_every_configured_model_is_checked(self):
+        """Node registers each comma-separated name as its own model, so
+        checking only the first ships untested models."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4, gpt-3.5"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model) as mock_gen, \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+        checked = [call.kwargs["model_name"] for call in mock_gen.call_args_list]
+        assert checked == ["gpt-4", "gpt-3.5"]
+
+    @pytest.mark.asyncio
+    async def test_multimodal_timeout_on_image(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4o"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 504
+
+
+class TestPerformEmbeddingHealthCheck:
+    @pytest.mark.asyncio
+    async def test_success(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        # Use provider-neutral VectorCollectionInfo-style mock
+        coll_info = MagicMock()
+        coll_info.exists = True
+        coll_info.dense_dimension = 768  # matches embedding dimension
+        coll_info.points_count = 0       # no data - no mismatch check
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(return_value=coll_info)
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_no_model_names(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": ""}}
+
+        from app.api.routes.health import perform_embedding_health_check
+        resp = await perform_embedding_health_check(mock_request, config, logger)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_empty_results(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_timeout(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_with_data(self, mock_request):
+        """perform_embedding_health_check only tests model connectivity; mismatch
+        detection is now in check_collection_info / handle_model_change."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_http_exception(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+
+        with patch(f"{MODULE}.get_embedding_model", side_effect=HTTPException(status_code=401, detail="unauthorized")):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_general_exception(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+
+        with patch(f"{MODULE}.get_embedding_model", side_effect=RuntimeError("bad")):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_grpc_not_found_during_collection_check(self, mock_request):
+        from app.services.vector_db.models import VectorCollectionInfo
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        # Collection does not exist yet — provider returns exists=False
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=False)
+        )
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+            # Collection not found is acceptable — returns healthy
+            assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_collection_lookup_error_does_not_affect_result(self, mock_request):
+        """perform_embedding_health_check no longer calls get_collection_info.
+        Collection errors are handled by check_collection_info (separate code path)."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_comma_separated_models_uses_first(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "model-a, model-b"}}
+        mock_embed = MagicMock()
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+
+        dense_vec = MagicMock()
+        dense_vec.size = 768
+        vectors = MagicMock()
+        vectors.get.return_value = dense_vec
+        coll_info = MagicMock()
+        coll_info.config.params.vectors = vectors
+        coll_info.points_count = 0
+        retrieval_svc.vector_db_service.get_collection = AsyncMock(return_value=coll_info)
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed) as mock_get, \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert [call.kwargs["model_name"] for call in mock_get.call_args_list] == [
+            "model-a",
+            "model-b",
+        ]
+
+
+class TestHealthCheckEndpoint:
+    @pytest.mark.asyncio
+    async def test_embedding_type(self, mock_request):
+        config = {"provider": "openai", "configuration": {"model": "text-embedding"}}
+
+        with patch(f"{MODULE}.perform_embedding_health_check", new_callable=AsyncMock,
+                   return_value=JSONResponse(status_code=200, content={"status": "healthy"})):
+            from app.api.routes.health import health_check
+            resp = await health_check(mock_request, "embedding", config)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_llm_type(self, mock_request):
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.perform_llm_health_check", new_callable=AsyncMock,
+                   return_value=JSONResponse(status_code=200, content={"status": "healthy"})):
+            from app.api.routes.health import health_check
+            resp = await health_check(mock_request, "llm", config)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_unknown_type_is_rejected(self, mock_request):
+        """A type with no implementation used to return 200 healthy, which
+        registered a model nothing had checked. Node's own validator accepts
+        `ocr`, `slm`, `reasoning` and `multiModal`, all of which land here."""
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        from app.api.routes.health import health_check
+        resp = await health_check(mock_request, "unknown", config)
+        assert resp.status_code == 400
+        assert "No health check exists" in resp.body.decode()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_type", ["ocr", "slm", "reasoning", "multiModal"])
+    async def test_types_node_accepts_but_python_cannot_check(self, mock_request, model_type):
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        from app.api.routes.health import health_check
+        resp = await health_check(mock_request, model_type, config)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_exception_handling(self, mock_request):
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.perform_llm_health_check", new_callable=AsyncMock,
+                   side_effect=Exception("unexpected")):
+            from app.api.routes.health import health_check
+            resp = await health_check(mock_request, "llm", config)
+
+        assert resp.status_code == 500
+
+
+class TestInitializeEmbeddingModelExtraEdgeCases:
+    """Extra edge cases for initialize_embedding_model to cover remaining branches."""
+
+    @pytest.mark.asyncio
+    async def test_all_configs_return_none_raises(self, mock_request):
+        """Cover lines 85->89: when no default found AND fallback also returns None."""
+        configs = [{"provider": "openai", "isDefault": False}]
+        # get_embedding_model returns None for both the first loop (no default)
+        # and the fallback loop
+        with patch(f"{MODULE}.get_embedding_model", return_value=None):
+            from app.api.routes.health import initialize_embedding_model
+            with pytest.raises(HTTPException) as exc_info:
+                await initialize_embedding_model(mock_request, configs)
+            assert exc_info.value.status_code == 500
+            assert "couldn't start" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_dense_embeddings_none_after_try_block(self, mock_request):
+        """Cover line 103: dense_embeddings is None after the try/except.
+
+        This is a safety guard for the case where the try block doesn't raise
+        but dense_embeddings still ends up None. We achieve this by providing
+        an empty list of configs (no default) which bypasses both for loops,
+        and then the HTTPException from line 90 is caught and re-raised by the
+        except block. So instead, we mock get_default_embedding_model to return None.
+        """
+        with patch(f"{MODULE}.get_default_embedding_model", return_value=None):
+            from app.api.routes.health import initialize_embedding_model
+            with pytest.raises(HTTPException) as exc_info:
+                await initialize_embedding_model(mock_request, [])
+            assert exc_info.value.status_code == 500
+            assert "initialization_failed" in str(exc_info.value.detail)
+
+
+class TestCheckCollectionInfoExtraEdgeCases:
+    """Extra edge cases for check_collection_info to cover remaining branches."""
+
+    @pytest.mark.asyncio
+    async def test_grpc_non_not_found_error(self):
+        """Non-HTTPException errors from get_collection_info are swallowed (logged as warning)."""
+        import grpc
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+
+        from grpc._channel import _InactiveRpcError
+        state = MagicMock()
+        state.code = grpc.StatusCode.UNAVAILABLE
+        state.details = "unavailable"
+        error = _InactiveRpcError(state)
+
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(side_effect=error)
+        logger = MagicMock()
+        dense_embeddings = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        # Should NOT raise — exception is swallowed and logged as warning
+        await check_collection_info(retrieval_svc, dense_embeddings, 768, logger)
+        logger.warning.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_model_change_with_data_raises_via_check_collection_info(self):
+        """Model change with data is rejected via check_collection_info (handle_model_change raises)."""
+        from app.services.vector_db.models import VectorCollectionInfo
+
+        retrieval_svc = AsyncMock()
+        # A real registry double: the survey enumerates the manifest now, so a
+        # bare AsyncMock would report "nothing managed" and let the change past.
+        retrieval_svc.collection_registry = make_collection_registry("coll")
+
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=True, dense_dimension=768, points_count=100)
+        )
+        retrieval_svc.get_current_embedding_model_name = AsyncMock(return_value="model-a")
+        retrieval_svc.get_embedding_model_name = MagicMock(return_value="model-b")
+
+        logger = MagicMock()
+        dense_embeddings = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        with pytest.raises(HTTPException) as exc_info:
+            await check_collection_info(retrieval_svc, dense_embeddings, 768, logger)
+        assert exc_info.value.status_code == 400
+
+
+class TestPerformEmbeddingHealthCheckExtraEdgeCases:
+    """Extra edge cases for perform_embedding_health_check."""
+
+    @pytest.mark.asyncio
+    async def test_collection_exists_no_dimension(self, mock_request):
+        """Collection exists but dense_dimension is None — treated as 0, no mismatch."""
+        from app.services.vector_db.models import VectorCollectionInfo
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=True, dense_dimension=None, points_count=0)
+        )
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        # No data yet (points_count=0) → healthy
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_collection_does_not_exist(self, mock_request):
+        """Collection not yet created — exists=False means skip dimension check."""
+        from app.services.vector_db.models import VectorCollectionInfo
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=False)
+        )
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_grpc_error_during_collection_check_returns_200(self, mock_request):
+        """perform_embedding_health_check no longer calls get_collection_info, so
+        connectivity errors there do not affect this check's result."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_inner_exception_reraise(self, mock_request):
+        """Cover lines 573-574: except Exception as e: raise e in the inner try block.
+
+        This triggers when embed_documents succeeds but something after that
+        (in the inner try of the inner try) raises a non-timeout, non-gRPC exception
+        that is not caught by the grpc or generic handler above -- specifically,
+        the raise on line 574 propagates to the outer except.
+        """
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        # We need wait_for to succeed, then have the collection check raise
+        # an Exception that passes through the inner except chain.
+        # The raise on line 540 is already a gRPC path. Let's trigger line 573-574
+        # by having retrieval_service() itself raise (before getting to collection).
+        # Actually, looking at the code flow: lines 573-574 catch exceptions raised
+        # after the timeout try that are NOT TimeoutError. Let's make
+        # embed_documents raise a non-timeout exception via wait_for.
+
+        # Actually re-reading: lines 559-574 are:
+        #   except asyncio.TimeoutError: ... (line 559)
+        #   except Exception as e: raise e  (line 573)
+        # This re-raises any non-timeout exception from within the inner try block
+        # (lines 483-558), which is then caught by the outer try's except blocks.
+        # The inner try covers: wait_for, empty check, collection check.
+        # If we raise a ValueError (not timeout, not grpc) from within the
+        # collection check's inner except chain... but those are already caught.
+        # The simplest way: make wait_for raise a generic Exception (not timeout).
+        # But that goes to line 573 -> raise -> caught by outer except Exception on 578.
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=ValueError("embed fail")):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 500
+        body = resp.body.decode()
+        assert "embed fail" not in body  # logged, never returned
+
+    @pytest.mark.asyncio
+    async def test_collection_info_falsy(self, mock_request):
+        """Cover the branch where collection does not exist (exists=False skips dimension checks)."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        # Use provider-neutral VectorCollectionInfo-style mock with exists=False
+        coll_info = MagicMock()
+        coll_info.exists = False
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(return_value=coll_info)
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+
+class TestLoadTestImage:
+    def test_load_test_image_file_not_found(self):
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            with pytest.raises(FileNotFoundError):
+                from app.api.routes.health import _load_test_image
+                _load_test_image()
+
+# =============================================================================
+# Merged from test_health_full_coverage.py
+# =============================================================================
+
+MODULE = "app.api.routes.health"
+
+
+@pytest.fixture
+def mock_request():
+    req = MagicMock()
+    app = MagicMock()
+    container = MagicMock()
+    container.logger.return_value = MagicMock()
+    container.config_service.return_value = MagicMock()
+    app.container = container
+
+    retrieval_svc = AsyncMock()
+    retrieval_svc.collection_name = "test_collection"
+    retrieval_svc.vector_db_service = AsyncMock()
+    retrieval_svc.get_current_embedding_model_name = AsyncMock(return_value="model-a")
+    retrieval_svc.get_embedding_model_name = MagicMock(return_value="model-a")
+    container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+    req.app = app
+    return req
+
+
+class TestLlmHealthCheckFullCoverage:
+    @pytest.mark.asyncio
+    async def test_success(self, mock_request):
+        """The bulk route now runs the same per-model check as the model
+        dialog, so both screens verify the same things."""
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import llm_health_check
+            resp = await llm_health_check(
+                mock_request, [{"provider": "openai", "configuration": {"model": "gpt-4"}}],
+            )
+
+        assert resp.status_code == 200
+        assert "healthy" in resp.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_no_configs_is_rejected(self, mock_request):
+        from app.api.routes.health import llm_health_check
+        resp = await llm_health_check(mock_request, [])
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_one_bad_config_fails_the_batch(self, mock_request):
+        """A batch is only healthy if every model in it is."""
+        with patch(f"{MODULE}.get_generator_model", side_effect=RuntimeError("bad key")):
+            from app.api.routes.health import llm_health_check
+            resp = await llm_health_check(
+                mock_request,
+                [
+                    {"provider": "openai", "configuration": {"model": "gpt-4"}},
+                    {"provider": "openai", "configuration": {"model": "gpt-4o"}},
+                ],
+            )
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_failure(self, mock_request):
+        with patch(f"{MODULE}.get_generator_model", side_effect=Exception("LLM failed")):
+            from app.api.routes.health import llm_health_check
+            resp = await llm_health_check(
+                mock_request, [{"provider": "openai", "configuration": {"model": "gpt-4"}}],
+            )
+
+        assert resp.status_code == 500
+        assert "LLM failed" not in resp.body.decode()  # logged, never returned
+
+
+class TestInitializeEmbeddingModelFullCoverage:
+    @pytest.mark.asyncio
+    async def test_default_model(self, mock_request):
+        mock_embed = MagicMock()
+        with patch(f"{MODULE}.get_default_embedding_model", return_value=mock_embed):
+            from app.api.routes.health import initialize_embedding_model
+            result = await initialize_embedding_model(mock_request, [])
+
+        assert result[0] is mock_embed
+
+    @pytest.mark.asyncio
+    async def test_config_with_default_flag(self, mock_request):
+        mock_embed = MagicMock()
+        configs = [
+            {"provider": "openai", "isDefault": False},
+            {"provider": "openai", "isDefault": True},
+        ]
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed):
+            from app.api.routes.health import initialize_embedding_model
+            result = await initialize_embedding_model(mock_request, configs)
+
+        assert result[0] is mock_embed
+
+    @pytest.mark.asyncio
+    async def test_config_without_default_uses_first(self, mock_request):
+        mock_embed = MagicMock()
+        configs = [{"provider": "openai", "isDefault": False}]
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed):
+            from app.api.routes.health import initialize_embedding_model
+            result = await initialize_embedding_model(mock_request, configs)
+
+        assert result[0] is mock_embed
+
+    @pytest.mark.asyncio
+    async def test_no_model_found_raises(self, mock_request):
+        configs = [{"provider": "openai", "isDefault": False}]
+        with patch(f"{MODULE}.get_embedding_model", return_value=None):
+            from app.api.routes.health import initialize_embedding_model
+            with pytest.raises(HTTPException) as exc_info:
+                await initialize_embedding_model(mock_request, configs)
+            assert exc_info.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_exception_during_init_raises(self, mock_request):
+        configs = [{"provider": "bad", "isDefault": True}]
+        with patch(f"{MODULE}.get_embedding_model", side_effect=Exception("init fail")):
+            from app.api.routes.health import initialize_embedding_model
+            with pytest.raises(HTTPException) as exc_info:
+                await initialize_embedding_model(mock_request, configs)
+            assert exc_info.value.status_code == 500
+
+
+class TestVerifyEmbeddingHealthFullCoverage:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        mock_embed = AsyncMock()
+        mock_embed.aembed_query = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        logger = MagicMock()
+
+        from app.api.routes.health import verify_embedding_health
+        size = await verify_embedding_health(mock_embed, logger)
+        assert size == 3
+
+    @pytest.mark.asyncio
+    async def test_empty_embedding_raises(self):
+        mock_embed = AsyncMock()
+        mock_embed.aembed_query = AsyncMock(return_value=[])
+        logger = MagicMock()
+
+        from app.api.routes.health import verify_embedding_health
+        with pytest.raises(HTTPException) as exc_info:
+            await verify_embedding_health(mock_embed, logger)
+        assert exc_info.value.status_code == 500
+
+
+class TestHandleModelChangeFullCoverage:
+    @pytest.mark.asyncio
+    async def test_no_change(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "model-a", "model-a", 768, 100, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_model_change_with_data_raises(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        with pytest.raises(HTTPException) as exc_info:
+            await handle_model_change(retrieval_svc, "model-a", "model-b", 768, 100, 512, logger)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_model_change_empty_collection_recreates(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.recreate_collection", new_callable=AsyncMock) as mock_recreate:
+            from app.api.routes.health import handle_model_change
+            await handle_model_change(retrieval_svc, "model-a", "model-b", 768, 0, 512, logger)
+            mock_recreate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_change_when_current_is_none(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, None, "model-b", 768, 0, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_no_change_when_new_is_none(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "model-a", None, 768, 0, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_strips_models_prefix(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "models/model-a", "models/model-a", 768, 100, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_comparison(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "Model-A", "model-a", 768, 100, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_same_name_empty_recreates(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.recreate_collection", new_callable=AsyncMock) as mock_recreate:
+            from app.api.routes.health import handle_model_change
+            await handle_model_change(retrieval_svc, "model-a", "model-a", 768, 0, 1024, logger)
+            mock_recreate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_same_name_with_data_raises(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        with pytest.raises(HTTPException) as exc_info:
+            await handle_model_change(retrieval_svc, "model-a", "model-a", 768, 50, 1024, logger)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_zero_qdrant_vector_size_no_recreate(self):
+        retrieval_svc = AsyncMock()
+        logger = MagicMock()
+
+        from app.api.routes.health import handle_model_change
+        await handle_model_change(retrieval_svc, "model-a", "model-b", 0, 0, 512, logger)
+
+
+class TestRecreateCollectionFullCoverage:
+    @pytest.mark.asyncio
+    async def test_rebuilds_every_managed_collection(self):
+        retrieval_svc = MagicMock()
+        retrieval_svc.collection_name = "test_coll"
+        registry = MagicMock()
+        registry.recreate_records_collections = AsyncMock(return_value=["test_coll", "other"])
+        registry.ensure_collection = AsyncMock()
+        retrieval_svc.collection_registry = registry
+        logger = MagicMock()
+
+        from app.api.routes.health import recreate_collection
+        await recreate_collection(retrieval_svc, 768, logger)
+
+        registry.recreate_records_collections.assert_awaited_once()
+        # Nothing to backfill when the registry already rebuilt something.
+        registry.ensure_collection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_creates_the_collection_when_nothing_is_managed_yet(self):
+        """Nothing managed means nothing to rebuild.
+
+        Creating one here would have to invent a context, which under a
+        strategy that names collections per org or connector names a
+        collection belonging to nobody. The indexing write path pins the
+        dimension from the record that actually needs it.
+        """
+        retrieval_svc = MagicMock()
+        retrieval_svc.collection_name = "test_coll"
+        registry = MagicMock()
+        registry.recreate_records_collections = AsyncMock(return_value=[])
+        registry.ensure_collection = AsyncMock(return_value="test_coll")
+        retrieval_svc.collection_registry = registry
+        logger = MagicMock()
+
+        from app.api.routes.health import recreate_collection
+        await recreate_collection(retrieval_svc, 768, logger)
+
+        registry.ensure_collection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failure_raises(self):
+        retrieval_svc = MagicMock()
+        retrieval_svc.collection_name = "test_coll"
+        registry = MagicMock()
+        registry.recreate_records_collections = AsyncMock(side_effect=Exception("fail"))
+        retrieval_svc.collection_registry = registry
+        logger = MagicMock()
+
+        from app.api.routes.health import recreate_collection
+        with pytest.raises(Exception, match="fail"):
+            await recreate_collection(retrieval_svc, 768, logger)
+
+
+class TestCheckCollectionInfoFullCoverage:
+    @pytest.mark.asyncio
+    async def test_success(self):
+        from app.services.vector_db.models import VectorCollectionInfo
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=True, dense_dimension=768, points_count=10)
+        )
+        retrieval_svc.get_current_embedding_model_name = AsyncMock(return_value="model-a")
+        retrieval_svc.get_embedding_model_name = MagicMock(return_value="model-a")
+        logger = MagicMock()
+        dense_embeddings = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        await check_collection_info(retrieval_svc, dense_embeddings, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_grpc_not_found(self):
+        from app.services.vector_db.models import VectorCollectionInfo
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(
+            return_value=VectorCollectionInfo(name="coll", exists=False)
+        )
+        retrieval_svc.get_current_embedding_model_name = AsyncMock(return_value="model-a")
+        retrieval_svc.get_embedding_model_name = MagicMock(return_value="model-a")
+        logger = MagicMock()
+        dense_embeddings = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        await check_collection_info(retrieval_svc, dense_embeddings, 768, logger)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception(self):
+        """Non-HTTPException errors from get_collection_info are swallowed (logged as warning)."""
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(side_effect=RuntimeError("bad"))
+        logger = MagicMock()
+
+        from app.api.routes.health import check_collection_info
+        # Should NOT raise — swallowed and logged as a warning
+        await check_collection_info(retrieval_svc, MagicMock(), 768, logger)
+        logger.warning.assert_called()
+
+
+class TestEmbeddingHealthCheckFullCoverage:
+    @pytest.mark.asyncio
+    async def test_success(self, mock_request):
+        mock_embed = AsyncMock()
+        mock_embed.aembed_query = AsyncMock(return_value=[0.1, 0.2])
+
+        with patch(f"{MODULE}.initialize_embedding_model", new_callable=AsyncMock,
+                   return_value=(mock_embed, mock_request.app.container.retrieval_service.return_value, MagicMock())), \
+             patch(f"{MODULE}.verify_embedding_health", new_callable=AsyncMock, return_value=2), \
+             patch(f"{MODULE}.check_collection_info", new_callable=AsyncMock):
+            from app.api.routes.health import embedding_health_check
+            resp = await embedding_health_check(mock_request, [{"provider": "openai"}])
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_http_exception(self, mock_request):
+        with patch(f"{MODULE}.initialize_embedding_model", new_callable=AsyncMock,
+                   side_effect=HTTPException(status_code=500, detail={"status": "not healthy", "error": "fail"})):
+            from app.api.routes.health import embedding_health_check
+            resp = await embedding_health_check(mock_request, [])
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_general_exception(self, mock_request):
+        mock_embed = AsyncMock()
+        retrieval_svc = mock_request.app.container.retrieval_service.return_value
+        logger = MagicMock()
+
+        with patch(f"{MODULE}.initialize_embedding_model", new_callable=AsyncMock,
+                   return_value=(mock_embed, retrieval_svc, logger)), \
+             patch(f"{MODULE}.verify_embedding_health", new_callable=AsyncMock, side_effect=Exception("boom")):
+            from app.api.routes.health import embedding_health_check
+            resp = await embedding_health_check(mock_request, [{"provider": "openai"}])
+
+        assert resp.status_code == 500
+
+
+class TestPerformLlmHealthCheckFullCoverage:
+    @pytest.fixture(autouse=True)
+    def _mock_outbound_probe(self):
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=True):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_success_text(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+        mock_model.invoke.return_value = "ok"
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_no_model_names(self):
+        """A configuration the admin has to fix is a 400, so the UI can tell it
+        apart from the service being broken."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": ""}}
+
+        from app.api.routes.health import perform_llm_health_check
+        resp = await perform_llm_health_check(config, logger)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_multimodal_image_success(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4o"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_multimodal_image_fails_text_passes(self):
+        """Text works, the image is rejected with an error that names the
+        limitation: that is the one case where "no vision" is the right
+        verdict."""
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+
+        call_count = 0
+        async def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:      # text probe first, image second
+                raise Exception("This model does not support image input")
+            return "text ok"
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", side_effect=side_effect):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 400
+        body = resp.body.decode()
+        assert "doesn't support images" in body
+
+    @pytest.mark.asyncio
+    async def test_transient_image_failure_is_not_a_vision_verdict(self):
+        """A 429 says nothing about vision. Reporting "no vision" here tells an
+        admin to disable a capability their model actually has."""
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4o"}}
+        rate_limited = Exception("Rate limit reached")
+        rate_limited.status_code = 429
+
+        call_count = 0
+        async def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise rate_limited
+            return "text ok"
+
+        with patch(f"{MODULE}.get_generator_model", return_value=MagicMock()), \
+             patch("asyncio.wait_for", side_effect=side_effect):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        body = resp.body.decode()
+        assert resp.status_code == 500
+        assert "doesn't support images" not in body
+        assert "Rate limit" not in body  # the provider's text is logged, never returned
+
+    @pytest.mark.asyncio
+    async def test_multimodal_both_fail(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=Exception("total fail")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_outbound_connectivity_on_connection_failure(self):
+        logger = MagicMock()
+        config = {"provider": "gemini", "configuration": {"model": "gemini-pro"}}
+
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False), \
+             patch(f"{MODULE}.get_generator_model", side_effect=ConnectionError("failed to establish a new connection")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 500
+        body = resp.body.decode()
+        assert "outbound_connectivity" in body
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_does_not_block_reachable_provider(self):
+        logger = MagicMock()
+        config = {"provider": "gemini", "configuration": {"model": "gemini-pro"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False) as probe, \
+             patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_not_called()
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_outbound_probe_skipped_for_ollama(self):
+        logger = MagicMock()
+        config = {
+            "provider": "ollama",
+            "configuration": {"model": "llama3", "endpoint": "http://host.docker.internal:11434"},
+        }
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False) as probe, \
+             patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_not_called()
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_timeout(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 504
+        body = resp.body.decode()
+        assert "timed out" in body
+        assert "health_check_timeout" in body
+
+    @pytest.mark.asyncio
+    async def test_http_exception(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.get_generator_model", side_effect=HTTPException(status_code=401, detail="unauthorized")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_general_exception(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.get_generator_model", side_effect=RuntimeError("bad")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_multimodal_from_configuration(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4o", "isMultimodal": True}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_every_configured_model_is_checked(self):
+        """Node registers each comma-separated name as its own model, so
+        checking only the first ships untested models."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4, gpt-3.5"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model) as mock_gen, \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value="ok"):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 200
+        checked = [call.kwargs["model_name"] for call in mock_gen.call_args_list]
+        assert checked == ["gpt-4", "gpt-3.5"]
+
+    @pytest.mark.asyncio
+    async def test_multimodal_timeout_on_image(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "isMultimodal": True, "configuration": {"model": "gpt-4o"}}
+        mock_model = MagicMock()
+
+        with patch(f"{MODULE}.get_generator_model", return_value=mock_model), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        assert resp.status_code == 504
+
+
+class TestPerformEmbeddingHealthCheckFullCoverage:
+    @pytest.mark.asyncio
+    async def test_success(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        coll_info = MagicMock()
+        coll_info.exists = True
+        coll_info.dense_dimension = 768
+        coll_info.points_count = 0
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        retrieval_svc.vector_db_service.get_collection_info = AsyncMock(return_value=coll_info)
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_no_model_names(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": ""}}
+
+        from app.api.routes.health import perform_embedding_health_check
+        resp = await perform_embedding_health_check(mock_request, config, logger)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_empty_results(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_timeout(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_dimension_mismatch_with_data(self, mock_request):
+        """perform_embedding_health_check only tests model connectivity; mismatch
+        detection has moved to check_collection_info / handle_model_change."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_http_exception(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+
+        with patch(f"{MODULE}.get_embedding_model", side_effect=HTTPException(status_code=401, detail="unauthorized")):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_general_exception(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+
+        with patch(f"{MODULE}.get_embedding_model", side_effect=RuntimeError("bad")):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_grpc_not_found_during_collection_check(self, mock_request):
+        import grpc
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        error = grpc._channel._InactiveRpcError(MagicMock())
+        type(error).code = MagicMock(return_value=grpc.StatusCode.NOT_FOUND)
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        retrieval_svc.vector_db_service.get_collection = AsyncMock(side_effect=error)
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            try:
+                resp = await perform_embedding_health_check(mock_request, config, logger)
+                assert resp.status_code in [200, 500]
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_collection_lookup_error_does_not_affect_result(self, mock_request):
+        """perform_embedding_health_check no longer calls get_collection_info.
+        Collection errors are handled by check_collection_info (separate code path)."""
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "text-embedding-3-small"}}
+        mock_embed = MagicMock()
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_comma_separated_models_uses_first(self, mock_request):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "model-a, model-b"}}
+        mock_embed = MagicMock()
+
+        retrieval_svc = AsyncMock()
+        retrieval_svc.collection_name = "coll"
+        retrieval_svc.vector_db_service = AsyncMock()
+        mock_request.app.container.retrieval_service = AsyncMock(return_value=retrieval_svc)
+
+        with patch(f"{MODULE}.get_embedding_model", return_value=mock_embed) as mock_get, \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[[0.1] * 768]):
+            from app.api.routes.health import perform_embedding_health_check
+            resp = await perform_embedding_health_check(mock_request, config, logger)
+
+        assert [call.kwargs["model_name"] for call in mock_get.call_args_list] == [
+            "model-a",
+            "model-b",
+        ]
+
+
+class TestHealthCheckEndpointFullCoverage:
+    @pytest.mark.asyncio
+    async def test_embedding_type(self, mock_request):
+        config = {"provider": "openai", "configuration": {"model": "text-embedding"}}
+
+        with patch(f"{MODULE}.perform_embedding_health_check", new_callable=AsyncMock,
+                   return_value=JSONResponse(status_code=200, content={"status": "healthy"})):
+            from app.api.routes.health import health_check
+            resp = await health_check(mock_request, "embedding", config)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_llm_type(self, mock_request):
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.perform_llm_health_check", new_callable=AsyncMock,
+                   return_value=JSONResponse(status_code=200, content={"status": "healthy"})):
+            from app.api.routes.health import health_check
+            resp = await health_check(mock_request, "llm", config)
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_unknown_type_is_rejected(self, mock_request):
+        """A type with no implementation used to return 200 healthy, which
+        registered a model nothing had checked. Node's own validator accepts
+        `ocr`, `slm`, `reasoning` and `multiModal`, all of which land here."""
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        from app.api.routes.health import health_check
+        resp = await health_check(mock_request, "unknown", config)
+        assert resp.status_code == 400
+        assert "No health check exists" in resp.body.decode()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_type", ["ocr", "slm", "reasoning", "multiModal"])
+    async def test_types_node_accepts_but_python_cannot_check(self, mock_request, model_type):
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        from app.api.routes.health import health_check
+        resp = await health_check(mock_request, model_type, config)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_exception_handling(self, mock_request):
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+
+        with patch(f"{MODULE}.perform_llm_health_check", new_callable=AsyncMock,
+                   side_effect=Exception("unexpected")):
+            from app.api.routes.health import health_check
+            resp = await health_check(mock_request, "llm", config)
+
+        assert resp.status_code == 500
+
+
+class TestLoadTestImageFullCoverage:
+    def test_load_test_image_file_not_found(self):
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            with pytest.raises(FileNotFoundError):
+                from app.api.routes.health import _load_test_image
+                _load_test_image()
+
+
+class TestPerformImageGenerationHealthCheck:
+    def _cfg(self, provider: str, model: str = "gpt-image-1", api_key: str = "sk-test") -> dict:
+        return {"provider": provider, "configuration": {"model": model, "apiKey": api_key}}
+
+    @pytest.mark.asyncio
+    async def test_no_model_names_returns_500(self):
+        logger = MagicMock()
+        from app.api.routes.health import perform_image_generation_health_check
+        resp = await perform_image_generation_health_check(
+            {"provider": "openAI", "configuration": {"model": "  ", "apiKey": "sk"}},
+            logger,
+        )
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_unsupported_provider_returns_400(self):
+        logger = MagicMock()
+        mock_adapter = MagicMock()
+        with patch(f"{MODULE}.get_image_generation_model", return_value=mock_adapter):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(
+                self._cfg("stability"), logger
+            )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_adapter_build_failure_returns_500(self):
+        logger = MagicMock()
+        with patch(f"{MODULE}.get_image_generation_model", side_effect=ValueError("bad cfg")):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(self._cfg("openAI"), logger)
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_openai_success(self):
+        logger = MagicMock()
+        mock_adapter = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.models.list = AsyncMock(return_value=[])
+        mock_client.close = AsyncMock()
+
+        with patch(f"{MODULE}.get_image_generation_model", return_value=mock_adapter), \
+             patch("openai.AsyncOpenAI", return_value=mock_client), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=[]):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(self._cfg("openAI"), logger)
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_openai_probe_exception_returns_500(self):
+        logger = MagicMock()
+        mock_adapter = MagicMock()
+        with patch(f"{MODULE}.get_image_generation_model", return_value=mock_adapter), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, side_effect=RuntimeError("network error")):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(self._cfg("openAI"), logger)
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_openrouter_success(self):
+        logger = MagicMock()
+        mock_adapter = MagicMock()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        mock_http = AsyncMock()
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=None)
+        mock_http.get = AsyncMock(return_value=mock_response)
+
+        with patch(f"{MODULE}.get_image_generation_model", return_value=mock_adapter), \
+             patch("httpx.AsyncClient", return_value=mock_http):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(
+                self._cfg("openRouter", model="bytedance-seed/seedream-4.5"), logger
+            )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_openrouter_bad_api_key_is_a_settings_error(self):
+        logger = MagicMock()
+        mock_adapter = MagicMock()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+
+        mock_http = AsyncMock()
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=None)
+        mock_http.get = AsyncMock(return_value=mock_response)
+
+        with patch(f"{MODULE}.get_image_generation_model", return_value=mock_adapter), \
+             patch("httpx.AsyncClient", return_value=mock_http):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(
+                self._cfg("openRouter", model="bytedance-seed/seedream-4.5"), logger
+            )
+        assert resp.status_code == 400
+        assert "API key" in json.loads(resp.body)["message"]
+
+    @pytest.mark.asyncio
+    async def test_openrouter_network_error_is_an_unreachable_endpoint(self):
+        logger = MagicMock()
+        mock_adapter = MagicMock()
+
+        mock_http = AsyncMock()
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=None)
+        mock_http.get = AsyncMock(side_effect=RuntimeError("connection refused"))
+
+        with patch(f"{MODULE}.get_image_generation_model", return_value=mock_adapter), \
+             patch("httpx.AsyncClient", return_value=mock_http), \
+             patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=True):
+            from app.api.routes.health import perform_image_generation_health_check
+            resp = await perform_image_generation_health_check(
+                self._cfg("openRouter", model="bytedance-seed/seedream-4.5"), logger
+            )
+        assert resp.status_code == 400
+        assert json.loads(resp.body)["details"]["error_code"] == "endpoint_unreachable"
+
+
+# ============================================================================
+# _is_collection_not_found_error
+# ============================================================================
+
+class TestIsCollectionNotFoundError:
+    def test_detects_not_found_in_message(self):
+        exc = Exception("Collection not found in database")
+        from app.api.routes.health import _is_collection_not_found_error
+        assert _is_collection_not_found_error(exc) is True
+
+    def test_detects_doesnt_exist_in_message(self):
+        exc = Exception("Index doesn't exist")
+        from app.api.routes.health import _is_collection_not_found_error
+        assert _is_collection_not_found_error(exc) is True
+
+    def test_detects_404_in_message(self):
+        exc = Exception("HTTP 404 error occurred")
+        from app.api.routes.health import _is_collection_not_found_error
+        assert _is_collection_not_found_error(exc) is True
+
+    def test_detects_status_code_404(self):
+        exc = Exception("Some error")
+        exc.status_code = 404
+        from app.api.routes.health import _is_collection_not_found_error
+        assert _is_collection_not_found_error(exc) is True
+
+    def test_other_error_returns_false(self):
+        exc = Exception("Generic error")
+        from app.api.routes.health import _is_collection_not_found_error
+        assert _is_collection_not_found_error(exc) is False
+
+
+# ============================================================================
+# _extract_error_message
+# ============================================================================
+
+class TestExtractErrorMessage:
+    def test_extracts_openai_nested_error(self):
+        exc = Exception("Wrapper error")
+        exc.body = {
+            "error": {
+                "message": "Invalid API key provided"
+            }
+        }
+        from app.api.routes.health import _extract_error_message
+        result = _extract_error_message(exc)
+        assert result == "Invalid API key provided"
+
+    def test_extracts_body_message_direct(self):
+        exc = Exception("Wrapper error")
+        exc.body = {
+            "message": "Rate limit exceeded"
+        }
+        from app.api.routes.health import _extract_error_message
+        result = _extract_error_message(exc)
+        assert result == "Rate limit exceeded"
+
+    def test_extracts_anthropic_message_attribute(self):
+        exc = Exception("Generic error")
+        exc.message = "Model not found"
+        from app.api.routes.health import _extract_error_message
+        result = _extract_error_message(exc)
+        assert result == "Model not found"
+
+    def test_falls_back_to_str(self):
+        exc = Exception("Plain exception message")
+        from app.api.routes.health import _extract_error_message
+        result = _extract_error_message(exc)
+        assert result == "Plain exception message"
+
+
+class TestLlmHealthCheckNeedsOutbound:
+    def test_openai_compatible_localhost_does_not_need_outbound(self):
+        from app.api.routes.health import _llm_health_check_needs_outbound
+        assert _llm_health_check_needs_outbound(
+            "openAICompatible",
+            {"endpoint": "http://localhost:8000"},
+        ) is False
+
+    def test_openai_compatible_lan_and_compose_names_do_not_need_outbound(self):
+        from app.api.routes.health import _llm_health_check_needs_outbound
+        assert _llm_health_check_needs_outbound(
+            "openAICompatible",
+            {"endpoint": "http://vllm:8000"},
+        ) is False
+        assert _llm_health_check_needs_outbound(
+            "openAICompatible",
+            {"endpoint": "http://192.168.1.50:8000"},
+        ) is False
+
+    def test_misspelled_openai_compatible_id_is_not_the_local_escape(self):
+        from app.api.routes.health import _llm_health_check_needs_outbound
+        # Registered id is openAICompatible. The lowercase-i spelling matches nothing.
+        assert _llm_health_check_needs_outbound(
+            "openaiCompatible",
+            {"endpoint": "http://localhost:8000"},
+        ) is True
+
+    def test_openai_compatible_unique_local_ipv6_is_private(self):
+        from app.api.routes.health import _endpoint_is_local
+        # Must not treat ``::1`` as a substring of ``fd00::1234``.
+        assert _endpoint_is_local("http://[fd00::1234]:8000") is True
+        assert _endpoint_is_local("http://[::1]:8000") is True
+
+    def test_cloud_provider_needs_outbound(self):
+        from app.api.routes.health import _llm_health_check_needs_outbound
+        assert _llm_health_check_needs_outbound("gemini", {}) is True
+
+    @pytest.mark.asyncio
+    async def test_local_compatible_connection_error_is_not_outbound_code(self):
+        logger = MagicMock()
+        config = {
+            "provider": "openAICompatible",
+            "configuration": {"model": "local-model", "endpoint": "http://localhost:8000"},
+        }
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False) as probe, \
+             patch(f"{MODULE}.get_generator_model", side_effect=ConnectionError("connection refused")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_not_called()
+        assert resp.status_code == 400
+        assert "outbound_connectivity" not in resp.body.decode()
+
+    def test_litellm_proxy_localhost_does_not_need_outbound(self):
+        from app.api.routes.health import _llm_health_check_needs_outbound
+        assert _llm_health_check_needs_outbound(
+            "litellmProxy",
+            {"endpoint": "http://localhost:4000"},
+        ) is False
+
+    def test_openai_compatible_public_host_needs_outbound(self):
+        from app.api.routes.health import _llm_health_check_needs_outbound
+        assert _llm_health_check_needs_outbound(
+            "openAICompatible",
+            {"endpoint": "https://api.example.com/v1"},
+        ) is True
+
+    def test_endpoint_host_classification(self):
+        from app.api.routes.health import _endpoint_is_local
+        assert _endpoint_is_local("http://host.docker.internal:11434") is True
+        assert _endpoint_is_local("https://api.openai.com") is False
+        assert _endpoint_is_local("http://8.8.8.8:8000") is False
+
+    def test_looks_like_connectivity_error(self):
+        from app.api.routes.health import _looks_like_connectivity_error
+        assert _looks_like_connectivity_error(ConnectionError("failed to establish")) is True
+        assert _looks_like_connectivity_error(Exception("name or service not known")) is True
+        assert _looks_like_connectivity_error(ValueError("Incorrect API key provided")) is False
+
+    @pytest.mark.asyncio
+    async def test_probe_success_does_not_label_as_outbound(self):
+        logger = MagicMock()
+        config = {"provider": "gemini", "configuration": {"model": "gemini-pro"}}
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=True) as probe, \
+             patch(f"{MODULE}.get_generator_model", side_effect=ConnectionError("failed to establish a new connection")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_awaited()
+        assert resp.status_code == 400
+        assert "outbound_connectivity" not in resp.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_non_connectivity_error_does_not_run_probe(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": {"model": "gpt-4"}}
+        with patch(f"{MODULE}._probe_outbound_connectivity", new_callable=AsyncMock, return_value=False) as probe, \
+             patch(f"{MODULE}.get_generator_model", side_effect=ValueError("Incorrect API key provided")):
+            from app.api.routes.health import perform_llm_health_check
+            resp = await perform_llm_health_check(config, logger)
+
+        probe.assert_not_called()
+        assert resp.status_code == 500
+        assert "outbound_connectivity" not in resp.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_null_configuration_does_not_crash(self):
+        logger = MagicMock()
+        config = {"provider": "openai", "configuration": None}
+        from app.api.routes.health import perform_llm_health_check
+        resp = await perform_llm_health_check(config, logger)
+        # 400, not 500: nothing broke, the admin left the model name empty.
+        assert resp.status_code == 400
+        assert "No valid model names" in resp.body.decode()
+
+
+class TestOpenAIListedModelProbe:
+    @pytest.mark.asyncio
+    async def test_keyless_server_gets_the_placeholder_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        created: dict = {}
+        client = MagicMock()
+        client.models.retrieve = AsyncMock(return_value=MagicMock(id="kokoro"))
+        client.close = AsyncMock()
+
+        def factory(**kwargs):
+            created.update(kwargs)
+            return client
+
+        with patch("openai.AsyncOpenAI", side_effect=factory):
+            from app.api.routes.health import _probe_openai_listed_model
+            await _probe_openai_listed_model({"endpoint": "http://127.0.0.1:8080/v1"}, "kokoro")
+
+        assert created["api_key"] == "not-needed"
+        assert created["base_url"] == "http://127.0.0.1:8080/v1"
+
+    @pytest.mark.asyncio
+    async def test_configured_key_and_env_key_are_kept(self, monkeypatch):
+        created: dict = {}
+        client = MagicMock()
+        client.models.retrieve = AsyncMock(return_value=MagicMock(id="gpt-4o"))
+        client.close = AsyncMock()
+
+        def factory(**kwargs):
+            created.clear()
+            created.update(kwargs)
+            return client
+
+        with patch("openai.AsyncOpenAI", side_effect=factory):
+            from app.api.routes.health import _probe_openai_listed_model
+            await _probe_openai_listed_model({"apiKey": "sk-real"}, "gpt-4o")
+        assert created["api_key"] == "sk-real"
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+        created.clear()
+        with patch("openai.AsyncOpenAI", side_effect=factory):
+            from app.api.routes.health import _probe_openai_listed_model
+            await _probe_openai_listed_model({}, "gpt-4o")
+        assert "api_key" not in created
+

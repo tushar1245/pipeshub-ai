@@ -1,0 +1,434 @@
+from logging import Logger
+from typing import TYPE_CHECKING
+
+from app.config.configuration_service import ConfigurationService
+from app.config.constants.arangodb import ExtensionTypes
+from app.events.events import EventProcessor
+from app.events.processor import Processor, convert_record_dict_to_record
+from app.modules.entity_resolution import EntityResolver
+from app.modules.indexing.connector_off_events import GraphConnectorOffFilter
+from app.modules.indexing.run import IndexingPipeline
+from app.modules.indexing.stored_content_cleanup import StoredContentCleanup
+from app.modules.parsers.code_parser.code_file_parser import CodeFileParser
+from app.modules.parsers.csv.csv_parser import CSVParser
+from app.modules.parsers.docx.docparser import DocParser
+from app.modules.parsers.excel.excel_parser import ExcelParser
+from app.modules.parsers.excel.xls_parser import XLSParser
+from app.modules.parsers.html_parser.html_parser import HTMLParser
+from app.modules.parsers.image_parser.image_parser import ImageParser
+from app.modules.parsers.json.json_parser import JSONParser
+from app.modules.parsers.markdown.markdown_parser import MarkdownParser
+from app.modules.parsers.markdown.mdx_parser import MDXParser
+from app.modules.parsers.pptx.ppt_parser import PPTParser
+from app.modules.parsers.pptx.pptx_parser import PPTXParser
+from app.modules.parsers.sql.sql_table_parser import SQLTableParser
+from app.modules.parsers.sql.sql_view_parser import SQLViewParser
+from app.modules.parsers.yaml.yaml_parser import YAMLParser
+from app.modules.pipeline.runtime import PipelineRuntime, build_pipeline_runtime
+from app.modules.retrieval.retrieval_service import RetrievalService
+from app.modules.transformers.blob_storage import BlobStorage
+from app.modules.transformers.document_extraction import DocumentExtraction
+from app.modules.transformers.entity_vectorstore import EntityVectorStore
+from app.modules.transformers.graphdb import GraphDBTransformer
+from app.modules.transformers.sink_orchestrator import SinkOrchestrator
+from app.modules.transformers.vectorstore import VectorStore
+from app.services.extraction.client import ExtractionClient
+from app.services.featureflag.featureflag import FeatureFlagService
+from app.services.featureflag.provider.etcd import EtcdProvider
+from app.services.graph_db.graph_db_provider_factory import GraphDBProviderFactory
+from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.messaging.config import messaging_env
+from app.services.vector_db.collection_manifest import CollectionManifestStore
+from app.services.vector_db.collection_registry import CollectionRegistry
+from app.services.vector_db.interface.vector_db import IVectorDBService
+from app.services.vector_db.models import CollectionConfig
+from app.services.vector_db.strategy_resolver import (
+    StrategyConfigurationError,
+    resolve_strategy,
+)
+from app.services.vector_db.vector_db_provider_factory import VectorDBProviderFactory
+from app.utils.logger import create_logger
+
+if TYPE_CHECKING:
+    from app.services.cache.accessible_records_cache import (
+        AccessibleRecordsInvalidator,
+    )
+    from app.services.cache.interface import IAccessibleRecordsCache
+    from app.services.parsing.client import ParsingClient
+
+
+# Note - Cannot make this a singleton as it is used in the container and DI does not work with static methods
+class ContainerUtils:
+    """Utility class for container operations"""
+    def __init__(self) -> None:
+        self.logger = create_logger("container_utils")
+
+    async def get_vector_db_service(
+        self,
+        config_service: ConfigurationService,
+    ) -> IVectorDBService:
+        return await VectorDBProviderFactory.create_provider(
+            logger=self.logger,
+            config_service=config_service,
+        )
+
+    async def create_graph_provider(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+        accessible_records_cache: "IAccessibleRecordsCache | None" = None,
+    ) -> IGraphDBProvider:
+        """Async factory to create and connect graph database provider"""
+        return await GraphDBProviderFactory.create_provider(
+            logger=logger,
+            config_service=config_service,
+            accessible_records_cache=accessible_records_cache,
+        )
+
+    async def create_accessible_records_cache(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+    ) -> "IAccessibleRecordsCache":
+        """Async factory for the accessible-record map cache (never raises)."""
+        from app.services.cache.accessible_records_cache import AccessibleRecordsCache
+
+        return await AccessibleRecordsCache.create(logger, config_service)
+
+    async def create_accessible_records_invalidator(
+        self,
+        logger: Logger,
+        accessible_records_cache: "IAccessibleRecordsCache",
+        graph_provider: IGraphDBProvider,
+    ) -> "AccessibleRecordsInvalidator":
+        """Async factory for the invalidation façade used by writer services."""
+        from app.services.cache.accessible_records_cache import (
+            AccessibleRecordsInvalidator,
+        )
+
+        return AccessibleRecordsInvalidator(logger, accessible_records_cache, graph_provider)
+
+    async def create_collection_registry(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+        vector_db_service: IVectorDBService,
+    ) -> CollectionRegistry:
+        """Async factory for the shared CollectionRegistry.
+
+        One instance per process: shared by VectorStore (writes), IndexingPipeline
+        (deletes/rebuilds), and RetrievalService (reads) so the existence cache and
+        collection manifest stay coherent across the indexing/query surface.
+        """
+        strategy = await resolve_strategy(config_service, logger)
+        capabilities = vector_db_service.get_capabilities()
+
+        # A strategy that names collections from record context needs more than
+        # one; a provider that cannot hold them would otherwise fail per-record,
+        # deep in indexing, rather than here.
+        if strategy.required_axes and not capabilities.supports_multi_collection:
+            raise StrategyConfigurationError(
+                f"Collection strategy '{strategy.strategy_name()}' needs a "
+                f"collection per {sorted(a.value for a in strategy.required_axes)}, "
+                f"but vector DB provider '{vector_db_service.get_service_name()}' "
+                f"does not support multiple collections."
+            )
+
+        def collection_config_factory(embedding_size: int) -> CollectionConfig:
+            return CollectionConfig(
+                embedding_size=embedding_size,
+                enable_sparse=capabilities.supports_sparse_vectors,
+            )
+
+        return CollectionRegistry(
+            vector_db_service=vector_db_service,
+            strategy=strategy,
+            collection_config_factory=collection_config_factory,
+            manifest_store=CollectionManifestStore(config_service, logger),
+            logger=logger,
+            max_collections_advisory=capabilities.max_recommended_collections,
+        )
+
+    async def create_indexing_pipeline(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+        graph_provider: IGraphDBProvider,
+        vector_db_service: IVectorDBService,
+        collection_registry: CollectionRegistry,
+        blob_storage: BlobStorage | None = None,
+    ) -> IndexingPipeline:
+        """Async factory for the legacy IndexingPipeline (collection mgmt, bulk deletes)."""
+        pipeline = IndexingPipeline(
+            logger=logger,
+            config_service=config_service,
+            graph_provider=graph_provider,
+            collection_registry=collection_registry,
+            vector_db_service=vector_db_service,
+            stored_content=(
+                StoredContentCleanup(logger, graph_provider, blob_storage)
+                if blob_storage is not None else None
+            ),
+        )
+        return pipeline
+
+    async def create_vector_store(
+        self, logger, graph_provider, config_service, vector_db_service, collection_registry: CollectionRegistry
+    ) -> VectorStore:
+        """Async factory for VectorStore"""
+        vector_store = VectorStore(logger, config_service, graph_provider, collection_registry, vector_db_service)
+        return vector_store
+
+    async def create_entity_vector_store(
+        self, logger, config_service, vector_db_service, collection_name: str,
+        recreate_on_dimension_mismatch: bool = False,
+    ) -> EntityVectorStore:
+        """Async factory for EntityVectorStore"""
+        return EntityVectorStore(
+            logger, config_service, vector_db_service, collection_name,
+            recreate_on_dimension_mismatch=recreate_on_dimension_mismatch,
+        )
+
+    async def create_entity_resolver(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+        graph_provider: IGraphDBProvider,
+        entity_vector_store: EntityVectorStore | None = None,
+    ) -> EntityResolver:
+        """Async factory for the taxonomy EntityResolver (indexing service).
+
+        Always on (apply mode) — see ``app.modules.entity_resolution``.
+        """
+        return EntityResolver(
+            logger=logger,
+            config_service=config_service,
+            graph_provider=graph_provider,
+            entity_vector_store=entity_vector_store,
+        )
+
+    async def create_connector_off_filter(
+        self, logger: Logger, graph_provider: IGraphDBProvider
+    ) -> GraphConnectorOffFilter | None:
+        """Async factory for the indexing consumer's connector-off filter."""
+        refresh_seconds = messaging_env.connector_state_refresh_seconds
+        if refresh_seconds <= 0:
+            return None
+        return GraphConnectorOffFilter(graph_provider, logger, refresh_seconds)
+
+    async def create_graphdb(self, graph_provider, logger) -> GraphDBTransformer:
+        """Async factory for GraphDB transformer (uses graph_provider for transactions)"""
+        graphdb = GraphDBTransformer(graph_provider, logger)
+        return graphdb
+
+    async def create_sink_orchestrator(
+        self,
+        logger: Logger,
+        graphdb: GraphDBTransformer,
+        blob_storage: BlobStorage,
+        vector_store: VectorStore,
+        graph_provider: IGraphDBProvider,
+        config_service: ConfigurationService,
+        entity_vector_store: EntityVectorStore | None = None,
+        entity_resolver: EntityResolver | None = None,
+    ) -> SinkOrchestrator:
+        """Async factory for SinkOrchestrator"""
+        orchestrator = SinkOrchestrator(
+            graphdb=graphdb,
+            blob_storage=blob_storage,
+            vector_store=vector_store,
+            graph_provider=graph_provider,
+            logger=logger,
+            config_service=config_service,
+            entity_vector_store=entity_vector_store,
+            entity_resolver=entity_resolver,
+        )
+        return orchestrator
+
+    async def create_document_extractor(self, logger, graph_provider: IGraphDBProvider, config_service) -> DocumentExtraction:
+        """Async factory for DocumentExtraction"""
+        extractor = DocumentExtraction(logger, graph_provider, config_service)
+        return extractor
+
+    async def create_blob_storage(self, logger, config_service, graph_provider: IGraphDBProvider) -> BlobStorage:
+        """Async factory for BlobStorage"""
+        blob_storage = BlobStorage(logger, config_service, graph_provider)
+        return blob_storage
+
+    async def create_parsers(
+        self, logger: Logger, config_service: ConfigurationService
+    ) -> dict:
+        """Async factory for Parsers"""
+        image_parser = ImageParser(logger)
+
+        parsers = {
+            ExtensionTypes.DOC.value: DocParser(),
+            ExtensionTypes.PPT.value: PPTParser(),
+            ExtensionTypes.PPTX.value: PPTXParser(),
+            ExtensionTypes.HTML.value: HTMLParser(
+                logger=logger, config_service=config_service
+            ),
+            ExtensionTypes.MD.value: MarkdownParser(
+                logger=logger, config_service=config_service
+            ),
+            ExtensionTypes.MDX.value: MDXParser(MarkdownParser(logger=logger, config_service=config_service)),
+            ExtensionTypes.CSV.value: CSVParser(config_service=config_service),
+            ExtensionTypes.TSV.value: CSVParser(config_service=config_service, delimiter="\t"),
+            ExtensionTypes.XLSX.value: ExcelParser(logger, config_service),
+            ExtensionTypes.XLS.value: XLSParser(excel_parser=ExcelParser(logger, config_service)),
+            ExtensionTypes.PNG.value: image_parser,
+            ExtensionTypes.JPG.value: image_parser,
+            ExtensionTypes.JPEG.value: image_parser,
+            ExtensionTypes.WEBP.value: image_parser,
+            ExtensionTypes.SVG.value: image_parser,
+            ExtensionTypes.HEIC.value: image_parser,
+            ExtensionTypes.HEIF.value: image_parser,
+            ExtensionTypes.SQL_TABLE.value: SQLTableParser(),
+            ExtensionTypes.SQL_VIEW.value: SQLViewParser(),
+            ExtensionTypes.JSON.value: JSONParser(),
+            ExtensionTypes.YAML.value: YAMLParser(),
+            ExtensionTypes.YML.value: YAMLParser(),
+            ExtensionTypes.CODE.value: CodeFileParser(),
+        }
+        return parsers
+
+    async def create_pipeline_runtime(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+        graph_provider: IGraphDBProvider,
+        sink_orchestrator: SinkOrchestrator,
+        document_extractor: DocumentExtraction,
+        extraction_client: ExtractionClient,
+    ) -> PipelineRuntime:
+        """The pipeline stage runtime. Its publisher is bound to a producer when the consumers
+        start, and its duplicate release to the vector-membership sync with the event processor."""
+        return build_pipeline_runtime(
+            logger=logger,
+            config_service=config_service,
+            graph=graph_provider,
+            sink=sink_orchestrator,
+            document_extraction=document_extractor,
+            extraction_client=extraction_client,
+            record_from_document=convert_record_dict_to_record,
+        )
+
+    async def create_processor(
+        self,
+        logger: Logger,
+        config_service: ConfigurationService,
+        indexing_pipeline: IndexingPipeline,
+        graph_provider: IGraphDBProvider,
+        parsers: dict,
+        document_extractor: DocumentExtraction,
+        sink_orchestrator: SinkOrchestrator,
+        pipeline_runtime: PipelineRuntime,
+    ) -> Processor:
+        """Async factory for Processor"""
+        processor = Processor(
+            logger=logger,
+            config_service=config_service,
+            indexing_pipeline=indexing_pipeline,
+            graph_provider=graph_provider,
+            parsers=parsers,
+            document_extractor=document_extractor,
+            sink_orchestrator=sink_orchestrator,
+            stage_ingress=pipeline_runtime.ingress,
+        )
+        # Add any necessary async initialization
+        return processor
+
+    async def create_event_processor(
+        self,
+        logger: Logger,
+        processor: Processor,
+        graph_provider: IGraphDBProvider,
+        config_service: ConfigurationService,
+        collection_registry: CollectionRegistry,
+        parsing_client: "ParsingClient | None" = None,
+        extraction_client: ExtractionClient | None = None,
+        sink_orchestrator: SinkOrchestrator | None = None,
+        pipeline_runtime: PipelineRuntime | None = None,
+    ) -> EventProcessor:
+        """Async factory for EventProcessor.
+
+        When *parsing_client* and *extraction_client* are provided (and
+        ``USE_PARSING_SERVICE=true`` in the environment) the event processor
+        routes through the standalone parsing / extraction services instead of
+        using the legacy inline dispatch.
+
+        The strategy comes off the shared registry rather than being resolved
+        again here: dedup decides "same collection?" with it, and the write
+        path resolves the actual target with it, so the two must be the same
+        object or a record can be skipped as a duplicate of something living
+        in a different collection.
+        """
+        event_processor = EventProcessor(
+            logger=logger,
+            processor=processor,
+            graph_provider=graph_provider,
+            config_service=config_service,
+            parsing_client=parsing_client,
+            extraction_client=extraction_client,
+            sink_orchestrator=sink_orchestrator,
+            collection_strategy=collection_registry.strategy,
+            stage_ingress=pipeline_runtime.ingress if pipeline_runtime else None,
+        )
+        if pipeline_runtime is not None:
+            # The classify stage releases a record's QUEUED copies; their reconcile syncs membership.
+            pipeline_runtime.queued_copies.bind(event_processor.sync_vector_membership)
+        return event_processor
+
+    async def create_parsing_client(self, config_service: object) -> "ParsingClient":
+        """Async factory for ParsingClient."""
+        from app.services.parsing.client import ParsingClient  # noqa: PLC0415
+        return ParsingClient(config_service=config_service)
+
+    async def create_extraction_client(
+        self, config_service: ConfigurationService
+    ) -> "ExtractionClient":  # type: ignore[name-defined]
+        """Async factory for ExtractionClient."""
+        from app.services.extraction.client import ExtractionClient  # noqa: PLC0415
+        return ExtractionClient(config_service=config_service)
+
+    async def create_retrieval_service(
+        self,
+        config_service: ConfigurationService,
+        logger: Logger,
+        vector_db_service: IVectorDBService,
+        graph_provider: IGraphDBProvider,
+        blob_store: BlobStorage,
+        collection_registry: CollectionRegistry,
+    ) -> RetrievalService:
+        """Async factory for RetrievalService"""
+        service = RetrievalService(
+            logger=logger,
+            config_service=config_service,
+            collection_registry=collection_registry,
+            vector_db_service=vector_db_service,
+            graph_provider=graph_provider,
+            blob_store=blob_store,
+        )
+        return service
+
+    async def create_feature_flag_service(
+        self,
+        config_service: ConfigurationService | None = None,
+    ) -> FeatureFlagService:
+        """Async factory for FeatureFlagService
+
+        Preference order:
+        1) EtcdProvider-backed provider (uses get_config under the hood)
+        2) Env provider fallback
+        """
+        if config_service is not None:
+            print("Creating EtcdProvider")
+            provider = EtcdProvider(config_service)
+            try:
+                await provider.refresh()
+            except Exception as e:
+                self.logger.debug(f"Feature flag provider refresh failed: {e}")
+            return await FeatureFlagService.init_with_etcd_provider(provider, self.logger)
+        else:
+            print("Creating EnvFileProvider")
+            return FeatureFlagService.get_service()

@@ -1,0 +1,833 @@
+"""Tests for app.sandbox.artifact_upload."""
+
+import asyncio
+import hashlib
+import os
+import tempfile
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.config.constants.arangodb import Connectors
+from app.sandbox.artifact_upload import (
+    MAX_ARTIFACT_BYTES,
+    _read_file_bytes,
+    create_artifact_record,
+    save_query_result_csv,
+    schedule_artifact_upload_task,
+    upload_artifacts_to_blob,
+    upload_bytes_artifact,
+)
+from app.sandbox.models import ArtifactOutput, ExecutionResult
+
+
+class TestReadFileBytes:
+    def test_reads_file_under_sandbox_root(self, monkeypatch):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "test_read.txt")
+        try:
+            with open(test_file, "wb") as f:
+                f.write(b"hello world")
+            assert _read_file_bytes(test_file) == b"hello world"
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+    def test_nonexistent_file(self):
+        assert _read_file_bytes("/nonexistent/file.txt") is None
+
+    def test_rejects_file_outside_sandbox(self, tmp_path):
+        f = tmp_path / "secret.txt"
+        f.write_bytes(b"sensitive data")
+        assert _read_file_bytes(str(f)) is None
+
+    def test_rejects_symlinked_artifact(self, tmp_path) -> None:
+        """An artifact that is a symlink to a host file must be refused (SB-5),
+        even when the link itself sits under the sandbox root."""
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        secret = tmp_path / "host_secret.txt"
+        secret.write_bytes(b"TOP-SECRET-HOST")
+        link = os.path.join(sandbox_root, "artifact_link.txt")
+        try:
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(str(secret), link)
+            assert _read_file_bytes(link) is None
+        finally:
+            if os.path.lexists(link):
+                os.unlink(link)
+
+    def test_rejects_file_exceeding_size_cap(self):
+        """A file larger than max_bytes must be refused without being loaded into memory."""
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "test_oversize.bin")
+        try:
+            # 2 MiB file with a 1 MiB cap
+            with open(test_file, "wb") as f:
+                f.write(b"\x00" * (2 * 1024 * 1024))
+            assert _read_file_bytes(test_file, max_bytes=1024 * 1024) is None
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+    def test_allows_file_at_size_cap(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "test_atcap.bin")
+        try:
+            payload = b"\x00" * 1024
+            with open(test_file, "wb") as f:
+                f.write(payload)
+            assert _read_file_bytes(test_file, max_bytes=1024) == payload
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+    def test_default_cap_is_reasonable(self):
+        """Sanity-check the module-level default cap is within an expected range."""
+        assert 1024 * 1024 <= MAX_ARTIFACT_BYTES <= 1024 * 1024 * 1024
+
+    def test_reads_file_under_docker_sandbox_root(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox_docker")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "test_read_docker.txt")
+        try:
+            with open(test_file, "wb") as f:
+                f.write(b"docker sandbox content")
+            assert _read_file_bytes(test_file) == b"docker sandbox content"
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+
+class TestUploadArtifactsToBlob:
+    @pytest.mark.asyncio
+    async def test_empty_list(self):
+        blob_store = AsyncMock()
+        result = await upload_artifacts_to_blob(
+            [],
+            blob_store=blob_store,
+            org_id="org1",
+            conversation_id="conv1",
+        )
+        assert result == []
+        blob_store.save_conversation_file_to_storage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uploads_artifacts(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        file_path = os.path.join(sandbox_root, "test_upload_chart.png")
+        file_data = b"\x89PNG" + b"\x00" * 100
+        try:
+            with open(file_path, "wb") as f:
+                f.write(file_data)
+
+            artifact = ArtifactOutput(
+                file_name="chart.png",
+                file_path=file_path,
+                mime_type="image/png",
+                size_bytes=104,
+            )
+
+            blob_store = AsyncMock()
+            blob_store.save_conversation_file_to_storage = AsyncMock(return_value={
+                "documentId": "doc123",
+                "fileName": "chart.png",
+                "signedUrl": "https://storage.example.com/chart.png",
+            })
+
+            result = await upload_artifacts_to_blob(
+                [artifact],
+                blob_store=blob_store,
+                org_id="org1",
+                conversation_id="conv1",
+            )
+
+            assert len(result) == 1
+            assert result[0]["documentId"] == "doc123"
+            assert result[0]["mimeType"] == "image/png"
+            assert result[0]["sizeBytes"] == 104
+
+            blob_store.save_conversation_file_to_storage.assert_called_once_with(
+                org_id="org1",
+                conversation_id="conv1",
+                file_name="chart.png",
+                file_bytes=file_data,
+                content_type="image/png",
+            )
+        finally:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+
+    @pytest.mark.asyncio
+    async def test_skips_unreadable_files(self):
+        artifact = ArtifactOutput(
+            file_name="missing.csv",
+            file_path="/nonexistent/missing.csv",
+            mime_type="text/csv",
+            size_bytes=0,
+        )
+        blob_store = AsyncMock()
+
+        result = await upload_artifacts_to_blob(
+            [artifact],
+            blob_store=blob_store,
+            org_id="org1",
+            conversation_id="conv1",
+        )
+        assert result == []
+        blob_store.save_conversation_file_to_storage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_continues_on_upload_error(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        f1_path = os.path.join(sandbox_root, "test_bad.png")
+        f2_path = os.path.join(sandbox_root, "test_good.csv")
+        try:
+            with open(f1_path, "wb") as f:
+                f.write(b"data1")
+            with open(f2_path, "wb") as f:
+                f.write(b"a,b\n1,2\n")
+
+            art1 = ArtifactOutput(file_name="bad.png", file_path=f1_path, mime_type="image/png", size_bytes=5)
+            art2 = ArtifactOutput(file_name="good.csv", file_path=f2_path, mime_type="text/csv", size_bytes=8)
+
+            blob_store = AsyncMock()
+
+            call_count = 0
+            async def _mock_save(**kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise RuntimeError("upload failed")
+                return {"documentId": "doc2", "fileName": "good.csv", "signedUrl": "https://url"}
+
+            blob_store.save_conversation_file_to_storage = _mock_save
+
+            result = await upload_artifacts_to_blob(
+                [art1, art2],
+                blob_store=blob_store,
+                org_id="org1",
+                conversation_id="conv1",
+            )
+            assert len(result) == 1
+            assert result[0]["fileName"] == "good.csv"
+        finally:
+            for p in (f1_path, f2_path):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+
+class TestUploadBytesArtifact:
+    @pytest.mark.asyncio
+    async def test_rejects_oversize_in_memory_bytes(self):
+        """upload_bytes_artifact must refuse payloads over the cap without calling the blob store."""
+        blob_store = AsyncMock()
+        blob_store.save_conversation_file_to_storage = AsyncMock()
+
+        huge_bytes = b"\x00" * (MAX_ARTIFACT_BYTES + 1)
+        result = await upload_bytes_artifact(
+            file_name="huge.png",
+            file_bytes=huge_bytes,
+            mime_type="image/png",
+            blob_store=blob_store,
+            org_id="org-1",
+            conversation_id="conv-1",
+        )
+        assert result is None
+        blob_store.save_conversation_file_to_storage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepts_small_bytes(self):
+        blob_store = AsyncMock()
+        blob_store.save_conversation_file_to_storage = AsyncMock(return_value={
+            "documentId": "doc-xyz",
+            "fileName": "ok.png",
+            "signedUrl": "https://ok.example/x",
+        })
+        result = await upload_bytes_artifact(
+            file_name="ok.png",
+            file_bytes=b"\x89PNG" + b"\x00" * 100,
+            mime_type="image/png",
+            blob_store=blob_store,
+            org_id="org-1",
+            conversation_id="conv-1",
+        )
+        assert result is not None
+        assert result["documentId"] == "doc-xyz"
+        blob_store.save_conversation_file_to_storage.assert_called_once()
+
+
+class TestCreateArtifactRecord:
+    @pytest.mark.asyncio
+    async def test_creates_record_with_edges(self):
+        mock_graph = AsyncMock()
+        mock_graph.get_user_by_user_id = AsyncMock(return_value={"_key": "user-key-1", "id": "user-key-1"})
+        mock_graph.batch_upsert_nodes = AsyncMock()
+        mock_graph.batch_create_edges = AsyncMock()
+
+        record_id = await create_artifact_record(
+            graph_provider=mock_graph,
+            document_id="doc-ext-123",
+            file_name="chart.png",
+            mime_type="image/png",
+            size_bytes=4096,
+            org_id="org-1",
+            user_id="user-1",
+            conversation_id="conv-1",
+            source_tool="coding_sandbox.execute_python",
+        )
+
+        assert record_id is not None
+        assert len(record_id) > 0
+
+        # Should have created records and artifacts nodes
+        assert mock_graph.batch_upsert_nodes.call_count == 2
+        # Should have created permission and is_of_type edges
+        assert mock_graph.batch_create_edges.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_raises_on_missing_user(self):
+        from app.services.artifact_registry.access import ArtifactNotFoundError
+
+        mock_graph = AsyncMock()
+        mock_graph.get_user_by_user_id = AsyncMock(return_value=None)
+
+        with pytest.raises(ArtifactNotFoundError, match="User not found"):
+            await create_artifact_record(
+                graph_provider=mock_graph,
+                document_id="doc-ext-123",
+                file_name="chart.png",
+                mime_type="image/png",
+                size_bytes=4096,
+                org_id="org-1",
+                user_id="nonexistent-user",
+                conversation_id="conv-1",
+            )
+
+
+class TestUploadBytesArtifactWithRecord:
+    """Cover the ``user_id + graph_provider`` branch in upload_bytes_artifact."""
+
+    @pytest.mark.asyncio
+    async def test_creates_record_when_user_and_graph_present(self):
+        """`user_id` + `graph_provider` present routes through
+        `ArtifactRegistryService.register_output` directly (see that
+        function's docstring) — NOT through the standalone
+        `create_artifact_record` helper, which only the (unversioned,
+        pre-existing-document) `upload_artifacts_to_blob` path still uses."""
+        blob_store = AsyncMock()
+        blob_store.save_versioned_artifact_to_storage = AsyncMock(return_value={
+            "documentId": "doc-record-1",
+        })
+        mock_graph = AsyncMock()
+        mock_graph.get_user_by_user_id = AsyncMock(return_value={"_key": "user-key-1"})
+        mock_graph.get_documents_paginated = AsyncMock(return_value=[])  # no pre-existing artifact -> create(), not add_version()
+        mock_graph.batch_upsert_nodes = AsyncMock(return_value=True)
+        mock_graph.batch_create_edges = AsyncMock(return_value=True)
+
+        with patch(
+            "app.services.artifact_registry.registry.ArtifactRegistryService.get_download_url",
+            AsyncMock(return_value="https://blob/x"),
+        ):
+            result = await upload_bytes_artifact(
+                file_name="img.png",
+                file_bytes=b"\x89PNG-fake",
+                mime_type="image/png",
+                blob_store=blob_store,
+                org_id="org-1",
+                conversation_id="conv-1",
+                user_id="user-1",
+                graph_provider=mock_graph,
+            )
+
+        assert result is not None
+        assert result["recordId"]  # a fresh uuid — only its presence is asserted
+        assert result["version"] == 1
+        assert result["documentId"] == "doc-record-1"
+        assert result["downloadUrl"] == "https://blob/x"
+        blob_store.save_versioned_artifact_to_storage.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_registry_failure_does_not_raise_returns_none(self):
+        """A registry-level failure (e.g. the graph write raising) must
+        make `upload_bytes_artifact` return `None`, never propagate — a
+        caller in a POST_TOOL_USE hook must not have the whole tool
+        response blow up because artifact bookkeeping failed."""
+        blob_store = AsyncMock()
+        mock_graph = AsyncMock()
+        mock_graph.get_documents_paginated = AsyncMock(return_value=[])
+        mock_graph.get_user_by_user_id = AsyncMock(side_effect=RuntimeError("graph failure"))
+
+        result = await upload_bytes_artifact(
+            file_name="img2.png",
+            file_bytes=b"\x89PNG-fake2",
+            mime_type="image/png",
+            blob_store=blob_store,
+            org_id="org-1",
+            conversation_id="conv-1",
+            user_id="user-1",
+            graph_provider=mock_graph,
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_blob_save_failure_returns_none(self):
+        """upload_bytes_artifact must return None if the blob save raises."""
+        blob_store = AsyncMock()
+        blob_store.save_conversation_file_to_storage = AsyncMock(
+            side_effect=RuntimeError("blob boom"),
+        )
+
+        result = await upload_bytes_artifact(
+            file_name="bad.png",
+            file_bytes=b"data",
+            mime_type="image/png",
+            blob_store=blob_store,
+            org_id="org-1",
+            conversation_id="conv-1",
+        )
+        assert result is None
+
+
+class TestUploadArtifactsToBlobWithRecord:
+    """Cover the ``user_id + graph_provider`` record-creation branch in
+    ``upload_artifacts_to_blob``, including the exception swallow."""
+
+    @pytest.mark.asyncio
+    async def test_creates_record_and_handles_failure(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        f1 = os.path.join(sandbox_root, "t_rec_ok.png")
+        f2 = os.path.join(sandbox_root, "t_rec_fail.png")
+        try:
+            with open(f1, "wb") as f:
+                f.write(b"ok")
+            with open(f2, "wb") as f:
+                f.write(b"fail")
+
+            art1 = ArtifactOutput(
+                file_name="ok.png", file_path=f1, mime_type="image/png", size_bytes=2,
+            )
+            art2 = ArtifactOutput(
+                file_name="fail.png", file_path=f2, mime_type="image/png", size_bytes=4,
+            )
+
+            blob_store = AsyncMock()
+            doc_counter = {"n": 0}
+
+            async def _save(**kwargs):
+                doc_counter["n"] += 1
+                return {
+                    "documentId": f"doc-{doc_counter['n']}",
+                    "fileName": kwargs["file_name"],
+                    "signedUrl": "https://blob/x",
+                }
+
+            blob_store.save_conversation_file_to_storage = _save
+
+            create_counter = {"n": 0}
+
+            async def _create_record(**kwargs):
+                create_counter["n"] += 1
+                if create_counter["n"] == 1:
+                    return "rec-1"
+                raise RuntimeError("record failure")
+
+            mock_graph = AsyncMock()
+
+            with patch(
+                "app.sandbox.artifact_upload.create_artifact_record",
+                _create_record,
+            ):
+                result = await upload_artifacts_to_blob(
+                    [art1, art2],
+                    blob_store=blob_store,
+                    org_id="org-1",
+                    conversation_id="conv-1",
+                    user_id="user-1",
+                    graph_provider=mock_graph,
+                )
+
+            assert len(result) == 2
+            assert result[0]["recordId"] == "rec-1"
+            assert "recordId" not in result[1]
+        finally:
+            for p in (f1, f2):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+
+class TestReadFileBytesErrorPaths:
+    """Cover the getsize OSError, open OSError, and TOCTOU grow-past-cap branches."""
+
+    def test_stat_oserror(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "stat_error.txt")
+        try:
+            with open(test_file, "wb") as f:
+                f.write(b"data")
+            with patch(
+                "app.sandbox.artifact_upload.os.path.getsize",
+                side_effect=OSError("permission denied"),
+            ):
+                assert _read_file_bytes(test_file) is None
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+    def test_open_oserror(self):
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "open_error.txt")
+        try:
+            with open(test_file, "wb") as f:
+                f.write(b"data")
+            real_open = open
+
+            def _raise_open(path, *args, **kwargs):
+                if os.path.realpath(str(path)) == os.path.realpath(test_file):
+                    raise OSError("nope")
+                return real_open(path, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=_raise_open):
+                assert _read_file_bytes(test_file) is None
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+    def test_grew_past_cap_during_read(self):
+        """File stat-ed at cap but delivered more bytes during streaming read."""
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        test_file = os.path.join(sandbox_root, "grew_past_cap.bin")
+        try:
+            # File at exactly the cap, but the fake file will return more.
+            with open(test_file, "wb") as f:
+                f.write(b"\x00" * 1024)
+
+            real_open = open
+
+            class _GrowingFile:
+                def __init__(self, real):
+                    self._real = real
+                    self._calls = 0
+
+                def read(self, size):
+                    self._calls += 1
+                    if self._calls == 1:
+                        return b"\x00" * 1024
+                    if self._calls == 2:
+                        # extra chunk past the cap -> trigger TOCTOU branch
+                        return b"\x00" * 2048
+                    return b""
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    self._real.close()
+
+            def _fake_open(path, mode="r", *args, **kwargs):
+                if os.path.realpath(str(path)) == os.path.realpath(test_file):
+                    real = real_open(path, mode, *args, **kwargs)
+                    return _GrowingFile(real)
+                return real_open(path, mode, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=_fake_open):
+                # max_bytes set to the stat-reported size so the first chunk
+                # passes but the second pushes past the cap.
+                assert _read_file_bytes(test_file, max_bytes=1024) is None
+        finally:
+            if os.path.exists(test_file):
+                os.unlink(test_file)
+
+
+class TestScheduleArtifactUploadTask:
+    @pytest.mark.asyncio
+    async def test_registers_task_for_artifacts(self):
+        artifact = ArtifactOutput(
+            file_name="chart.png",
+            file_path="/tmp/pipeshub_sandbox/test/chart.png",
+            mime_type="image/png",
+            size_bytes=100,
+        )
+        exec_result = ExecutionResult(
+            success=True, stdout="", exit_code=0, artifacts=[artifact],
+        )
+        mock_blob = AsyncMock()
+        mock_blob.save_conversation_file_to_storage = AsyncMock(return_value={
+            "documentId": "doc1", "fileName": "chart.png", "signedUrl": "https://url",
+        })
+
+        with patch("app.sandbox.artifact_upload.register_task") as mock_register:
+            schedule_artifact_upload_task(
+                exec_result,
+                blob_store=mock_blob,
+                org_id="org-1",
+                conversation_id="conv-1",
+            )
+            mock_register.assert_called_once()
+            assert mock_register.call_args[0][0] == "conv-1"
+
+    def test_no_op_without_artifacts(self):
+        exec_result = ExecutionResult(success=True, stdout="", exit_code=0, artifacts=[])
+
+        with patch("app.sandbox.artifact_upload.register_task") as mock_register:
+            schedule_artifact_upload_task(
+                exec_result,
+                blob_store=AsyncMock(),
+                org_id="org-1",
+                conversation_id="conv-1",
+            )
+            mock_register.assert_not_called()
+
+    def test_no_op_without_conversation_id(self):
+        artifact = ArtifactOutput(
+            file_name="chart.png", file_path="/tmp/chart.png",
+            mime_type="image/png", size_bytes=100,
+        )
+        exec_result = ExecutionResult(
+            success=True, stdout="", exit_code=0, artifacts=[artifact],
+        )
+
+        with patch("app.sandbox.artifact_upload.register_task") as mock_register:
+            schedule_artifact_upload_task(
+                exec_result,
+                blob_store=AsyncMock(),
+                org_id="org-1",
+                conversation_id="",
+            )
+            mock_register.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uses_blob_storage_fallback(self):
+        """When blob_store is None, the helper must build a BlobStorage from
+        config_service + graph_provider and run the upload through it."""
+        sandbox_root = os.path.join(tempfile.gettempdir(), "pipeshub_sandbox")
+        os.makedirs(sandbox_root, exist_ok=True)
+        file_path = os.path.join(sandbox_root, "test_schedule_fallback.csv")
+        try:
+            with open(file_path, "wb") as f:
+                f.write(b"a,b\n1,2\n")
+            artifact = ArtifactOutput(
+                file_name="out.csv",
+                file_path=file_path,
+                mime_type="text/csv",
+                size_bytes=8,
+            )
+            exec_result = ExecutionResult(
+                success=True, stdout="", exit_code=0, artifacts=[artifact],
+            )
+
+            fake_store = MagicMock()
+            fake_store.save_conversation_file_to_storage = AsyncMock(return_value={
+                "documentId": "doc-fb",
+                "fileName": "out.csv",
+                "signedUrl": "https://blob/fb",
+            })
+            fake_cls = MagicMock(return_value=fake_store)
+
+            captured_tasks: list[asyncio.Task] = []
+
+            with patch(
+                "app.modules.transformers.blob_storage.BlobStorage", fake_cls,
+            ), patch(
+                "app.sandbox.artifact_upload.register_task",
+                lambda conv_id, task: captured_tasks.append(task),
+            ):
+                schedule_artifact_upload_task(
+                    exec_result,
+                    blob_store=None,
+                    org_id="org-1",
+                    conversation_id="conv-1",
+                    config_service=MagicMock(),
+                    graph_provider=MagicMock(),
+                )
+                assert len(captured_tasks) == 1
+                result = await captured_tasks[0]
+
+            assert result is not None
+            assert result["type"] == "artifacts"
+            assert len(result["artifacts"]) == 1
+            fake_cls.assert_called_once()
+        finally:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+
+    @pytest.mark.asyncio
+    async def test_no_store_available_returns_none(self):
+        """No blob_store, no config_service/graph_provider to construct one ->
+        scheduled task resolves to None with a warning."""
+        artifact = ArtifactOutput(
+            file_name="x.csv",
+            file_path="/tmp/pipeshub_sandbox/test_no_store/x.csv",
+            mime_type="text/csv",
+            size_bytes=0,
+        )
+        exec_result = ExecutionResult(
+            success=True, stdout="", exit_code=0, artifacts=[artifact],
+        )
+
+        captured_tasks: list[asyncio.Task] = []
+        with patch(
+            "app.sandbox.artifact_upload.register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            schedule_artifact_upload_task(
+                exec_result,
+                blob_store=None,
+                org_id="org-1",
+                conversation_id="conv-1",
+                config_service=None,
+                graph_provider=None,
+            )
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_handles_upload_exception(self):
+        """If the underlying upload raises, the task must resolve to None."""
+        artifact = ArtifactOutput(
+            file_name="x.csv",
+            file_path="/tmp/pipeshub_sandbox/whatever/x.csv",
+            mime_type="text/csv",
+            size_bytes=0,
+        )
+        exec_result = ExecutionResult(
+            success=True, stdout="", exit_code=0, artifacts=[artifact],
+        )
+
+        captured_tasks: list[asyncio.Task] = []
+        blob_store = AsyncMock()
+
+        async def _raise(*args, **kwargs):
+            raise RuntimeError("upload exploded")
+
+        with patch(
+            "app.sandbox.artifact_upload.upload_artifacts_to_blob", _raise,
+        ), patch(
+            "app.sandbox.artifact_upload.register_task",
+            lambda conv_id, task: captured_tasks.append(task),
+        ):
+            schedule_artifact_upload_task(
+                exec_result,
+                blob_store=blob_store,
+                org_id="org-1",
+                conversation_id="conv-1",
+            )
+            assert len(captured_tasks) == 1
+            result = await captured_tasks[0]
+
+        assert result is None
+
+
+class TestSaveQueryResultCsv:
+    @staticmethod
+    def _blob(*, error: Exception | None = None, signed_url: str | None = None) -> MagicMock:
+        info = {"documentId": "doc-1", "fileName": "q.csv", **({"signedUrl": signed_url} if signed_url else {})}
+        blob = MagicMock()
+        blob.save_versioned_artifact_to_storage = AsyncMock(return_value=info, side_effect=error)
+        blob.save_conversation_file_to_storage = AsyncMock(return_value=info, side_effect=error)
+        return blob
+
+    @staticmethod
+    async def _save(blob: MagicMock, *, user_id: str | None = "user-1", graph_provider: MagicMock | None = None) -> dict | None:
+        return await save_query_result_csv(
+            blob_store=blob,
+            graph_provider=graph_provider if graph_provider is not None else MagicMock(),
+            org_id="org-1",
+            user_id=user_id,
+            conversation_id="conv-1",
+            columns=["id", "name"],
+            rows=[(1, "a"), (2, "b,c")],
+            file_name="q.csv",
+            source_tool="sql.execute_sql_query",
+        )
+
+    @pytest.mark.asyncio
+    async def test_registers_the_csv_as_an_owned_versioned_artifact(self):
+        blob = self._blob()
+        with patch(
+            "app.sandbox.artifact_upload.create_artifact_record", AsyncMock(return_value="rec-1"),
+        ) as create:
+            result = await self._save(blob)
+
+        assert result["type"] == "artifacts"
+        (entry,) = result["artifacts"]
+        assert (entry["documentId"], entry["recordId"], entry["version"]) == ("doc-1", "rec-1", 1)
+        assert (entry["mimeType"], entry["fileName"]) == ("text/csv", "q.csv")
+
+        blob.save_conversation_file_to_storage.assert_not_awaited()
+        upload = blob.save_versioned_artifact_to_storage.await_args.kwargs
+        assert (upload["org_id"], upload["conversation_id"], upload["content_type"]) == ("org-1", "conv-1", "text/csv")
+        assert upload["file_bytes"].decode().splitlines() == ["id,name", "1,a", '2,"b,c"']
+        assert entry["sizeBytes"] == len(upload["file_bytes"])
+
+        kwargs = create.await_args.kwargs
+        assert (kwargs["user_id"], kwargs["org_id"], kwargs["conversation_id"]) == ("user-1", "org-1", "conv-1")
+        assert (kwargs["document_id"], kwargs["mime_type"]) == ("doc-1", "text/csv")
+        assert kwargs["connector_name"] == Connectors.DATABASE_SANDBOX
+        assert kwargs["content_hash"] == hashlib.sha256(upload["file_bytes"]).hexdigest()
+
+    @pytest.mark.asyncio
+    async def test_without_a_user_on_cloud_storage_links_by_signed_url(self):
+        blob = self._blob(signed_url="https://s3/q")
+        with patch("app.sandbox.artifact_upload.create_artifact_record", AsyncMock()) as create:
+            result = await self._save(blob, user_id=None)
+
+        create.assert_not_awaited()
+        blob.save_versioned_artifact_to_storage.assert_not_awaited()
+        blob.save_conversation_file_to_storage.assert_awaited_once()
+        (entry,) = result["artifacts"]
+        assert entry["signedUrl"] == "https://s3/q"
+        assert "recordId" not in entry
+
+    @pytest.mark.asyncio
+    async def test_without_a_user_on_local_storage_is_a_failed_export(self):
+        # No record and no signed URL: nothing the user could download.
+        with patch("app.sandbox.artifact_upload.create_artifact_record", AsyncMock()):
+            assert await self._save(self._blob(), user_id=None) is None
+
+    @pytest.mark.asyncio
+    async def test_record_failure_without_a_signed_url_is_a_failed_export(self):
+        blob = self._blob()
+        with patch(
+            "app.sandbox.artifact_upload.create_artifact_record", AsyncMock(side_effect=RuntimeError("graph down")),
+        ):
+            assert await self._save(blob) is None
+        blob.save_versioned_artifact_to_storage.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_keeps_the_export_when_record_creation_fails(self):
+        blob = self._blob(signed_url="https://s3/q")
+        with patch(
+            "app.sandbox.artifact_upload.create_artifact_record", AsyncMock(side_effect=RuntimeError("graph down")),
+        ):
+            result = await self._save(blob)
+
+        (entry,) = result["artifacts"]
+        assert entry["signedUrl"] == "https://s3/q"
+        assert "recordId" not in entry and "version" not in entry
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_upload_fails(self):
+        assert await self._save(self._blob(error=OSError("bucket gone"))) is None
+
+    @pytest.mark.asyncio
+    async def test_never_emits_a_storage_service_link(self):
+        blob = self._blob()
+        with patch("app.sandbox.artifact_upload.create_artifact_record", AsyncMock(return_value="rec-1")):
+            result = await self._save(blob)
+
+        assert "/api/v1/document/" not in repr(result)
+        assert "downloadUrl" not in result["artifacts"][0]

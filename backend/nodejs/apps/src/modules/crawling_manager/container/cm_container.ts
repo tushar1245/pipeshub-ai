@@ -1,0 +1,219 @@
+import { Container } from 'inversify';
+import { Logger } from '../../../libs/services/logger.service';
+import { RedisService } from '../../../libs/services/redis.service';
+import { AppConfig } from '../../tokens_manager/config/config';
+import { AuthMiddleware } from '../../../config';
+import { AuthTokenService } from '../../../libs/services/authtoken.service';
+import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
+import { ConfigurationManagerConfig } from '../../configuration_manager/config/config';
+import { CrawlingWorkerService } from '../services/crawling_worker';
+import { CrawlingSchedulerService } from '../services/crawling_service';
+import { ConnectorScheduleSweepService } from '../services/connector_schedule_sweep';
+import { RedisConfig } from '../../../libs/types/redis.types';
+import { ConnectorsCrawlingService } from '../services/connectors/connectors';
+import { SyncEventProducer } from '../../knowledge_base/services/sync_events.service';
+import { IMessageProducer } from '../../../libs/types/messaging.types';
+import {
+  resolveMessageBrokerConfig,
+  createMessageProducer,
+} from '../../../libs/services/message-broker.factory';
+
+const loggerConfig = {
+  service: 'Crawling Manager Container',
+};
+
+export class CrawlingManagerContainer {
+  private static instance: Container;
+  private static logger: Logger = Logger.getInstance(loggerConfig);
+
+  static async initialize(
+    configurationManagerConfig: ConfigurationManagerConfig,
+    appConfig: AppConfig,
+  ): Promise<Container> {
+    const container = new Container();
+    container.bind<Logger>('Logger').toConstantValue(this.logger);
+    container
+      .bind<ConfigurationManagerConfig>('ConfigurationManagerConfig')
+      .toConstantValue(configurationManagerConfig);
+
+    container
+      .bind<AppConfig>('AppConfig')
+      .toDynamicValue(() => appConfig) // Always fetch latest reference
+      .inTransientScope();
+    await this.initializeServices(container, appConfig);
+    this.instance = container;
+    return container;
+  }
+
+  private static async initializeServices(
+    container: Container,
+    appConfig: AppConfig,
+  ): Promise<void> {
+    try {
+      const logger = container.get<Logger>('Logger');
+      logger.info('Initializing Crawling Manager services');
+      setupCrawlingDependencies(container, appConfig.redis);
+
+      const authTokenService = new AuthTokenService(
+        appConfig.jwtSecret,
+        appConfig.scopedJwtSecret,
+      );
+      const authMiddleware = new AuthMiddleware(
+        container.get('Logger'),
+        authTokenService,
+      );
+      container
+        .bind<AuthMiddleware>(AuthMiddleware)
+        .toConstantValue(authMiddleware);
+
+      const configurationManagerConfig =
+        container.get<ConfigurationManagerConfig>('ConfigurationManagerConfig');
+      const keyValueStoreService = KeyValueStoreService.getInstance(
+        configurationManagerConfig,
+      );
+
+      await keyValueStoreService.connect();
+      container
+        .bind<KeyValueStoreService>('KeyValueStoreService')
+        .toConstantValue(keyValueStoreService);
+
+      // Create broker-agnostic message producer
+      const brokerConfig = resolveMessageBrokerConfig(appConfig);
+      const messageProducer = createMessageProducer(brokerConfig, container.get('Logger'));
+      await messageProducer.connect();
+
+      container
+        .bind<IMessageProducer>('MessageProducer')
+        .toConstantValue(messageProducer);
+
+      const syncEventsService = new SyncEventProducer(
+        messageProducer,
+        container.get('Logger'),
+      );
+      await syncEventsService.start();
+      container
+        .bind<SyncEventProducer>('SyncEventProducer')
+        .toConstantValue(syncEventsService);
+
+      logger.info('Starting crawling worker service...');
+      const crawlingWorkerService = container.get<CrawlingWorkerService>(
+        CrawlingWorkerService,
+      );
+
+      if (!crawlingWorkerService) {
+        throw new Error('CrawlingWorkerService not found');
+      }
+
+      logger.info('Crawling worker service started successfully');
+
+      // Not awaited: a slow Redis must not hold up startup for a repair job.
+      void container
+        .get<ConnectorScheduleSweepService>(ConnectorScheduleSweepService)
+        .start();
+
+      this.logger.info('Crawling Manager services initialized successfully');
+    } catch (error) {
+      const logger = container.get<Logger>('Logger');
+      logger.error('Failed to initialize services', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      throw error;
+    }
+  }
+
+  static getInstance(): Container {
+    if (!this.instance) {
+      throw new Error('Crawling Manager container not initialized');
+    }
+    return this.instance;
+  }
+
+  static async dispose(): Promise<void> {
+    if (this.instance) {
+      try {
+        const redisService = this.instance.isBound('RedisService')
+          ? this.instance.get<RedisService>('RedisService')
+          : null;
+
+        const messageProducer = this.instance.isBound('MessageProducer')
+          ? this.instance.get<IMessageProducer>('MessageProducer')
+          : null;
+          
+        if (redisService && redisService.isConnected()) {
+          await redisService.disconnect();
+        }
+
+        const crawlingWorkerService = this.instance.isBound(
+          CrawlingWorkerService,
+        )
+          ? this.instance.get<CrawlingWorkerService>(CrawlingWorkerService)
+          : null;
+        if (crawlingWorkerService) {
+          await crawlingWorkerService.close();
+        }
+
+        const scheduleSweepService = this.instance.isBound(
+          ConnectorScheduleSweepService,
+        )
+          ? this.instance.get<ConnectorScheduleSweepService>(
+              ConnectorScheduleSweepService,
+            )
+          : null;
+        await scheduleSweepService?.close();
+
+        const keyValueStoreService = this.instance.isBound(KeyValueStoreService)
+          ? this.instance.get<KeyValueStoreService>(KeyValueStoreService)
+          : null;
+        if (keyValueStoreService && keyValueStoreService.isConnected()) {
+          await keyValueStoreService.disconnect();
+          this.logger.info('KeyValueStoreService disconnected successfully');
+        }
+
+        if (messageProducer && messageProducer.isConnected()) {
+          await messageProducer.disconnect();
+          this.logger.info('MessageProducer disconnected successfully');
+        }
+
+        this.logger.info(
+          'All crawling manager services disconnected successfully',
+        );
+      } catch (error) {
+        this.logger.error(
+          'Error while disconnecting crawling manager services',
+          {
+            error: error instanceof Error ? error.message : 'Unknown error',
+          },
+        );
+      } finally {
+        this.instance = null!;
+      }
+    }
+  }
+}
+
+export function setupCrawlingDependencies(
+  container: Container,
+  redisConfig: RedisConfig,
+): void {
+  container.bind<RedisConfig>('RedisConfig').toConstantValue(redisConfig);
+
+  container
+    .bind<ConnectorsCrawlingService>(ConnectorsCrawlingService)
+    .to(ConnectorsCrawlingService)
+    .inSingletonScope();
+
+  container
+    .bind<CrawlingSchedulerService>(CrawlingSchedulerService)
+    .to(CrawlingSchedulerService)
+    .inSingletonScope();
+
+  container
+    .bind<CrawlingWorkerService>(CrawlingWorkerService)
+    .to(CrawlingWorkerService)
+    .inSingletonScope();
+
+  container
+    .bind<ConnectorScheduleSweepService>(ConnectorScheduleSweepService)
+    .to(ConnectorScheduleSweepService)
+    .inSingletonScope();
+}
