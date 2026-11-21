@@ -16,6 +16,9 @@ vi.mock('@/config', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/config')>()),
   PermissionLockIcon: () => <span data-testid="permission-lock" />,
 }));
+// These tests are about other behaviour; group permissions grant everything. Mocked at the EE hook
+// because @/config imports these components itself, so a partial @/config mock misses them.
+vi.mock('@/ee/hooks/useUserPermission', () => ({ useUserPermission: () => true }));
 vi.mock('@/lib/hooks/use-can-hover', () => ({ useCanHover: () => env.canHover }));
 
 beforeAll(installBrowserShims);

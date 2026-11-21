@@ -3,6 +3,10 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
 import '@/lib/__tests__/test-i18n';
 
+// These tests are about other behaviour; group permissions grant everything. Mocked at the EE hook
+// because @/config imports these components itself, so a partial @/config mock misses them.
+vi.mock('@/ee/hooks/useUserPermission', () => ({ useUserPermission: () => true }));
+
 const reindexConnector = vi.fn();
 vi.mock('../../../api', () => ({
   ConnectorsApi: { reindexConnector: (...args: unknown[]) => reindexConnector(...args) },

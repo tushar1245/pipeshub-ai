@@ -111,6 +111,11 @@ vi.mock('../api', async () => {
 });
 
 const permissions = vi.hoisted(() => ({ denied: new Set<string>() }));
+// @/config imports the collection views itself, so components loaded while the partial mock
+// below resolves bind to the real hook; mock the EE hook it re-exports as well.
+vi.mock('@/ee/hooks/useUserPermission', () => ({
+  useUserPermission: (key: string) => !permissions.denied.has(key),
+}));
 vi.mock('@/config', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/config')>();
   return {
